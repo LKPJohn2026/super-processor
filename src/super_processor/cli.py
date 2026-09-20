@@ -15,9 +15,11 @@ from .doctor import (
     format_doctor_text,
 )
 from .jobs import JobError, JobState, JobStore, default_jobs_root
-from .probe import ProbeError, probe_file, write_media_facts
-from .recipe import RecipeError, empty_recipe, write_recipe
+from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
+from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
+from .templates import TemplateError, build_ffmpeg_plan, default_output_path
 from .validator import validate_job_recipe
+from .worker import FFmpegWorker, WorkerError
 
 
 def positive_int(value: str) -> int:
@@ -90,6 +92,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("job_id", help="job identifier")
 
+    run = job_sub.add_parser(
+        "run",
+        help="execute a validated recipe through local FFmpeg templates",
+    )
+    run.add_argument("job_id", help="job identifier")
+    run.add_argument(
+        "--mode",
+        choices=["preview", "final"],
+        default="preview",
+        help="preview window encode or full-timeline final encode (default: preview)",
+    )
+    run.add_argument(
+        "--approve",
+        action="store_true",
+        help="required acknowledgment for --mode final",
+    )
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the FFmpeg plan as JSON without executing",
+    )
+
     job_sub.add_parser("list", help="list known jobs")
 
     doctor_cmd = subparsers.add_parser(
@@ -146,6 +170,14 @@ def run_job_command(arguments: argparse.Namespace) -> int:
             return run_job_init_recipe(store, str(arguments.job_id))
         if command == "validate":
             return run_job_validate(store, str(arguments.job_id))
+        if command == "run":
+            return run_job_run(
+                store,
+                str(arguments.job_id),
+                mode=str(arguments.mode),
+                approve=bool(arguments.approve),
+                dry_run=bool(arguments.dry_run),
+            )
         if command == "list":
             jobs = store.list_jobs()
             if not jobs:
@@ -159,7 +191,7 @@ def run_job_command(arguments: argparse.Namespace) -> int:
                 )
             )
             return 0
-    except (JobError, ProbeError, RecipeError) as exc:
+    except (JobError, ProbeError, RecipeError, TemplateError, WorkerError) as exc:
         print(f"error: {exc}", flush=True)
         return 1
 
@@ -204,10 +236,110 @@ def run_job_init_recipe(store: JobStore, job_id: str) -> int:
 
 def run_job_validate(store: JobStore, job_id: str) -> int:
     """Validate the on-disk recipe for a job."""
-    store.load(job_id)  # ensure job exists
+    manifest = store.load(job_id)
     result = validate_job_recipe(store.job_dir(job_id))
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
-    return 0 if result.ok else 1
+    if not result.ok:
+        return 1
+    if manifest.state in {JobState.PROBED, JobState.PLANNED}:
+        store.transition(job_id, JobState.VALIDATED, notes={"validated": True})
+    elif manifest.state is JobState.VALIDATED:
+        store.update_notes(job_id, {"validated": True})
+    return 0
+
+
+def run_job_run(
+    store: JobStore,
+    job_id: str,
+    *,
+    mode: str,
+    approve: bool,
+    dry_run: bool,
+) -> int:
+    """Build and optionally execute an FFmpeg plan for a job recipe."""
+    if mode == "final" and not approve and not dry_run:
+        raise JobError("final encode requires --approve")
+
+    manifest = store.load(job_id)
+    job_dir = store.job_dir(job_id)
+    validation = validate_job_recipe(job_dir)
+    if not validation.ok:
+        print(json.dumps(validation.to_dict(), indent=2, sort_keys=True))
+        return 1
+
+    if manifest.state in {JobState.PROBED, JobState.PLANNED}:
+        manifest = store.transition(
+            job_id, JobState.VALIDATED, notes={"validated": True}
+        )
+
+    recipe = load_recipe(job_dir)
+    recipe.target.mode = TargetMode.PREVIEW if mode == "preview" else TargetMode.FINAL
+    write_recipe(job_dir, recipe)
+
+    duration_s: float | None = None
+    try:
+        facts = load_media_facts(job_dir)
+        duration_s = facts.duration_s
+    except Exception:
+        duration_s = None
+
+    output_path = default_output_path(job_dir, recipe)
+    plan = build_ffmpeg_plan(
+        recipe,
+        output_path=output_path,
+        work_dir=job_dir,
+        duration_s=duration_s,
+    )
+
+    if dry_run:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if mode == "final":
+        if manifest.state not in {
+            JobState.VALIDATED,
+            JobState.PREVIEWED,
+            JobState.APPROVED,
+        }:
+            raise JobError(
+                f"job {job_id} must be validated before final encode "
+                f"(current: {manifest.state.value})"
+            )
+        store.transition(job_id, JobState.ENCODING, notes={"mode": "final"})
+    elif manifest.state is JobState.VALIDATED:
+        # Stay validated until preview succeeds.
+        pass
+
+    worker = FFmpegWorker()
+    result = worker.run_plan(plan)
+    payload = result.to_dict()
+    payload["validation"] = validation.to_dict()
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+    if not result.ok:
+        store.transition(
+            job_id,
+            JobState.FAILED,
+            error=result.steps[-1].stderr_tail if result.steps else "ffmpeg failed",
+        )
+        return 1
+
+    if mode == "preview":
+        if store.load(job_id).state is JobState.VALIDATED:
+            store.transition(
+                job_id,
+                JobState.PREVIEWED,
+                notes={"preview_path": result.output_path},
+            )
+        else:
+            store.update_notes(job_id, {"preview_path": result.output_path})
+    else:
+        store.transition(
+            job_id,
+            JobState.COMPLETE,
+            notes={"output_path": result.output_path},
+        )
+    return 0
 
 
 def run_doctor_command(arguments: argparse.Namespace) -> int:

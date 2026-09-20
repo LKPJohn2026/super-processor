@@ -37,11 +37,20 @@ class JobState(str, Enum):
 # non-terminal state; COMPLETE only from ENCODING).
 _TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.IMPORTED: frozenset({JobState.PROBED, JobState.FAILED}),
-    JobState.PROBED: frozenset({JobState.DIAGNOSED, JobState.FAILED}),
+    # Hand-authored recipes may skip diagnose/plan and jump to validated.
+    JobState.PROBED: frozenset(
+        {JobState.DIAGNOSED, JobState.VALIDATED, JobState.FAILED}
+    ),
     JobState.DIAGNOSED: frozenset({JobState.PLANNED, JobState.FAILED}),
     JobState.PLANNED: frozenset({JobState.VALIDATED, JobState.FAILED}),
-    JobState.VALIDATED: frozenset({JobState.PREVIEWED, JobState.FAILED}),
-    JobState.PREVIEWED: frozenset({JobState.APPROVED, JobState.FAILED}),
+    # v0.4 allows final encode from validated with explicit --approve; v0.9
+    # tightens this behind preview + apply.
+    JobState.VALIDATED: frozenset(
+        {JobState.PREVIEWED, JobState.ENCODING, JobState.FAILED}
+    ),
+    JobState.PREVIEWED: frozenset(
+        {JobState.APPROVED, JobState.ENCODING, JobState.FAILED}
+    ),
     JobState.APPROVED: frozenset({JobState.ENCODING, JobState.FAILED}),
     JobState.ENCODING: frozenset({JobState.COMPLETE, JobState.FAILED}),
     JobState.COMPLETE: frozenset(),
