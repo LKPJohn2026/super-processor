@@ -119,6 +119,22 @@ def test_list_models_and_missing_preview_qa(tmp_path: Path) -> None:
     assert isinstance(report, QAReport)
     assert report.ok is False
     assert report.issues[0].code == "missing_preview"
+    from super_processor.qa import write_qa_report
+
+    path = write_qa_report(tmp_path, report)
+    assert path.is_file()
+    assert "missing_preview" in path.read_text(encoding="utf-8")
+
+
+def test_diagnosis_roundtrip_loader(tmp_path: Path) -> None:
+    from super_processor.diagnose import load_diagnosis
+
+    estimates = _estimates(str(tmp_path / "clip.mp4"))
+    diagnosis = build_diagnosis(estimates, None)
+    write_diagnosis(tmp_path, diagnosis)
+    loaded = load_diagnosis(tmp_path)
+    assert loaded.summary == diagnosis.summary
+    assert "contrast" in loaded.suggestions
 
 
 def test_planner_available_and_advisory_fallback(
