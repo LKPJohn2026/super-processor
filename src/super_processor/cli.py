@@ -8,6 +8,12 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__, mean_luma, sum_squares
+from .doctor import (
+    collect_doctor_report,
+    doctor_json,
+    doctor_report_as_dict,
+    format_doctor_text,
+)
 from .jobs import JobError, JobStore, default_jobs_root
 
 
@@ -64,6 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("job_id", help="job identifier")
 
     job_sub.add_parser("list", help="list known jobs")
+
+    doctor_cmd = subparsers.add_parser(
+        "doctor",
+        help="check local FFmpeg, preview player, disk, and model configuration",
+    )
+    doctor_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="print the doctor report as JSON",
+    )
     return parser
 
 
@@ -123,6 +139,17 @@ def run_job_command(arguments: argparse.Namespace) -> int:
     raise AssertionError(f"unhandled job command: {command}")
 
 
+def run_doctor_command(arguments: argparse.Namespace) -> int:
+    """Run local toolchain diagnostics."""
+    jobs_dir = arguments.jobs_dir.resolve() if arguments.jobs_dir is not None else None
+    results = collect_doctor_report(jobs_dir)
+    if bool(arguments.json):
+        print(doctor_json(results))
+    else:
+        print(format_doctor_text(results))
+    return 0 if doctor_report_as_dict(results)["ok"] else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI."""
     arguments = build_parser().parse_args(argv)
@@ -135,5 +162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_self_test(int(arguments.sample_size))
     if command == "job":
         return run_job_command(arguments)
+    if command == "doctor":
+        return run_doctor_command(arguments)
 
     raise AssertionError(f"unhandled command: {command}")

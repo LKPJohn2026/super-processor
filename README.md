@@ -57,8 +57,16 @@ super-processor self-test
 ```bash
 super-processor version
 super-processor self-test
+super-processor doctor
+super-processor doctor --json
+super-processor job create ./clip.mp4
+super-processor job show JOB_ID
+super-processor job list
 python -m super_processor self-test --sample-size 100
 ```
+
+Jobs are stored under `~/.super-processor/jobs` by default. Override with
+`--jobs-dir` or `SUPER_PROCESSOR_JOBS_DIR`.
 
 ## Project layout
 
