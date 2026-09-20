@@ -61,6 +61,8 @@ super-processor doctor
 super-processor doctor --json
 super-processor job create ./clip.mp4
 super-processor job probe JOB_ID
+super-processor job init-recipe JOB_ID
+super-processor job validate JOB_ID
 super-processor job show JOB_ID
 super-processor job list
 python -m super_processor self-test --sample-size 100
@@ -69,6 +71,7 @@ python -m super_processor self-test --sample-size 100
 Jobs are stored under `~/.super-processor/jobs` by default. Override with
 `--jobs-dir` or `SUPER_PROCESSOR_JOBS_DIR`. `job probe` writes
 `media_facts.json` and moves the job from `imported` to `probed`.
+`job init-recipe` / `job validate` work with allowlisted Recipe JSON.
 
 ## Project layout
 

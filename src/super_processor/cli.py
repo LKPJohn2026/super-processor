@@ -16,6 +16,8 @@ from .doctor import (
 )
 from .jobs import JobError, JobState, JobStore, default_jobs_root
 from .probe import ProbeError, probe_file, write_media_facts
+from .recipe import RecipeError, empty_recipe, write_recipe
+from .validator import validate_job_recipe
 
 
 def positive_int(value: str) -> int:
@@ -76,6 +78,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     probe.add_argument("job_id", help="job identifier")
 
+    init_recipe = job_sub.add_parser(
+        "init-recipe",
+        help="write an empty allowlisted recipe for a probed or imported job",
+    )
+    init_recipe.add_argument("job_id", help="job identifier")
+
+    validate = job_sub.add_parser(
+        "validate",
+        help="validate the job recipe against policy and media facts",
+    )
+    validate.add_argument("job_id", help="job identifier")
+
     job_sub.add_parser("list", help="list known jobs")
 
     doctor_cmd = subparsers.add_parser(
@@ -128,6 +142,10 @@ def run_job_command(arguments: argparse.Namespace) -> int:
             return 0
         if command == "probe":
             return run_job_probe(store, str(arguments.job_id))
+        if command == "init-recipe":
+            return run_job_init_recipe(store, str(arguments.job_id))
+        if command == "validate":
+            return run_job_validate(store, str(arguments.job_id))
         if command == "list":
             jobs = store.list_jobs()
             if not jobs:
@@ -141,7 +159,7 @@ def run_job_command(arguments: argparse.Namespace) -> int:
                 )
             )
             return 0
-    except (JobError, ProbeError) as exc:
+    except (JobError, ProbeError, RecipeError) as exc:
         print(f"error: {exc}", flush=True)
         return 1
 
@@ -173,6 +191,23 @@ def run_job_probe(store: JobStore, job_id: str) -> int:
 
     print(json.dumps(facts.to_dict(), indent=2, sort_keys=True))
     return 0
+
+
+def run_job_init_recipe(store: JobStore, job_id: str) -> int:
+    """Write an empty allowlisted recipe for a job."""
+    manifest = store.load(job_id)
+    recipe = empty_recipe(manifest.job_id, manifest.source_path)
+    write_recipe(store.job_dir(job_id), recipe)
+    print(json.dumps(recipe.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def run_job_validate(store: JobStore, job_id: str) -> int:
+    """Validate the on-disk recipe for a job."""
+    store.load(job_id)  # ensure job exists
+    result = validate_job_recipe(store.job_dir(job_id))
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    return 0 if result.ok else 1
 
 
 def run_doctor_command(arguments: argparse.Namespace) -> int:
