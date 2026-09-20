@@ -1,0 +1,2 @@
+[console_scripts]
+super-processor = super_processor.cli:main
