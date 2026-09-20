@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Sequence
+from pathlib import Path
 
 from . import __version__, mean_luma, sum_squares
+from .jobs import JobError, JobStore, default_jobs_root
 
 
 def positive_int(value: str) -> int:
@@ -22,6 +25,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="super-processor",
         description="Local-first AI-assisted video processing.",
     )
+    parser.add_argument(
+        "--jobs-dir",
+        type=Path,
+        default=None,
+        help=(
+            "directory used to store processing jobs "
+            f"(default: {default_jobs_root()} or $SUPER_PROCESSOR_JOBS_DIR)"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("version", help="print the installed version")
@@ -36,6 +48,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=10_000,
         help="number of integers used by the compiled test (default: 10000)",
     )
+
+    job = subparsers.add_parser("job", help="create and inspect processing jobs")
+    job_sub = job.add_subparsers(dest="job_command", required=True)
+
+    create = job_sub.add_parser("create", help="create a job from a local media file")
+    create.add_argument("source", type=Path, help="path to the source media file")
+    create.add_argument(
+        "--job-id",
+        default=None,
+        help="optional explicit job id (8-32 lowercase hex/alphanumeric chars)",
+    )
+
+    show = job_sub.add_parser("show", help="print a job manifest as JSON")
+    show.add_argument("job_id", help="job identifier")
+
+    job_sub.add_parser("list", help="list known jobs")
     return parser
 
 
@@ -56,6 +84,45 @@ def run_self_test(sample_size: int) -> int:
     return 0
 
 
+def _store_from_args(arguments: argparse.Namespace) -> JobStore:
+    root = arguments.jobs_dir
+    return JobStore(root.resolve() if root is not None else None)
+
+
+def run_job_command(arguments: argparse.Namespace) -> int:
+    """Dispatch job subcommands."""
+    store = _store_from_args(arguments)
+    command = str(arguments.job_command)
+
+    try:
+        if command == "create":
+            manifest = store.create(arguments.source, job_id=arguments.job_id)
+            print(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
+            return 0
+        if command == "show":
+            manifest = store.load(str(arguments.job_id))
+            print(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
+            return 0
+        if command == "list":
+            jobs = store.list_jobs()
+            if not jobs:
+                print("[]")
+                return 0
+            print(
+                json.dumps(
+                    [job.to_dict() for job in jobs],
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+    except JobError as exc:
+        print(f"error: {exc}", flush=True)
+        return 1
+
+    raise AssertionError(f"unhandled job command: {command}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI."""
     arguments = build_parser().parse_args(argv)
@@ -66,5 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if command == "self-test":
         return run_self_test(int(arguments.sample_size))
+    if command == "job":
+        return run_job_command(arguments)
 
     raise AssertionError(f"unhandled command: {command}")
