@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,10 @@ def _ffmpeg_has_libvmaf() -> bool:
     return "libvmaf" in (completed.stdout or "")
 
 
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="libvmaf path escaping on Windows",
+)
 @pytest.mark.skipif(not _ffmpeg_has_libvmaf(), reason="ffmpeg libvmaf not available")
 def test_tiny_vmaf_fixture(tmp_path: Path) -> None:
     ref = tmp_path / "ref.mp4"
@@ -51,6 +56,7 @@ def test_tiny_vmaf_fixture(tmp_path: Path) -> None:
             capture_output=True,
         )
     log = tmp_path / "vmaf.json"
+    log_path = log.resolve().as_posix().replace(":", "\\:")
     completed = subprocess.run(
         [
             "ffmpeg",
@@ -60,7 +66,7 @@ def test_tiny_vmaf_fixture(tmp_path: Path) -> None:
             "-i",
             str(ref),
             "-lavfi",
-            f"libvmaf=log_path={log.as_posix()}:log_fmt=json",
+            f"libvmaf=log_path={log_path}:log_fmt=json",
             "-f",
             "null",
             "-",
