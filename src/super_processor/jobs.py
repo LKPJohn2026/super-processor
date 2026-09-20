@@ -217,6 +217,14 @@ class JobStore:
         self._write_manifest(manifest)
         return manifest
 
+    def update_notes(self, job_id: str, notes: dict[str, Any]) -> JobManifest:
+        """Merge notes into an existing job without changing its state."""
+        manifest = self.load(job_id)
+        manifest.notes.update(notes)
+        manifest.updated_at = utc_now_iso()
+        self._write_manifest(manifest)
+        return manifest
+
     def _write_manifest(self, manifest: JobManifest) -> None:
         """Atomically write a job manifest to disk."""
         path = self.manifest_path(manifest.job_id)

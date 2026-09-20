@@ -14,7 +14,8 @@ from .doctor import (
     doctor_report_as_dict,
     format_doctor_text,
 )
-from .jobs import JobError, JobStore, default_jobs_root
+from .jobs import JobError, JobState, JobStore, default_jobs_root
+from .probe import ProbeError, probe_file, write_media_facts
 
 
 def positive_int(value: str) -> int:
@@ -69,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     show = job_sub.add_parser("show", help="print a job manifest as JSON")
     show.add_argument("job_id", help="job identifier")
 
+    probe = job_sub.add_parser(
+        "probe",
+        help="run ffprobe and store versioned media facts for a job",
+    )
+    probe.add_argument("job_id", help="job identifier")
+
     job_sub.add_parser("list", help="list known jobs")
 
     doctor_cmd = subparsers.add_parser(
@@ -119,6 +126,8 @@ def run_job_command(arguments: argparse.Namespace) -> int:
             manifest = store.load(str(arguments.job_id))
             print(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
             return 0
+        if command == "probe":
+            return run_job_probe(store, str(arguments.job_id))
         if command == "list":
             jobs = store.list_jobs()
             if not jobs:
@@ -132,11 +141,38 @@ def run_job_command(arguments: argparse.Namespace) -> int:
                 )
             )
             return 0
-    except JobError as exc:
+    except (JobError, ProbeError) as exc:
         print(f"error: {exc}", flush=True)
         return 1
 
     raise AssertionError(f"unhandled job command: {command}")
+
+
+def run_job_probe(store: JobStore, job_id: str) -> int:
+    """Probe a job's source file and transition imported -> probed."""
+    manifest = store.load(job_id)
+    if manifest.state not in {JobState.IMPORTED, JobState.PROBED}:
+        raise JobError(
+            "job "
+            f"{job_id} must be imported or probed to run probe "
+            f"(current: {manifest.state.value})"
+        )
+
+    facts = probe_file(Path(manifest.source_path))
+    write_media_facts(store.job_dir(job_id), facts)
+    notes = {
+        "has_video": facts.has_video,
+        "has_audio": facts.has_audio,
+        "duration_s": facts.duration_s,
+    }
+
+    if manifest.state is JobState.IMPORTED:
+        store.transition(job_id, JobState.PROBED, notes=notes)
+    else:
+        store.update_notes(job_id, notes)
+
+    print(json.dumps(facts.to_dict(), indent=2, sort_keys=True))
+    return 0
 
 
 def run_doctor_command(arguments: argparse.Namespace) -> int:

@@ -12,6 +12,7 @@ from .jobs import (
     JobStore,
     default_jobs_root,
 )
+from .probe import MediaFacts, ProbeError, StreamFacts, probe_file
 
 try:
     __version__ = version("super-processor")
@@ -25,8 +26,12 @@ __all__ = [
     "JobNotFoundError",
     "JobState",
     "JobStore",
+    "MediaFacts",
+    "ProbeError",
+    "StreamFacts",
     "__version__",
     "default_jobs_root",
     "mean_luma",
+    "probe_file",
     "sum_squares",
 ]
