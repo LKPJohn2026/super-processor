@@ -1,0 +1,14 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include setup.py
+recursive-include docs *.md
+recursive-include src/super_processor *.py *.pyi *.pyx py.typed
+global-exclude *.c
+global-exclude *.html
+global-exclude *.so
+global-exclude *.pyd
+global-exclude *.dylib
+global-exclude *.py[cod]
+global-exclude __pycache__
+exclude src/super_processor/_version.py

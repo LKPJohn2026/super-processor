@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+  CIBW_SKIP: "*-musllinux_* *-win32"
+  CIBW_TEST_COMMAND: "python -m pytest {project}/tests"
+  CIBW_TEST_REQUIRES: "pytest>=8.3 pytest-cov>=6"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Build source distribution
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build --sdist
+
+      - name: Test source distribution
+        run: |
+          python -m pip install dist/*.tar.gz
+          super-processor self-test --sample-size 1000
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-distribution
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  wheels:
+    name: Build wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install cibuildwheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "cibuildwheel>=2.22,<4"
+
+      - name: Build and test wheels
+        run: python -m cibuildwheel --output-dir wheelhouse
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub Release
+    needs: [sdist, wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download source distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: source-distribution
+          path: dist
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Verify release artifacts
+        run: |
+          python -m pip install twine
+          python -m twine check dist/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  pypi:
+    name: Publish to PyPI
+    if: ${{ vars.PYPI_PUBLISH == 'true' }}
+    needs: [github-release]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/super-processor
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download source distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: source-distribution
+          path: dist
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish distributions
+        uses: pypa/gh-action-pypi-publish@release/v1

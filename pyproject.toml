@@ -1,0 +1,117 @@
+[build-system]
+requires = [
+  "Cython>=3.0,<4",
+  "setuptools>=77",
+  "setuptools-scm[toml]>=8,<10",
+  "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "super-processor"
+dynamic = ["version"]
+description = "Local-first AI-assisted video processing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "Super Processor contributors" },
+]
+keywords = ["cython", "ffmpeg", "video-processing", "computer-vision"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Cython",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "Cython>=3.0,<4",
+  "build>=1.2.2",
+  "mypy>=1.11",
+  "pytest>=8.3",
+  "pytest-cov>=6",
+  "ruff>=0.11",
+  "setuptools>=77",
+  "twine>=5.1",
+]
+
+[project.scripts]
+super-processor = "super_processor.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/LKPJohn2026/super-processor/tree/main/docs"
+Issues = "https://github.com/LKPJohn2026/super-processor/issues"
+Repository = "https://github.com/LKPJohn2026/super-processor"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+super_processor = ["*.pyi", "py.typed"]
+
+[tool.setuptools.exclude-package-data]
+super_processor = ["*.c", "*.html", "*.pyx"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.dev0"
+version_file = "src/super_processor/_version.py"
+
+[tool.pytest.ini_options]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "--cov=super_processor",
+  "--cov-branch",
+  "--cov-report=term-missing:skip-covered",
+  "--cov-fail-under=85",
+]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["super_processor"]
+omit = [
+  "src/super_processor/__main__.py",
+  "src/super_processor/_version.py",
+]
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+extend-exclude = ["src/super_processor/_version.py"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/super_processor", "tests"]
+mypy_path = "src"
+strict = true
+exclude = ["src/super_processor/_version.py"]
