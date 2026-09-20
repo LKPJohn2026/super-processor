@@ -18,6 +18,7 @@ from .estimators import EstimatorError, estimate_look, write_estimates
 from .jobs import JobError, JobState, JobStore, default_jobs_root
 from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
+from .reframe import ReframeError, plan_social_export, write_reframe_plan
 from .templates import TemplateError, build_ffmpeg_plan, default_output_path
 from .validator import validate_job_recipe
 from .worker import FFmpegWorker, WorkerError
@@ -86,6 +87,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="sample CV look/motion priors for a probed job",
     )
     estimate.add_argument("job_id", help="job identifier")
+
+    reframe = job_sub.add_parser(
+        "reframe",
+        help="compute vertical reframe path and size-cap feasibility",
+    )
+    reframe.add_argument("job_id", help="job identifier")
+    reframe.add_argument(
+        "--max-height",
+        type=positive_int,
+        default=1920,
+        help="target vertical height (default: 1920)",
+    )
+    reframe.add_argument(
+        "--max-size-mb",
+        type=float,
+        default=None,
+        help="optional delivery size cap in megabytes",
+    )
+    reframe.add_argument(
+        "--padding",
+        type=float,
+        default=0.0,
+        help="optional pad inset fraction in [0, 0.25]",
+    )
 
     init_recipe = job_sub.add_parser(
         "init-recipe",
@@ -175,6 +200,18 @@ def run_job_command(arguments: argparse.Namespace) -> int:
             return run_job_probe(store, str(arguments.job_id))
         if command == "estimate":
             return run_job_estimate(store, str(arguments.job_id))
+        if command == "reframe":
+            return run_job_reframe(
+                store,
+                str(arguments.job_id),
+                max_height=int(arguments.max_height),
+                max_size_mb=(
+                    None
+                    if arguments.max_size_mb is None
+                    else float(arguments.max_size_mb)
+                ),
+                padding=float(arguments.padding),
+            )
         if command == "init-recipe":
             return run_job_init_recipe(store, str(arguments.job_id))
         if command == "validate":
@@ -207,6 +244,7 @@ def run_job_command(arguments: argparse.Namespace) -> int:
         TemplateError,
         WorkerError,
         EstimatorError,
+        ReframeError,
     ) as exc:
         print(f"error: {exc}", flush=True)
         return 1
@@ -268,6 +306,37 @@ def run_job_estimate(store: JobStore, job_id: str) -> int:
         },
     )
     print(json.dumps(estimates.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def run_job_reframe(
+    store: JobStore,
+    job_id: str,
+    *,
+    max_height: int,
+    max_size_mb: float | None,
+    padding: float,
+) -> int:
+    """Compute vertical reframe path and optional size-cap feasibility."""
+    store.load(job_id)
+    facts = load_media_facts(store.job_dir(job_id))
+    plan = plan_social_export(
+        facts,
+        max_height=max_height,
+        max_size_mb=max_size_mb,
+        padding=padding,
+    )
+    write_reframe_plan(store.job_dir(job_id), plan)
+    notes: dict[str, object] = {
+        "reframe": True,
+        "subject_strategy": plan.reframe.subject_strategy,
+    }
+    if plan.size_cap is not None:
+        notes["size_cap_status"] = plan.size_cap.status
+    store.update_notes(job_id, notes)
+    print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+    if plan.size_cap is not None and plan.size_cap.status == "infeasible":
+        return 1
     return 0
 
 

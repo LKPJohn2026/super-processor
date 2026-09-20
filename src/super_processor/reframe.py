@@ -65,7 +65,19 @@ class ReframePath:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReframePath:
-        return cls(**{key: data[key] for key in cls.__dataclass_fields__})  # type: ignore[misc]
+        return cls(
+            mode=str(data["mode"]),
+            input_width=int(data["input_width"]),
+            input_height=int(data["input_height"]),
+            output_width=int(data["output_width"]),
+            output_height=int(data["output_height"]),
+            crop_x=int(data["crop_x"]),
+            crop_y=int(data["crop_y"]),
+            crop_w=int(data["crop_w"]),
+            crop_h=int(data["crop_h"]),
+            padding=float(data["padding"]),
+            subject_strategy=str(data["subject_strategy"]),
+        )
 
 
 @dataclass(slots=True)
