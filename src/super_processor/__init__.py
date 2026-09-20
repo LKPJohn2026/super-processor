@@ -2,7 +2,14 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from ._core import mean_luma, sum_squares
+from ._core import (
+    histogram_u8,
+    mean_luma,
+    percentile_u8,
+    sad_u8,
+    sum_squares,
+    variance_u8,
+)
 from .jobs import (
     InvalidTransitionError,
     JobError,
@@ -36,7 +43,11 @@ __all__ = [
     "__version__",
     "default_jobs_root",
     "empty_recipe",
+    "histogram_u8",
     "mean_luma",
+    "percentile_u8",
     "probe_file",
+    "sad_u8",
     "sum_squares",
+    "variance_u8",
 ]

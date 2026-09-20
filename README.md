@@ -61,6 +61,7 @@ super-processor doctor
 super-processor doctor --json
 super-processor job create ./clip.mp4
 super-processor job probe JOB_ID
+super-processor job estimate JOB_ID
 super-processor job init-recipe JOB_ID
 super-processor job validate JOB_ID
 super-processor job run JOB_ID --mode preview --dry-run

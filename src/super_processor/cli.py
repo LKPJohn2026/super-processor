@@ -14,6 +14,7 @@ from .doctor import (
     doctor_report_as_dict,
     format_doctor_text,
 )
+from .estimators import EstimatorError, estimate_look, write_estimates
 from .jobs import JobError, JobState, JobStore, default_jobs_root
 from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
@@ -79,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="run ffprobe and store versioned media facts for a job",
     )
     probe.add_argument("job_id", help="job identifier")
+
+    estimate = job_sub.add_parser(
+        "estimate",
+        help="sample CV look/motion priors for a probed job",
+    )
+    estimate.add_argument("job_id", help="job identifier")
 
     init_recipe = job_sub.add_parser(
         "init-recipe",
@@ -166,6 +173,8 @@ def run_job_command(arguments: argparse.Namespace) -> int:
             return 0
         if command == "probe":
             return run_job_probe(store, str(arguments.job_id))
+        if command == "estimate":
+            return run_job_estimate(store, str(arguments.job_id))
         if command == "init-recipe":
             return run_job_init_recipe(store, str(arguments.job_id))
         if command == "validate":
@@ -191,7 +200,14 @@ def run_job_command(arguments: argparse.Namespace) -> int:
                 )
             )
             return 0
-    except (JobError, ProbeError, RecipeError, TemplateError, WorkerError) as exc:
+    except (
+        JobError,
+        ProbeError,
+        RecipeError,
+        TemplateError,
+        WorkerError,
+        EstimatorError,
+    ) as exc:
         print(f"error: {exc}", flush=True)
         return 1
 
@@ -222,6 +238,36 @@ def run_job_probe(store: JobStore, job_id: str) -> int:
         store.update_notes(job_id, notes)
 
     print(json.dumps(facts.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def run_job_estimate(store: JobStore, job_id: str) -> int:
+    """Sample classical look/motion priors for a probed job."""
+    manifest = store.load(job_id)
+    if manifest.state not in {
+        JobState.PROBED,
+        JobState.DIAGNOSED,
+        JobState.PLANNED,
+        JobState.VALIDATED,
+    }:
+        raise JobError(
+            f"job {job_id} must be probed before estimate "
+            f"(current: {manifest.state.value})"
+        )
+    facts = load_media_facts(store.job_dir(job_id))
+    estimates = estimate_look(Path(manifest.source_path), facts)
+    write_estimates(store.job_dir(job_id), estimates)
+    store.update_notes(
+        job_id,
+        {
+            "estimated": True,
+            "contrast": estimates.contrast.enabled,
+            "white_balance": estimates.white_balance.enabled,
+            "denoise": estimates.denoise.enabled,
+            "stabilize": estimates.stabilize.enabled,
+        },
+    )
+    print(json.dumps(estimates.to_dict(), indent=2, sort_keys=True))
     return 0
 
 
