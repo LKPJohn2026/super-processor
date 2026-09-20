@@ -189,9 +189,10 @@ def validate_probe_compliance(
             )
         )
 
-    if any(
-        op.op is OpName.REFRAME_VERTICAL and op.enabled for op in recipe.ops
-    ) and not facts.has_video:
+    if (
+        any(op.op is OpName.REFRAME_VERTICAL and op.enabled for op in recipe.ops)
+        and not facts.has_video
+    ):
         issues.append(
             ValidationIssue(
                 code="reframe_without_video",
