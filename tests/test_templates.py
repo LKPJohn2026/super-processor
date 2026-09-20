@@ -66,9 +66,13 @@ def test_stabilize_adds_detect_pass(tmp_path: Path) -> None:
         work_dir=tmp_path,
         ffmpeg_bin="ffmpeg",
     )
-    assert [step.name for step in plan.steps] == ["stabilize_detect", "encode"]
-    assert "vidstabdetect=" in plan.steps[0].argv[plan.steps[0].argv.index("-vf") + 1]
-    assert "vidstabtransform=" in plan.filter_graph
+    names = [step.name for step in plan.steps]
+    assert names[-1] == "encode"
+    assert "vidstabtransform=" in plan.filter_graph or "deshake" in plan.filter_graph
+    if "stabilize_detect" in names:
+        assert (
+            "vidstabdetect=" in plan.steps[0].argv[plan.steps[0].argv.index("-vf") + 1]
+        )
 
 
 def test_reframe_and_size_cap_bitrate(tmp_path: Path) -> None:

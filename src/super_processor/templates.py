@@ -6,6 +6,7 @@ a shell string.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,9 +18,35 @@ PREVIEW_FILE_NAME = "preview.mp4"
 OUTPUT_FILE_NAME = "output.mp4"
 TRANSFORMS_FILE_NAME = "transforms.trf"
 
+_FILTER_CACHE: dict[str, bool] | None = None
+
 
 class TemplateError(ValueError):
     """Raised when a recipe cannot be mapped to an FFmpeg plan."""
+
+
+def ffmpeg_has_filter(name: str, *, ffmpeg_bin: str | None = None) -> bool:
+    """Return whether the local ffmpeg build exposes a named filter."""
+    global _FILTER_CACHE
+    binary = ffmpeg_bin or which("ffmpeg") or "ffmpeg"
+    if _FILTER_CACHE is None:
+        _FILTER_CACHE = {}
+        try:
+            completed = subprocess.run(
+                [binary, "-hide_banner", "-filters"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            listing = completed.stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            listing = ""
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] not in _FILTER_CACHE:
+                _FILTER_CACHE[parts[1]] = True
+    return bool(_FILTER_CACHE.get(name))
 
 
 @dataclass(slots=True)
@@ -101,9 +128,17 @@ def _look_filters(ops: dict[OpName, RecipeOp]) -> list[str]:
     return filters
 
 
-def _stabilize_detect(ops: dict[OpName, RecipeOp], transforms: Path) -> str | None:
+def _stabilize_detect(
+    ops: dict[OpName, RecipeOp],
+    transforms: Path,
+    *,
+    ffmpeg_bin: str | None = None,
+) -> str | None:
     stabilize = ops.get(OpName.STABILIZE)
     if stabilize is None:
+        return None
+    if not ffmpeg_has_filter("vidstabdetect", ffmpeg_bin=ffmpeg_bin):
+        # Homebrew/Chocolatey builds often omit vid.stab; deshake is single-pass.
         return None
     shakiness = int(float(stabilize.params.get("shakiness", 5.0)))
     return (
@@ -112,17 +147,26 @@ def _stabilize_detect(ops: dict[OpName, RecipeOp], transforms: Path) -> str | No
     )
 
 
-def _stabilize_transform(ops: dict[OpName, RecipeOp], transforms: Path) -> str | None:
+def _stabilize_transform(
+    ops: dict[OpName, RecipeOp],
+    transforms: Path,
+    *,
+    ffmpeg_bin: str | None = None,
+) -> str | None:
     stabilize = ops.get(OpName.STABILIZE)
     if stabilize is None:
         return None
-    smoothing = int(float(stabilize.params.get("smoothing", 10.0)))
-    max_crop = float(stabilize.params.get("max_crop_pct", 10.0))
-    zoom = max(0.0, min(30.0, max_crop))
-    return (
-        f"vidstabtransform=input={_escape_filter_path(transforms)}:"
-        f"smoothing={smoothing}:crop=black:zoom={zoom:g}:optzoom=0"
-    )
+    if ffmpeg_has_filter("vidstabtransform", ffmpeg_bin=ffmpeg_bin):
+        smoothing = int(float(stabilize.params.get("smoothing", 10.0)))
+        max_crop = float(stabilize.params.get("max_crop_pct", 10.0))
+        zoom = max(0.0, min(30.0, max_crop))
+        return (
+            f"vidstabtransform=input={_escape_filter_path(transforms)}:"
+            f"smoothing={smoothing}:crop=black:zoom={zoom:g}:optzoom=0"
+        )
+    if ffmpeg_has_filter("deshake", ffmpeg_bin=ffmpeg_bin):
+        return "deshake"
+    raise TemplateError("stabilize requires ffmpeg vidstabtransform or deshake support")
 
 
 def _reframe_filter(ops: dict[OpName, RecipeOp], recipe: Recipe) -> str | None:
@@ -246,8 +290,8 @@ def build_ffmpeg_plan(
     mode = recipe.target.mode.value
     ops = _op_map(recipe)
     look = _look_filters(ops)
-    detect = _stabilize_detect(ops, transforms)
-    transform = _stabilize_transform(ops, transforms)
+    detect = _stabilize_detect(ops, transforms, ffmpeg_bin=binary)
+    transform = _stabilize_transform(ops, transforms, ffmpeg_bin=binary)
     reframe = _reframe_filter(ops, recipe)
 
     steps: list[FFmpegStep] = []

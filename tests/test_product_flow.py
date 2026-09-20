@@ -108,7 +108,7 @@ def test_diagnose_plan_preview_flow(
                 "plan",
                 "abcd1234abcd1234",
                 "--instruction",
-                "less denoise",
+                "less denoise no stabilize",
             ]
         )
         == 0
