@@ -88,6 +88,8 @@ filterwarnings = ["error"]
 branch = true
 source = ["super_processor"]
 omit = [
+  "*/super_processor/__main__.py",
+  "*/super_processor/_version.py",
   "src/super_processor/__main__.py",
   "src/super_processor/_version.py",
 ]
