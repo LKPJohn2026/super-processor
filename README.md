@@ -33,10 +33,15 @@ Safe mode is on by default (`--safe-mode`): planning uses CV priors and
 deterministic NL patches. Pass `--no-safe-mode` to allow advisory local LLM
 calls that still cannot emit shell commands.
 
+When a `--max-size-mb` cap implies a bitrate below the quality floor, diagnosis
+and validation fail unless you pass `--acknowledge-size-risk`.
+
 ```bash
 super-processor models
 super-processor models --consent-remote-frames
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for 1.x hardening notes.
 
 ## Development checks
 

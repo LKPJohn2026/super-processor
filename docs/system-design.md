@@ -130,7 +130,7 @@ The first processing vocabulary is deliberately small:
 | White balance | Neutral-pixel and color-cast estimates | FFmpeg color/temperature adjustment |
 | Denoise | Flat-region noise and detail estimates | Parameter-capped FFmpeg denoise |
 | Stabilize | Global motion and crop-loss estimates | Vid.stab or equivalent FFmpeg transform |
-| Social export | Face/saliency tracking and aspect constraints | Vertical reframe, scale, and HEVC encode |
+| Social export | Classical saliency (edge energy) and aspect constraints | Vertical reframe, scale, and HEVC encode |
 
 These operations address common real-footage problems without requiring a
 model to redraw textures or objects.
@@ -295,7 +295,7 @@ Deferred decisions:
 
 - desktop UI;
 - hardware encoder support;
-- neural enhancement models;
+- neural enhancement models (including learned face/saliency trackers);
 - cloud render workers;
 - generative video features;
 - multi-track nonlinear editing;

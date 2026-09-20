@@ -182,7 +182,6 @@ def _reframe_filter(ops: dict[OpName, RecipeOp], recipe: Recipe) -> str | None:
     if size_op is not None and "max_height" in size_op.params:
         max_height = int(float(size_op.params["max_height"]))
 
-    # Center-crop to 9:16, then optionally pad inward by `padding` fraction.
     target_h = int(max_height)
     target_w = int(round(target_h * 9 / 16))
     pad_px = int(round(min(target_w, target_h) * padding))
@@ -193,6 +192,24 @@ def _reframe_filter(ops: dict[OpName, RecipeOp], recipe: Recipe) -> str | None:
     inner_h -= inner_h % 2
     target_w -= target_w % 2
     target_h -= target_h % 2
+
+    crop_keys = ("crop_x", "crop_y", "crop_w", "crop_h")
+    if all(key in reframe.params for key in crop_keys):
+        crop_x = int(float(reframe.params["crop_x"]))
+        crop_y = int(float(reframe.params["crop_y"]))
+        crop_w = int(float(reframe.params["crop_w"]))
+        crop_h = int(float(reframe.params["crop_h"]))
+        crop_w -= crop_w % 2
+        crop_h -= crop_h % 2
+        crop_x -= crop_x % 2
+        crop_y -= crop_y % 2
+        return (
+            f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
+            f"scale={inner_w}:{inner_h},"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black"
+        )
+
+    # Fallback: center-crop via scale+crop when no planned window is present.
     return (
         f"scale={inner_w}:{inner_h}:force_original_aspect_ratio=increase,"
         f"crop={inner_w}:{inner_h},"

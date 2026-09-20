@@ -12,6 +12,8 @@ from .validator import MIN_BITRATE_KBPS
 
 REFRAME_FILE_NAME = "reframe_plan.json"
 REFRAME_SCHEMA_VERSION = 1
+# Offset from frame center (fraction of width) before we claim saliency tracking.
+_SALIENCY_OFFSET_FRAC = 0.04
 
 
 class ReframeError(ValueError):
@@ -46,7 +48,7 @@ class SizeCapAssessment:
 
 @dataclass(slots=True)
 class ReframePath:
-    """Center-weighted 9:16 crop path (face/saliency deferred to later)."""
+    """9:16 crop path with optional classical saliency subject tracking."""
 
     mode: str
     input_width: int
@@ -59,6 +61,7 @@ class ReframePath:
     crop_h: int
     padding: float
     subject_strategy: str
+    subject_cx: float = 0.5
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -77,6 +80,7 @@ class ReframePath:
             crop_h=int(data["crop_h"]),
             padding=float(data["padding"]),
             subject_strategy=str(data["subject_strategy"]),
+            subject_cx=float(data.get("subject_cx", 0.5)),
         )
 
 
@@ -154,21 +158,8 @@ def _even(value: int) -> int:
     return value - (value % 2)
 
 
-def compute_center_reframe(
-    *,
-    width: int,
-    height: int,
-    max_height: int = 1920,
-    padding: float = 0.0,
-) -> ReframePath:
-    """Compute a center-weighted 9:16 crop, with optional pad inset."""
-    if width <= 0 or height <= 0:
-        raise ReframeError("video dimensions must be positive")
-    padding = max(0.0, min(0.25, padding))
-    target_h = _even(max(2, int(max_height)))
-    target_w = _even(max(2, int(round(target_h * 9 / 16))))
-
-    # Source crop window that matches 9:16, centered.
+def _crop_window_9_16(width: int, height: int) -> tuple[int, int]:
+    """Return even crop_w/crop_h for a 9:16 window inside the source frame."""
     source_aspect = width / height
     target_aspect = 9 / 16
     if source_aspect > target_aspect:
@@ -179,9 +170,86 @@ def compute_center_reframe(
         crop_h = int(round(width / target_aspect))
     crop_w = _even(max(2, min(width, crop_w)))
     crop_h = _even(max(2, min(height, crop_h)))
-    crop_x = _even(max(0, (width - crop_w) // 2))
+    return crop_w, crop_h
+
+
+def subject_x_from_gray(frame: bytes, width: int, height: int) -> float:
+    """Estimate horizontal subject center as a fraction of frame width.
+
+    Uses column edge energy (classical saliency proxy). Values are in [0, 1].
+    """
+    if width <= 1 or height <= 1 or len(frame) < width * height:
+        return 0.5
+    scores = [0.0] * width
+    for y in range(height - 1):
+        row = y * width
+        nxt = (y + 1) * width
+        for x in range(width):
+            scores[x] += abs(frame[row + x] - frame[nxt + x])
+    for y in range(height):
+        row = y * width
+        for x in range(width - 1):
+            scores[x] += 0.5 * abs(frame[row + x] - frame[row + x + 1])
+    total = sum(scores)
+    if total <= 0:
+        return 0.5
+    com = sum(index * score for index, score in enumerate(scores)) / total
+    return max(0.0, min(1.0, com / float(width - 1)))
+
+
+def estimate_subject_x_frac(
+    source: Path,
+    facts: MediaFacts,
+    *,
+    sample_width: int = 160,
+    sample_height: int = 90,
+) -> float:
+    """Average classical saliency across stratified sample windows."""
+    # Local import avoids a circular dependency with estimators ↔ reframe.
+    from .estimators import EstimatorError, choose_sample_windows, extract_gray_frame
+
+    windows = choose_sample_windows(facts, count=3)
+    fractions: list[float] = []
+    for window in windows:
+        try:
+            frame = extract_gray_frame(
+                source,
+                at_s=window.start_s,
+                width=sample_width,
+                height=sample_height,
+            )
+        except EstimatorError:
+            continue
+        fractions.append(subject_x_from_gray(frame, sample_width, sample_height))
+    if not fractions:
+        return 0.5
+    return sum(fractions) / len(fractions)
+
+
+def compute_center_reframe(
+    *,
+    width: int,
+    height: int,
+    max_height: int = 1920,
+    padding: float = 0.0,
+    subject_cx: float = 0.5,
+) -> ReframePath:
+    """Compute a 9:16 crop anchored on ``subject_cx`` (0=left, 1=right)."""
+    if width <= 0 or height <= 0:
+        raise ReframeError("video dimensions must be positive")
+    padding = max(0.0, min(0.25, padding))
+    subject_cx = max(0.0, min(1.0, subject_cx))
+    target_h = _even(max(2, int(max_height)))
+    target_w = _even(max(2, int(round(target_h * 9 / 16))))
+
+    crop_w, crop_h = _crop_window_9_16(width, height)
+    ideal_x = int(round(subject_cx * width - crop_w / 2.0))
+    crop_x = _even(max(0, min(width - crop_w, ideal_x)))
     crop_y = _even(max(0, (height - crop_h) // 2))
 
+    strategy = (
+        "saliency" if abs(subject_cx - 0.5) >= _SALIENCY_OFFSET_FRAC else "center"
+    )
     return ReframePath(
         mode="vertical_9_16",
         input_width=width,
@@ -193,7 +261,8 @@ def compute_center_reframe(
         crop_w=crop_w,
         crop_h=crop_h,
         padding=padding,
-        subject_strategy="center",  # face/saliency arrives with later ML work
+        subject_strategy=strategy,
+        subject_cx=round(subject_cx, 4),
     )
 
 
@@ -203,6 +272,7 @@ def plan_social_export(
     max_height: int = 1920,
     padding: float = 0.0,
     max_size_mb: float | None = None,
+    source: Path | None = None,
 ) -> SocialExportPlan:
     """Build a vertical reframe path and optional size-cap assessment."""
     if not facts.has_video:
@@ -217,11 +287,20 @@ def plan_social_export(
     if width is None or height is None:
         raise ReframeError("media facts lack video width/height")
 
+    subject_cx = 0.5
+    media = source if source is not None else Path(facts.source_path)
+    if media.is_file():
+        try:
+            subject_cx = estimate_subject_x_frac(media, facts)
+        except Exception:
+            subject_cx = 0.5
+
     reframe = compute_center_reframe(
         width=width,
         height=height,
         max_height=max_height,
         padding=padding,
+        subject_cx=subject_cx,
     )
     size_cap = None
     if max_size_mb is not None:

@@ -85,7 +85,14 @@ def test_reframe_and_size_cap_bitrate(tmp_path: Path) -> None:
     for op in recipe.ops:
         if op.op is OpName.REFRAME_VERTICAL:
             op.enabled = True
-            op.params = {"padding": 0.05}
+            op.params = {
+                "padding": 0.05,
+                "crop_x": 100.0,
+                "crop_y": 0.0,
+                "crop_w": 720.0,
+                "crop_h": 1280.0,
+                "subject_cx": 0.3,
+            }
         if op.op is OpName.ENCODE_HEVC_SIZE_CAP:
             op.enabled = True
             op.params = {"max_size_mb": 20.0, "max_height": 1280}
@@ -96,6 +103,7 @@ def test_reframe_and_size_cap_bitrate(tmp_path: Path) -> None:
         duration_s=40.0,
         ffmpeg_bin="ffmpeg",
     )
+    assert "crop=720:1280:100:0" in plan.filter_graph
     assert "pad=" in plan.filter_graph
     argv = plan.steps[0].argv
     assert "-b:v" in argv

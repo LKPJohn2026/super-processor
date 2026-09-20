@@ -95,6 +95,25 @@ def test_size_cap_infeasible(tmp_path: Path) -> None:
     assert MIN_BITRATE_KBPS == 300.0
 
 
+def test_size_cap_acknowledged(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    recipe = empty_recipe("abcd1234abcd1234", str(source.resolve()))
+    recipe.target.export.max_size_mb = 1.0
+    for op in recipe.ops:
+        if op.op is OpName.ENCODE_HEVC_SIZE_CAP:
+            op.enabled = True
+            op.params = {
+                "max_size_mb": 1.0,
+                "max_height": 1080.0,
+                "acknowledge_size_risk": 1.0,
+            }
+    facts = _facts(source, duration_s=7200.0)
+    result = validate_recipe(recipe, facts)
+    assert result.ok is True
+    assert any(issue.code == "size_cap_infeasible" for issue in result.warnings)
+
+
 def test_validate_job_recipe_round_trip(tmp_path: Path) -> None:
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"x")

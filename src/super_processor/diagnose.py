@@ -111,6 +111,7 @@ def diagnose_source(
     *,
     max_size_mb: float | None = None,
     max_height: int = 1920,
+    acknowledge_size_risk: bool = False,
 ) -> Diagnosis:
     """Run estimators (+ social plan) for a source file."""
     estimates = estimate_look(source, facts)
@@ -119,14 +120,25 @@ def diagnose_source(
         max_height=max_height,
         max_size_mb=max_size_mb,
         padding=0.0,
+        source=source,
     )
-    return build_diagnosis(estimates, social)
+    diagnosis = build_diagnosis(estimates, social)
+    if (
+        acknowledge_size_risk
+        and diagnosis.size_cap is not None
+        and diagnosis.size_cap.get("status") == "infeasible"
+    ):
+        diagnosis.size_cap = dict(diagnosis.size_cap)
+        diagnosis.size_cap["acknowledge_size_risk"] = 1.0
+        diagnosis.summary += "; size risk acknowledged"
+    return diagnosis
 
 
 def diagnose_job_dir(
     job_dir: Path,
     *,
     max_size_mb: float | None = None,
+    acknowledge_size_risk: bool = False,
 ) -> Diagnosis:
     """Diagnose using on-disk facts/estimates when present, else compute."""
     facts = load_media_facts(job_dir)
@@ -137,8 +149,21 @@ def diagnose_job_dir(
     try:
         social = load_reframe_plan(job_dir)
     except Exception:
-        social = plan_social_export(facts, max_size_mb=max_size_mb)
-    return build_diagnosis(estimates, social)
+        social = plan_social_export(
+            facts,
+            max_size_mb=max_size_mb,
+            source=Path(facts.source_path),
+        )
+    diagnosis = build_diagnosis(estimates, social)
+    if (
+        acknowledge_size_risk
+        and diagnosis.size_cap is not None
+        and diagnosis.size_cap.get("status") == "infeasible"
+    ):
+        diagnosis.size_cap = dict(diagnosis.size_cap)
+        diagnosis.size_cap["acknowledge_size_risk"] = 1.0
+        diagnosis.summary += "; size risk acknowledged"
+    return diagnosis
 
 
 def diagnosis_path(job_dir: Path) -> Path:

@@ -67,17 +67,27 @@ def recipe_from_diagnosis(
         for op in ops:
             if op.op is OpName.REFRAME_VERTICAL:
                 op.enabled = True
-                op.params = {"padding": float(diagnosis.reframe.get("padding", 0.0))}
+                reframe = diagnosis.reframe
+                params: dict[str, float] = {
+                    "padding": float(reframe.get("padding", 0.0)),
+                }
+                for key in ("crop_x", "crop_y", "crop_w", "crop_h", "subject_cx"):
+                    if key in reframe:
+                        params[key] = float(reframe[key])
+                op.params = params
     if diagnosis.size_cap is not None:
         for op in ops:
             if op.op is OpName.ENCODE_HEVC_SIZE_CAP:
                 op.enabled = True
-                op.params = {
+                params = {
                     "max_size_mb": float(diagnosis.size_cap.get("max_size_mb", 50.0)),
                     "max_height": float(
                         (diagnosis.reframe or {}).get("output_height", 1920)
                     ),
                 }
+                if float(diagnosis.size_cap.get("acknowledge_size_risk", 0.0) or 0.0):
+                    params["acknowledge_size_risk"] = 1.0
+                op.params = params
         recipe.target.export.max_size_mb = float(
             diagnosis.size_cap.get("max_size_mb", 50.0)
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -37,7 +38,7 @@ from .templates import (
     default_output_path,
 )
 from .validator import validate_job_recipe
-from .worker import FFmpegWorker, WorkerError
+from .worker import FFmpegWorker, WorkerError, format_progress_status
 
 
 def positive_int(value: str) -> int:
@@ -116,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional social export size cap",
     )
+    diagnose_cmd.add_argument(
+        "--acknowledge-size-risk",
+        action="store_true",
+        help="allow planning when a size cap is below the bitrate floor",
+    )
 
     plan_cmd = subparsers.add_parser(
         "plan",
@@ -126,6 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--instruction",
         default=None,
         help="optional natural-language patch (e.g. 'less denoise')",
+    )
+    plan_cmd.add_argument(
+        "--acknowledge-size-risk",
+        action="store_true",
+        help="downgrade an infeasible size cap to a warning",
     )
 
     preview_cmd = subparsers.add_parser(
@@ -156,6 +167,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="required explicit approval for the final encode",
     )
+    apply_cmd.add_argument(
+        "--acknowledge-size-risk",
+        action="store_true",
+        help="allow final encode when the size cap is below the bitrate floor",
+    )
 
     show_cmd = subparsers.add_parser(
         "show",
@@ -184,6 +200,11 @@ def build_parser() -> argparse.ArgumentParser:
     reframe.add_argument("--max-height", type=positive_int, default=1920)
     reframe.add_argument("--max-size-mb", type=float, default=None)
     reframe.add_argument("--padding", type=float, default=0.0)
+    reframe.add_argument(
+        "--acknowledge-size-risk",
+        action="store_true",
+        help="exit 0 even when the size cap is below the bitrate floor",
+    )
 
     init_recipe = job_sub.add_parser("init-recipe", help="write an empty recipe")
     init_recipe.add_argument("job_id", help="job identifier")
@@ -256,18 +277,28 @@ def run_diagnose_command(arguments: argparse.Namespace) -> int:
     estimates = estimate_look(Path(manifest.source_path), facts)
     write_estimates(store.job_dir(manifest.job_id), estimates)
     max_size = None if arguments.max_size_mb is None else float(arguments.max_size_mb)
-    social = plan_social_export(facts, max_size_mb=max_size)
+    ack = bool(getattr(arguments, "acknowledge_size_risk", False))
+    social = plan_social_export(
+        facts,
+        max_size_mb=max_size,
+        source=Path(manifest.source_path),
+    )
     write_reframe_plan(store.job_dir(manifest.job_id), social)
     diagnosis = diagnose_source(
         Path(manifest.source_path),
         facts,
         max_size_mb=max_size,
+        acknowledge_size_risk=ack,
     )
     write_diagnosis(store.job_dir(manifest.job_id), diagnosis)
     store.transition(
         manifest.job_id,
         JobState.DIAGNOSED,
-        notes={"summary": diagnosis.summary},
+        notes={
+            "summary": diagnosis.summary,
+            "subject_strategy": social.reframe.subject_strategy,
+            "size_risk_acknowledged": ack,
+        },
     )
     print(json.dumps(diagnosis.to_dict(), indent=2, sort_keys=True))
     return 0
@@ -278,6 +309,7 @@ def run_plan_command(arguments: argparse.Namespace) -> int:
     store = _store_from_args(arguments)
     job_id = str(arguments.job_id)
     manifest = store.load(job_id)
+    ack = bool(getattr(arguments, "acknowledge_size_risk", False))
     if manifest.state not in {
         JobState.DIAGNOSED,
         JobState.PLANNED,
@@ -285,7 +317,10 @@ def run_plan_command(arguments: argparse.Namespace) -> int:
     }:
         # Allow planning from probed jobs by diagnosing on the fly.
         if manifest.state is JobState.PROBED:
-            diagnosis = diagnose_job_dir(store.job_dir(job_id))
+            diagnosis = diagnose_job_dir(
+                store.job_dir(job_id),
+                acknowledge_size_risk=ack,
+            )
             write_diagnosis(store.job_dir(job_id), diagnosis)
             store.transition(job_id, JobState.DIAGNOSED)
         else:
@@ -293,6 +328,14 @@ def run_plan_command(arguments: argparse.Namespace) -> int:
                 f"job {job_id} must be diagnosed before plan "
                 f"(current: {manifest.state.value})"
             )
+
+    if ack:
+        # Re-stamp diagnosis so planner/validator see the acknowledgment.
+        diagnosis = diagnose_job_dir(
+            store.job_dir(job_id),
+            acknowledge_size_risk=True,
+        )
+        write_diagnosis(store.job_dir(job_id), diagnosis)
 
     recipe = plan_job(
         store.job_dir(job_id),
@@ -307,9 +350,20 @@ def run_plan_command(arguments: argparse.Namespace) -> int:
         )
         write_recipe(store.job_dir(job_id), recipe)
 
+    if ack:
+        for op in recipe.ops:
+            if op.op.value == "encode_hevc_size_cap" and op.enabled:
+                op.params = dict(op.params)
+                op.params["acknowledge_size_risk"] = 1.0
+        write_recipe(store.job_dir(job_id), recipe)
+
     validation = validate_job_recipe(store.job_dir(job_id))
     if store.load(job_id).state is JobState.DIAGNOSED:
-        store.transition(job_id, JobState.PLANNED, notes={"planned": True})
+        store.transition(
+            job_id,
+            JobState.PLANNED,
+            notes={"planned": True, "size_risk_acknowledged": ack},
+        )
     if validation.ok and store.load(job_id).state is JobState.PLANNED:
         store.transition(job_id, JobState.VALIDATED, notes={"validated": True})
 
@@ -367,6 +421,14 @@ def run_apply_command(arguments: argparse.Namespace) -> int:
             f"job {job_id} must be previewed before apply "
             f"(current: {manifest.state.value})"
         )
+    if bool(getattr(arguments, "acknowledge_size_risk", False)):
+        recipe = load_recipe(store.job_dir(job_id))
+        for op in recipe.ops:
+            if op.op.value == "encode_hevc_size_cap" and op.enabled:
+                op.params = dict(op.params)
+                op.params["acknowledge_size_risk"] = 1.0
+        write_recipe(store.job_dir(job_id), recipe)
+        store.update_notes(job_id, {"size_risk_acknowledged": True})
     if manifest.state is JobState.PREVIEWED:
         store.transition(job_id, JobState.APPROVED, notes={"approved": True})
     return run_job_run(
@@ -428,6 +490,7 @@ def run_job_command(arguments: argparse.Namespace) -> int:
                     else float(arguments.max_size_mb)
                 ),
                 padding=float(arguments.padding),
+                acknowledge_size_risk=bool(arguments.acknowledge_size_risk),
             )
         if command == "init-recipe":
             return run_job_init_recipe(store, str(arguments.job_id))
@@ -526,6 +589,7 @@ def run_job_reframe(
     max_height: int,
     max_size_mb: float | None,
     padding: float,
+    acknowledge_size_risk: bool = False,
 ) -> int:
     """Compute vertical reframe path and optional size-cap feasibility."""
     store.load(job_id)
@@ -535,17 +599,25 @@ def run_job_reframe(
         max_height=max_height,
         max_size_mb=max_size_mb,
         padding=padding,
+        source=Path(facts.source_path),
     )
     write_reframe_plan(store.job_dir(job_id), plan)
     notes: dict[str, object] = {
         "reframe": True,
         "subject_strategy": plan.reframe.subject_strategy,
+        "subject_cx": plan.reframe.subject_cx,
     }
     if plan.size_cap is not None:
         notes["size_cap_status"] = plan.size_cap.status
+        if acknowledge_size_risk and plan.size_cap.status == "infeasible":
+            notes["size_risk_acknowledged"] = True
     store.update_notes(job_id, notes)
     print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
-    if plan.size_cap is not None and plan.size_cap.status == "infeasible":
+    if (
+        plan.size_cap is not None
+        and plan.size_cap.status == "infeasible"
+        and not acknowledge_size_risk
+    ):
         return 1
     return 0
 
@@ -632,7 +704,13 @@ def run_job_run(
         store.transition(job_id, JobState.ENCODING, notes={"mode": "final"})
 
     worker = FFmpegWorker()
-    result = worker.run_plan(plan)
+
+    def _on_progress(progress: dict[str, str]) -> None:
+        status = format_progress_status(progress, duration_s=duration_s)
+        print(f"\r{status}", end="", flush=True, file=sys.stderr)
+
+    result = worker.run_plan(plan, on_progress=_on_progress)
+    print(file=sys.stderr)
     payload = result.to_dict()
     payload["validation"] = validation.to_dict()
     print(json.dumps(payload, indent=2, sort_keys=True))

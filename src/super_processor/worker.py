@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -101,6 +102,33 @@ def parse_progress_line(line: str, progress: dict[str, str]) -> None:
         return
     key, _, value = text.partition("=")
     progress[key] = value
+
+
+def format_progress_status(
+    progress: dict[str, str],
+    *,
+    duration_s: float | None = None,
+) -> str:
+    """Render a short human-readable progress status for stderr."""
+    out_ms = progress.get("out_time_ms")
+    out_time = progress.get("out_time")
+    seconds: float | None = None
+    if out_ms is not None:
+        with contextlib.suppress(ValueError):
+            seconds = int(out_ms) / 1000.0
+    if seconds is None and out_time is not None:
+        parts = out_time.split(":")
+        with contextlib.suppress(ValueError):
+            if len(parts) == 3:
+                hours, minutes, secs = parts
+                seconds = int(hours) * 3600 + int(minutes) * 60 + float(secs)
+    speed = progress.get("speed", "?")
+    if seconds is None:
+        return f"encoding… speed={speed}"
+    if duration_s and duration_s > 0:
+        pct = min(100.0, 100.0 * seconds / duration_s)
+        return f"encoding {pct:5.1f}% ({seconds:.1f}/{duration_s:.1f}s) speed={speed}"
+    return f"encoding {seconds:.1f}s speed={speed}"
 
 
 class FFmpegWorker:

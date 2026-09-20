@@ -13,6 +13,7 @@ from super_processor.reframe import (
     compute_center_reframe,
     load_reframe_plan,
     plan_social_export,
+    subject_x_from_gray,
     write_reframe_plan,
 )
 
@@ -24,6 +25,31 @@ def test_center_reframe_landscape() -> None:
     assert path.crop_w < path.input_width
     assert path.crop_h == 1080
     assert path.subject_strategy == "center"
+    assert path.subject_cx == 0.5
+
+
+def test_saliency_reframe_shifts_crop() -> None:
+    left = compute_center_reframe(
+        width=1920, height=1080, max_height=1920, subject_cx=0.25
+    )
+    right = compute_center_reframe(
+        width=1920, height=1080, max_height=1920, subject_cx=0.75
+    )
+    assert left.subject_strategy == "saliency"
+    assert right.subject_strategy == "saliency"
+    assert left.crop_x < right.crop_x
+
+
+def test_subject_x_from_gray_finds_bright_edge() -> None:
+    width, height = 40, 20
+    frame = bytearray(width * height)
+    # Strong vertical edge on the right half.
+    for y in range(height):
+        for x in range(width):
+            frame[y * width + x] = 220 if x > 28 else 20
+    cx = subject_x_from_gray(bytes(frame), width, height)
+    assert cx > 0.55
+    assert subject_x_from_gray(b"", 10, 10) == 0.5
 
 
 def test_size_cap_statuses() -> None:

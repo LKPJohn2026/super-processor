@@ -92,6 +92,64 @@ def test_collect_doctor_report_json(
     assert "required tools: missing" in text
 
 
+def test_ffmpeg_capability_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "super_processor.doctor._ffmpeg_listing",
+        lambda kind: " V..... libx265\n",
+    )
+    result = doctor.check_ffmpeg_capability(
+        "encoder:libx265",
+        kind="encoders",
+        token="libx265",
+        required=True,
+        hint="required",
+    )
+    assert result.ok is True
+    assert "available" in result.detail
+
+
+def test_ffmpeg_capability_missing_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "super_processor.doctor._ffmpeg_listing",
+        lambda kind: "Filters:\n T. deshake\n",
+    )
+    result = doctor.check_ffmpeg_capability(
+        "filter:stabilize",
+        kind="filters",
+        token="vidstabdetect",
+        required=False,
+        hint="falls back to deshake",
+    )
+    assert result.ok is True
+    assert "missing" in result.detail
+
+
+def test_ffmpeg_listing_without_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("super_processor.doctor.which", lambda _: None)
+    assert doctor._ffmpeg_listing("filters") == ""
+
+
+def test_ffmpeg_listing_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fake = tmp_path / "ffmpeg"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setattr("super_processor.doctor.which", lambda _: str(fake))
+
+    class Completed:
+        stdout = " V..... libx265\n"
+
+    monkeypatch.setattr(
+        "super_processor.doctor.subprocess.run",
+        lambda *args, **kwargs: Completed(),
+    )
+    assert "libx265" in doctor._ffmpeg_listing("encoders")
+
+
 def test_doctor_cli_json(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

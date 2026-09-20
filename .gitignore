@@ -25,6 +25,9 @@ src/super_processor/_core.c
 src/super_processor/_core.html
 src/super_processor/_version.py
 
+# Local dogfood artifacts
+.dogfood/
+
 # Editors and operating systems
 .DS_Store
 .idea/

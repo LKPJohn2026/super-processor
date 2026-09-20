@@ -124,11 +124,91 @@ def check_model_endpoint(name: str, env_var: str) -> CheckResult:
     )
 
 
+def _ffmpeg_listing(kind: str) -> str:
+    """Return stdout from ``ffmpeg -<filters|encoders>`` or empty string."""
+    path = which("ffmpeg")
+    if path is None:
+        return ""
+    try:
+        completed = subprocess.run(
+            [path, "-hide_banner", f"-{kind}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout or ""
+
+
+def check_ffmpeg_capability(
+    name: str,
+    *,
+    kind: str,
+    token: str,
+    required: bool,
+    hint: str,
+) -> CheckResult:
+    """Check whether ffmpeg exposes an encoder or filter capability."""
+    listing = _ffmpeg_listing(kind)
+    if not listing:
+        return CheckResult(
+            name=name,
+            ok=not required,
+            detail=(
+                f"ffmpeg not found; cannot probe {token}"
+                if which("ffmpeg") is None
+                else f"unable to list ffmpeg {kind}"
+            ),
+        )
+    present = any(
+        parts and token in parts
+        for line in listing.splitlines()
+        for parts in [line.split()]
+    )
+    if present:
+        return CheckResult(name=name, ok=True, detail=f"{token} available")
+    return CheckResult(
+        name=name,
+        ok=not required,
+        detail=f"{token} missing ({hint})",
+    )
+
+
 def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
     """Run all doctor checks and return structured results."""
     return [
         check_tool("ffmpeg", "ffmpeg", "-version"),
         check_tool("ffprobe", "ffprobe", "-version"),
+        check_ffmpeg_capability(
+            "encoder:libx265",
+            kind="encoders",
+            token="libx265",
+            required=True,
+            hint="required for HEVC export",
+        ),
+        check_ffmpeg_capability(
+            "filter:stabilize",
+            kind="filters",
+            token="vidstabdetect",
+            required=False,
+            hint="falls back to deshake when absent",
+        ),
+        check_ffmpeg_capability(
+            "filter:deshake",
+            kind="filters",
+            token="deshake",
+            required=False,
+            hint="soft stabilize fallback",
+        ),
+        check_ffmpeg_capability(
+            "filter:libvmaf",
+            kind="filters",
+            token="libvmaf",
+            required=False,
+            hint="optional offline VMAF regression",
+        ),
         check_player(),
         check_jobs_dir(jobs_dir),
         check_model_endpoint("local_llm", "SUPER_PROCESSOR_LLM_BASE_URL"),
@@ -139,8 +219,9 @@ def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
 
 def doctor_report_as_dict(results: list[CheckResult]) -> dict[str, Any]:
     """Serialize doctor results for JSON output."""
+    required = {"ffmpeg", "ffprobe", "encoder:libx265"}
     return {
-        "ok": all(item.ok for item in results if item.name in {"ffmpeg", "ffprobe"}),
+        "ok": all(item.ok for item in results if item.name in required),
         "checks": [asdict(item) for item in results],
     }
 
@@ -154,7 +235,8 @@ def format_doctor_text(results: list[CheckResult]) -> str:
         lines.append(f"[{mark}] {item.name}: {item.detail}{location}")
     summary = doctor_report_as_dict(results)
     lines.append(
-        "required tools: " + ("ready" if summary["ok"] else "missing ffmpeg/ffprobe")
+        "required tools: "
+        + ("ready" if summary["ok"] else "missing ffmpeg/ffprobe/libx265")
     )
     return "\n".join(lines)
 

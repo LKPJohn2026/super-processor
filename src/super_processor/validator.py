@@ -71,10 +71,16 @@ PARAM_BOUNDS: dict[OpName, dict[str, tuple[float, float]]] = {
     },
     OpName.REFRAME_VERTICAL: {
         "padding": (0.0, 0.25),
+        "crop_x": (0.0, 16_384.0),
+        "crop_y": (0.0, 16_384.0),
+        "crop_w": (2.0, 16_384.0),
+        "crop_h": (2.0, 16_384.0),
+        "subject_cx": (0.0, 1.0),
     },
     OpName.ENCODE_HEVC_SIZE_CAP: {
         "max_size_mb": (1.0, 10_000.0),
         "max_height": (360.0, 4320.0),
+        "acknowledge_size_risk": (0.0, 1.0),
     },
 }
 
@@ -239,17 +245,30 @@ def validate_size_cap_feasibility(
 
     budget_bits = export.max_size_mb * 1024 * 1024 * 8
     avg_kbps = (budget_bits / facts.duration_s) / 1000.0
+    acknowledged = False
+    for op in recipe.enabled_ops():
+        if op.op is OpName.ENCODE_HEVC_SIZE_CAP:
+            acknowledged = float(op.params.get("acknowledge_size_risk", 0.0)) >= 1.0
+            break
     if avg_kbps < MIN_BITRATE_KBPS:
-        errors.append(
-            ValidationIssue(
-                code="size_cap_infeasible",
-                message=(
-                    f"max_size_mb={export.max_size_mb} implies "
-                    f"~{avg_kbps:.1f} kbps over {facts.duration_s:.1f}s; "
-                    f"below floor {MIN_BITRATE_KBPS:.0f} kbps"
-                ),
-            )
+        issue = ValidationIssue(
+            code="size_cap_infeasible",
+            message=(
+                f"max_size_mb={export.max_size_mb} implies "
+                f"~{avg_kbps:.1f} kbps over {facts.duration_s:.1f}s; "
+                f"below floor {MIN_BITRATE_KBPS:.0f} kbps"
+                + (
+                    " (acknowledged)"
+                    if acknowledged
+                    else "; pass --acknowledge-size-risk to proceed"
+                )
+            ),
+            severity="warning" if acknowledged else "error",
         )
+        if acknowledged:
+            warnings.append(issue)
+        else:
+            errors.append(issue)
     elif avg_kbps < MIN_BITRATE_KBPS * 1.5:
         warnings.append(
             ValidationIssue(
