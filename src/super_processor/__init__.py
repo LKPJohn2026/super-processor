@@ -13,6 +13,7 @@ from .jobs import (
     default_jobs_root,
 )
 from .probe import MediaFacts, ProbeError, StreamFacts, probe_file
+from .recipe import OpName, Recipe, RecipeError, empty_recipe
 
 try:
     __version__ = version("super-processor")
@@ -27,10 +28,14 @@ __all__ = [
     "JobState",
     "JobStore",
     "MediaFacts",
+    "OpName",
     "ProbeError",
+    "Recipe",
+    "RecipeError",
     "StreamFacts",
     "__version__",
     "default_jobs_root",
+    "empty_recipe",
     "mean_luma",
     "probe_file",
     "sum_squares",
