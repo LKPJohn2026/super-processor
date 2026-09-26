@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 MIN_SEGMENT_S = 5.0
 MAX_SEGMENT_S = 120.0
 MAX_SEGMENTS = 15
 MAX_DURATION_S = 30.0 * 60.0
+SAMPLES_FILE_NAME = "samples.json"
+SAMPLES_SCHEMA_VERSION = 1
 
 
 class SegmentError(ValueError):
@@ -30,6 +34,35 @@ class SampleRow:
     motion: float
     subject_x: float
     upper_luma: float = 128.0
+
+    def to_dict(self) -> dict[str, float]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> SampleRow:
+        def num(key: str, default: float | None = None) -> float:
+            if key not in data:
+                if default is None:
+                    raise SegmentError(f"sample missing {key}")
+                return default
+            value = data[key]
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise SegmentError(f"sample {key} must be numeric")
+            return float(value)
+
+        return cls(
+            time_s=num("time_s"),
+            luma_mean=num("luma_mean"),
+            luma_p05=num("luma_p05"),
+            luma_p95=num("luma_p95"),
+            clip_low=num("clip_low"),
+            clip_high=num("clip_high"),
+            rb_cast=num("rb_cast"),
+            variance=num("variance"),
+            motion=num("motion"),
+            subject_x=num("subject_x"),
+            upper_luma=num("upper_luma", 128.0),
+        )
 
 
 def change_score(before: SampleRow, after: SampleRow) -> float:
@@ -291,3 +324,42 @@ def merge_short_and_cap(
         _, index = min(candidates, key=lambda item: (item[0], item[1]))
         pieces = _merge_pair(pieces, index)
     return pieces
+
+
+def samples_path(job_dir: Path) -> Path:
+    """Return the on-disk sample list for a job."""
+    return job_dir / SAMPLES_FILE_NAME
+
+
+def write_samples(job_dir: Path, rows: list[SampleRow]) -> Path:
+    """Atomically write one-hertz sample rows."""
+    path = samples_path(job_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": SAMPLES_SCHEMA_VERSION,
+        "samples": [row.to_dict() for row in rows],
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_samples(job_dir: Path) -> list[SampleRow]:
+    """Load one-hertz sample rows from a job directory."""
+    path = samples_path(job_dir)
+    if not path.is_file():
+        raise SegmentError(f"samples not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SegmentError("samples root must be an object")
+    raw_rows = data.get("samples")
+    if not isinstance(raw_rows, list):
+        raise SegmentError("samples list is missing")
+    rows: list[SampleRow] = []
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            raise SegmentError("each sample must be an object")
+        rows.append(SampleRow.from_dict(item))
+    return rows
