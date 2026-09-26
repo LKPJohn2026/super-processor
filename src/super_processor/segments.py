@@ -18,6 +18,9 @@ MAX_SEGMENTS = 15
 MAX_DURATION_S = 30.0 * 60.0
 SAMPLES_FILE_NAME = "samples.json"
 SAMPLES_SCHEMA_VERSION = 1
+SEGMENTS_FILE_NAME = "segments.json"
+SEGMENTS_SCHEMA_VERSION = 1
+STILLS_DIR_NAME = "segment_stills"
 SAMPLE_WIDTH = 160
 SAMPLE_HEIGHT = 90
 
@@ -452,3 +455,152 @@ def sample_media(
     return sample_from_reader(
         duration_s, ffmpeg_frame_reader(source, ffmpeg_bin=ffmpeg_bin)
     )
+
+
+@dataclass(slots=True)
+class TimelineSegment:
+    """One labeled span of the timeline, plus the still that represents it."""
+
+    index: int
+    start_s: float
+    end_s: float
+    context: str
+    problem: str
+    keyframe_s: float
+    look_group: int
+    still_path: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> TimelineSegment:
+        def num(key: str) -> float:
+            value = data[key]
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise SegmentError(f"segment {key} must be numeric")
+            return float(value)
+
+        def text(key: str) -> str:
+            value = data.get(key, "")
+            if not isinstance(value, str):
+                raise SegmentError(f"segment {key} must be text")
+            return value
+
+        return cls(
+            index=int(num("index")),
+            start_s=num("start_s"),
+            end_s=num("end_s"),
+            context=text("context"),
+            problem=text("problem"),
+            keyframe_s=num("keyframe_s"),
+            look_group=int(num("look_group")),
+            still_path=text("still_path"),
+        )
+
+
+def boundary_scores(rows: list[SampleRow]) -> list[float]:
+    """Change score for the boundary after each sample except the last."""
+    return [
+        change_score(rows[index], rows[index + 1]) for index in range(len(rows) - 1)
+    ]
+
+
+def _rows_in_span(rows: list[SampleRow], start: float, end: float) -> list[SampleRow]:
+    return [row for row in rows if start <= row.time_s < end]
+
+
+def propose_segments(rows: list[SampleRow]) -> list[TimelineSegment]:
+    """Split sample rows into labeled segments inside the duration bounds."""
+    if not rows:
+        raise SegmentError("cannot segment an empty sample list")
+    duration = rows[-1].time_s + 1.0
+    legal_segment_counts(duration)
+    intervals = merge_short_and_cap([(0.0, duration)], boundary_scores(rows))
+    spans = [_rows_in_span(rows, start, end) for start, end in intervals]
+    if any(not span for span in spans):
+        raise SegmentError("a segment contains no sample rows")
+    labels = [(context_label(span), primary_problem(span)) for span in spans]
+    groups = look_group_ids(labels)
+    segments: list[TimelineSegment] = []
+    for index, ((start, end), span, (context, problem), group) in enumerate(
+        zip(intervals, spans, labels, groups, strict=True)
+    ):
+        segments.append(
+            TimelineSegment(
+                index=index,
+                start_s=start,
+                end_s=end,
+                context=context,
+                problem=problem,
+                keyframe_s=keyframe_time(span),
+                look_group=group,
+            )
+        )
+    return segments
+
+
+def write_gray_still(path: Path, gray: bytes) -> None:
+    """Write a packed gray frame as a binary PPM still."""
+    pixels = SAMPLE_WIDTH * SAMPLE_HEIGHT
+    if len(gray) < pixels:
+        raise SegmentError(f"short still frame ({len(gray)} < {pixels} bytes)")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = f"P5\n{SAMPLE_WIDTH} {SAMPLE_HEIGHT}\n255\n".encode()
+    path.write_bytes(header + gray[:pixels])
+
+
+def segments_path(job_dir: Path) -> Path:
+    """Return the on-disk segment list for a job."""
+    return job_dir / SEGMENTS_FILE_NAME
+
+
+def write_segments(job_dir: Path, segments: list[TimelineSegment]) -> Path:
+    """Atomically write the proposed segment list."""
+    path = segments_path(job_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": SEGMENTS_SCHEMA_VERSION,
+        "segments": [segment.to_dict() for segment in segments],
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_segments(job_dir: Path) -> list[TimelineSegment]:
+    """Load a proposed segment list from a job directory."""
+    path = segments_path(job_dir)
+    if not path.is_file():
+        raise SegmentError(f"segments not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SegmentError("segments root must be an object")
+    raw_rows = data.get("segments")
+    if not isinstance(raw_rows, list):
+        raise SegmentError("segments list is missing")
+    segments: list[TimelineSegment] = []
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            raise SegmentError("each segment must be an object")
+        segments.append(TimelineSegment.from_dict(item))
+    return segments
+
+
+def write_segment_review(
+    job_dir: Path,
+    rows: list[SampleRow],
+    read_frame: FrameReader | None = None,
+) -> list[TimelineSegment]:
+    """Propose segments, store one still per key frame, and write segments.json."""
+    segments = propose_segments(rows)
+    if read_frame is not None:
+        for segment in segments:
+            gray, _rgb = read_frame(segment.keyframe_s)
+            relative = f"{STILLS_DIR_NAME}/seg_{segment.index:02d}.ppm"
+            write_gray_still(job_dir / relative, gray)
+            segment.still_path = relative
+    write_segments(job_dir, segments)
+    return segments
