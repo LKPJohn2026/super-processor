@@ -511,22 +511,39 @@ def _rows_in_span(rows: list[SampleRow], start: float, end: float) -> list[Sampl
     return [row for row in rows if start <= row.time_s < end]
 
 
-def propose_segments(rows: list[SampleRow]) -> list[TimelineSegment]:
-    """Split sample rows into labeled segments inside the duration bounds."""
-    if not rows:
-        raise SegmentError("cannot segment an empty sample list")
-    duration = rows[-1].time_s + 1.0
-    legal_segment_counts(duration)
-    intervals = merge_short_and_cap([(0.0, duration)], boundary_scores(rows))
-    spans = [_rows_in_span(rows, start, end) for start, end in intervals]
-    if any(not span for span in spans):
-        raise SegmentError("a segment contains no sample rows")
-    labels = [(context_label(span), primary_problem(span)) for span in spans]
+def _label_intervals(
+    rows: list[SampleRow],
+    intervals: list[tuple[float, float]],
+    overrides: dict[int, tuple[str | None, str | None]] | None = None,
+) -> list[TimelineSegment]:
+    """Label each interval, applying any context or problem override."""
+    chosen = overrides or {}
+    spans: list[list[SampleRow]] = []
+    labels: list[tuple[str, str]] = []
+    problems: list[str] = []
+    for index, (start, end) in enumerate(intervals):
+        span = _rows_in_span(rows, start, end)
+        if not span:
+            raise SegmentError("a segment contains no sample rows")
+        context = context_label(span)
+        problem = primary_problem(span)
+        override_context, override_problem = chosen.get(index, (None, None))
+        if override_context is not None:
+            context = override_context
+        if override_problem is not None:
+            problem = override_problem
+        spans.append(span)
+        labels.append((context, problem))
+        problems.append(problem)
     groups = look_group_ids(labels)
     segments: list[TimelineSegment] = []
     for index, ((start, end), span, (context, problem), group) in enumerate(
         zip(intervals, spans, labels, groups, strict=True)
     ):
+        if problems[index] == primary_problem(span):
+            keyframe = keyframe_time(span)
+        else:
+            keyframe = max(span, key=lambda row: problem_scores(row)[problem]).time_s
         segments.append(
             TimelineSegment(
                 index=index,
@@ -534,11 +551,21 @@ def propose_segments(rows: list[SampleRow]) -> list[TimelineSegment]:
                 end_s=end,
                 context=context,
                 problem=problem,
-                keyframe_s=keyframe_time(span),
+                keyframe_s=keyframe,
                 look_group=group,
             )
         )
     return segments
+
+
+def propose_segments(rows: list[SampleRow]) -> list[TimelineSegment]:
+    """Split sample rows into labeled segments inside the duration bounds."""
+    if not rows:
+        raise SegmentError("cannot segment an empty sample list")
+    duration = rows[-1].time_s + 1.0
+    legal_segment_counts(duration)
+    intervals = merge_short_and_cap([(0.0, duration)], boundary_scores(rows))
+    return _label_intervals(rows, intervals)
 
 
 def write_gray_still(path: Path, gray: bytes) -> None:
@@ -695,3 +722,119 @@ def parse_split_note(text: str) -> SplitNote:
     if len(matched) != 1:
         raise SegmentError("rephrase the note")
     return matched[0]
+
+
+def _merge_weakest_once(
+    pieces: list[tuple[float, float]],
+    scores: list[float],
+) -> list[tuple[float, float]]:
+    """Merge the quietest boundary whose combined length stays within 120s."""
+    candidates: list[tuple[float, int]] = []
+    for index in range(len(pieces) - 1):
+        combined = pieces[index + 1][1] - pieces[index][0]
+        if combined > MAX_SEGMENT_S + 1e-6:
+            continue
+        boundary = pieces[index][1]
+        candidates.append((_boundary_score(boundary, scores), index))
+    if not candidates:
+        return pieces
+    _, index = min(candidates, key=lambda item: (item[0], item[1]))
+    return _merge_pair(pieces, index)
+
+
+def _split_longest_once(
+    pieces: list[tuple[float, float]],
+    scores: list[float],
+) -> list[tuple[float, float]]:
+    """Cut the longest piece once, on its strongest interior score or its midpoint."""
+    index = max(
+        range(len(pieces)),
+        key=lambda item: (pieces[item][1] - pieces[item][0], -item),
+    )
+    start, end = pieces[index]
+    cut = _strongest_interior_cut(start, end, scores)
+    if (
+        cut is None
+        or cut - start < MIN_SEGMENT_S - 1e-6
+        or end - cut < MIN_SEGMENT_S - 1e-6
+    ):
+        cut = start + (end - start) / 2.0
+    if (
+        cut - start < MIN_SEGMENT_S - 1e-6
+        or end - cut < MIN_SEGMENT_S - 1e-6
+        or cut - start > MAX_SEGMENT_S + 1e-6
+        or end - cut > MAX_SEGMENT_S + 1e-6
+    ):
+        return pieces
+    return [*pieces[:index], (start, cut), (cut, end), *pieces[index + 1 :]]
+
+
+def _clamp_boundary(
+    left: tuple[float, float],
+    right: tuple[float, float],
+    boundary: float,
+) -> float:
+    """Keep both neighbors inside the 5–120s segment bounds."""
+    low = max(left[0] + MIN_SEGMENT_S, right[1] - MAX_SEGMENT_S)
+    high = min(left[0] + MAX_SEGMENT_S, right[1] - MIN_SEGMENT_S)
+    if low > high:
+        return left[1]
+    return min(high, max(low, boundary))
+
+
+def _move_boundary(
+    pieces: list[tuple[float, float]],
+    segments: list[TimelineSegment],
+    note: SplitNote,
+) -> list[tuple[float, float]]:
+    if note.segment_index is not None:
+        target = note.segment_index
+    elif note.problem is not None:
+        matches = [
+            segment.index for segment in segments if segment.problem == note.problem
+        ]
+        if len(matches) != 1:
+            raise SegmentError("rephrase the note")
+        target = matches[0]
+    else:
+        target = 1
+    if target <= 0 or target >= len(pieces):
+        raise SegmentError("rephrase the note")
+    left = pieces[target - 1]
+    right = pieces[target]
+    moved = _clamp_boundary(left, right, right[0] + float(note.delta_s or 0.0))
+    updated = list(pieces)
+    updated[target - 1] = (left[0], moved)
+    updated[target] = (moved, right[1])
+    return updated
+
+
+def apply_split_note(
+    rows: list[SampleRow],
+    segments: list[TimelineSegment],
+    note: SplitNote,
+) -> list[TimelineSegment]:
+    """Re-split or relabel inside the same duration bounds."""
+    if not rows or not segments:
+        raise SegmentError("rephrase the note")
+    duration = rows[-1].time_s + 1.0
+    fewest, most = legal_segment_counts(duration)
+    pieces = [(segment.start_s, segment.end_s) for segment in segments]
+    scores = boundary_scores(rows)
+    if note.intent == "too_many":
+        if len(pieces) > fewest:
+            pieces = _merge_weakest_once(pieces, scores)
+        return _label_intervals(rows, pieces)
+    if note.intent == "too_few":
+        if len(pieces) < most:
+            pieces = _split_longest_once(pieces, scores)
+        return _label_intervals(rows, pieces)
+    if note.intent == "move_boundary":
+        pieces = _move_boundary(pieces, segments, note)
+        return _label_intervals(rows, pieces)
+    if note.intent == "relabel":
+        index = 0 if note.segment_index is None else note.segment_index
+        if index < 0 or index >= len(segments):
+            raise SegmentError("rephrase the note")
+        return _label_intervals(rows, pieces, {index: (note.context, note.problem)})
+    raise SegmentError("rephrase the note")

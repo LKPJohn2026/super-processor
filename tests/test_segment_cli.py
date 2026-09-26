@@ -118,6 +118,29 @@ def test_segment_samples_when_rows_are_missing(
     assert store.load(JOB_ID).state is JobState.SPLIT_PROPOSED
 
 
+def test_segment_note_resplits_and_stays_proposed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _probed_job(tmp_path)
+    write_samples(store.job_dir(JOB_ID), _timeline())
+    monkeypatch.setattr("super_processor.cli.ffmpeg_frame_reader", _reader)
+
+    assert main(["--jobs-dir", str(store.root), "segment", JOB_ID]) == 0
+    capsys.readouterr()
+    code = main(
+        ["--jobs-dir", str(store.root), "segment", JOB_ID, "--note", "too few cuts"]
+    )
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "0  0-60s" in output
+    assert "1  60-95s" in output
+    assert "2  95-130s" in output
+    assert store.load(JOB_ID).state is JobState.SPLIT_PROPOSED
+
+
 def test_segment_refuses_a_job_that_is_not_probed(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -33,11 +33,17 @@ from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_re
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
 from .segments import (
     SegmentError,
+    TimelineSegment,
+    apply_split_note,
     ffmpeg_frame_reader,
     load_samples,
+    load_segments,
+    parse_split_note,
     sample_media,
+    write_gray_still,
     write_samples,
     write_segment_review,
+    write_segments,
 )
 from .templates import (
     PREVIEW_FILE_NAME,
@@ -192,6 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="propose a timeline split and print each segment",
     )
     segment_cmd.add_argument("job_id", help="job identifier")
+    segment_cmd.add_argument(
+        "--note",
+        default=None,
+        help="short correction: too many, too few, a boundary move, or a relabel",
+    )
 
     job = subparsers.add_parser("job", help="low-level job management commands")
     job_sub = job.add_subparsers(dest="job_command", required=True)
@@ -318,6 +329,26 @@ def run_diagnose_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _print_segments(segments: list[TimelineSegment]) -> None:
+    for segment in segments:
+        print(
+            f"{segment.index}  {segment.start_s:.0f}-{segment.end_s:.0f}s  "
+            f"{segment.context}  {segment.problem}  "
+            f"key {segment.keyframe_s:.0f}s  {segment.still_path}"
+        )
+
+
+def _attach_stills(
+    job_dir: Path, source: Path, segments: list[TimelineSegment]
+) -> None:
+    read_frame = ffmpeg_frame_reader(source)
+    for segment in segments:
+        gray, _rgb = read_frame(segment.keyframe_s)
+        relative = f"segment_stills/seg_{segment.index:02d}.ppm"
+        write_gray_still(job_dir / relative, gray)
+        segment.still_path = relative
+
+
 def run_segment_command(arguments: argparse.Namespace) -> int:
     """Sample a probed job, write the split, and print it."""
     store = _store_from_args(arguments)
@@ -330,6 +361,23 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
         )
     job_dir = store.job_dir(job_id)
     source = Path(manifest.source_path)
+    note = getattr(arguments, "note", None)
+    if note:
+        if manifest.state is not JobState.SPLIT_PROPOSED:
+            raise JobError(
+                f"job {job_id} needs a proposed split before a note "
+                f"(current: {manifest.state.value})"
+            )
+        rows = load_samples(job_dir)
+        segments = apply_split_note(
+            rows,
+            load_segments(job_dir),
+            parse_split_note(str(note)),
+        )
+        _attach_stills(job_dir, source, segments)
+        write_segments(job_dir, segments)
+        _print_segments(segments)
+        return 0
     try:
         rows = load_samples(job_dir)
     except SegmentError:
@@ -345,12 +393,7 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
             JobState.SPLIT_PROPOSED,
             notes={"segments": len(segments)},
         )
-    for segment in segments:
-        print(
-            f"{segment.index}  {segment.start_s:.0f}-{segment.end_s:.0f}s  "
-            f"{segment.context}  {segment.problem}  "
-            f"key {segment.keyframe_s:.0f}s  {segment.still_path}"
-        )
+    _print_segments(segments)
     return 0
 
 
