@@ -6,7 +6,14 @@ import pytest
 
 from super_processor.recipe import DEFAULT_OP_ORDER, OpName
 from super_processor.segments import PROBLEM_NAMES
-from super_processor.treatments import TreatmentError, iter_treatments, treatments_for
+from super_processor.treatments import (
+    Treatment,
+    TreatmentError,
+    TreatmentStep,
+    iter_treatments,
+    require_legal_treatment,
+    treatments_for,
+)
 from super_processor.validator import PARAM_BOUNDS
 
 
@@ -63,6 +70,46 @@ def test_denoise_and_sharpen_stay_apart() -> None:
     for treatment in iter_treatments():
         ops = {step.op for step in treatment.steps}
         assert not (OpName.DENOISE in ops and OpName.SHARPEN in ops)
+
+
+def test_catalog_treatments_are_legal() -> None:
+    for treatment in iter_treatments():
+        require_legal_treatment(treatment)
+
+
+def test_strong_denoise_with_sharpen_is_rejected() -> None:
+    illegal = Treatment(
+        treatment_id="noisy.harsh",
+        problem="noisy",
+        steps=(
+            TreatmentStep(OpName.DENOISE, (("strength", 0.8),)),
+            TreatmentStep(OpName.SHARPEN, (("luma_amount", 0.5), ("luma_size", 5.0))),
+        ),
+    )
+    with pytest.raises(TreatmentError, match="sharpen"):
+        require_legal_treatment(illegal)
+    mild = Treatment(
+        treatment_id="noisy.gentle",
+        problem="noisy",
+        steps=(
+            TreatmentStep(OpName.DENOISE, (("strength", 0.2),)),
+            TreatmentStep(OpName.SHARPEN, (("luma_amount", 0.4), ("luma_size", 5.0))),
+        ),
+    )
+    require_legal_treatment(mild)
+
+
+def test_out_of_order_steps_are_rejected() -> None:
+    illegal = Treatment(
+        treatment_id="noisy.reversed",
+        problem="noisy",
+        steps=(
+            TreatmentStep(OpName.DENOISE, (("strength", 0.2),)),
+            TreatmentStep(OpName.CONTRAST, (("contrast", 1.1),)),
+        ),
+    )
+    with pytest.raises(TreatmentError, match="order"):
+        require_legal_treatment(illegal)
 
 
 def test_unknown_problem_is_refused() -> None:

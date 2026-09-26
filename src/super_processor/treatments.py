@@ -11,7 +11,11 @@ _ORDER = {name: index for index, name in enumerate(DEFAULT_OP_ORDER)}
 
 
 class TreatmentError(ValueError):
-    """Raised when a problem has no treatment list."""
+    """Raised when a treatment list is missing or a treatment is illegal."""
+
+
+# Denoise at or above this strength cannot share a treatment with sharpen.
+STRONG_DENOISE = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,3 +190,31 @@ def iter_treatments() -> tuple[Treatment, ...]:
     for problem in PROBLEM_NAMES:
         listed.extend(treatments_for(problem))
     return tuple(listed)
+
+
+def treatment_violation(treatment: Treatment) -> str | None:
+    """Return why a treatment is illegal, or ``None`` when it is allowed.
+
+    Steps must follow the recipe allowlist, each operation once. Strong denoise
+    and sharpen cannot appear together.
+    """
+    indexes = [_ORDER[step.op] for step in treatment.steps]
+    if indexes != sorted(indexes) or len(indexes) != len(set(indexes)):
+        return "operation order does not match the allowlist"
+    denoise = 0.0
+    sharpen = False
+    for step in treatment.steps:
+        if step.op is OpName.DENOISE:
+            denoise = float(step.as_dict().get("strength", 0.0))
+        if step.op is OpName.SHARPEN:
+            sharpen = True
+    if sharpen and denoise >= STRONG_DENOISE:
+        return "strong denoise and sharpen cannot share a treatment"
+    return None
+
+
+def require_legal_treatment(treatment: Treatment) -> None:
+    """Raise when a treatment breaks order or pairs strong denoise with sharpen."""
+    reason = treatment_violation(treatment)
+    if reason is not None:
+        raise TreatmentError(reason)
