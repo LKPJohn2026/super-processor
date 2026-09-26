@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import math
+from array import array
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from . import histogram_u8, mean_luma, percentile_u8, sad_u8, variance_u8
 
 MIN_SEGMENT_S = 5.0
 MAX_SEGMENT_S = 120.0
@@ -13,6 +17,10 @@ MAX_SEGMENTS = 15
 MAX_DURATION_S = 30.0 * 60.0
 SAMPLES_FILE_NAME = "samples.json"
 SAMPLES_SCHEMA_VERSION = 1
+SAMPLE_WIDTH = 160
+SAMPLE_HEIGHT = 90
+
+FrameReader = Callable[[float], tuple[bytes, tuple[float, float, float]]]
 
 
 class SegmentError(ValueError):
@@ -362,4 +370,58 @@ def load_samples(job_dir: Path) -> list[SampleRow]:
         if not isinstance(item, dict):
             raise SegmentError("each sample must be an object")
         rows.append(SampleRow.from_dict(item))
+    return rows
+
+
+def _row_from_frame(
+    time_s: float,
+    frame: bytes,
+    rgb: tuple[float, float, float],
+    previous: bytes | None,
+) -> SampleRow:
+    hist = array("Q", [0]) * 256
+    histogram_u8(frame, memoryview(hist))
+    total = float(sum(hist)) or 1.0
+    upper_rows = SAMPLE_HEIGHT // 3
+    upper = frame[: SAMPLE_WIDTH * upper_rows]
+    red, green, blue = rgb
+    cast = (blue - red) / max(1.0, (red + green + blue) / 3.0)
+    motion = 0.0 if previous is None else sad_u8(previous, frame) / float(len(frame))
+    return SampleRow(
+        time_s=time_s,
+        luma_mean=mean_luma(frame),
+        luma_p05=percentile_u8(frame, 5.0),
+        luma_p95=percentile_u8(frame, 95.0),
+        clip_low=hist[0] / total,
+        clip_high=hist[255] / total,
+        rb_cast=cast,
+        variance=variance_u8(frame),
+        motion=motion,
+        subject_x=0.5,
+        upper_luma=mean_luma(upper) if upper else 0.0,
+    )
+
+
+def sample_from_reader(duration_s: float, read_frame: FrameReader) -> list[SampleRow]:
+    """Walk one second at a time and store feature rows.
+
+    ``read_frame`` returns a packed gray frame of ``SAMPLE_WIDTH`` by
+    ``SAMPLE_HEIGHT`` plus mean red, green, and blue. Duration limits are
+    enforced before any frame is read.
+    """
+    legal_segment_counts(duration_s)
+    count = max(1, int(math.floor(duration_s)))
+    pixels = SAMPLE_WIDTH * SAMPLE_HEIGHT
+    rows: list[SampleRow] = []
+    previous: bytes | None = None
+    for index in range(count):
+        time_s = float(index)
+        gray, rgb = read_frame(time_s)
+        if len(gray) < pixels:
+            raise SegmentError(
+                f"short frame at {time_s:.0f}s ({len(gray)} < {pixels} bytes)"
+            )
+        frame = gray[:pixels]
+        rows.append(_row_from_frame(time_s, frame, rgb, previous))
+        previous = frame
     return rows
