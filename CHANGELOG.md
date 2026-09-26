@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-26
+
+### Added
+
+- Split loop for a local file: one-hertz sample rows, segments of 5–120
+  seconds (at most 15, files over 30 minutes refused), a context and problem
+  label, one still per segment, and shared look groups.
+- `segment` prints a proposed split. `--note` re-splits inside those bounds
+  (too many, too few, a boundary move, or a relabel). `--accept` records the
+  timeline; a second accept leaves the job unchanged.
+- Sharpen and trim on the recipe allowlist. Sharpen stays inside a mild
+  unsharp range. A trim must keep at least 5 seconds.
+
 ## [1.1.0] - 2026-09-20
 
 ### Added
