@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from array import array
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -604,3 +605,93 @@ def write_segment_review(
             segment.still_path = relative
     write_segments(job_dir, segments)
     return segments
+
+
+_MOVE_NOTE = re.compile(
+    r"(?:segment\s+(?P<index>\d+)\s+)?"
+    r"(?:the\s+)?(?:(?P<cue>warm|dark|bright)\s+part\s+)?"
+    r"starts\s+(?:(?P<amount>\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)\s+)?"
+    r"(?P<direction>later|earlier)\b"
+)
+_RELABEL_NOTE = re.compile(
+    r"(?:segment\s+(?P<index>\d+)\s+)?(?:this\s+is|call\s+this)\s+(?P<label>.+)$"
+)
+_NOTE_CONTEXTS = {"indoor": "indoor", "outdoor": "outdoor", "mixed": "mixed"}
+_NOTE_PROBLEMS = {
+    "low light": "low_light",
+    "low contrast": "low_contrast",
+    "silhouette": "silhouette",
+    "too warm": "too_warm",
+    "warm": "too_warm",
+    "noisy": "noisy",
+    "shaky": "shaky",
+    "off center": "off_center",
+    "off-center": "off_center",
+}
+_NOTE_CUES = {"warm": "too_warm", "dark": "low_light", "bright": "low_contrast"}
+
+
+@dataclass(frozen=True, slots=True)
+class SplitNote:
+    """A structured correction the split loop already knows how to apply."""
+
+    intent: str
+    segment_index: int | None = None
+    delta_s: float | None = None
+    context: str | None = None
+    problem: str | None = None
+
+
+def _note_index(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    return int(raw)
+
+
+def parse_split_note(text: str) -> SplitNote:
+    """Turn a short split note into one known intent.
+
+    Unknown wording raises ``SegmentError`` so the caller can ask for a rephrase.
+    A note that matches more than one intent is also refused.
+    """
+    cleaned = " ".join(text.strip().lower().split())
+    if not cleaned:
+        raise SegmentError("rephrase the note")
+    matched: list[SplitNote] = []
+    if "too many" in cleaned:
+        matched.append(SplitNote(intent="too_many"))
+    if "too few" in cleaned or "not enough" in cleaned:
+        matched.append(SplitNote(intent="too_few"))
+    move = _MOVE_NOTE.search(cleaned)
+    if move is not None:
+        amount = move.group("amount")
+        delta = 5.0 if amount is None else float(amount)
+        if move.group("direction") == "earlier":
+            delta = -delta
+        cue = move.group("cue")
+        matched.append(
+            SplitNote(
+                intent="move_boundary",
+                segment_index=_note_index(move.group("index")),
+                delta_s=delta,
+                problem=None if cue is None else _NOTE_CUES[cue],
+            )
+        )
+    relabel = _RELABEL_NOTE.search(cleaned)
+    if relabel is not None:
+        label = relabel.group("label").strip(" .")
+        context = _NOTE_CONTEXTS.get(label)
+        problem = _NOTE_PROBLEMS.get(label)
+        if context is None and problem is None:
+            raise SegmentError("rephrase the note")
+        matched.append(
+            SplitNote(
+                intent="relabel",
+                segment_index=_note_index(relabel.group("index")),
+                context=context,
+                problem=problem,
+            )
+        )
+    if len(matched) != 1:
+        raise SegmentError("rephrase the note")
+    return matched[0]
