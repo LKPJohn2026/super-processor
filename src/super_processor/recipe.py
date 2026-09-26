@@ -22,8 +22,10 @@ class OpName(str, Enum):
     WHITE_BALANCE = "white_balance"
     CONTRAST = "contrast"
     DENOISE = "denoise"
+    SHARPEN = "sharpen"
     STABILIZE = "stabilize"
     REFRAME_VERTICAL = "reframe_vertical"
+    TRIM = "trim"
     ENCODE_HEVC_SIZE_CAP = "encode_hevc_size_cap"
 
 
@@ -39,8 +41,10 @@ DEFAULT_OP_ORDER: tuple[OpName, ...] = (
     OpName.WHITE_BALANCE,
     OpName.CONTRAST,
     OpName.DENOISE,
+    OpName.SHARPEN,
     OpName.STABILIZE,
     OpName.REFRAME_VERTICAL,
+    OpName.TRIM,
     OpName.ENCODE_HEVC_SIZE_CAP,
 )
 

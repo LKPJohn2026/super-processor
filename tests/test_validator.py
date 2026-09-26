@@ -123,3 +123,37 @@ def test_validate_job_recipe_round_trip(tmp_path: Path) -> None:
     write_media_facts(job_dir, _facts(source))
     result = validate_job_recipe(job_dir)
     assert result.ok is True
+
+
+def test_sharpen_amount_is_capped(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    recipe = empty_recipe("abcd1234abcd1234", str(source.resolve()))
+    for op in recipe.ops:
+        if op.op is OpName.SHARPEN:
+            op.enabled = True
+            op.params = {"luma_amount": 2.0, "luma_size": 5.0}
+    result = validate_recipe(recipe, _facts(source))
+    assert any(issue.code == "param_bounds" for issue in result.errors)
+
+    for op in recipe.ops:
+        if op.op is OpName.SHARPEN:
+            op.params = {"luma_amount": 0.8, "luma_size": 5.0}
+    assert validate_recipe(recipe, _facts(source)).ok is True
+
+
+def test_trim_must_keep_five_seconds(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    recipe = empty_recipe("abcd1234abcd1234", str(source.resolve()))
+    for op in recipe.ops:
+        if op.op is OpName.TRIM:
+            op.enabled = True
+            op.params = {"start_s": 0.0, "end_s": 4.0}
+    short = validate_recipe(recipe, _facts(source))
+    assert any(issue.code == "trim_too_short" for issue in short.errors)
+
+    for op in recipe.ops:
+        if op.op is OpName.TRIM:
+            op.params = {"start_s": 2.0, "end_s": 8.0}
+    assert validate_recipe(recipe, _facts(source)).ok is True

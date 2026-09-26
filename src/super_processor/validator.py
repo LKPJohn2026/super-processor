@@ -64,6 +64,14 @@ PARAM_BOUNDS: dict[OpName, dict[str, tuple[float, float]]] = {
     OpName.DENOISE: {
         "strength": (0.0, 1.0),
     },
+    OpName.SHARPEN: {
+        "luma_amount": (0.0, 1.2),
+        "luma_size": (3.0, 7.0),
+    },
+    OpName.TRIM: {
+        "start_s": (0.0, 1800.0),
+        "end_s": (0.0, 1800.0),
+    },
     OpName.STABILIZE: {
         "shakiness": (1.0, 10.0),
         "smoothing": (1.0, 50.0),
@@ -121,6 +129,30 @@ def validate_param_bounds(recipe: Recipe) -> list[ValidationIssue]:
                         ),
                     )
                 )
+    return issues
+
+
+def validate_trim_span(recipe: Recipe) -> list[ValidationIssue]:
+    """A trim must keep at least five seconds."""
+    issues: list[ValidationIssue] = []
+    for op in recipe.enabled_ops():
+        if op.op is not OpName.TRIM:
+            continue
+        try:
+            start = float(op.params.get("start_s", 0.0))
+            end = float(op.params.get("end_s", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if end - start < 5.0:
+            issues.append(
+                ValidationIssue(
+                    code="trim_too_short",
+                    message=(
+                        f"trim keeps {end - start:.1f}s; "
+                        "the kept range must be at least 5s"
+                    ),
+                )
+            )
     return issues
 
 
@@ -292,6 +324,7 @@ def validate_recipe(
     warnings: list[ValidationIssue] = []
 
     errors.extend(validate_param_bounds(recipe))
+    errors.extend(validate_trim_span(recipe))
     errors.extend(validate_op_order(recipe))
     errors.extend(validate_encode_settings(recipe))
     errors.extend(validate_probe_compliance(recipe, facts))
