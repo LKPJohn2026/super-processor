@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import histogram_u8, mean_luma, percentile_u8, sad_u8, variance_u8
+from .estimators import extract_gray_frame, extract_rgb_means
 
 MIN_SEGMENT_S = 5.0
 MAX_SEGMENT_S = 120.0
@@ -425,3 +426,29 @@ def sample_from_reader(duration_s: float, read_frame: FrameReader) -> list[Sampl
         rows.append(_row_from_frame(time_s, frame, rgb, previous))
         previous = frame
     return rows
+
+
+def ffmpeg_frame_reader(source: Path, *, ffmpeg_bin: str | None = None) -> FrameReader:
+    """Return a reader that decodes one gray frame and RGB means per second."""
+
+    def read_frame(time_s: float) -> tuple[bytes, tuple[float, float, float]]:
+        gray = extract_gray_frame(
+            source,
+            at_s=time_s,
+            width=SAMPLE_WIDTH,
+            height=SAMPLE_HEIGHT,
+            ffmpeg_bin=ffmpeg_bin,
+        )
+        rgb = extract_rgb_means(source, at_s=time_s, ffmpeg_bin=ffmpeg_bin)
+        return gray, rgb
+
+    return read_frame
+
+
+def sample_media(
+    source: Path, duration_s: float, *, ffmpeg_bin: str | None = None
+) -> list[SampleRow]:
+    """Sample one feature row per second from a media file."""
+    return sample_from_reader(
+        duration_s, ffmpeg_frame_reader(source, ffmpeg_bin=ffmpeg_bin)
+    )
