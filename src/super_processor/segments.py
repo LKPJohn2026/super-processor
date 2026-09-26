@@ -35,3 +35,61 @@ def legal_segment_counts(duration_s: float) -> tuple[int, int]:
             f"{MIN_SEGMENT_S:.0f}–{MAX_SEGMENT_S:.0f}s segments"
         )
     return fewest, most
+
+
+def _equal_pieces(start: float, end: float) -> list[tuple[float, float]]:
+    """Cut ``[start, end]`` into equal pieces of at most ``MAX_SEGMENT_S``."""
+    length = end - start
+    count = max(1, math.ceil(length / MAX_SEGMENT_S - 1e-9))
+    step = length / count
+    pieces: list[tuple[float, float]] = []
+    cursor = start
+    for index in range(count):
+        nxt = end if index == count - 1 else cursor + step
+        pieces.append((cursor, nxt))
+        cursor = nxt
+    return pieces
+
+
+def _strongest_interior_cut(
+    start: float,
+    end: float,
+    scores: list[float],
+) -> float | None:
+    """Return the integer second with the strongest positive change score."""
+    best_time: float | None = None
+    best_score = 0.0
+    time_s = int(math.floor(start)) + 1
+    while time_s < end:
+        index = time_s - 1
+        if 0 <= index < len(scores) and scores[index] > best_score:
+            best_score = scores[index]
+            best_time = float(time_s)
+        time_s += 1
+    return best_time
+
+
+def split_oversized(
+    intervals: list[tuple[float, float]],
+    scores: list[float] | None = None,
+) -> list[tuple[float, float]]:
+    """Break every interval longer than ``MAX_SEGMENT_S``.
+
+    A flat interval (no positive interior score) is divided into equal pieces.
+    Otherwise the cut falls on the strongest interior score, and both sides are
+    repaired the same way.
+    """
+    repaired: list[tuple[float, float]] = []
+    for start, end in intervals:
+        if end < start:
+            raise SegmentError("interval end is before its start")
+        length = end - start
+        if length <= MAX_SEGMENT_S + 1e-9:
+            repaired.append((start, end))
+            continue
+        cut = None if scores is None else _strongest_interior_cut(start, end, scores)
+        if cut is None:
+            repaired.extend(_equal_pieces(start, end))
+            continue
+        repaired.extend(split_oversized([(start, cut), (cut, end)], scores))
+    return repaired
