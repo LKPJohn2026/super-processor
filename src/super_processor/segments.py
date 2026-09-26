@@ -29,6 +29,7 @@ class SampleRow:
     variance: float
     motion: float
     subject_x: float
+    upper_luma: float = 128.0
 
 
 def change_score(before: SampleRow, after: SampleRow) -> float:
@@ -43,6 +44,72 @@ def change_score(before: SampleRow, after: SampleRow) -> float:
     motion = abs(after.motion - before.motion) / 255.0
     subject = abs(after.subject_x - before.subject_x)
     return luma + (1.2 * cast) + (0.8 * variance) + motion + (0.6 * subject)
+
+
+PROBLEM_NAMES: tuple[str, ...] = (
+    "low_light",
+    "low_contrast",
+    "silhouette",
+    "too_warm",
+    "noisy",
+    "shaky",
+    "off_center",
+)
+
+
+def problem_scores(row: SampleRow) -> dict[str, float]:
+    """Map one sample onto the photographic problem axes, each roughly 0–1+."""
+    span = max(0.0, row.luma_p95 - row.luma_p05)
+    subject_dark = max(0.0, (80.0 - row.luma_p05) / 80.0)
+    background_bright = max(0.0, (row.upper_luma - 140.0) / 115.0)
+    return {
+        "low_light": max(0.0, (90.0 - row.luma_mean) / 90.0),
+        "low_contrast": max(0.0, (80.0 - span) / 80.0),
+        "silhouette": subject_dark * background_bright,
+        "too_warm": max(0.0, row.rb_cast),
+        "noisy": max(0.0, (row.variance - 150.0) / 250.0),
+        "shaky": max(0.0, row.motion / 40.0),
+        "off_center": min(1.0, abs(row.subject_x - 0.5) * 2.0),
+    }
+
+
+def _mean_problem_scores(rows: list[SampleRow]) -> dict[str, float]:
+    totals = dict.fromkeys(PROBLEM_NAMES, 0.0)
+    for row in rows:
+        for name, score in problem_scores(row).items():
+            totals[name] += score
+    count = float(len(rows))
+    return {name: totals[name] / count for name in PROBLEM_NAMES}
+
+
+def primary_problem(rows: list[SampleRow]) -> str:
+    """Return the strongest mean problem label for these samples."""
+    if not rows:
+        raise SegmentError("cannot label an empty sample list")
+    means = _mean_problem_scores(rows)
+    return max(PROBLEM_NAMES, key=lambda name: means[name])
+
+
+def context_label(rows: list[SampleRow]) -> str:
+    """Weak indoor/outdoor guess from average brightness and the upper frame."""
+    if not rows:
+        raise SegmentError("cannot label an empty sample list")
+    mean_luma = sum(row.luma_mean for row in rows) / len(rows)
+    upper = sum(row.upper_luma for row in rows) / len(rows)
+    if upper >= 160.0 and mean_luma >= 100.0:
+        return "outdoor"
+    if mean_luma < 90.0:
+        return "indoor"
+    return "mixed"
+
+
+def keyframe_time(rows: list[SampleRow]) -> float:
+    """Return the timestamp whose primary problem is the strongest."""
+    if not rows:
+        raise SegmentError("cannot pick a key frame from an empty sample list")
+    problem = primary_problem(rows)
+    chosen = max(rows, key=lambda row: problem_scores(row)[problem])
+    return chosen.time_s
 
 
 def legal_segment_counts(duration_s: float) -> tuple[int, int]:
