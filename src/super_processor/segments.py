@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 MIN_SEGMENT_S = 5.0
 MAX_SEGMENT_S = 120.0
@@ -12,6 +13,36 @@ MAX_DURATION_S = 30.0 * 60.0
 
 class SegmentError(ValueError):
     """Raised when a timeline cannot be segmented inside the bounds."""
+
+
+@dataclass(slots=True)
+class SampleRow:
+    """One one-hertz feature row used to find photographic changes."""
+
+    time_s: float
+    luma_mean: float
+    luma_p05: float
+    luma_p95: float
+    clip_low: float
+    clip_high: float
+    rb_cast: float
+    variance: float
+    motion: float
+    subject_x: float
+
+
+def change_score(before: SampleRow, after: SampleRow) -> float:
+    """Weighted distance between two neighboring sample rows.
+
+    Components are scaled into roughly unit ranges: luma and motion by 255,
+    variance by 400, cast and subject position left as stored.
+    """
+    luma = abs(after.luma_mean - before.luma_mean) / 255.0
+    cast = abs(after.rb_cast - before.rb_cast)
+    variance = abs(after.variance - before.variance) / 400.0
+    motion = abs(after.motion - before.motion) / 255.0
+    subject = abs(after.subject_x - before.subject_x)
+    return luma + (1.2 * cast) + (0.8 * variance) + motion + (0.6 * subject)
 
 
 def legal_segment_counts(duration_s: float) -> tuple[int, int]:
