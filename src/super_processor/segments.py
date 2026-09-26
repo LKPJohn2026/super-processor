@@ -93,3 +93,88 @@ def split_oversized(
             continue
         repaired.extend(split_oversized([(start, cut), (cut, end)], scores))
     return repaired
+
+
+def _boundary_score(time_s: float, scores: list[float] | None) -> float:
+    if not scores:
+        return 0.0
+    index = int(round(time_s)) - 1
+    if index < 0 or index >= len(scores):
+        return 0.0
+    return scores[index]
+
+
+def _merge_pair(
+    intervals: list[tuple[float, float]],
+    index: int,
+) -> list[tuple[float, float]]:
+    start = intervals[index][0]
+    end = intervals[index + 1][1]
+    return [*intervals[:index], (start, end), *intervals[index + 2 :]]
+
+
+def _merge_shorter_than_min(
+    intervals: list[tuple[float, float]],
+    scores: list[float] | None,
+) -> list[tuple[float, float]]:
+    """Absorb pieces shorter than ``MIN_SEGMENT_S`` into a neighbor."""
+    pieces = list(intervals)
+    guard = 0
+    while guard < len(pieces) + 2:
+        guard += 1
+        short_index = next(
+            (
+                index
+                for index, (start, end) in enumerate(pieces)
+                if end - start < MIN_SEGMENT_S - 1e-6
+            ),
+            None,
+        )
+        if short_index is None or len(pieces) == 1:
+            return pieces
+        left = short_index - 1 if short_index > 0 else None
+        right = short_index if short_index < len(pieces) - 1 else None
+        if left is None and right is None:
+            return pieces
+        if left is None:
+            assert right is not None
+            pieces = _merge_pair(pieces, right)
+            continue
+        if right is None:
+            pieces = _merge_pair(pieces, left)
+            continue
+        left_score = _boundary_score(pieces[short_index][0], scores)
+        right_score = _boundary_score(pieces[short_index][1], scores)
+        # Equal scores absorb into the previous piece, which keeps a short tail stable.
+        pieces = _merge_pair(pieces, left if left_score <= right_score else right)
+    return pieces
+
+
+def merge_short_and_cap(
+    intervals: list[tuple[float, float]],
+    scores: list[float] | None = None,
+) -> list[tuple[float, float]]:
+    """Absorb sub-5s pieces, then merge down to ``MAX_SEGMENTS``.
+
+    The count cap merges the weakest boundary first and skips a merge that
+    would exceed ``MAX_SEGMENT_S``. A merge of a short piece that overshoots
+    the cap is split again so the result still respects both bounds.
+    """
+    pieces = _merge_shorter_than_min(list(intervals), scores)
+    pieces = split_oversized(pieces, scores)
+    while len(pieces) > MAX_SEGMENTS:
+        candidates: list[tuple[float, int]] = []
+        for index in range(len(pieces) - 1):
+            combined = pieces[index + 1][1] - pieces[index][0]
+            if combined > MAX_SEGMENT_S + 1e-6:
+                continue
+            boundary = pieces[index][1]
+            candidates.append((_boundary_score(boundary, scores), index))
+        if not candidates:
+            raise SegmentError(
+                f"cannot merge {len(pieces)} segments without exceeding "
+                f"{MAX_SEGMENT_S:.0f}s"
+            )
+        _, index = min(candidates, key=lambda item: (item[0], item[1]))
+        pieces = _merge_pair(pieces, index)
+    return pieces
