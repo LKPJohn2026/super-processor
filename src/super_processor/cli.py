@@ -31,6 +31,14 @@ from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
 from .qa import analyze_preview, write_qa_report
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
+from .segments import (
+    SegmentError,
+    ffmpeg_frame_reader,
+    load_samples,
+    sample_media,
+    write_samples,
+    write_segment_review,
+)
 from .templates import (
     PREVIEW_FILE_NAME,
     TemplateError,
@@ -179,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     show_cmd.add_argument("job_id", help="job identifier")
 
+    segment_cmd = subparsers.add_parser(
+        "segment",
+        help="propose a timeline split and print each segment",
+    )
+    segment_cmd.add_argument("job_id", help="job identifier")
+
     job = subparsers.add_parser("job", help="low-level job management commands")
     job_sub = job.add_subparsers(dest="job_command", required=True)
 
@@ -301,6 +315,42 @@ def run_diagnose_command(arguments: argparse.Namespace) -> int:
         },
     )
     print(json.dumps(diagnosis.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def run_segment_command(arguments: argparse.Namespace) -> int:
+    """Sample a probed job, write the split, and print it."""
+    store = _store_from_args(arguments)
+    job_id = str(arguments.job_id)
+    manifest = store.load(job_id)
+    if manifest.state not in {JobState.PROBED, JobState.SPLIT_PROPOSED}:
+        raise JobError(
+            f"job {job_id} must be probed before a split "
+            f"(current: {manifest.state.value})"
+        )
+    job_dir = store.job_dir(job_id)
+    source = Path(manifest.source_path)
+    try:
+        rows = load_samples(job_dir)
+    except SegmentError:
+        facts = load_media_facts(job_dir)
+        if facts.duration_s is None:
+            raise JobError(f"job {job_id} has no duration to sample") from None
+        rows = sample_media(source, facts.duration_s)
+        write_samples(job_dir, rows)
+    segments = write_segment_review(job_dir, rows, ffmpeg_frame_reader(source))
+    if manifest.state is JobState.PROBED:
+        store.transition(
+            job_id,
+            JobState.SPLIT_PROPOSED,
+            notes={"segments": len(segments)},
+        )
+    for segment in segments:
+        print(
+            f"{segment.index}  {segment.start_s:.0f}-{segment.end_s:.0f}s  "
+            f"{segment.context}  {segment.problem}  "
+            f"key {segment.keyframe_s:.0f}s  {segment.still_path}"
+        )
     return 0
 
 
@@ -765,6 +815,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_apply_command(arguments)
         if command == "show":
             return run_show_command(arguments)
+        if command == "segment":
+            return run_segment_command(arguments)
         if command == "job":
             return run_job_command(arguments)
     except (
@@ -777,6 +829,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ReframeError,
         DiagnosisError,
         PlanError,
+        SegmentError,
     ) as exc:
         print(f"error: {exc}", flush=True)
         return 1
