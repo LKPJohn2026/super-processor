@@ -203,6 +203,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="short correction: too many, too few, a boundary move, or a relabel",
     )
+    segment_cmd.add_argument(
+        "--accept",
+        action="store_true",
+        help="accept the current split",
+    )
 
     job = subparsers.add_parser("job", help="low-level job management commands")
     job_sub = job.add_subparsers(dest="job_command", required=True)
@@ -354,7 +359,11 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
     store = _store_from_args(arguments)
     job_id = str(arguments.job_id)
     manifest = store.load(job_id)
-    if manifest.state not in {JobState.PROBED, JobState.SPLIT_PROPOSED}:
+    if manifest.state not in {
+        JobState.PROBED,
+        JobState.SPLIT_PROPOSED,
+        JobState.SPLIT_ACCEPTED,
+    }:
         raise JobError(
             f"job {job_id} must be probed before a split "
             f"(current: {manifest.state.value})"
@@ -362,6 +371,19 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
     job_dir = store.job_dir(job_id)
     source = Path(manifest.source_path)
     note = getattr(arguments, "note", None)
+    accept = bool(getattr(arguments, "accept", False))
+    if note and accept:
+        raise JobError("pass either --note or --accept")
+    if accept:
+        if manifest.state is JobState.PROBED:
+            raise JobError(
+                f"job {job_id} needs a proposed split before accept "
+                f"(current: {manifest.state.value})"
+            )
+        if manifest.state is JobState.SPLIT_PROPOSED:
+            store.transition(job_id, JobState.SPLIT_ACCEPTED)
+        _print_segments(load_segments(job_dir))
+        return 0
     if note:
         if manifest.state is not JobState.SPLIT_PROPOSED:
             raise JobError(

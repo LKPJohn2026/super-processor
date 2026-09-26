@@ -141,6 +141,34 @@ def test_segment_note_resplits_and_stays_proposed(
     assert store.load(JOB_ID).state is JobState.SPLIT_PROPOSED
 
 
+def test_accept_marks_the_split_and_a_second_accept_is_a_no_op(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _probed_job(tmp_path)
+    write_samples(store.job_dir(JOB_ID), _timeline())
+    monkeypatch.setattr("super_processor.cli.ffmpeg_frame_reader", _reader)
+    assert main(["--jobs-dir", str(store.root), "segment", JOB_ID]) == 0
+    capsys.readouterr()
+
+    assert main(["--jobs-dir", str(store.root), "segment", JOB_ID, "--accept"]) == 0
+    assert "0  0-60s" in capsys.readouterr().out
+    assert store.load(JOB_ID).state is JobState.SPLIT_ACCEPTED
+
+    assert main(["--jobs-dir", str(store.root), "segment", JOB_ID, "--accept"]) == 0
+    assert store.load(JOB_ID).state is JobState.SPLIT_ACCEPTED
+
+
+def test_accept_before_a_proposal_is_refused(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _probed_job(tmp_path)
+    assert main(["--jobs-dir", str(store.root), "segment", JOB_ID, "--accept"]) == 1
+    assert "before accept" in capsys.readouterr().out
+
+
 def test_segment_refuses_a_job_that_is_not_probed(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
