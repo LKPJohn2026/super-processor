@@ -112,6 +112,21 @@ def keyframe_time(rows: list[SampleRow]) -> float:
     return chosen.time_s
 
 
+def look_group_ids(labels: list[tuple[str, str]]) -> list[int]:
+    """Share an id across neighboring segments with the same context and problem."""
+    if not labels:
+        return []
+    ids: list[int] = []
+    current = 0
+    previous: tuple[str, str] | None = None
+    for label in labels:
+        if previous is not None and label != previous:
+            current += 1
+        ids.append(current)
+        previous = label
+    return ids
+
+
 def legal_segment_counts(duration_s: float) -> tuple[int, int]:
     """Return the inclusive ``(fewest, most)`` segment counts for ``duration_s``.
 
