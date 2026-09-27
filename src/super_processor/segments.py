@@ -215,11 +215,16 @@ def _strongest_interior_cut(
     end: float,
     scores: list[float],
 ) -> float | None:
-    """Return the integer second with the strongest positive change score."""
+    """Return the integer second with the strongest positive change score.
+
+    The cut stays at least ``MIN_SEGMENT_S`` away from both ends, so a later
+    split cannot leave a sliver under the floor.
+    """
     best_time: float | None = None
     best_score = 0.0
-    time_s = int(math.floor(start)) + 1
-    while time_s < end:
+    time_s = int(math.ceil(start + MIN_SEGMENT_S - 1e-9))
+    latest = end - MIN_SEGMENT_S
+    while time_s <= latest + 1e-9:
         index = time_s - 1
         if 0 <= index < len(scores) and scores[index] > best_score:
             best_score = scores[index]

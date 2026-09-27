@@ -38,6 +38,16 @@ def test_strongest_interior_score_wins() -> None:
     assert pieces[-1][1] == pytest.approx(200.0)
 
 
+def test_edge_score_cannot_leave_a_sliver() -> None:
+    scores = [0.0] * 199
+    scores[1] = 10.0  # loud change at t=2, inside the 5s margin
+    scores[49] = 3.0  # legal change at t=50
+    pieces = split_oversized([(0.0, 200.0)], scores=scores)
+    lengths = [end - start for start, end in pieces]
+    assert all(length >= 5.0 for length in lengths)
+    assert pieces[0][1] == pytest.approx(50.0)
+
+
 def test_scores_shorter_than_the_interval_fall_back_to_equal_pieces() -> None:
     pieces = split_oversized([(0.0, 240.0)], scores=[0.0, 0.0])
     assert [end - start for start, end in pieces] == pytest.approx([120.0, 120.0])
