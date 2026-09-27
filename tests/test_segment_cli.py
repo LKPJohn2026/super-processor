@@ -43,7 +43,7 @@ def _timeline() -> list[SampleRow]:
     return dark + bright
 
 
-def _reader(_source: Path) -> FrameReader:
+def _reader(_source: Path, **_kwargs: object) -> FrameReader:
     def read_frame(_time_s: float) -> tuple[bytes, tuple[float, float, float]]:
         return bytes([32]) * PIXELS, (10.0, 10.0, 10.0)
 
@@ -106,7 +106,9 @@ def test_segment_samples_when_rows_are_missing(
         ),
     )
 
-    def fake_sample(_source: Path, duration_s: float) -> list[SampleRow]:
+    def fake_sample(
+        _source: Path, duration_s: float, **_kwargs: object
+    ) -> list[SampleRow]:
         assert duration_s == 130.0
         return _timeline()
 

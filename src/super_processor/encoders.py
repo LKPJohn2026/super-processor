@@ -10,12 +10,26 @@ HARDWARE_ENCODERS: tuple[str, ...] = (
     "hevc_videotoolbox",
 )
 ALLOWED_ENCODERS: tuple[str, ...] = (SOFTWARE_ENCODER, *HARDWARE_ENCODERS)
-HARDWARE_DECODERS: tuple[str, ...] = (
-    "hevc_cuvid",
-    "hevc_qsv",
-    "hevc_amf",
-    "hevc_videotoolbox",
-)
+DECODER_INPUT_ARGS: dict[str, tuple[str, ...]] = {
+    "hevc_cuvid": ("-hwaccel", "cuda", "-c:v", "hevc_cuvid"),
+    "hevc_qsv": ("-hwaccel", "qsv", "-c:v", "hevc_qsv"),
+    "hevc_amf": ("-hwaccel", "amf", "-c:v", "hevc_amf"),
+    "hevc_videotoolbox": (
+        "-hwaccel",
+        "videotoolbox",
+    ),
+}
+HARDWARE_DECODERS: tuple[str, ...] = tuple(DECODER_INPUT_ARGS)
+
+
+def decoder_input_args(decoder: str | None) -> list[str]:
+    """Return input flags for a hardware decoder. ``None`` is software decode."""
+    if decoder is None:
+        return []
+    try:
+        return list(DECODER_INPUT_ARGS[decoder])
+    except KeyError as exc:
+        raise EncoderError(f"unsupported decoder {decoder}") from exc
 
 
 class EncoderError(ValueError):

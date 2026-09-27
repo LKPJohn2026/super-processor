@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from . import histogram_u8, mean_luma, percentile_u8, sad_u8, variance_u8
-from .doctor import which
+from .doctor import check_ffmpeg_capability, which
+from .encoders import HARDWARE_DECODERS, decoder_input_args
 from .probe import MediaFacts
 
 ESTIMATES_FILE_NAME = "estimates.json"
@@ -20,6 +21,21 @@ ESTIMATES_SCHEMA_VERSION = 1
 
 class EstimatorError(RuntimeError):
     """Raised when look/motion estimation cannot complete."""
+
+
+def ensure_decoder(decoder: str) -> None:
+    """Fail before sampling when this ffmpeg has no such decoder."""
+    if decoder not in HARDWARE_DECODERS:
+        raise EstimatorError(f"unsupported decoder {decoder}")
+    result = check_ffmpeg_capability(
+        f"decoder:{decoder}",
+        kind="decoders",
+        token=decoder,
+        required=True,
+        hint="install ffmpeg with this decoder or sample in software",
+    )
+    if not result.ok:
+        raise EstimatorError(result.detail)
 
 
 @dataclass(slots=True)
@@ -146,6 +162,7 @@ def extract_gray_frame(
     width: int = 160,
     height: int = 90,
     ffmpeg_bin: str | None = None,
+    decoder: str | None = None,
 ) -> bytes:
     """Decode one grayscale frame near ``at_s`` as packed 8-bit luma."""
     binary = ffmpeg_bin or _ffmpeg_bin()
@@ -154,6 +171,7 @@ def extract_gray_frame(
         "-hide_banner",
         "-loglevel",
         "error",
+        *decoder_input_args(decoder),
         "-ss",
         f"{at_s:g}",
         "-i",
@@ -199,6 +217,7 @@ def extract_rgb_means(
     width: int = 80,
     height: int = 45,
     ffmpeg_bin: str | None = None,
+    decoder: str | None = None,
 ) -> tuple[float, float, float]:
     """Return mean R/G/B for a downscaled frame (white-balance prior)."""
     binary = ffmpeg_bin or _ffmpeg_bin()
@@ -207,6 +226,7 @@ def extract_rgb_means(
         "-hide_banner",
         "-loglevel",
         "error",
+        *decoder_input_args(decoder),
         "-ss",
         f"{at_s:g}",
         "-i",

@@ -25,7 +25,7 @@ from .doctor import (
     which,
 )
 from .encoders import SOFTWARE_ENCODER
-from .estimators import EstimatorError, estimate_look, write_estimates
+from .estimators import EstimatorError, ensure_decoder, estimate_look, write_estimates
 from .jobs import JobError, JobState, JobStore, default_jobs_root
 from .models import apply_llm_plan_patch, list_models
 from .plan import PlanError, plan_job
@@ -227,6 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="accept the current split",
     )
+    segment_cmd.add_argument(
+        "--decode",
+        default=None,
+        help="hardware decoder for sampling; software when omitted",
+    )
 
     review_cmd = subparsers.add_parser(
         "review",
@@ -402,9 +407,13 @@ def _print_segments(segments: list[TimelineSegment]) -> None:
 
 
 def _attach_stills(
-    job_dir: Path, source: Path, segments: list[TimelineSegment]
+    job_dir: Path,
+    source: Path,
+    segments: list[TimelineSegment],
+    *,
+    decoder: str | None = None,
 ) -> None:
-    read_frame = ffmpeg_frame_reader(source)
+    read_frame = ffmpeg_frame_reader(source, decoder=decoder)
     for segment in segments:
         gray, _rgb = read_frame(segment.keyframe_s)
         relative = f"segment_stills/seg_{segment.index:02d}.ppm"
@@ -430,6 +439,9 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
     source = Path(manifest.source_path)
     note = getattr(arguments, "note", None)
     accept = bool(getattr(arguments, "accept", False))
+    decoder = getattr(arguments, "decode", None)
+    if decoder:
+        ensure_decoder(str(decoder))
     if note and accept:
         raise JobError("pass either --note or --accept")
     if accept:
@@ -454,7 +466,7 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
             load_segments(job_dir),
             parse_split_note(str(note)),
         )
-        _attach_stills(job_dir, source, segments)
+        _attach_stills(job_dir, source, segments, decoder=decoder)
         write_segments(job_dir, segments)
         _print_segments(segments)
         return 0
@@ -464,9 +476,11 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
         facts = load_media_facts(job_dir)
         if facts.duration_s is None:
             raise JobError(f"job {job_id} has no duration to sample") from None
-        rows = sample_media(source, facts.duration_s)
+        rows = sample_media(source, facts.duration_s, decoder=decoder)
         write_samples(job_dir, rows)
-    segments = write_segment_review(job_dir, rows, ffmpeg_frame_reader(source))
+    segments = write_segment_review(
+        job_dir, rows, ffmpeg_frame_reader(source, decoder=decoder)
+    )
     if manifest.state is JobState.PROBED:
         store.transition(
             job_id,

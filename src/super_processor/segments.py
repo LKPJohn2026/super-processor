@@ -437,7 +437,12 @@ def sample_from_reader(duration_s: float, read_frame: FrameReader) -> list[Sampl
     return rows
 
 
-def ffmpeg_frame_reader(source: Path, *, ffmpeg_bin: str | None = None) -> FrameReader:
+def ffmpeg_frame_reader(
+    source: Path,
+    *,
+    ffmpeg_bin: str | None = None,
+    decoder: str | None = None,
+) -> FrameReader:
     """Return a reader that decodes one gray frame and RGB means per second."""
 
     def read_frame(time_s: float) -> tuple[bytes, tuple[float, float, float]]:
@@ -447,19 +452,27 @@ def ffmpeg_frame_reader(source: Path, *, ffmpeg_bin: str | None = None) -> Frame
             width=SAMPLE_WIDTH,
             height=SAMPLE_HEIGHT,
             ffmpeg_bin=ffmpeg_bin,
+            decoder=decoder,
         )
-        rgb = extract_rgb_means(source, at_s=time_s, ffmpeg_bin=ffmpeg_bin)
+        rgb = extract_rgb_means(
+            source, at_s=time_s, ffmpeg_bin=ffmpeg_bin, decoder=decoder
+        )
         return gray, rgb
 
     return read_frame
 
 
 def sample_media(
-    source: Path, duration_s: float, *, ffmpeg_bin: str | None = None
+    source: Path,
+    duration_s: float,
+    *,
+    ffmpeg_bin: str | None = None,
+    decoder: str | None = None,
 ) -> list[SampleRow]:
     """Sample one feature row per second from a media file."""
     return sample_from_reader(
-        duration_s, ffmpeg_frame_reader(source, ffmpeg_bin=ffmpeg_bin)
+        duration_s,
+        ffmpeg_frame_reader(source, ffmpeg_bin=ffmpeg_bin, decoder=decoder),
     )
 
 
