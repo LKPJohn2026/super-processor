@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-09-26
+
+### Added
+
+- `doctor` lists `hevc_cuvid`, `hevc_qsv`, `hevc_amf`, and
+  `hevc_videotoolbox` next to the hardware encoders.
+- `segment JOB --decode NAME` reads sample frames with that decoder. One-hertz
+  rows keep the same shape. A decoder this ffmpeg does not have fails before
+  sampling.
+- A frame the device cannot decode is read again in software. The sample row
+  and the segment label match a software read.
+
 ## [2.2.0] - 2026-09-26
 
 ### Added
