@@ -92,6 +92,24 @@ def test_collect_doctor_report_json(
     assert "required tools: missing" in text
 
 
+def test_doctor_reports_each_hardware_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "super_processor.doctor._ffmpeg_listing",
+        lambda kind: (
+            " V..... libx265\n V..... hevc_nvenc\n"
+            if kind == "encoders"
+            else " T. deshake\n"
+        ),
+    )
+    results = {item.name: item for item in doctor.collect_doctor_report()}
+    assert results["encoder:libx265"].ok is True
+    assert "available" in results["encoder:hevc_nvenc"].detail
+    for name in ("hevc_qsv", "hevc_amf", "hevc_videotoolbox"):
+        assert results[f"encoder:{name}"].ok is True
+        assert "missing" in results[f"encoder:{name}"].detail
+    assert doctor.doctor_report_as_dict(list(results.values()))["ok"] is True
+
+
 def test_ffmpeg_capability_present(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "super_processor.doctor._ffmpeg_listing",

@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .encoders import HARDWARE_ENCODERS, SOFTWARE_ENCODER
 from .jobs import default_jobs_root
 
 
@@ -182,12 +183,22 @@ def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
         check_tool("ffmpeg", "ffmpeg", "-version"),
         check_tool("ffprobe", "ffprobe", "-version"),
         check_ffmpeg_capability(
-            "encoder:libx265",
+            f"encoder:{SOFTWARE_ENCODER}",
             kind="encoders",
-            token="libx265",
+            token=SOFTWARE_ENCODER,
             required=True,
             hint="required for HEVC export",
         ),
+        *[
+            check_ffmpeg_capability(
+                f"encoder:{name}",
+                kind="encoders",
+                token=name,
+                required=False,
+                hint="optional hardware encoder",
+            )
+            for name in HARDWARE_ENCODERS
+        ],
         check_ffmpeg_capability(
             "filter:stabilize",
             kind="filters",
