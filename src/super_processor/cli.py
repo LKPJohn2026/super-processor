@@ -40,6 +40,7 @@ from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
 from .qa import analyze_preview, write_qa_report
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
+from .render import RenderError, render_chosen_plan
 from .segments import (
     SegmentError,
     TimelineSegment,
@@ -245,6 +246,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--text",
         default=None,
         help="sentence mapped onto the fault list after a fault rejection",
+    )
+    plans_cmd.add_argument(
+        "--choose",
+        type=int,
+        default=None,
+        help="plan index to render",
     )
 
     job = subparsers.add_parser("job", help="low-level job management commands")
@@ -492,6 +499,9 @@ def run_plans_command(arguments: argparse.Namespace) -> int:
     segment_index = getattr(arguments, "segment", None)
     fault = getattr(arguments, "fault", None)
     text = getattr(arguments, "text", None)
+    choose = getattr(arguments, "choose", None)
+    if choose is not None and (text or segment_index is not None or fault):
+        raise JobError("pass --choose on its own")
     if text and (segment_index is not None or fault):
         raise JobError("pass either --text or --segment/--fault")
     if (segment_index is None) != (fault is None):
@@ -518,9 +528,7 @@ def run_plans_command(arguments: argparse.Namespace) -> int:
             else:
                 problems = FAULT_PROBLEMS[faults[0]]
                 indexes = [
-                    segment.index
-                    for segment in segments
-                    if segment.problem in problems
+                    segment.index for segment in segments if segment.problem in problems
                 ]
             if not indexes:
                 print("unused")
@@ -544,6 +552,31 @@ def run_plans_command(arguments: argparse.Namespace) -> int:
         write_plans(job_dir, plans)
         store.update_notes(job_id, {"plan_rejections": rejections + 1})
         _print_plans(plans)
+        return 0
+    if choose is not None:
+        if manifest.state is not JobState.PLANS_READY:
+            raise JobError(
+                f"job {job_id} needs plans before a choice "
+                f"(current: {manifest.state.value})"
+            )
+        plans = load_plans(job_dir)
+        if choose < 0 or choose >= len(plans):
+            raise JobError(f"plan {choose} is outside 0..{len(plans) - 1}")
+        selected = plans[choose].treatments()
+        store.transition(job_id, JobState.PLAN_SELECTED, notes={"chosen_plan": choose})
+        store.transition(job_id, JobState.ENCODING)
+        try:
+            output = render_chosen_plan(
+                job_dir,
+                Path(manifest.source_path),
+                segments,
+                selected,
+            )
+        except RenderError as exc:
+            store.transition(job_id, JobState.FAILED, error=str(exc))
+            raise
+        store.transition(job_id, JobState.COMPLETE, notes={"output": str(output)})
+        print(output)
         return 0
     plans = build_plans(segments)
     write_plans(job_dir, plans)
@@ -1032,6 +1065,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         PlanError,
         SegmentError,
         TreatmentError,
+        RenderError,
     ) as exc:
         print(f"error: {exc}", flush=True)
         return 1
