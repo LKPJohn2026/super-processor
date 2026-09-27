@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A frame the device cannot decode is read again in software. The sample row
   and the segment label match a software read.
 
+### Fixed
+
+- The hardware-encoder doctor check and `plans --choose` test no longer
+  require `ffmpeg` on `PATH`. Wheel builds were failing when the image had
+  no FFmpeg binary.
+
 ## [2.2.0] - 2026-09-26
 
 ### Added
