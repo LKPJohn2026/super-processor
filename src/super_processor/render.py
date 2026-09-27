@@ -5,7 +5,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from .encoders import SOFTWARE_ENCODER, encoder_rate_args
+from .doctor import check_ffmpeg_capability
+from .encoders import ALLOWED_ENCODERS, SOFTWARE_ENCODER, encoder_rate_args
 from .preview import kept_range, preview_filters
 from .segments import TimelineSegment
 from .treatments import Treatment
@@ -100,6 +101,21 @@ def _run_ffmpeg(command: list[str]) -> None:
         raise RenderError(detail or "ffmpeg failed")
 
 
+def ensure_encoder(encoder: str) -> None:
+    """Fail before the first segment when the encoder is not in this ffmpeg."""
+    if encoder not in ALLOWED_ENCODERS:
+        raise RenderError(f"unsupported encoder {encoder}")
+    result = check_ffmpeg_capability(
+        f"encoder:{encoder}",
+        kind="encoders",
+        token=encoder,
+        required=True,
+        hint="install ffmpeg with this encoder or render with libx265",
+    )
+    if not result.ok:
+        raise RenderError(result.detail)
+
+
 def render_chosen_plan(
     job_dir: Path,
     source: Path,
@@ -108,8 +124,10 @@ def render_chosen_plan(
     *,
     ffmpeg_bin: str = "ffmpeg",
     include_audio: bool = True,
+    encoder: str = SOFTWARE_ENCODER,
 ) -> Path:
     """Encode each kept segment, then concatenate them into one file."""
+    ensure_encoder(encoder)
     if len(segments) != len(treatments):
         raise RenderError("assignment length does not match the segments")
     parts: list[Path] = []
@@ -124,6 +142,7 @@ def render_chosen_plan(
                 dest,
                 ffmpeg_bin=ffmpeg_bin,
                 include_audio=include_audio,
+                encoder=encoder,
             )
         )
         parts.append(dest)

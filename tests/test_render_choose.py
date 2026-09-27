@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from super_processor.cli import main
+from super_processor.doctor import CheckResult
 from super_processor.jobs import JobState, JobStore
 from super_processor.render import render_chosen_plan
 from super_processor.segments import TimelineSegment, write_segments
@@ -69,6 +70,47 @@ def test_choose_stores_the_plan_and_prints_the_output(
     manifest = store.load(JOB_ID)
     assert manifest.state is JobState.COMPLETE
     assert manifest.notes["chosen_plan"] == 1
+
+
+def test_missing_encoder_fails_before_ffmpeg(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _ready_job(tmp_path)
+    assert main(["--jobs-dir", str(store.root), "plans", JOB_ID]) == 0
+    capsys.readouterr()
+
+    def missing(*_args: object, **_kwargs: object) -> CheckResult:
+        return CheckResult(
+            name="encoder:hevc_nvenc",
+            ok=False,
+            detail=(
+                "hevc_nvenc missing "
+                "(install ffmpeg with this encoder or render with libx265)"
+            ),
+        )
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("ffmpeg ran")
+
+    monkeypatch.setattr("super_processor.render.check_ffmpeg_capability", missing)
+    monkeypatch.setattr("super_processor.render.subprocess.run", boom)
+    code = main(
+        [
+            "--jobs-dir",
+            str(store.root),
+            "plans",
+            JOB_ID,
+            "--choose",
+            "0",
+            "--encoder",
+            "hevc_nvenc",
+        ]
+    )
+    assert code == 1
+    assert "hevc_nvenc missing" in capsys.readouterr().out
+    assert store.load(JOB_ID).state is JobState.PLANS_READY
 
 
 def test_choose_refuses_an_index_outside_the_five_plans(

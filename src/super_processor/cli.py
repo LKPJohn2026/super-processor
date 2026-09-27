@@ -24,6 +24,7 @@ from .doctor import (
     format_doctor_text,
     which,
 )
+from .encoders import SOFTWARE_ENCODER
 from .estimators import EstimatorError, estimate_look, write_estimates
 from .jobs import JobError, JobState, JobStore, default_jobs_root
 from .models import apply_llm_plan_patch, list_models
@@ -40,7 +41,7 @@ from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
 from .qa import analyze_preview, write_qa_report
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
-from .render import RenderError, render_chosen_plan
+from .render import RenderError, ensure_encoder, render_chosen_plan
 from .review import ReviewError, ReviewServer
 from .segments import (
     SegmentError,
@@ -259,6 +260,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="plan index to render",
+    )
+    plans_cmd.add_argument(
+        "--encoder",
+        default=None,
+        help="HEVC encoder for --choose; libx265 when omitted",
     )
 
     job = subparsers.add_parser("job", help="low-level job management commands")
@@ -525,6 +531,9 @@ def run_plans_command(arguments: argparse.Namespace) -> int:
     fault = getattr(arguments, "fault", None)
     text = getattr(arguments, "text", None)
     choose = getattr(arguments, "choose", None)
+    encoder = getattr(arguments, "encoder", None)
+    if encoder and choose is None:
+        raise JobError("pass --encoder with --choose")
     if choose is not None and (text or segment_index is not None or fault):
         raise JobError("pass --choose on its own")
     if text and (segment_index is not None or fault):
@@ -588,6 +597,8 @@ def run_plans_command(arguments: argparse.Namespace) -> int:
         if choose < 0 or choose >= len(plans):
             raise JobError(f"plan {choose} is outside 0..{len(plans) - 1}")
         selected = plans[choose].treatments()
+        chosen_encoder = str(encoder) if encoder else SOFTWARE_ENCODER
+        ensure_encoder(chosen_encoder)
         store.transition(job_id, JobState.PLAN_SELECTED, notes={"chosen_plan": choose})
         store.transition(job_id, JobState.ENCODING)
         try:
@@ -596,6 +607,7 @@ def run_plans_command(arguments: argparse.Namespace) -> int:
                 Path(manifest.source_path),
                 segments,
                 selected,
+                encoder=chosen_encoder,
             )
         except RenderError as exc:
             store.transition(job_id, JobState.FAILED, error=str(exc))
