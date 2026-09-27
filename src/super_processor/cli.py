@@ -41,6 +41,7 @@ from .qa import analyze_preview, write_qa_report
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
 from .render import RenderError, render_chosen_plan
+from .review import ReviewError, ReviewServer
 from .segments import (
     SegmentError,
     TimelineSegment,
@@ -225,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="accept the current split",
     )
+
+    review_cmd = subparsers.add_parser(
+        "review",
+        help="serve the local split review page",
+    )
+    review_cmd.add_argument("job_id", help="job identifier")
 
     plans_cmd = subparsers.add_parser(
         "plans",
@@ -484,6 +491,24 @@ def _plans_from_assignments(
             )
         )
     return plans
+
+
+def run_review_command(arguments: argparse.Namespace) -> int:
+    """Serve the split review page until interrupted."""
+    store = _store_from_args(arguments)
+    job_id = str(arguments.job_id)
+    store.load(job_id)
+    server = ReviewServer(
+        store.job_dir(job_id),
+        jobs_dir=store.root,
+        job_id=job_id,
+    )
+    print(server.start(), flush=True)
+    try:
+        server.wait()
+    except KeyboardInterrupt:
+        server.stop()
+    return 0
 
 
 def run_plans_command(arguments: argparse.Namespace) -> int:
@@ -1049,6 +1074,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_show_command(arguments)
         if command == "segment":
             return run_segment_command(arguments)
+        if command == "review":
+            return run_review_command(arguments)
         if command == "plans":
             return run_plans_command(arguments)
         if command == "job":
@@ -1066,6 +1093,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         SegmentError,
         TreatmentError,
         RenderError,
+        ReviewError,
     ) as exc:
         print(f"error: {exc}", flush=True)
         return 1
