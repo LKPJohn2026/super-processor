@@ -176,6 +176,87 @@ _TABLE: dict[str, tuple[Treatment, ...]] = {
 }
 
 
+FAULT_NAMES: tuple[str, ...] = (
+    "too-warm",
+    "too-cool",
+    "too-dark",
+    "too-bright",
+    "not-sharp",
+    "too-much-denoise",
+    "too-much-contrast",
+    "bad-trim",
+)
+
+
+def _step_param(treatment: Treatment, op: OpName, key: str) -> float | None:
+    for step in treatment.steps:
+        if step.op is op and key in step.as_dict():
+            return float(step.as_dict()[key])
+    return None
+
+
+def filter_treatments(problem: str, fault: str) -> tuple[Treatment, ...]:
+    """Shrink one problem's treatment list according to a fixed fault."""
+    options = treatments_for(problem)
+    if fault not in FAULT_NAMES:
+        raise TreatmentError(f"unknown fault {fault}")
+    if fault == "too-warm":
+        chosen = [
+            treatment
+            for treatment in options
+            if (_step_param(treatment, OpName.WHITE_BALANCE, "temperature") or 0.0)
+            > 6500.0
+        ]
+    elif fault == "too-cool":
+        chosen = [
+            treatment
+            for treatment in options
+            if (_step_param(treatment, OpName.WHITE_BALANCE, "temperature") or 10_000.0)
+            < 6500.0
+        ]
+    elif fault == "too-dark":
+        chosen = [
+            treatment
+            for treatment in options
+            if (_step_param(treatment, OpName.CONTRAST, "brightness") or 0.0) > 0.0
+        ]
+    elif fault == "too-bright":
+        chosen = [
+            treatment
+            for treatment in options
+            if (_step_param(treatment, OpName.CONTRAST, "brightness") or 0.0) < 0.0
+        ]
+    elif fault == "not-sharp":
+        chosen = [
+            treatment
+            for treatment in options
+            if any(step.op is OpName.SHARPEN for step in treatment.steps)
+        ]
+    elif fault == "too-much-denoise":
+        chosen = [
+            treatment
+            for treatment in options
+            if (_step_param(treatment, OpName.DENOISE, "strength") or 0.0)
+            < STRONG_DENOISE
+        ]
+    elif fault == "too-much-contrast":
+        contrasts = [
+            (_step_param(treatment, OpName.CONTRAST, "contrast") or 1.0, treatment)
+            for treatment in options
+        ]
+        mildest = min(value for value, _treatment in contrasts)
+        chosen = [treatment for value, treatment in contrasts if value == mildest]
+    else:
+        chosen = [
+            treatment
+            for treatment in options
+            if any(step.op is OpName.TRIM for step in treatment.steps)
+        ]
+    if not chosen:
+        return (options[0],)
+    return tuple(chosen)
+
+
 def treatments_for(problem: str) -> tuple[Treatment, ...]:
     """Return the ordered local treatments for one primary problem."""
     try:
