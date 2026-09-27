@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .encoders import ALLOWED_ENCODERS
 from .probe import MediaFacts, load_media_facts
 from .recipe import (
     DEFAULT_OP_ORDER,
@@ -178,13 +179,14 @@ def validate_op_order(recipe: Recipe) -> list[ValidationIssue]:
 
 
 def validate_encode_settings(recipe: Recipe) -> list[ValidationIssue]:
-    """Check software-only encode defaults for v1."""
+    """Check encode settings. ``libx265`` remains the default."""
     issues: list[ValidationIssue] = []
-    if recipe.encode.video_codec != "libx265":
+    if recipe.encode.video_codec not in ALLOWED_ENCODERS:
+        allowed = ", ".join(ALLOWED_ENCODERS)
         issues.append(
             ValidationIssue(
                 code="encode_codec",
-                message="v1 requires encode.video.codec=libx265",
+                message=f"encode.video.codec must be one of {allowed}",
             )
         )
     if recipe.encode.crf < 10 or recipe.encode.crf > 40:

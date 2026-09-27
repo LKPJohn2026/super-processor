@@ -142,6 +142,19 @@ def test_sharpen_amount_is_capped(tmp_path: Path) -> None:
     assert validate_recipe(recipe, _facts(source)).ok is True
 
 
+def test_encoder_allowlist_keeps_libx265_as_default(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    recipe = empty_recipe("abcd1234abcd1234", str(source.resolve()))
+    assert recipe.encode.video_codec == "libx265"
+    assert validate_recipe(recipe, _facts(source)).ok is True
+    recipe.encode.video_codec = "hevc_nvenc"
+    assert validate_recipe(recipe, _facts(source)).ok is True
+    recipe.encode.video_codec = "libx264"
+    rejected = validate_recipe(recipe, _facts(source))
+    assert any(issue.code == "encode_codec" for issue in rejected.errors)
+
+
 def test_trim_must_keep_five_seconds(tmp_path: Path) -> None:
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"x")
