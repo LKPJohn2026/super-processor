@@ -28,6 +28,27 @@ def kept_range(segment: TimelineSegment, treatment: Treatment) -> tuple[float, f
     return start, end
 
 
+def kept_duration(
+    segments: list[TimelineSegment], treatments: list[Treatment]
+) -> float:
+    """Return the sum of the kept ranges, which the size-cap floor uses."""
+    if len(segments) != len(treatments):
+        raise TreatmentError("assignment length does not match the segments")
+    total = 0.0
+    for segment, treatment in zip(segments, treatments, strict=True):
+        start, end = kept_range(segment, treatment)
+        total += end - start
+    return total
+
+
+def size_cap_bitrate_kbps(max_size_mb: float, duration_s: float) -> float:
+    """Return the average bitrate implied by a size cap over ``duration_s``."""
+    if duration_s <= 0:
+        raise TreatmentError("kept duration must be positive")
+    budget_bits = max_size_mb * 1024 * 1024 * 8
+    return (budget_bits / duration_s) / 1000.0
+
+
 def preview_window(
     segment: TimelineSegment,
     treatment: Treatment,
