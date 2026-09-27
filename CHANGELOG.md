@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-26
+
+### Added
+
+- `doctor` reports `hevc_nvenc`, `hevc_qsv`, `hevc_amf`, and
+  `hevc_videotoolbox` as present or missing. `libx265` stays required.
+- A recipe may name one of those encoders. Any other codec name fails
+  validation. The default remains `libx265`.
+- `plans JOB --choose N --encoder NAME` renders with that encoder's own
+  rate-control flags. Trim and the filter graph stay the same. A missing
+  device fails with the doctor line before any segment is encoded.
+
 ## [2.1.0] - 2026-09-26
 
 ### Added
