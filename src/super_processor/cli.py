@@ -27,6 +27,7 @@ from .estimators import EstimatorError, estimate_look, write_estimates
 from .jobs import JobError, JobState, JobStore, default_jobs_root
 from .models import apply_llm_plan_patch, list_models
 from .plan import PlanError, plan_job
+from .plans import build_plans, write_plans
 from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
 from .qa import analyze_preview, write_qa_report
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
@@ -51,6 +52,7 @@ from .templates import (
     build_ffmpeg_plan,
     default_output_path,
 )
+from .treatments import TreatmentError
 from .validator import validate_job_recipe
 from .worker import FFmpegWorker, WorkerError, format_progress_status
 
@@ -208,6 +210,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="accept the current split",
     )
+
+    plans_cmd = subparsers.add_parser(
+        "plans",
+        help="build five timeline plans and print each treatment",
+    )
+    plans_cmd.add_argument("job_id", help="job identifier")
 
     job = subparsers.add_parser("job", help="low-level job management commands")
     job_sub = job.add_subparsers(dest="job_command", required=True)
@@ -416,6 +424,27 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
             notes={"segments": len(segments)},
         )
     _print_segments(segments)
+    return 0
+
+
+def run_plans_command(arguments: argparse.Namespace) -> int:
+    """Build five plans for an accepted split and print them."""
+    store = _store_from_args(arguments)
+    job_id = str(arguments.job_id)
+    manifest = store.load(job_id)
+    if manifest.state not in {JobState.SPLIT_ACCEPTED, JobState.PLANS_READY}:
+        raise JobError(
+            f"job {job_id} needs an accepted split before plans "
+            f"(current: {manifest.state.value})"
+        )
+    job_dir = store.job_dir(job_id)
+    plans = build_plans(load_segments(job_dir))
+    write_plans(job_dir, plans)
+    if manifest.state is JobState.SPLIT_ACCEPTED:
+        store.transition(job_id, JobState.PLANS_READY, notes={"plans": len(plans)})
+    for plan in plans:
+        treatments = " | ".join(plan.treatment_ids)
+        print(f"{plan.index}  {plan.score:.1f}  {treatments}")
     return 0
 
 
@@ -882,6 +911,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_show_command(arguments)
         if command == "segment":
             return run_segment_command(arguments)
+        if command == "plans":
+            return run_plans_command(arguments)
         if command == "job":
             return run_job_command(arguments)
     except (
@@ -895,6 +926,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         DiagnosisError,
         PlanError,
         SegmentError,
+        TreatmentError,
     ) as exc:
         print(f"error: {exc}", flush=True)
         return 1

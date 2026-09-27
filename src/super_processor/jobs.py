@@ -25,6 +25,7 @@ class JobState(str, Enum):
     PROBED = "probed"
     SPLIT_PROPOSED = "split_proposed"
     SPLIT_ACCEPTED = "split_accepted"
+    PLANS_READY = "plans_ready"
     DIAGNOSED = "diagnosed"
     PLANNED = "planned"
     VALIDATED = "validated"
@@ -49,7 +50,8 @@ _TRANSITIONS: dict[JobState, frozenset[JobState]] = {
         }
     ),
     JobState.SPLIT_PROPOSED: frozenset({JobState.SPLIT_ACCEPTED, JobState.FAILED}),
-    JobState.SPLIT_ACCEPTED: frozenset({JobState.FAILED}),
+    JobState.SPLIT_ACCEPTED: frozenset({JobState.PLANS_READY, JobState.FAILED}),
+    JobState.PLANS_READY: frozenset({JobState.FAILED}),
     JobState.DIAGNOSED: frozenset({JobState.PLANNED, JobState.FAILED}),
     JobState.PLANNED: frozenset({JobState.VALIDATED, JobState.FAILED}),
     # v0.4 allows final encode from validated with explicit --approve; v0.9
