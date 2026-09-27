@@ -10,6 +10,7 @@ from super_processor.cli import main
 from super_processor.doctor import CheckResult
 from super_processor.estimators import extract_gray_frame
 from super_processor.jobs import JobState, JobStore
+from super_processor.segments import _row_from_frame, primary_problem
 
 PIXELS = 160 * 90
 JOB_ID = "abcd1234abcd1234"
@@ -35,6 +36,30 @@ def test_hardware_decoder_flags_precede_the_input(
     assert frame == bytes([8]) * PIXELS
     assert command.index("-hwaccel") < command.index("-i")
     assert "hevc_cuvid" in command
+
+
+def test_failed_device_falls_back_to_the_same_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gray = bytes([20]) * PIXELS
+
+    class Completed:
+        def __init__(self, command: list[str]) -> None:
+            failed = "-hwaccel" in command
+            self.returncode = 1 if failed else 0
+            self.stdout = b"" if failed else gray
+            self.stderr = b"no device" if failed else b""
+
+    def run(cmd: list[str], **_kwargs: object) -> Completed:
+        return Completed(cmd)
+
+    monkeypatch.setattr("super_processor.estimators.subprocess.run", run)
+    hardware = extract_gray_frame(Path("clip.mp4"), at_s=1.0, decoder="hevc_cuvid")
+    software = extract_gray_frame(Path("clip.mp4"), at_s=1.0)
+    assert hardware == software == gray
+    hardware_row = _row_from_frame(0.0, hardware, (10.0, 10.0, 40.0), None)
+    software_row = _row_from_frame(0.0, software, (10.0, 10.0, 40.0), None)
+    assert primary_problem([hardware_row]) == primary_problem([software_row])
 
 
 def test_missing_decoder_fails_before_sampling(

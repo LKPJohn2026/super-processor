@@ -155,6 +155,13 @@ def _ffmpeg_bin() -> str:
     return path
 
 
+def _decoder_attempts(decoder: str | None) -> list[str | None]:
+    """Try the selected device, then the software decoder."""
+    if decoder is None:
+        return [None]
+    return [decoder, None]
+
+
 def extract_gray_frame(
     source: Path,
     *,
@@ -166,48 +173,62 @@ def extract_gray_frame(
 ) -> bytes:
     """Decode one grayscale frame near ``at_s`` as packed 8-bit luma."""
     binary = ffmpeg_bin or _ffmpeg_bin()
-    cmd = [
-        binary,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        *decoder_input_args(decoder),
-        "-ss",
-        f"{at_s:g}",
-        "-i",
-        str(source),
-        "-frames:v",
-        "1",
-        "-vf",
-        f"scale={width}:{height},format=gray",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "gray",
-        "pipe:1",
-    ]
-    try:
-        completed = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise EstimatorError(f"failed to sample frame at {at_s:g}s: {exc}") from exc
-    if completed.returncode != 0 or not completed.stdout:
-        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise EstimatorError(
-            f"ffmpeg frame extract failed at {at_s:g}s"
-            + (f": {detail}" if detail else "")
-        )
     expected = width * height
-    if len(completed.stdout) < expected:
-        raise EstimatorError(
-            f"short frame buffer at {at_s:g}s "
-            f"({len(completed.stdout)} < {expected} bytes)"
-        )
-    return completed.stdout[:expected]
+    last_detail = ""
+    for attempt in _decoder_attempts(decoder):
+        cmd = [
+            binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *decoder_input_args(attempt),
+            "-ss",
+            f"{at_s:g}",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={width}:{height},format=gray",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "pipe:1",
+        ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            if attempt is not None:
+                continue
+            raise EstimatorError(f"failed to sample frame at {at_s:g}s: {exc}") from exc
+        if completed.returncode != 0 or not completed.stdout:
+            last_detail = (
+                (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+            )
+            if attempt is not None:
+                continue
+            raise EstimatorError(
+                f"ffmpeg frame extract failed at {at_s:g}s"
+                + (f": {last_detail}" if last_detail else "")
+            )
+        if len(completed.stdout) < expected:
+            if attempt is not None:
+                continue
+            raise EstimatorError(
+                f"short frame buffer at {at_s:g}s "
+                f"({len(completed.stdout)} < {expected} bytes)"
+            )
+        return completed.stdout[:expected]
+    raise EstimatorError(
+        f"ffmpeg frame extract failed at {at_s:g}s"
+        + (f": {last_detail}" if last_detail else "")
+    )
 
 
 def extract_rgb_means(
@@ -221,30 +242,44 @@ def extract_rgb_means(
 ) -> tuple[float, float, float]:
     """Return mean R/G/B for a downscaled frame (white-balance prior)."""
     binary = ffmpeg_bin or _ffmpeg_bin()
-    cmd = [
-        binary,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        *decoder_input_args(decoder),
-        "-ss",
-        f"{at_s:g}",
-        "-i",
-        str(source),
-        "-frames:v",
-        "1",
-        "-vf",
-        f"scale={width}:{height},format=rgb24",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "pipe:1",
-    ]
-    completed = subprocess.run(cmd, check=False, capture_output=True, timeout=30)
-    if completed.returncode != 0 or not completed.stdout:
+    raw = b""
+    for attempt in _decoder_attempts(decoder):
+        cmd = [
+            binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *decoder_input_args(attempt),
+            "-ss",
+            f"{at_s:g}",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={width}:{height},format=rgb24",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]
+        try:
+            completed = subprocess.run(
+                cmd, check=False, capture_output=True, timeout=30
+            )
+        except (OSError, subprocess.SubprocessError):
+            if attempt is not None:
+                continue
+            raise EstimatorError(f"ffmpeg rgb extract failed at {at_s:g}s") from None
+        if completed.returncode != 0 or not completed.stdout:
+            if attempt is not None:
+                continue
+            raise EstimatorError(f"ffmpeg rgb extract failed at {at_s:g}s")
+        raw = completed.stdout
+        break
+    if not raw:
         raise EstimatorError(f"ffmpeg rgb extract failed at {at_s:g}s")
-    raw = completed.stdout
     pixels = len(raw) // 3
     if pixels == 0:
         raise EstimatorError("empty rgb frame")
