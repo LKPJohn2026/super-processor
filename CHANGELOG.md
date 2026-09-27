@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-26
+
+### Added
+
+- A named fault filters one segment's treatments. A sentence maps onto that
+  fault list only after a fault rejection. Neighbors keep the treatment they
+  already shared.
+- `plans JOB --choose N` is the approval to render. Each kept segment is
+  encoded with libx265, audio is cut on the same timestamps, and the parts
+  are concatenated.
+- The size-cap bitrate uses the sum of the kept durations.
+
+### Fixed
+
+- A split of an oversized range stays at least 5 seconds from both ends, so a
+  loud change at the edge cannot leave a piece shorter than 5 seconds.
+
 ## [1.3.0] - 2026-09-26
 
 ### Added
