@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-26
+
+### Added
+
+- A fixed treatment list for each segment problem. Silhouette lifts shadows
+  harder than low light. Strong denoise cannot share a treatment with sharpen,
+  and steps stay in allowlist order.
+- Five timeline plans. The first is the highest score. Later plans change as
+  many look groups as they can, and neighbors that share a look share a
+  treatment. `plans JOB` writes `plans.json` and prints each assignment.
+- A three-second preview window around each key frame, clamped inside that
+  treatment's trim, and one cached encode of that window.
+
 ## [1.2.0] - 2026-09-26
 
 ### Added
