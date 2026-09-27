@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import itertools
+import json
+from dataclasses import dataclass
+from pathlib import Path
 
 from .recipe import OpName
 from .segments import TimelineSegment
@@ -10,9 +13,13 @@ from .treatments import (
     STRONG_DENOISE,
     Treatment,
     TreatmentError,
+    treatment_by_id,
     treatment_violation,
     treatments_for,
 )
+
+PLANS_FILE_NAME = "plans.json"
+PLANS_SCHEMA_VERSION = 1
 
 PLAN_COUNT = 5
 _ENUM_LIMIT = 4096
@@ -240,3 +247,95 @@ def choose_plans(
     else:
         scored = _bounded_candidates(segments, groups, options)
     return [_expand(segments, groups, picks) for picks in _select_plans(scored, limit)]
+
+
+@dataclass(frozen=True, slots=True)
+class TimelinePlan:
+    """One saved assignment: a score and one treatment id per segment."""
+
+    index: int
+    score: float
+    treatment_ids: tuple[str, ...]
+
+    def treatments(self) -> list[Treatment]:
+        return [treatment_by_id(treatment_id) for treatment_id in self.treatment_ids]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "index": self.index,
+            "score": self.score,
+            "treatment_ids": list(self.treatment_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> TimelinePlan:
+        raw_ids = data.get("treatment_ids")
+        if not isinstance(raw_ids, list) or not all(
+            isinstance(item, str) for item in raw_ids
+        ):
+            raise TreatmentError("treatment_ids must be a list of strings")
+        index = data.get("index")
+        score = data.get("score")
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TreatmentError("plan index must be an integer")
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise TreatmentError("plan score must be numeric")
+        return cls(index=index, score=float(score), treatment_ids=tuple(raw_ids))
+
+
+def build_plans(
+    segments: list[TimelineSegment],
+    *,
+    limit: int = PLAN_COUNT,
+) -> list[TimelinePlan]:
+    """Choose plans and record each score beside its treatment ids."""
+    chosen = choose_plans(segments, limit=limit)
+    plans: list[TimelinePlan] = []
+    for index, treatments in enumerate(chosen):
+        plans.append(
+            TimelinePlan(
+                index=index,
+                score=assignment_score(segments, treatments),
+                treatment_ids=tuple(treatment.treatment_id for treatment in treatments),
+            )
+        )
+    return plans
+
+
+def plans_path(job_dir: Path) -> Path:
+    """Return the on-disk plan list for a job."""
+    return job_dir / PLANS_FILE_NAME
+
+
+def write_plans(job_dir: Path, plans: list[TimelinePlan]) -> Path:
+    """Atomically write the five timeline plans."""
+    path = plans_path(job_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": PLANS_SCHEMA_VERSION,
+        "plans": [plan.to_dict() for plan in plans],
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_plans(job_dir: Path) -> list[TimelinePlan]:
+    """Load timeline plans from a job directory."""
+    path = plans_path(job_dir)
+    if not path.is_file():
+        raise TreatmentError(f"plans not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise TreatmentError("plans root must be an object")
+    raw_plans = data.get("plans")
+    if not isinstance(raw_plans, list):
+        raise TreatmentError("plans list is missing")
+    plans: list[TimelinePlan] = []
+    for item in raw_plans:
+        if not isinstance(item, dict):
+            raise TreatmentError("each plan must be an object")
+        plans.append(TimelinePlan.from_dict(item))
+    return plans

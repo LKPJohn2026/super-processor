@@ -184,6 +184,14 @@ def treatments_for(problem: str) -> tuple[Treatment, ...]:
         raise TreatmentError(f"no treatments for {problem}") from exc
 
 
+def treatment_by_id(treatment_id: str) -> Treatment:
+    """Return the catalog treatment with this id."""
+    for treatment in iter_treatments():
+        if treatment.treatment_id == treatment_id:
+            return treatment
+    raise TreatmentError(f"unknown treatment {treatment_id}")
+
+
 def iter_treatments() -> tuple[Treatment, ...]:
     """Return every treatment, in problem order."""
     listed: list[Treatment] = []
