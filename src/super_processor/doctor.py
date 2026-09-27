@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .encoders import HARDWARE_ENCODERS, SOFTWARE_ENCODER
+from .encoders import HARDWARE_DECODERS, HARDWARE_ENCODERS, SOFTWARE_ENCODER
 from .jobs import default_jobs_root
 
 
@@ -198,6 +198,16 @@ def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
                 hint="optional hardware encoder",
             )
             for name in HARDWARE_ENCODERS
+        ],
+        *[
+            check_ffmpeg_capability(
+                f"decoder:{name}",
+                kind="decoders",
+                token=name,
+                required=False,
+                hint="optional hardware decoder",
+            )
+            for name in HARDWARE_DECODERS
         ],
         check_ffmpeg_capability(
             "filter:stabilize",

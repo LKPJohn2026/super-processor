@@ -110,6 +110,20 @@ def test_doctor_reports_each_hardware_encoder(monkeypatch: pytest.MonkeyPatch) -
     assert doctor.doctor_report_as_dict(list(results.values()))["ok"] is True
 
 
+def test_doctor_reports_each_hardware_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "super_processor.doctor._ffmpeg_listing",
+        lambda kind: (
+            " V..... hevc_cuvid\n" if kind == "decoders" else " V..... libx265\n"
+        ),
+    )
+    results = {item.name: item for item in doctor.collect_doctor_report()}
+    assert "available" in results["decoder:hevc_cuvid"].detail
+    for name in ("hevc_qsv", "hevc_amf", "hevc_videotoolbox"):
+        assert "missing" in results[f"decoder:{name}"].detail
+    assert doctor.doctor_report_as_dict(list(results.values()))["ok"] is True
+
+
 def test_ffmpeg_capability_present(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "super_processor.doctor._ffmpeg_listing",

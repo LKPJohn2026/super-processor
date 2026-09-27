@@ -10,6 +10,12 @@ HARDWARE_ENCODERS: tuple[str, ...] = (
     "hevc_videotoolbox",
 )
 ALLOWED_ENCODERS: tuple[str, ...] = (SOFTWARE_ENCODER, *HARDWARE_ENCODERS)
+HARDWARE_DECODERS: tuple[str, ...] = (
+    "hevc_cuvid",
+    "hevc_qsv",
+    "hevc_amf",
+    "hevc_videotoolbox",
+)
 
 
 class EncoderError(ValueError):
