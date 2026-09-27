@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from .encoders import SOFTWARE_ENCODER, encoder_rate_args
 from .preview import kept_range, preview_filters
 from .segments import TimelineSegment
 from .treatments import Treatment
@@ -22,6 +23,7 @@ def build_segment_argv(
     *,
     ffmpeg_bin: str = "ffmpeg",
     include_audio: bool = True,
+    encoder: str = SOFTWARE_ENCODER,
 ) -> list[str]:
     """Build one segment encode. ``-ss`` and ``-t`` cut every stream the same way."""
     start, end = kept_range(segment, treatment)
@@ -41,7 +43,7 @@ def build_segment_argv(
     filters = preview_filters(treatment)
     if filters:
         command.extend(["-vf", ",".join(filters)])
-    command.extend(["-c:v", "libx265"])
+    command.extend(encoder_rate_args(encoder))
     if include_audio:
         command.extend(["-c:a", "aac"])
     else:
