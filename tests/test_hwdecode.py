@@ -31,7 +31,9 @@ def test_hardware_decoder_flags_precede_the_input(
         return Completed()
 
     monkeypatch.setattr("super_processor.estimators.subprocess.run", run)
-    frame = extract_gray_frame(Path("clip.mp4"), at_s=1.0, decoder="hevc_cuvid")
+    frame = extract_gray_frame(
+        Path("clip.mp4"), at_s=1.0, decoder="hevc_cuvid", ffmpeg_bin="ffmpeg"
+    )
     command = seen["cmd"]
     assert frame == bytes([8]) * PIXELS
     assert command.index("-hwaccel") < command.index("-i")
@@ -54,8 +56,10 @@ def test_failed_device_falls_back_to_the_same_frame(
         return Completed(cmd)
 
     monkeypatch.setattr("super_processor.estimators.subprocess.run", run)
-    hardware = extract_gray_frame(Path("clip.mp4"), at_s=1.0, decoder="hevc_cuvid")
-    software = extract_gray_frame(Path("clip.mp4"), at_s=1.0)
+    hardware = extract_gray_frame(
+        Path("clip.mp4"), at_s=1.0, decoder="hevc_cuvid", ffmpeg_bin="ffmpeg"
+    )
+    software = extract_gray_frame(Path("clip.mp4"), at_s=1.0, ffmpeg_bin="ffmpeg")
     assert hardware == software == gray
     hardware_row = _row_from_frame(0.0, hardware, (10.0, 10.0, 40.0), None)
     software_row = _row_from_frame(0.0, software, (10.0, 10.0, 40.0), None)

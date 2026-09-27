@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-09-26
+
+### Fixed
+
+- Hardware-decode sample tests pass an explicit ffmpeg path, so wheel
+  builds no longer fail when the image has no FFmpeg binary.
+
 ## [2.3.0] - 2026-09-26
 
 ### Added
