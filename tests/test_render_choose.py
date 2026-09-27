@@ -63,6 +63,7 @@ def test_choose_stores_the_plan_and_prints_the_output(
         dest.write_bytes(b"rendered")
         return dest
 
+    monkeypatch.setattr("super_processor.cli.ensure_encoder", lambda _encoder: None)
     monkeypatch.setattr("super_processor.cli.render_chosen_plan", fake)
     code = main(["--jobs-dir", str(store.root), "plans", JOB_ID, "--choose", "1"])
     assert code == 0

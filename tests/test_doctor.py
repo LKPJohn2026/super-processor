@@ -94,6 +94,12 @@ def test_collect_doctor_report_json(
 
 def test_doctor_reports_each_hardware_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
+        "super_processor.doctor.check_tool",
+        lambda name, *_args, **_kwargs: doctor.CheckResult(
+            name=name, ok=True, detail="present"
+        ),
+    )
+    monkeypatch.setattr(
         "super_processor.doctor._ffmpeg_listing",
         lambda kind: (
             " V..... libx265\n V..... hevc_nvenc\n"
