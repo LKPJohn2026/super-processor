@@ -176,6 +176,17 @@ _TABLE: dict[str, tuple[Treatment, ...]] = {
 }
 
 
+FAULT_PROBLEMS: dict[str, frozenset[str]] = {
+    "too-warm": frozenset({"too_warm"}),
+    "too-cool": frozenset(),
+    "too-dark": frozenset({"low_light", "silhouette"}),
+    "too-bright": frozenset(),
+    "not-sharp": frozenset({"low_contrast"}),
+    "too-much-denoise": frozenset({"noisy"}),
+    "too-much-contrast": frozenset({"low_contrast"}),
+    "bad-trim": frozenset(),
+}
+
 FAULT_NAMES: tuple[str, ...] = (
     "too-warm",
     "too-cool",

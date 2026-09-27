@@ -51,6 +51,49 @@ def test_plans_prints_five_assignments(
     assert store.load(JOB_ID).state is JobState.PLANS_READY
 
 
+def test_sentence_waits_for_a_fault_rejection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _accepted_job(tmp_path)
+    assert main(["--jobs-dir", str(store.root), "plans", JOB_ID]) == 0
+    capsys.readouterr()
+
+    denied = main(
+        ["--jobs-dir", str(store.root), "plans", JOB_ID, "--text", "not sharp enough"]
+    )
+    assert denied == 1
+    assert "fault rejection" in capsys.readouterr().out
+
+    revised = main(
+        [
+            "--jobs-dir",
+            str(store.root),
+            "plans",
+            JOB_ID,
+            "--segment",
+            "1",
+            "--fault",
+            "not-sharp",
+        ]
+    )
+    assert revised == 0
+    assert "low_contrast.contrast_sharpen" in capsys.readouterr().out
+    assert store.load(JOB_ID).notes["plan_rejections"] == 1
+
+    unused = main(
+        ["--jobs-dir", str(store.root), "plans", JOB_ID, "--text", "make it cinematic"]
+    )
+    assert unused == 0
+    assert capsys.readouterr().out.strip() == "unused"
+
+    sentence = main(
+        ["--jobs-dir", str(store.root), "plans", JOB_ID, "--text", "not sharp enough"]
+    )
+    assert sentence == 0
+    assert "low_contrast.contrast_sharpen" in capsys.readouterr().out
+
+
 def test_plans_before_accept_is_refused(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

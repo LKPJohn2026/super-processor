@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -27,7 +28,14 @@ from .estimators import EstimatorError, estimate_look, write_estimates
 from .jobs import JobError, JobState, JobStore, default_jobs_root
 from .models import apply_llm_plan_patch, list_models
 from .plan import PlanError, plan_job
-from .plans import build_plans, write_plans
+from .plans import (
+    TimelinePlan,
+    assignment_score,
+    build_plans,
+    load_plans,
+    revise_plans,
+    write_plans,
+)
 from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
 from .qa import analyze_preview, write_qa_report
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
@@ -52,7 +60,13 @@ from .templates import (
     build_ffmpeg_plan,
     default_output_path,
 )
-from .treatments import TreatmentError
+from .treatments import (
+    FAULT_PROBLEMS,
+    Treatment,
+    TreatmentError,
+    faults_from_sentence,
+    filter_treatments,
+)
 from .validator import validate_job_recipe
 from .worker import FFmpegWorker, WorkerError, format_progress_status
 
@@ -216,6 +230,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="build five timeline plans and print each treatment",
     )
     plans_cmd.add_argument("job_id", help="job identifier")
+    plans_cmd.add_argument(
+        "--segment",
+        type=int,
+        default=None,
+        help="segment to revise",
+    )
+    plans_cmd.add_argument(
+        "--fault",
+        default=None,
+        help="fault that filters that segment",
+    )
+    plans_cmd.add_argument(
+        "--text",
+        default=None,
+        help="sentence mapped onto the fault list after a fault rejection",
+    )
 
     job = subparsers.add_parser("job", help="low-level job management commands")
     job_sub = job.add_subparsers(dest="job_command", required=True)
@@ -427,6 +457,28 @@ def run_segment_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _print_plans(plans: list[TimelinePlan]) -> None:
+    for plan in plans:
+        treatments = " | ".join(plan.treatment_ids)
+        print(f"{plan.index}  {plan.score:.1f}  {treatments}")
+
+
+def _plans_from_assignments(
+    segments: list[TimelineSegment],
+    assignments: list[list[Treatment]],
+) -> list[TimelinePlan]:
+    plans: list[TimelinePlan] = []
+    for index, chosen in enumerate(assignments):
+        plans.append(
+            TimelinePlan(
+                index=index,
+                score=assignment_score(segments, chosen),
+                treatment_ids=tuple(treatment.treatment_id for treatment in chosen),
+            )
+        )
+    return plans
+
+
 def run_plans_command(arguments: argparse.Namespace) -> int:
     """Build five plans for an accepted split and print them."""
     store = _store_from_args(arguments)
@@ -437,14 +489,67 @@ def run_plans_command(arguments: argparse.Namespace) -> int:
             f"job {job_id} needs an accepted split before plans "
             f"(current: {manifest.state.value})"
         )
+    segment_index = getattr(arguments, "segment", None)
+    fault = getattr(arguments, "fault", None)
+    text = getattr(arguments, "text", None)
+    if text and (segment_index is not None or fault):
+        raise JobError("pass either --text or --segment/--fault")
+    if (segment_index is None) != (fault is None):
+        raise JobError("pass --segment and --fault together")
     job_dir = store.job_dir(job_id)
-    plans = build_plans(load_segments(job_dir))
+    segments = load_segments(job_dir)
+    if text or fault:
+        if manifest.state is not JobState.PLANS_READY:
+            raise JobError(
+                f"job {job_id} needs plans before a rejection "
+                f"(current: {manifest.state.value})"
+            )
+        rejections = int(manifest.notes.get("plan_rejections", 0))
+        if text and rejections < 1:
+            raise JobError("a sentence is available after a fault rejection")
+        if text:
+            faults = faults_from_sentence(str(text))
+            if not faults:
+                print("unused")
+                return 0
+            named = re.search(r"segment\s+(\d+)", str(text).lower())
+            if named:
+                indexes = [int(named.group(1))]
+            else:
+                problems = FAULT_PROBLEMS[faults[0]]
+                indexes = [
+                    segment.index
+                    for segment in segments
+                    if segment.problem in problems
+                ]
+            if not indexes:
+                print("unused")
+                return 0
+            base = load_plans(job_dir)[0].treatments()
+            revised = revise_plans(segments, base, indexes[0], faults[0])
+            for plan in revised:
+                for index in indexes[1:]:
+                    replacement = filter_treatments(
+                        segments[index].problem,
+                        faults[0],
+                    )[0]
+                    plan[index] = replacement
+            plans = _plans_from_assignments(segments, revised)
+        else:
+            base = load_plans(job_dir)[0].treatments()
+            if segment_index is None or fault is None:
+                raise JobError("pass --segment and --fault together")
+            revised = revise_plans(segments, base, int(segment_index), str(fault))
+            plans = _plans_from_assignments(segments, revised)
+        write_plans(job_dir, plans)
+        store.update_notes(job_id, {"plan_rejections": rejections + 1})
+        _print_plans(plans)
+        return 0
+    plans = build_plans(segments)
     write_plans(job_dir, plans)
     if manifest.state is JobState.SPLIT_ACCEPTED:
         store.transition(job_id, JobState.PLANS_READY, notes={"plans": len(plans)})
-    for plan in plans:
-        treatments = " | ".join(plan.treatment_ids)
-        print(f"{plan.index}  {plan.score:.1f}  {treatments}")
+    _print_plans(plans)
     return 0
 
 
