@@ -13,6 +13,7 @@ from .treatments import (
     STRONG_DENOISE,
     Treatment,
     TreatmentError,
+    filter_treatments,
     treatment_by_id,
     treatment_violation,
     treatments_for,
@@ -281,6 +282,30 @@ class TimelinePlan:
         if isinstance(score, bool) or not isinstance(score, int | float):
             raise TreatmentError("plan score must be numeric")
         return cls(index=index, score=float(score), treatment_ids=tuple(raw_ids))
+
+
+def revise_plans(
+    segments: list[TimelineSegment],
+    base: list[Treatment],
+    segment_index: int,
+    fault: str,
+) -> list[list[Treatment]]:
+    """Rebuild plans that differ only on one named segment.
+
+    Other segments keep the base treatment, including neighbors that used to
+    share its look group. The named segment uses the fault's filtered list.
+    """
+    if len(base) != len(segments):
+        raise TreatmentError("assignment length does not match the segments")
+    if segment_index < 0 or segment_index >= len(segments):
+        raise TreatmentError("segment index is outside the timeline")
+    options = filter_treatments(segments[segment_index].problem, fault)
+    revised: list[list[Treatment]] = []
+    for treatment in options[:PLAN_COUNT]:
+        chosen = list(base)
+        chosen[segment_index] = treatment
+        revised.append(chosen)
+    return revised
 
 
 def build_plans(
