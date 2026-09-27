@@ -195,6 +195,28 @@ def _step_param(treatment: Treatment, op: OpName, key: str) -> float | None:
     return None
 
 
+_SENTENCE_FAULTS: tuple[tuple[str, str], ...] = (
+    ("too much denoise", "too-much-denoise"),
+    ("too much contrast", "too-much-contrast"),
+    ("not sharp", "not-sharp"),
+    ("too dark", "too-dark"),
+    ("too bright", "too-bright"),
+    ("too warm", "too-warm"),
+    ("too cool", "too-cool"),
+    ("bad trim", "bad-trim"),
+)
+
+
+def faults_from_sentence(text: str) -> list[str]:
+    """Map a sentence onto the fault list. Unmatched wording returns nothing."""
+    cleaned = " ".join(text.strip().lower().split())
+    found: list[str] = []
+    for phrase, fault in _SENTENCE_FAULTS:
+        if phrase in cleaned and fault not in found:
+            found.append(fault)
+    return found
+
+
 def filter_treatments(problem: str, fault: str) -> tuple[Treatment, ...]:
     """Shrink one problem's treatment list according to a fixed fault."""
     options = treatments_for(problem)
