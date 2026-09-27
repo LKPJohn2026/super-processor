@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-26
+
+### Added
+
+- `review JOB` serves a localhost split page. It lists each segment's range,
+  context, problem, and still. Accept and a note call the existing `segment`
+  command.
+
 ## [2.0.0] - 2026-09-26
 
 ### Added
