@@ -7,13 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+
+- Enhance-option loop: let the user revise from a chosen option plus free text
+  (seed the next Gemini proposal from the selected ops, not only a blank note).
+
+## [2.4.0] - 2026-10-03
+
 ### Added
 
 - Localhost Gemini wizard via `super-processor review` (no job id): setup,
   pick file, structured split choice, per-segment options with short previews,
   enhance-and-concat render, and a happy/revise result step.
 - Gemini structured-output client (`gemini.py`) with chat persistence,
-  dynamic-FPS sampling, and allowlisted ops validation.
+  dynamic-FPS sampling, allowlisted ops validation, and failover across
+  multimodal models with usable RPM.
 - Design docs: revised [docs/system-design.md](docs/system-design.md) and new
   [docs/ui-wizard.md](docs/ui-wizard.md).
 - CI job **Gemini live API** calls the real Gemini structured-output endpoints
@@ -27,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Matrix unit tests run with `-m "not gemini_live"` and never receive the
   Gemini secret; live split/enhance/multi-turn checks run only in the dedicated
   job.
+
+### Fixed
+
+- Gemini API key storage works without an OS keyring backend (headless CI).
+- Live Gemini calls close HTTP error bodies, retry transient 503s, and skip
+  image-generation models when discovering candidates.
+- Windows CI retries Chocolatey FFmpeg installs and skips ffmpeg-dependent
+  wizard tests when the binary is missing from `PATH`.
 
 ## [2.3.1] - 2026-09-26
 
