@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+
+- Localhost website UI for the wizard (richer browser surface beyond the
+  current minimal HTML forms served by `super-processor review`).
+
+## [2.5.0] - 2026-10-03
+
 ### Added
 
 - Enhance **Something else** loop: `combine_enhance_revise_message` /
