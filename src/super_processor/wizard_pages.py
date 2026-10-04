@@ -270,8 +270,11 @@ def render_enhance(
 {accept}
 <form method="post" action="/segment">
 <label>Something else
-<textarea name="note" rows="3"></textarea>
+<textarea name="note" rows="3"
+placeholder="e.g. warmer white balance, less denoise"></textarea>
 </label>
+<p class="muted">Describe how to improve these options. Gemini will return a
+new set; repeat until you preview and accept one.</p>
 <button type="submit">Revise options</button>
 </form>
 """

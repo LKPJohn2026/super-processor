@@ -136,8 +136,13 @@ and starting analysis.
 ```
 
 Free-text revise on split or enhance appends a user turn and re-calls Gemini
-with the same schema. Happy→revise on the result screen returns to
-`choose_split` without wiping history.
+with the same schema. On enhance, **Something else** combines the user note
+with the previous structured options (`revise_enhance` /
+`combine_enhance_revise_message`) and replaces the option set for that
+segment. The UI stays on the segment until the user previews and accepts an
+option (the revise loop has no fixed cap in production; tests cover five
+rounds). Happy→revise on the result screen returns to `choose_split` without
+wiping history.
 
 ## Job files
 

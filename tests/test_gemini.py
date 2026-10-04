@@ -18,6 +18,7 @@ from super_processor.gemini import (
     SplitProposal,
     StructuredOp,
     append_chat_turn,
+    combine_enhance_revise_message,
     frame_timestamps,
     load_chat,
     model_accepts_text_or_video,
@@ -266,6 +267,73 @@ def test_validate_split_empty_layouts() -> None:
 
 def test_frame_timestamps_zero_duration() -> None:
     assert frame_timestamps(0.0) == [0.0]
+
+
+def _sample_enhance_payload(*, label: str = "lift") -> dict[str, Any]:
+    return {
+        "issues": ["low_light"],
+        "options": [
+            {
+                "id": "A",
+                "label": label,
+                "ops": [{"op": "contrast", "params": {"brightness": 0.1}}],
+            },
+            {
+                "id": "B",
+                "label": "denoise",
+                "ops": [{"op": "denoise", "params": {"strength": 0.3}}],
+            },
+            {
+                "id": "C",
+                "label": "sharpen",
+                "ops": [{"op": "sharpen", "params": {"luma_amount": 0.5}}],
+            },
+        ],
+    }
+
+
+def test_combine_enhance_revise_message_includes_prior_and_note() -> None:
+    prior = SegmentEnhanceResult.from_dict(_sample_enhance_payload())
+    prompt = combine_enhance_revise_message(
+        prior=prior,
+        user_note="make it warmer",
+        segment_label="low_light",
+        start_s=0.0,
+        end_s=20.0,
+    )
+    assert "make it warmer" in prompt
+    assert "Previous structured options" in prompt
+    assert '"id": "A"' in prompt
+    assert "white_balance" in prompt
+    with pytest.raises(GeminiError, match="empty"):
+        combine_enhance_revise_message(
+            prior=prior,
+            user_note="   ",
+            segment_label="x",
+            start_s=0.0,
+            end_s=10.0,
+        )
+
+
+def test_revise_enhance_combines_prior_into_prompt(tmp_path: Path) -> None:
+    transport = _FakeTransport(_sample_enhance_payload(label="warmer"))
+    client = GeminiClient(api_key="k", transport=transport)
+    prior = SegmentEnhanceResult.from_dict(_sample_enhance_payload())
+    result = client.revise_enhance(
+        prior=prior,
+        frame_paths=[],
+        segment_label="low_light",
+        start_s=0.0,
+        end_s=20.0,
+        user_note="warmer white balance",
+        job_dir=tmp_path,
+    )
+    assert result.options[0].label == "warmer"
+    assert transport.last_body is not None
+    user_text = transport.last_body["contents"][-1]["parts"][0]["text"]
+    assert "warmer white balance" in user_text
+    assert "Previous structured options" in user_text
+    assert len(load_chat(tmp_path)) >= 2
 
 
 def test_parse_model_info_rpm_fraction() -> None:

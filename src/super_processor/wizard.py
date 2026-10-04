@@ -613,18 +613,47 @@ class WizardController:
         segment = segments[state.segment_index]
         note = fields.get("note", [""])[0].strip()
         if note:
+            # Something-else loop: combine note + prior options, re-propose.
+            # Repeats until the user previews/accepts an option (no note).
             try:
                 frames = sorted((job_dir / WIZARD_FRAMES_DIR).glob("f_*.jpg"))[:3]
-                result = self.gemini().propose_enhance(
-                    frame_paths=frames,
-                    segment_label=segment.problem,
-                    start_s=segment.start_s,
-                    end_s=segment.end_s,
-                    user_text=note,
-                    job_dir=job_dir,
+                key = str(state.segment_index)
+                raw_prior = state.enhance_cache.get(key)
+                prior = (
+                    SegmentEnhanceResult.from_dict(raw_prior)
+                    if isinstance(raw_prior, dict)
+                    else None
                 )
-                state.enhance_cache[str(state.segment_index)] = result.to_dict()
-                state.enhance_cache.pop(f"{state.segment_index}:preview", None)
+                if prior is None:
+                    result = self.gemini().propose_enhance(
+                        frame_paths=frames,
+                        segment_label=segment.problem,
+                        start_s=segment.start_s,
+                        end_s=segment.end_s,
+                        user_text=note,
+                        job_dir=job_dir,
+                    )
+                else:
+                    result = self.gemini().revise_enhance(
+                        prior=prior,
+                        frame_paths=frames,
+                        segment_label=segment.problem,
+                        start_s=segment.start_s,
+                        end_s=segment.end_s,
+                        user_note=note,
+                        job_dir=job_dir,
+                    )
+                revise_key = f"{key}:revise_count"
+                prior_count = state.enhance_cache.get(revise_key, 0)
+                try:
+                    count = int(prior_count)
+                except (TypeError, ValueError):
+                    count = 0
+                state.enhance_cache[revise_key] = count + 1
+                state.enhance_cache[key] = result.to_dict()
+                state.enhance_cache.pop(f"{key}:preview", None)
+                state.enhance_cache.pop(f"{key}:option", None)
+                state.step = WizardStep.ENHANCE
             except GeminiError as exc:
                 state.error = str(exc)
             self._save(state)

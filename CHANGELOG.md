@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned
+### Added
 
-- Enhance-option loop: let the user revise from a chosen option plus free text
-  (seed the next Gemini proposal from the selected ops, not only a blank note).
+- Enhance **Something else** loop: `combine_enhance_revise_message` /
+  `revise_enhance` feed the user note plus prior structured options back into
+  Gemini; the wizard stays on the segment until an option is previewed and
+  accepted (tests cover five revise rounds).
 
 ## [2.4.0] - 2026-10-03
 

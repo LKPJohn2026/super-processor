@@ -31,6 +31,8 @@ MAX_LAYOUTS = 5
 MIN_SEGMENT_S = 5.0
 FRAME_CAP = 160
 WIZARD_FRAMES_DIR = "wizard_frames"
+# Production revise loops until the user picks an option; tests use this cap.
+MAX_ENHANCE_REVISE_ROUNDS_FOR_TESTS = 5
 _MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # Names that cannot diagnose frames/video for the wizard.
 _EXCLUDE_NAME_PARTS = (
@@ -786,6 +788,37 @@ def validate_split_proposal(
     return SplitProposal(layouts=cleaned, highlights=proposal.highlights)
 
 
+def combine_enhance_revise_message(
+    *,
+    prior: SegmentEnhanceResult,
+    user_note: str,
+    segment_label: str,
+    start_s: float,
+    end_s: float,
+) -> str:
+    """Build the structured-revise prompt from prior options + user note.
+
+    Used by the Something-else loop: the user is improving or changing the
+    current option set, so Gemini must see both the request and the last JSON.
+    """
+    note = user_note.strip()
+    if not note:
+        raise GeminiError("revise note is empty")
+    prior_json = json.dumps(prior.to_dict(), indent=2)
+    return (
+        f"Act as a pro photographer. Segment {segment_label!r} runs from "
+        f"{start_s:.1f}s to {end_s:.1f}s.\n"
+        "The user wants to improve, enhance, or change the current options "
+        "(Something else).\n"
+        f"User request:\n{note}\n\n"
+        "Previous structured options (JSON):\n"
+        f"{prior_json}\n\n"
+        "Return a new set of 3 to 5 enhancement options that incorporate the "
+        "request. Keep ops allowlisted: white_balance, contrast, denoise, "
+        "sharpen, stabilize, trim. Do not invent shell commands."
+    )
+
+
 def validate_enhance_result(result: SegmentEnhanceResult) -> SegmentEnhanceResult:
     """Enforce option count and allowlisted ops."""
     if not (3 <= len(result.options) <= 5):
@@ -1067,28 +1100,57 @@ class GeminiClient:
         start_s: float,
         end_s: float,
         user_text: str | None = None,
+        prior: SegmentEnhanceResult | None = None,
         job_dir: Path | None = None,
     ) -> SegmentEnhanceResult:
-        """Ask Gemini for 3–5 allowlisted enhancement options."""
-        prompt = user_text or (
-            f"Act as a pro photographer. Segment {segment_label!r} runs from "
-            f"{start_s:.1f}s to {end_s:.1f}s. List issues and 3 to 5 enhancement "
-            "options. Ops must be from: white_balance, contrast, denoise, "
-            "sharpen, stabilize, trim. Do not invent shell commands."
-        )
+        """Ask Gemini for 3–5 allowlisted enhancement options.
+
+        When ``user_text`` and ``prior`` are both set, the prompt combines the
+        user's revise note with the previous structured options (Something else
+        loop). Otherwise this is the first proposal for the segment.
+        """
+        if user_text and prior is not None:
+            prompt = combine_enhance_revise_message(
+                prior=prior,
+                user_note=user_text,
+                segment_label=segment_label,
+                start_s=start_s,
+                end_s=end_s,
+            )
+        elif user_text:
+            prompt = (
+                f"Act as a pro photographer. Segment {segment_label!r} runs from "
+                f"{start_s:.1f}s to {end_s:.1f}s. The user wants different "
+                f"options: {user_text.strip()}. Return 3 to 5 enhancement "
+                "options. Ops must be from: white_balance, contrast, denoise, "
+                "sharpen, stabilize, trim. Do not invent shell commands."
+            )
+        else:
+            prompt = (
+                f"Act as a pro photographer. Segment {segment_label!r} runs from "
+                f"{start_s:.1f}s to {end_s:.1f}s. List issues and 3 to 5 "
+                "enhancement options. Ops must be from: white_balance, contrast, "
+                "denoise, sharpen, stabilize, trim. Do not invent shell commands."
+            )
         parts: list[dict[str, Any]] = [{"text": prompt}]
         refs: list[str] = []
         for path in frame_paths:
             if path.is_file():
                 parts.append(_file_part(path))
                 refs.append(path.name)
-        contents = [{"role": "user", "parts": parts}]
+        contents: list[dict[str, Any]] = []
+        if job_dir is not None:
+            for turn in load_chat(job_dir):
+                role = "user" if turn.role == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": turn.text}]})
+        contents.append({"role": "user", "parts": parts})
         data = self._generate(
             contents=contents,
             schema=_ENHANCE_SCHEMA,
             system=(
                 "You enhance existing frames with structured ops only. "
-                "Never propose generative edits or shell strings."
+                "When revising, incorporate the user's request into a fresh "
+                "option set. Never propose generative edits or shell strings."
             ),
         )
         result = validate_enhance_result(SegmentEnhanceResult.from_dict(data))
@@ -1097,7 +1159,7 @@ class GeminiClient:
                 job_dir,
                 ChatTurn(
                     role="user",
-                    text=user_text if user_text else prompt,
+                    text=prompt,
                     frame_refs=refs,
                 ),
             )
@@ -1110,3 +1172,25 @@ class GeminiClient:
                 ),
             )
         return result
+
+    def revise_enhance(
+        self,
+        *,
+        prior: SegmentEnhanceResult,
+        frame_paths: list[Path],
+        segment_label: str,
+        start_s: float,
+        end_s: float,
+        user_note: str,
+        job_dir: Path | None = None,
+    ) -> SegmentEnhanceResult:
+        """Combine a Something-else note with prior options and re-propose."""
+        return self.propose_enhance(
+            frame_paths=frame_paths,
+            segment_label=segment_label,
+            start_s=start_s,
+            end_s=end_s,
+            user_text=user_note,
+            prior=prior,
+            job_dir=job_dir,
+        )
