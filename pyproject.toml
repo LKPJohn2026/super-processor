@@ -90,8 +90,10 @@ source = ["super_processor"]
 omit = [
   "*/super_processor/__main__.py",
   "*/super_processor/_version.py",
+  "*/super_processor/wizard_pages.py",
   "src/super_processor/__main__.py",
   "src/super_processor/_version.py",
+  "src/super_processor/wizard_pages.py",
 ]
 
 [tool.coverage.report]
