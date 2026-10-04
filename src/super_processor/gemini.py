@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -21,7 +22,7 @@ from .recipe import OpName
 
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 GEMINI_MODEL_ENV = "SUPER_PROCESSOR_GEMINI_MODEL"
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 CHAT_FILE_NAME = "gemini_chat.json"
 CHAT_VERSION = 1
 MAX_SEGMENTS = 20
@@ -29,6 +30,19 @@ MAX_LAYOUTS = 5
 MIN_SEGMENT_S = 5.0
 FRAME_CAP = 160
 WIZARD_FRAMES_DIR = "wizard_frames"
+_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+# Names that cannot diagnose frames/video for the wizard.
+_EXCLUDE_NAME_PARTS = (
+    "embedding",
+    "embed-content",
+    "tts",
+    "imagen",
+    "image-generation",
+    "aqa",
+    "gecko",
+    "learnlm",
+)
+_RETRYABLE_STATUS = frozenset({404, 429, 500, 503})
 
 _ALLOWED_OPS = {
     OpName.WHITE_BALANCE.value,
@@ -43,6 +57,10 @@ _ALLOWED_OPS = {
 class GeminiError(RuntimeError):
     """Raised when Gemini configuration or structured parse fails."""
 
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 class GeminiTransport(Protocol):
     """HTTP transport for Gemini generateContent calls."""
@@ -55,6 +73,190 @@ class GeminiTransport(Protocol):
         body: dict[str, Any],
     ) -> dict[str, Any]:
         """Return the parsed JSON response body."""
+
+
+class GeminiModelLister(Protocol):
+    """Optional transport capability for ``models.list`` discovery."""
+
+    def list_models(self, *, api_key: str) -> list[dict[str, Any]]:
+        """Return raw model objects from ``models.list``."""
+
+
+@dataclass(slots=True)
+class ModelInfo:
+    """One Gemini model candidate for the wizard."""
+
+    name: str
+    display_name: str = ""
+    description: str = ""
+    methods: tuple[str, ...] = ()
+    rpm_limit: int | None = None
+    rpm_used: int | None = None
+
+    @property
+    def rpm_remaining(self) -> int | None:
+        if self.rpm_limit is None or self.rpm_used is None:
+            return None
+        return max(0, self.rpm_limit - self.rpm_used)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "display_name": self.display_name,
+            "description": self.description,
+            "methods": list(self.methods),
+            "rpm_limit": self.rpm_limit,
+            "rpm_used": self.rpm_used,
+            "rpm_remaining": self.rpm_remaining,
+        }
+
+
+def _strip_models_prefix(name: str) -> str:
+    cleaned = name.strip()
+    if cleaned.startswith("models/"):
+        return cleaned[len("models/") :]
+    return cleaned
+
+
+def _parse_rpm_fields(raw: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Pull RPM used/limit when the list payload exposes them (AI Studio shape)."""
+    limit: int | None = None
+    used: int | None = None
+    for key, target in (
+        ("rpmLimit", "limit"),
+        ("rpm_limit", "limit"),
+        ("requestsPerMinuteLimit", "limit"),
+        ("rpm", "limit"),
+        ("rpmUsed", "used"),
+        ("rpm_used", "used"),
+        ("requestsPerMinuteUsed", "used"),
+    ):
+        if key not in raw:
+            continue
+        try:
+            value = int(raw[key])
+        except (TypeError, ValueError):
+            continue
+        if target == "limit":
+            limit = value
+        else:
+            used = value
+    # Nested rateLimits: { "rpm": "0/15" } as on the AI Studio rate-limit page.
+    nested = raw.get("rateLimits") or raw.get("rate_limits") or {}
+    if isinstance(nested, dict):
+        rpm = nested.get("rpm") or nested.get("RPM")
+        if isinstance(rpm, str) and "/" in rpm:
+            left, right = rpm.split("/", 1)
+            try:
+                used = int(left.strip())
+                limit = int(right.strip())
+            except ValueError:
+                pass
+        elif isinstance(rpm, dict):
+            try:
+                if "used" in rpm:
+                    used = int(rpm["used"])
+                if "limit" in rpm:
+                    limit = int(rpm["limit"])
+            except (TypeError, ValueError):
+                pass
+    return used, limit
+
+
+def parse_model_info(raw: dict[str, Any]) -> ModelInfo:
+    """Normalize a ``models.list`` / rate-limit row into ``ModelInfo``."""
+    name = _strip_models_prefix(str(raw.get("name") or raw.get("model") or ""))
+    methods_raw = (
+        raw.get("supportedGenerationMethods") or raw.get("supported_actions") or []
+    )
+    methods = (
+        tuple(str(item) for item in methods_raw)
+        if isinstance(methods_raw, list)
+        else ()
+    )
+    used, limit = _parse_rpm_fields(raw)
+    return ModelInfo(
+        name=name,
+        display_name=str(raw.get("displayName") or raw.get("display_name") or name),
+        description=str(raw.get("description") or ""),
+        methods=methods,
+        rpm_limit=limit,
+        rpm_used=used,
+    )
+
+
+def model_accepts_text_or_video(info: ModelInfo) -> bool:
+    """Return True when the model can take text and image/video inputs."""
+    if not info.name:
+        return False
+    lowered = info.name.lower()
+    if any(part in lowered for part in _EXCLUDE_NAME_PARTS):
+        return False
+    if info.methods and "generateContent" not in info.methods:
+        return False
+    blob = f"{info.name} {info.display_name} {info.description}".lower()
+    # Wizard sends text + stills (and can send video later). Accept multimodal
+    # Gemini chat models; reject pure audio-TTS / embedding names above.
+    if "gemini" not in lowered:
+        return False
+    if "video" in blob or "image" in blob or "multimodal" in blob:
+        return True
+    # Default Gemini flash/pro family accepts text + images/video.
+    return any(token in lowered for token in ("flash", "pro", "lite"))
+
+
+def model_has_usable_rpm(info: ModelInfo) -> bool:
+    """Match AI Studio rows like ``0/5`` / ``0/10``: limit must be non-zero.
+
+    When remaining is known, it must also be > 0 (not exhausted like ``5/5``).
+    Unknown RPM metadata is treated as usable so we can probe the model.
+    """
+    if info.rpm_limit is not None and info.rpm_limit <= 0:
+        return False
+    return not (info.rpm_remaining is not None and info.rpm_remaining <= 0)
+
+
+def select_candidate_models(
+    models: list[ModelInfo],
+    *,
+    preferred: str | None = None,
+) -> list[str]:
+    """Order multimodal models with usable RPM, preferred name first."""
+    usable = [
+        item
+        for item in models
+        if model_accepts_text_or_video(item) and model_has_usable_rpm(item)
+    ]
+    names = [_strip_models_prefix(item.name) for item in usable if item.name]
+    # De-dupe while preserving order.
+    ordered: list[str] = []
+    seen: set[str] = set()
+    pref = _strip_models_prefix(preferred) if preferred else ""
+    if pref:
+        ordered.append(pref)
+        seen.add(pref)
+    for name in names:
+        if name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    return ordered
+
+
+def _is_retryable_error(exc: GeminiError) -> bool:
+    if exc.status in _RETRYABLE_STATUS:
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "no longer available",
+            "not found",
+            "resource_exhausted",
+            "rate limit",
+            "quota",
+            "unavailable",
+        )
+    )
 
 
 class UrllibGeminiTransport:
@@ -83,7 +285,10 @@ class UrllibGeminiTransport:
                 parsed: object = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise GeminiError(f"Gemini HTTP {exc.code}: {detail}") from exc
+            raise GeminiError(
+                f"Gemini HTTP {exc.code}: {detail}",
+                status=int(exc.code),
+            ) from exc
         except (
             urllib.error.URLError,
             TimeoutError,
@@ -94,6 +299,42 @@ class UrllibGeminiTransport:
         if not isinstance(parsed, dict):
             raise GeminiError("Gemini response root must be an object")
         return parsed
+
+    def list_models(
+        self, *, api_key: str
+    ) -> list[dict[str, Any]]:  # pragma: no cover - mocked in unit tests
+        models: list[dict[str, Any]] = []
+        page_token = ""
+        while True:
+            url = f"{_MODELS_URL}?key={api_key}&pageSize=100"
+            if page_token:
+                url += f"&pageToken={urllib.parse.quote(page_token)}"
+            req = urllib.request.Request(url, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    parsed: object = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise GeminiError(
+                    f"Gemini HTTP {exc.code}: {detail}",
+                    status=int(exc.code),
+                ) from exc
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise GeminiError(f"Gemini list models failed: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise GeminiError("Gemini models.list root must be an object")
+            batch = parsed.get("models") or []
+            if isinstance(batch, list):
+                models.extend(item for item in batch if isinstance(item, dict))
+            page_token = str(parsed.get("nextPageToken") or "")
+            if not page_token:
+                break
+        return models
 
 
 @dataclass(slots=True)
@@ -562,6 +803,102 @@ class GeminiClient:
             )
         self.model = model or os.environ.get(GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL)
         self.transport: GeminiTransport = transport or UrllibGeminiTransport()
+        self._candidate_models: list[str] | None = None
+        self._exhausted_models: set[str] = set()
+
+    def list_model_infos(self) -> list[ModelInfo]:
+        """Fetch and normalize models from the transport when supported."""
+        lister = getattr(self.transport, "list_models", None)
+        if not callable(lister):
+            return [
+                ModelInfo(
+                    name=self.model,
+                    methods=("generateContent",),
+                    description="multimodal image video",
+                )
+            ]
+        raw_models = lister(api_key=self.api_key)
+        return [parse_model_info(item) for item in raw_models if isinstance(item, dict)]
+
+    def candidate_models(self, *, refresh: bool = False) -> list[str]:
+        """Multimodal models with usable RPM (limit != 0 / remaining > 0).
+
+        Preferred / env model is tried first. Results are cached until a
+        refresh or until failover marks models exhausted.
+        """
+        if self._candidate_models is not None and not refresh:
+            return [
+                name
+                for name in self._candidate_models
+                if name not in self._exhausted_models
+            ]
+        env_extra = os.environ.get("SUPER_PROCESSOR_GEMINI_CANDIDATES", "").strip()
+        extras = [
+            _strip_models_prefix(part) for part in env_extra.split(",") if part.strip()
+        ]
+        discovered = select_candidate_models(
+            self.list_model_infos(),
+            preferred=self.model,
+        )
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for name in [self.model, *extras, *discovered]:
+            clean = _strip_models_prefix(name)
+            if not clean or clean in seen or clean in self._exhausted_models:
+                continue
+            ordered.append(clean)
+            seen.add(clean)
+        self._candidate_models = ordered
+        return list(ordered)
+
+    def pick_working_model(self) -> str:
+        """Probe candidates until one accepts a tiny structured generate call."""
+        probe_schema = {
+            "type": "OBJECT",
+            "properties": {"ok": {"type": "BOOLEAN"}},
+            "required": ["ok"],
+        }
+        body = {
+            "systemInstruction": {
+                "parts": [{"text": "Reply with structured JSON only."}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": 'Return {"ok": true}.'}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json",
+                "responseSchema": probe_schema,
+            },
+        }
+        errors: list[str] = []
+        for model in self.candidate_models(refresh=True):
+            try:
+                response = self.transport.generate(
+                    model=model,
+                    api_key=self.api_key,
+                    body=body,
+                )
+                _parse_json_object(_extract_text(response))
+            except GeminiError as exc:
+                if _is_retryable_error(exc):
+                    self._exhausted_models.add(model)
+                    errors.append(f"{model}: {exc}")
+                    continue
+                raise
+            self.model = model
+            remaining = [
+                name
+                for name in (self._candidate_models or [])
+                if name != model and name not in self._exhausted_models
+            ]
+            self._candidate_models = [model, *remaining]
+            return model
+        detail = "; ".join(errors) if errors else "no multimodal candidates"
+        raise GeminiError(f"No Gemini model with usable quota: {detail}")
 
     def _generate(
         self,
@@ -579,12 +916,24 @@ class GeminiClient:
                 "responseSchema": schema,
             },
         }
-        response = self.transport.generate(
-            model=self.model,
-            api_key=self.api_key,
-            body=body,
-        )
-        return _parse_json_object(_extract_text(response))
+        errors: list[str] = []
+        for model in self.candidate_models():
+            try:
+                response = self.transport.generate(
+                    model=model,
+                    api_key=self.api_key,
+                    body=body,
+                )
+            except GeminiError as exc:
+                if _is_retryable_error(exc):
+                    self._exhausted_models.add(model)
+                    errors.append(f"{model}: {exc}")
+                    continue
+                raise
+            self.model = model
+            return _parse_json_object(_extract_text(response))
+        detail = "; ".join(errors) if errors else "no candidates"
+        raise GeminiError(f"All candidate Gemini models failed: {detail}")
 
     def propose_splits(
         self,

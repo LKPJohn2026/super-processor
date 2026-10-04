@@ -13,14 +13,19 @@ from super_processor.gemini import (
     ChatTurn,
     GeminiClient,
     GeminiError,
+    ModelInfo,
     SegmentEnhanceResult,
     SplitProposal,
     StructuredOp,
     append_chat_turn,
     frame_timestamps,
     load_chat,
+    model_accepts_text_or_video,
+    model_has_usable_rpm,
+    parse_model_info,
     sample_fps_for_duration,
     save_chat,
+    select_candidate_models,
     validate_enhance_result,
     validate_split_proposal,
 )
@@ -261,3 +266,306 @@ def test_validate_split_empty_layouts() -> None:
 
 def test_frame_timestamps_zero_duration() -> None:
     assert frame_timestamps(0.0) == [0.0]
+
+
+def test_parse_model_info_rpm_fraction() -> None:
+    info = parse_model_info(
+        {
+            "name": "models/gemini-3.8-flash",
+            "displayName": "Gemini 3.8 Flash",
+            "description": "Multimodal model for text, image, and video",
+            "supportedGenerationMethods": ["generateContent"],
+            "rateLimits": {"rpm": "0/10"},
+        }
+    )
+    assert info.name == "gemini-3.8-flash"
+    assert info.rpm_used == 0
+    assert info.rpm_limit == 10
+    assert info.rpm_remaining == 10
+    assert model_accepts_text_or_video(info)
+    assert model_has_usable_rpm(info)
+
+
+def test_model_rpm_zero_limit_rejected() -> None:
+    info = ModelInfo(
+        name="gemini-2.0-flash",
+        methods=("generateContent",),
+        description="image video",
+        rpm_limit=0,
+        rpm_used=0,
+    )
+    assert not model_has_usable_rpm(info)
+
+
+def test_model_rpm_exhausted_rejected() -> None:
+    info = ModelInfo(
+        name="gemini-2.0-flash",
+        methods=("generateContent",),
+        description="image video",
+        rpm_limit=5,
+        rpm_used=5,
+    )
+    assert not model_has_usable_rpm(info)
+
+
+def test_select_candidate_models_filters_and_orders() -> None:
+    models = [
+        ModelInfo(
+            name="text-embedding-004",
+            methods=("embedContent",),
+            description="embeddings",
+            rpm_limit=100,
+            rpm_used=0,
+        ),
+        ModelInfo(
+            name="gemini-2.0-flash",
+            methods=("generateContent",),
+            description="multimodal image video",
+            rpm_limit=0,
+            rpm_used=0,
+        ),
+        ModelInfo(
+            name="gemini-3.8-flash",
+            methods=("generateContent",),
+            description="text image video",
+            rpm_limit=10,
+            rpm_used=0,
+        ),
+        ModelInfo(
+            name="gemini-2.5-flash",
+            methods=("generateContent",),
+            description="multimodal",
+            rpm_limit=5,
+            rpm_used=1,
+        ),
+    ]
+    names = select_candidate_models(models, preferred="gemini-2.5-flash")
+    assert names[0] == "gemini-2.5-flash"
+    assert "gemini-3.8-flash" in names
+    assert "gemini-2.0-flash" not in names
+    assert "text-embedding-004" not in names
+
+
+class _FailoverTransport:
+    def __init__(self, payload: dict[str, Any], *, fail_models: set[str]) -> None:
+        self.payload = payload
+        self.fail_models = fail_models
+        self.calls: list[str] = []
+
+    def list_models(self, *, api_key: str) -> list[dict[str, Any]]:
+        del api_key
+        return [
+            {
+                "name": "models/gemini-gone",
+                "description": "multimodal image video",
+                "supportedGenerationMethods": ["generateContent"],
+                "rateLimits": {"rpm": "0/5"},
+            },
+            {
+                "name": "models/gemini-3.8-flash",
+                "description": "multimodal image video",
+                "supportedGenerationMethods": ["generateContent"],
+                "rateLimits": {"rpm": "0/10"},
+            },
+        ]
+
+    def generate(
+        self,
+        *,
+        model: str,
+        api_key: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        del api_key, body
+        self.calls.append(model)
+        if model in self.fail_models:
+            raise GeminiError(
+                f"Gemini HTTP 404: {model} is no longer available", status=404
+            )
+        text = json.dumps(self.payload)
+        return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
+
+
+def test_model_info_to_dict_and_rpm_shapes() -> None:
+    info = parse_model_info(
+        {
+            "model": "models/gemini-2.5-pro",
+            "display_name": "Pro",
+            "supported_actions": ["generateContent"],
+            "rpmLimit": 15,
+            "rpmUsed": "bad",
+            "rate_limits": {"rpm": {"used": 2, "limit": 15}},
+        }
+    )
+    assert info.name == "gemini-2.5-pro"
+    assert info.rpm_used == 2
+    assert info.rpm_limit == 15
+    assert info.to_dict()["rpm_remaining"] == 13
+    broken = parse_model_info({"name": "models/gemini-x", "rateLimits": {"rpm": "x/y"}})
+    assert broken.rpm_limit is None
+    assert model_accepts_text_or_video(
+        ModelInfo(name="gemini-2.5-flash", methods=("generateContent",))
+    )
+    assert not model_accepts_text_or_video(ModelInfo(name=""))
+    assert not model_accepts_text_or_video(
+        ModelInfo(name="gemini-embedding-001", methods=("embedContent",))
+    )
+    assert not model_accepts_text_or_video(
+        ModelInfo(name="other-model", methods=("generateContent",))
+    )
+
+
+def test_client_pick_working_model_all_fail() -> None:
+    transport = _FailoverTransport(
+        {"ok": True}, fail_models={"gemini-gone", "gemini-3.8-flash"}
+    )
+    client = GeminiClient(
+        api_key="k",
+        model="gemini-gone",
+        transport=transport,  # type: ignore[arg-type]
+    )
+    with pytest.raises(GeminiError, match="usable quota"):
+        client.pick_working_model()
+
+
+def test_client_pick_working_model_skips_exhausted() -> None:
+    payload = {"ok": True}
+    transport = _FailoverTransport(payload, fail_models={"gemini-gone"})
+    client = GeminiClient(
+        api_key="k",
+        model="gemini-gone",
+        transport=transport,  # type: ignore[arg-type]
+    )
+    picked = client.pick_working_model()
+    assert picked == "gemini-3.8-flash"
+    assert client.model == "gemini-3.8-flash"
+    assert transport.calls[0] == "gemini-gone"
+
+
+def test_client_failsover_unavailable_model(tmp_path: Path) -> None:
+    payload = {
+        "issues": ["low_light"],
+        "options": [
+            {
+                "id": "A",
+                "label": "lift",
+                "ops": [{"op": "contrast", "params": {"brightness": 0.1}}],
+            },
+            {
+                "id": "B",
+                "label": "denoise",
+                "ops": [{"op": "denoise", "params": {"strength": 0.3}}],
+            },
+            {
+                "id": "C",
+                "label": "sharpen",
+                "ops": [{"op": "sharpen", "params": {"luma_amount": 0.5}}],
+            },
+        ],
+    }
+    transport = _FailoverTransport(payload, fail_models={"gemini-gone"})
+    client = GeminiClient(
+        api_key="k",
+        model="gemini-gone",
+        transport=transport,  # type: ignore[arg-type]
+    )
+    result = client.propose_enhance(
+        frame_paths=[],
+        segment_label="low_light",
+        start_s=0,
+        end_s=20,
+        job_dir=tmp_path,
+    )
+    assert len(result.options) == 3
+    assert transport.calls[0] == "gemini-gone"
+    assert "gemini-3.8-flash" in transport.calls
+    assert client.model == "gemini-3.8-flash"
+
+
+def test_client_generate_all_candidates_fail(tmp_path: Path) -> None:
+    transport = _FailoverTransport({}, fail_models={"gemini-gone", "gemini-3.8-flash"})
+    client = GeminiClient(
+        api_key="k",
+        model="gemini-gone",
+        transport=transport,  # type: ignore[arg-type]
+    )
+    with pytest.raises(GeminiError, match="All candidate"):
+        client.propose_enhance(
+            frame_paths=[],
+            segment_label="x",
+            start_s=0,
+            end_s=20,
+            job_dir=tmp_path,
+        )
+
+
+def test_client_non_retryable_error_raises(tmp_path: Path) -> None:
+    class BoomTransport:
+        def list_models(self, *, api_key: str) -> list[dict[str, Any]]:
+            del api_key
+            return [
+                {
+                    "name": "models/gemini-3.8-flash",
+                    "description": "multimodal image video",
+                    "supportedGenerationMethods": ["generateContent"],
+                    "rateLimits": {"rpm": "0/10"},
+                }
+            ]
+
+        def generate(
+            self,
+            *,
+            model: str,
+            api_key: str,
+            body: dict[str, Any],
+        ) -> dict[str, Any]:
+            del model, api_key, body
+            raise GeminiError("Gemini HTTP 400: bad request", status=400)
+
+    client = GeminiClient(
+        api_key="k",
+        model="gemini-3.8-flash",
+        transport=BoomTransport(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(GeminiError, match="bad request"):
+        client.propose_enhance(
+            frame_paths=[],
+            segment_label="x",
+            start_s=0,
+            end_s=20,
+            job_dir=tmp_path,
+        )
+
+
+def test_candidate_models_honors_env_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "SUPER_PROCESSOR_GEMINI_CANDIDATES",
+        "gemini-2.5-flash,models/gemini-2.5-pro",
+    )
+
+    class ListTransport:
+        def list_models(self, *, api_key: str) -> list[dict[str, Any]]:
+            del api_key
+            return []
+
+        def generate(
+            self,
+            *,
+            model: str,
+            api_key: str,
+            body: dict[str, Any],
+        ) -> dict[str, Any]:
+            del model, api_key, body
+            raise GeminiError("unused", status=500)
+
+    client = GeminiClient(
+        api_key="k",
+        model="gemini-3.8-flash",
+        transport=ListTransport(),  # type: ignore[arg-type]
+    )
+    names = client.candidate_models(refresh=True)
+    assert names[0] == "gemini-3.8-flash"
+    assert "gemini-2.5-flash" in names
+    assert "gemini-2.5-pro" in names

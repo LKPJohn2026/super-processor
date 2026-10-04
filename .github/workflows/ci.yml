@@ -129,7 +129,55 @@ jobs:
             exit 1
           fi
 
+      # List multimodal models with usable RPM (limit != 0), probe until one
+      # accepts generateContent, then pin SUPER_PROCESSOR_GEMINI_MODEL for tests.
+      - name: Discover Gemini model with usable RPM
+        id: gemini_model
+        env:
+          GEMINI_API_KEY: ${{ secrets.Gemini_API_Test }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "GEMINI_API_KEY empty; skipping model discovery"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from super_processor.gemini import GeminiClient, GeminiError
+
+          client = GeminiClient()
+          infos = client.list_model_infos()
+          candidates = client.candidate_models(refresh=True)
+          print(f"listed={len(infos)} candidates={candidates}")
+          for info in infos:
+              if info.name in candidates:
+                  print(
+                      f"  {info.name} rpm={info.rpm_used}/{info.rpm_limit} "
+                      f"methods={list(info.methods)}"
+                  )
+          if not candidates:
+              raise SystemExit("No multimodal Gemini models with usable RPM")
+          try:
+              picked = client.pick_working_model()
+          except GeminiError as exc:
+              raise SystemExit(f"No Gemini model accepted a probe call: {exc}") from exc
+          print(f"picked={picked}")
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"SUPER_PROCESSOR_GEMINI_MODEL={picked}\n")
+              handle.write(
+                  "SUPER_PROCESSOR_GEMINI_CANDIDATES="
+                  + ",".join(client.candidate_models())
+                  + "\n"
+              )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"model={picked}\n")
+              handle.write("skipped=false\n")
+          PY
+
       - name: Run live Gemini structured-output tests
+        if: steps.gemini_model.outputs.skipped != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.Gemini_API_Test }}
         run: >

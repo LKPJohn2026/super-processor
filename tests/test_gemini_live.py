@@ -17,6 +17,8 @@ from super_processor.gemini import (
     GeminiClient,
     GeminiError,
     load_chat,
+    model_accepts_text_or_video,
+    model_has_usable_rpm,
 )
 
 pytestmark = [
@@ -51,6 +53,21 @@ def _tiny_png(path: Path, *, shade: int = 120) -> Path:
     return path
 
 
+def test_live_gemini_lists_multimodal_rpm_candidates() -> None:
+    """Discover generateContent models that accept text/video with RPM != 0."""
+    client = GeminiClient()
+    infos = client.list_model_infos()
+    assert infos, "models.list returned no models"
+    usable = [
+        info
+        for info in infos
+        if model_accepts_text_or_video(info) and model_has_usable_rpm(info)
+    ]
+    assert usable, "no multimodal models with usable RPM (limit != 0)"
+    candidates = client.candidate_models(refresh=True)
+    assert candidates
+
+
 def test_live_gemini_propose_splits_structured(tmp_path: Path) -> None:
     """Call the real API and require a parseable split layout set."""
     frames = [
@@ -59,6 +76,9 @@ def test_live_gemini_propose_splits_structured(tmp_path: Path) -> None:
     ]
     client = GeminiClient()
     try:
+        # Fail over across candidates when preferred model is 404/429.
+        if not client.candidate_models():
+            client.pick_working_model()
         proposal = client.propose_splits(
             frame_paths=frames,
             duration_s=30.0,
