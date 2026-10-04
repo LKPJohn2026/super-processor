@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Localhost Gemini wizard via `super-processor review` (no job id): setup,
+  pick file, structured split choice, per-segment options with short previews,
+  enhance-and-concat render, and a happy/revise result step.
+- Gemini structured-output client (`gemini.py`) with chat persistence,
+  dynamic-FPS sampling, and allowlisted ops validation.
+- Design docs: revised [docs/system-design.md](docs/system-design.md) and new
+  [docs/ui-wizard.md](docs/ui-wizard.md).
+- CI job **Gemini live API** calls the real Gemini structured-output endpoints
+  using the repository secret `Gemini_API_Test` (mapped to `GEMINI_API_KEY`).
+
+### Changed
+
+- Wizard product path uses Gemini for split/diagnosis; classical CV estimators
+  are not used by the wizard. Export keeps source aspect (no vertical social
+  default).
+- Matrix unit tests ignore `tests/test_gemini_live.py`; live calls run in the
+  dedicated Gemini job.
+
 ## [2.3.1] - 2026-09-26
 
 ### Fixed
