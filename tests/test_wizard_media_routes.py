@@ -54,6 +54,7 @@ def test_setup_rejects_empty_key(
     monkeypatch.setattr("super_processor.gemini.resolve_secret", lambda _env: None)
     controller = WizardController(tmp_path)
     controller.handle_post("/intro", {})
+    controller.handle_post("/llm", {"choice": ["gemini"]})
     controller.handle_post("/setup", {"api_key": ["  "]})
     assert controller.current_state().step is WizardStep.SETUP
     assert controller.current_state().error

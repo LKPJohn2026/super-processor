@@ -138,11 +138,26 @@ def test_wizard_setup_and_pick_flow(
     controller = WizardController(tmp_path)
     assert controller.current_state().step is WizardStep.INTRO
     controller.handle_post("/intro", {})
+    assert controller.current_state().step is WizardStep.LLM_CHOICE
+    controller.handle_post("/llm", {"choice": ["local"]})
+    assert controller.current_state().step is WizardStep.LOCAL_LLM_STUB
+    assert "Gemini" in controller.render()
+    controller.handle_post("/local-llm", {"action": ["gemini"]})
     assert controller.current_state().step is WizardStep.SETUP
     controller.handle_post("/setup", {"api_key": ["unit-test-key"]})
     state = controller.current_state()
     assert state.step is WizardStep.PICK_FILE
     assert load_session_state(tmp_path).step is WizardStep.PICK_FILE
+
+
+def test_wizard_llm_choice_gemini_direct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    controller = WizardController(tmp_path)
+    controller.handle_post("/intro", {})
+    controller.handle_post("/llm", {"choice": ["gemini"]})
+    assert controller.current_state().step is WizardStep.SETUP
 
 
 @pytest.mark.skipif(
@@ -220,6 +235,7 @@ def test_wizard_analyze_with_fake_gemini(
     gemini = GeminiClient(api_key="unit-test-key", transport=transport)
     controller = WizardController(tmp_path, gemini=gemini)
     controller.handle_post("/intro", {})
+    controller.handle_post("/llm", {"choice": ["gemini"]})
     controller.handle_post("/setup", {"skip": ["1"]})
     controller.handle_post("/pick", {"path": [str(clip)]})
     assert controller.current_state().step is WizardStep.ANALYZING

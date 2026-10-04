@@ -41,6 +41,8 @@ from .wizard_pages import (
     render_done,
     render_enhance,
     render_intro,
+    render_llm_choice,
+    render_local_llm_stub,
     render_overview,
     render_pick,
     render_rendering,
@@ -63,6 +65,8 @@ class WizardStep(str, Enum):
     """Persisted wizard screen."""
 
     INTRO = "intro"
+    LLM_CHOICE = "llm_choice"
+    LOCAL_LLM_STUB = "local_llm_stub"
     SETUP = "setup"
     PICK_FILE = "pick_file"
     ANALYZING = "analyzing"
@@ -370,6 +374,10 @@ class WizardController:
         state = self._state()
         if state.step is WizardStep.INTRO:
             return render_intro()
+        if state.step is WizardStep.LLM_CHOICE:
+            return render_llm_choice(error=state.error)
+        if state.step is WizardStep.LOCAL_LLM_STUB:
+            return render_local_llm_stub()
         if state.step is WizardStep.SETUP:
             return render_setup(
                 has_key=bool(resolve_gemini_api_key()), error=state.error
@@ -418,12 +426,29 @@ class WizardController:
             result=result,
             preview_url=preview_url,
             error=state.error,
+            segment_count=len(segments),
         )
 
     def handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
         state = self._state()
         state.error = None
         if path == "/intro":
+            state.step = WizardStep.LLM_CHOICE
+            self._save(state)
+            return
+        if path == "/llm":
+            choice = fields.get("choice", [""])[0]
+            if choice == "gemini":
+                state.step = WizardStep.SETUP
+            elif choice == "local":
+                state.step = WizardStep.LOCAL_LLM_STUB
+            else:
+                state.error = "pick how you want to run the LLM"
+                state.step = WizardStep.LLM_CHOICE
+            self._save(state)
+            return
+        if path == "/local-llm":
+            # Deferred stub: only path forward is Gemini setup.
             state.step = WizardStep.SETUP
             self._save(state)
             return

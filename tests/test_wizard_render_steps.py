@@ -154,6 +154,8 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
 
     steps = [
         (WizardStep.INTRO, "Super Processor"),
+        (WizardStep.LLM_CHOICE, "local LLM"),
+        (WizardStep.LOCAL_LLM_STUB, "Local LLM"),
         (WizardStep.SETUP, "Gemini"),
         (WizardStep.PICK_FILE, "Pick"),
         (WizardStep.ANALYZING, "Analyzing"),

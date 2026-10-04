@@ -68,6 +68,7 @@ def _clip(path: Path, seconds: int = 12) -> Path:
 def test_pick_missing_file(tmp_path: Path) -> None:
     controller = WizardController(tmp_path)
     controller.handle_post("/intro", {})
+    controller.handle_post("/llm", {"choice": ["gemini"]})
     controller.handle_post("/setup", {"api_key": ["k"]})
     controller.handle_post("/pick", {"path": [str(tmp_path / "missing.mp4")]})
     assert controller.current_state().step is WizardStep.PICK_FILE

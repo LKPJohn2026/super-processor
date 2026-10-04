@@ -37,6 +37,8 @@ from super_processor.wizard_pages import (
     render_analyzing,
     render_done,
     render_enhance,
+    render_llm_choice,
+    render_local_llm_stub,
     render_overview,
     render_pick,
     render_rendering,
@@ -87,14 +89,20 @@ def _facts() -> MediaFacts:
 
 
 def test_render_helpers_smoke() -> None:
+    assert "local LLM" in render_llm_choice()
+    assert (
+        "coming later" in render_local_llm_stub().lower()
+        or "Gemini" in render_local_llm_stub()
+    )
     assert "Gemini" in render_setup(has_key=False)
     assert "existing" in render_setup(has_key=True).lower()
     assert "Pick" in render_pick()
     assert "Analyzing" in render_analyzing()
     assert "Rendering" in render_rendering()
     assert "Done" in render_done()
-    assert "happy" in render_result(output_url="/output.mp4")
+    assert "happy" in render_result(output_url="/output.mp4").lower()
     assert "Duration" in render_overview(facts=_facts(), highlights=["one"])
+    assert "Setup" in render_pick()  # step rail
     proposal = SplitProposal.from_dict(
         {
             "highlights": [],
@@ -114,7 +122,7 @@ def test_render_helpers_smoke() -> None:
             ],
         }
     )
-    assert "Option 1" in render_split_choice(proposal=proposal)
+    assert "A. 1 segment" in render_split_choice(proposal=proposal)
     segment = TimelineSegment(
         0, 0.0, 12.0, "mixed", "noisy", 6.0, 0, "segment_stills/a.ppm"
     )

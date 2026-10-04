@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned
+### Added
 
-- Localhost website UI for the wizard (richer browser surface beyond the
-  current minimal HTML forms served by `super-processor review`).
+- Localhost website UI for the wizard: polished server-rendered screens with
+  step rail, LLM type choice (Gemini live + deferred local stub), lettered
+  split/enhance options, and the full sketch flow through result/happy.
+- CI HTTP test drives the wizard website from introduction through done
+  (FakeTransport Gemini + FFmpeg), asserting each screen’s copy and step rail.
 
 ## [2.5.0] - 2026-10-03
 

@@ -1,4 +1,4 @@
-"""HTML templates for the localhost Gemini wizard."""
+"""HTML templates for the localhost Gemini wizard website."""
 
 from __future__ import annotations
 
@@ -8,78 +8,260 @@ from .gemini import SegmentEnhanceResult, SplitProposal
 from .probe import MediaFacts
 from .segments import TimelineSegment
 
+# Phase keys for the step rail (setup → result).
+_PHASE_ORDER = ("setup", "file", "split", "enhance", "result")
 
-def _page(title: str, body: str) -> str:
+
+def _step_rail(active: str | None) -> str:
+    labels = {
+        "setup": "Setup",
+        "file": "File",
+        "split": "Split",
+        "enhance": "Enhance",
+        "result": "Result",
+    }
+    active_idx = _PHASE_ORDER.index(active) if active in _PHASE_ORDER else -1
+    items: list[str] = []
+    for index, key in enumerate(_PHASE_ORDER):
+        label = labels[key]
+        if index < active_idx:
+            cls = "step done"
+        elif index == active_idx:
+            cls = "step active"
+        else:
+            cls = "step upcoming"
+        items.append(f'<span class="{cls}">{escape(label)}</span>')
+    return '<nav class="steps" aria-label="Progress">' + "".join(items) + "</nav>"
+
+
+def _page(
+    title: str,
+    body: str,
+    *,
+    phase: str | None = None,
+    hero: bool = False,
+) -> str:
+    rail = _step_rail(phase) if not hero else ""
+    brand = '<p class="brand-mark">Super Processor</p>' if not hero else ""
+    main_class = "hero-main" if hero else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>{escape(title)}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)} · Super Processor</title>
 <style>
+:root {{
+  --ink: #1c2418;
+  --muted: #5c6654;
+  --sand: #e8dfd0;
+  --leaf: #2f3d28;
+  --leaf-hot: #3d5234;
+  --paper: #f3eee4;
+  --line: rgba(28, 36, 24, 0.14);
+  --err: #8b2e2e;
+}}
+* {{ box-sizing: border-box; }}
 body {{
   margin: 0;
   min-height: 100vh;
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-  color: #1a1f16;
+  color: var(--ink);
   background:
-    radial-gradient(ellipse at 20% 0%, #d9e8c8 0%, transparent 55%),
-    radial-gradient(ellipse at 90% 20%, #f0d9b5 0%, transparent 45%),
-    linear-gradient(160deg, #f7f3ea 0%, #e7efe0 48%, #f3ebe2 100%);
+    radial-gradient(
+      ellipse 80% 50% at 10% -10%,
+      rgba(120, 150, 90, 0.35),
+      transparent 55%
+    ),
+    radial-gradient(
+      ellipse 60% 40% at 100% 0%,
+      rgba(180, 130, 70, 0.22),
+      transparent 50%
+    ),
+    linear-gradient(165deg, #1a2216 0%, #2a3424 38%, #3a3228 100%);
 }}
-main {{
+body::before {{
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.12;
+  background:
+    repeating-linear-gradient(
+      -12deg,
+      transparent,
+      transparent 2px,
+      rgba(255, 255, 255, 0.02) 2px,
+      rgba(255, 255, 255, 0.02) 3px
+    );
+}}
+.shell {{
+  position: relative;
   max-width: 42rem;
   margin: 0 auto;
-  padding: 2.5rem 1.25rem 4rem;
+  padding: 1.25rem 1.15rem 3.5rem;
+}}
+.panel {{
+  background: color-mix(in srgb, var(--paper) 92%, white);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 1.75rem 1.4rem 2rem;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+}}
+.hero-main .panel {{
+  min-height: min(72vh, 36rem);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  background:
+    linear-gradient(
+      180deg,
+      transparent 0%,
+      color-mix(in srgb, var(--paper) 95%, white) 55%
+    ),
+    radial-gradient(
+      ellipse at 70% 20%,
+      rgba(200, 160, 90, 0.35),
+      transparent 55%
+    ),
+    linear-gradient(145deg, #d8e0cc, var(--sand));
+}}
+.brand-mark {{
+  margin: 0 0 0.75rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}}
+.brand-hero {{
+  font-family: "Fraunces", "Palatino Linotype", serif;
+  font-weight: 650;
+  font-size: clamp(2.4rem, 7vw, 3.4rem);
+  line-height: 1.05;
+  margin: 0 0 0.85rem;
+  letter-spacing: -0.02em;
 }}
 h1 {{
   font-family: "Fraunces", "Palatino Linotype", serif;
-  font-weight: 600;
-  font-size: 2rem;
-  margin: 0 0 0.75rem;
+  font-weight: 650;
+  font-size: 1.85rem;
+  margin: 0 0 0.65rem;
+  letter-spacing: -0.02em;
 }}
-p, li {{ line-height: 1.5; }}
-.card {{
-  margin: 1rem 0;
+h2 {{
+  font-family: "Fraunces", serif;
+  font-size: 1.15rem;
+  margin: 1.25rem 0 0.5rem;
+}}
+p, li {{ line-height: 1.55; }}
+.lede {{ font-size: 1.05rem; max-width: 34rem; }}
+.muted {{ color: var(--muted); font-size: 0.95rem; }}
+.error {{ color: var(--err); }}
+.steps {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  margin: 0 0 1rem;
+  padding: 0;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}}
+.step {{ color: rgba(243, 238, 228, 0.45); }}
+.step.done {{ color: rgba(243, 238, 228, 0.75); }}
+.step.active {{
+  color: var(--sand);
+  font-weight: 600;
+  border-bottom: 2px solid color-mix(in srgb, var(--sand) 70%, transparent);
+}}
+.choice {{
+  display: block;
+  width: 100%;
+  margin: 0.65rem 0;
   padding: 1rem 1.1rem;
-  background: rgba(255,255,255,0.55);
-  border: 1px solid rgba(40,50,30,0.12);
+  text-align: left;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.45);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}}
+.choice:hover {{
+  border-color: var(--leaf);
+  background: rgba(255, 255, 255, 0.75);
+}}
+.choice strong {{
+  display: block;
+  font-family: "Fraunces", serif;
+  font-size: 1.1rem;
+  margin-bottom: 0.25rem;
+}}
+.card {{
+  margin: 0.85rem 0;
+  padding: 0.95rem 1rem;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.4);
 }}
 button, .btn {{
   display: inline-block;
-  margin: 0.35rem 0.35rem 0.35rem 0;
-  padding: 0.55rem 0.9rem;
-  border: 1px solid #2c3a22;
-  background: #2c3a22;
-  color: #f7f3ea;
+  margin: 0.4rem 0.4rem 0.4rem 0;
+  padding: 0.65rem 1.05rem;
+  border: 1px solid var(--leaf);
+  background: var(--leaf);
+  color: var(--paper);
   text-decoration: none;
   cursor: pointer;
   font: inherit;
+  font-weight: 500;
 }}
+button:hover, .btn:hover {{ background: var(--leaf-hot); }}
 button.secondary, a.secondary {{
   background: transparent;
-  color: #2c3a22;
+  color: var(--leaf);
 }}
+button.full {{ width: 100%; text-align: center; }}
+ol.setup-steps {{
+  padding-left: 1.2rem;
+  margin: 0.5rem 0 1rem;
+}}
+ol.setup-steps li {{ margin: 0.35rem 0; }}
 input[type=text], input[type=password], textarea {{
   width: 100%;
-  box-sizing: border-box;
-  padding: 0.5rem;
-  margin: 0.4rem 0 0.8rem;
+  padding: 0.6rem 0.7rem;
+  margin: 0.35rem 0 0.85rem;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.7);
   font: inherit;
 }}
 img, video {{
   max-width: 100%;
   display: block;
-  margin: 0.6rem 0 1rem;
-  background: #222;
+  margin: 0.7rem 0 1rem;
+  background: #1a1a1a;
 }}
-.muted {{ color: #5a6350; font-size: 0.95rem; }}
-.error {{ color: #7a1f1f; }}
+.seg-progress {{
+  font-size: 0.85rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}}
+@media (max-width: 520px) {{
+  .shell {{ padding: 0.85rem 0.75rem 2.5rem; }}
+  .panel {{ padding: 1.35rem 1rem 1.6rem; }}
+}}
 </style>
 </head>
 <body>
-<main>
+<div class="shell {main_class}">
+{rail}
+{brand}
+<div class="panel">
 {body}
-</main>
+</div>
+</div>
 </body>
 </html>
 """
@@ -87,39 +269,84 @@ img, video {{
 
 def render_intro() -> str:
     body = """
-<h1>Super Processor</h1>
-<p>Enhance the video you already shot. We do not invent new frames, faces, or
-scenes — Gemini diagnoses issues; FFmpeg applies allowlisted repairs.</p>
-<p class="muted">Localhost wizard · media stays on your machine</p>
-<form method="post" action="/intro"><button type="submit">Continue</button></form>
+<p class="brand-hero">Super Processor</p>
+<p class="lede">Enhance the video you already shot. Gemini diagnoses issues;
+FFmpeg applies allowlisted repairs — no invented frames, faces, or scenes.</p>
+<p class="muted">Localhost website · media stays on your machine</p>
+<form method="post" action="/intro">
+<button type="submit" class="full">Continue</button>
+</form>
 """
-    return _page("Introduction", body)
+    return _page("Introduction", body, hero=True)
+
+
+def render_llm_choice(*, error: str | None = None) -> str:
+    err = f'<p class="error">{escape(error)}</p>' if error else ""
+    body = f"""
+<h1>What type of LLM do you have now?</h1>
+<p class="lede">Pick how diagnosis should run. Media never leaves this machine
+except Gemini API calls you authorize.</p>
+{err}
+<form method="post" action="/llm">
+<button class="choice" type="submit" name="choice" value="gemini">
+<strong>A. I don’t have a local LLM</strong>
+<span class="muted">Use a Google AI Studio (Gemini) API key</span>
+</button>
+<button class="choice" type="submit" name="choice" value="local">
+<strong>B. I have a local LLM</strong>
+<span class="muted">Configure a local model (coming later)</span>
+</button>
+</form>
+"""
+    return _page("LLM type", body, phase="setup")
+
+
+def render_local_llm_stub() -> str:
+    body = """
+<h1>Local LLM setup</h1>
+<p class="lede">Local models are not wired yet. This screen holds the place
+for the full setup checklist.</p>
+<ol class="setup-steps">
+<li>Choose a local runtime (Ollama, LM Studio, …)</li>
+<li>Pull a multimodal model that accepts image frames</li>
+<li>Expose an OpenAI-compatible or native endpoint</li>
+<li>Point Super Processor at that endpoint</li>
+<li>Set context / vision limits for frame batches</li>
+<li>Smoke-test a still diagnosis</li>
+<li>Return here to continue the wizard</li>
+</ol>
+<p class="muted">For now, continue with Gemini so you can finish a job today.</p>
+<form method="post" action="/local-llm">
+<button type="submit" name="action" value="gemini">Use Gemini instead</button>
+</form>
+"""
+    return _page("Local LLM", body, phase="setup")
 
 
 def render_setup(*, has_key: bool, error: str | None = None) -> str:
     status = (
-        "A Gemini API key is already configured."
+        "A Gemini API key is already configured on this machine."
         if has_key
-        else ("Paste a Google AI Studio API key to continue.")
+        else "Follow these steps, then paste your key below."
     )
     err = f'<p class="error">{escape(error)}</p>' if error else ""
     body = f"""
-<h1>Gemini setup</h1>
+<h1>Gemini API setup</h1>
 <p>{escape(status)}</p>
 {err}
-<div class="card">
-<ol>
-<li>Open <a href="https://aistudio.google.com/apikey"
-target="_blank" rel="noreferrer">Google AI Studio</a></li>
+<ol class="setup-steps">
+<li>Open <a href="https://aistudio.google.com/apikey" target="_blank"
+rel="noreferrer">Google AI Studio</a></li>
 <li>Accept the terms if prompted</li>
-<li>Create an API key</li>
+<li>Click to create an API key</li>
 <li>Copy the key</li>
-<li>Paste it below</li>
+<li>Paste it here</li>
 </ol>
-</div>
-<p class="muted">Local LLM support comes later. This wizard is Gemini-only.</p>
 <form method="post" action="/setup">
-<label>API key<input name="api_key" type="password" autocomplete="off"></label>
+<label>API key
+<input name="api_key" type="password" autocomplete="off"
+placeholder="AIza…">
+</label>
 <button type="submit">Save and continue</button>
 </form>
 """
@@ -130,34 +357,34 @@ target="_blank" rel="noreferrer">Google AI Studio</a></li>
             '<button type="submit" class="secondary">Use existing key</button>'
             "</form>"
         )
-    return _page("Gemini setup", body)
+    return _page("Gemini setup", body, phase="setup")
 
 
 def render_pick(*, error: str | None = None) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
     body = f"""
 <h1>Pick a video file</h1>
-<p>Choose a local file to start. Sampling and Gemini analysis usually take
-about 1–3 minutes.</p>
+<p class="lede">Click below to choose which file to start. Sampling and Gemini
+analysis usually take about 1–3 minutes.</p>
 {err}
 <form method="post" action="/pick">
 <label>Absolute path to video
 <input name="path" type="text" placeholder="/home/you/clip.mp4">
 </label>
-<button type="submit">Analyze</button>
+<button type="submit" class="full">Pick a video file</button>
 </form>
 """
-    return _page("Pick a video", body)
+    return _page("Pick a video", body, phase="file")
 
 
 def render_analyzing() -> str:
     body = """
 <h1>Analyzing</h1>
-<p>Sampling frames and asking Gemini for split layouts…</p>
+<p class="lede">Sampling frames and asking Gemini for split layouts…</p>
 <p class="muted">This usually takes about 1–3 minutes. The page will refresh.</p>
 <meta http-equiv="refresh" content="1;url=/analyze?run=1">
 """
-    return _page("Analyzing", body)
+    return _page("Analyzing", body, phase="file")
 
 
 def render_overview(
@@ -179,17 +406,14 @@ def render_overview(
     duration = facts.duration_s if facts.duration_s is not None else 0.0
     body = f"""
 <h1>Quick overview</h1>
-<div class="card">
-<p><strong>Duration:</strong> {duration:.1f}s</p>
-<p><strong>Video:</strong> {escape(video_line)}</p>
-<p><strong>Audio:</strong> {audio}</p>
-</div>
+<p class="muted">Duration {duration:.1f}s · Video {escape(video_line)} ·
+Audio {audio}</p>
 <ul>{bullets}</ul>
 <form method="post" action="/overview">
 <button type="submit">Choose a split</button>
 </form>
 """
-    return _page("Overview", body)
+    return _page("Overview", body, phase="split")
 
 
 def render_split_choice(
@@ -198,35 +422,41 @@ def render_split_choice(
     error: str | None = None,
 ) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     cards: list[str] = []
     for index, layout in enumerate(proposal.layouts):
+        letter = letters[index] if index < len(letters) else str(index + 1)
         segs = "".join(
             f"<li>{escape(f'{seg.start_s:.0f}–{seg.end_s:.0f}s {seg.label}')}</li>"
             for seg in layout.segments
         )
+        count = layout.segment_count
+        count_label = "1 segment" if count == 1 else f"{count} segments"
         cards.append(
-            f'<div class="card"><form method="post" action="/split">'
+            f'<form method="post" action="/split">'
             f'<input type="hidden" name="layout" value="{index}">'
-            f"<p><strong>Option {index + 1}</strong> — "
-            f"{layout.segment_count} segments</p>"
-            f"<p>{escape(layout.summary)}</p><ul>{segs}</ul>"
-            f'<button type="submit">Use this split</button></form></div>'
+            f'<button class="choice" type="submit">'
+            f"<strong>{letter}. {count_label}</strong>"
+            f"<span>{escape(layout.summary)}</span>"
+            f"<ul>{segs}</ul>"
+            f"</button></form>"
         )
+    else_letter = letters[len(proposal.layouts)] if len(proposal.layouts) < 26 else "E"
     body = f"""
 <h1>How should we split this?</h1>
-<p>As Gemini sees it, this video can be worked as independent segments.
-Pick the layout that best describes the video, or tell us something else.</p>
+<p class="lede">As Gemini sees it, this video has a few independent stretches.
+Tell me which description fits best — or say something else.</p>
 {err}
 {"".join(cards)}
-<form method="post" action="/split">
-<label>Something else
+<form method="post" action="/split" class="card">
+<label><strong>{else_letter}. Please tell me something else</strong>
 <textarea name="note" rows="3"
 placeholder="e.g. add a segment for the lat pulldown"></textarea>
 </label>
 <button type="submit">Revise split</button>
 </form>
 """
-    return _page("Split choice", body)
+    return _page("Split choice", body, phase="split")
 
 
 def render_enhance(
@@ -235,6 +465,7 @@ def render_enhance(
     result: SegmentEnhanceResult,
     preview_url: str | None,
     error: str | None = None,
+    segment_count: int | None = None,
 ) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
     still = ""
@@ -242,54 +473,66 @@ def render_enhance(
         still = f'<img src="/{escape(segment.still_path[:-4])}.bmp" alt="keyframe">'
     preview = ""
     if preview_url:
-        preview = f'<video controls src="{escape(preview_url)}"></video>'
+        preview = (
+            "<h2>Short preview</h2>"
+            f'<video controls src="{escape(preview_url)}"></video>'
+        )
     options = []
     for option in result.options:
         options.append(
-            f'<div class="card"><form method="post" action="/segment">'
+            f'<form method="post" action="/segment">'
             f'<input type="hidden" name="option" value="{escape(option.id)}">'
-            f"<p><strong>{escape(option.id)}</strong> {escape(option.label)}</p>"
-            f'<button type="submit">Preview this</button></form></div>'
+            f'<button class="choice" type="submit">'
+            f"<strong>{escape(option.id)}. {escape(option.label)}</strong>"
+            f'<span class="muted">Preview this look</span>'
+            f"</button></form>"
         )
     accept = ""
     if preview_url:
         accept = (
             '<form method="post" action="/segment">'
             '<input type="hidden" name="accept" value="1">'
-            '<button type="submit">Accept and continue</button></form>'
+            '<button type="submit" class="full">Accept and continue</button>'
+            "</form>"
         )
     span = f"{segment.start_s:.0f}–{segment.end_s:.0f}s"
+    total = segment_count if segment_count is not None else "?"
+    progress = f'<p class="seg-progress">Segment {segment.index + 1} of {total}</p>'
     body = f"""
-<h1>Segment {segment.index}: {escape(span)}</h1>
-<p>{escape(segment.context)} · {escape(segment.problem)}</p>
+{progress}
+<h1>Working {escape(span)}</h1>
+<p class="lede">As Gemini sees it, there are several ways to enhance this
+stretch. Preview one to be sure, or tell me something else.</p>
+<p class="muted">{escape(segment.context)} · {escape(segment.problem)}</p>
 {still}
 <p>Issues: {escape(", ".join(result.issues) or "none listed")}</p>
 {err}
 {"".join(options)}
 {preview}
 {accept}
-<form method="post" action="/segment">
-<label>Something else
+<form method="post" action="/segment" class="card">
+<label><strong>E. Please tell me something else</strong>
 <textarea name="note" rows="3"
 placeholder="e.g. warmer white balance, less denoise"></textarea>
 </label>
-<p class="muted">Describe how to improve these options. Gemini will return a
-new set; repeat until you preview and accept one.</p>
+<p class="muted">Describe how to improve these options. Gemini returns a new
+set; repeat until you preview and accept one.</p>
 <button type="submit">Revise options</button>
 </form>
 """
-    return _page("Enhance segment", body)
+    return _page("Enhance segment", body, phase="enhance")
 
 
 def render_rendering() -> str:
     body = """
 <h1>Rendering</h1>
-<p>Encoding each segment and concatenating the final file…</p>
+<p class="lede">Encoding each segment with allowlisted FFmpeg ops, then
+concatenating the final file…</p>
 <p class="muted">This often takes about 5–10 minutes for a short clip; longer
 files take longer. The page will refresh.</p>
 <meta http-equiv="refresh" content="1;url=/render?run=1">
 """
-    return _page("Rendering", body)
+    return _page("Rendering", body, phase="result")
 
 
 def render_result(*, output_url: str, error: str | None = None) -> str:
@@ -298,19 +541,23 @@ def render_result(*, output_url: str, error: str | None = None) -> str:
 <h1>Result</h1>
 {err}
 <video controls src="{escape(output_url)}"></video>
-<p>Do you feel happy with the result, or should we revise?</p>
+<p class="lede">Tell me what you think. Happy with this, or something else
+we can do with the result?</p>
 <form method="post" action="/result">
-<button type="submit" name="mood" value="happy">I am happy</button>
+<button type="submit" name="mood" value="happy">A. I am happy</button>
 <button type="submit" name="mood" value="revise" class="secondary">
-Something else</button>
+B. Please tell me something else</button>
 </form>
 """
-    return _page("Result", body)
+    return _page("Result", body, phase="result")
 
 
 def render_done() -> str:
     body = """
 <h1>Done</h1>
-<p>Your enhanced file is ready in the job directory as <code>output.mp4</code>.</p>
+<p class="lede">Your enhanced file is ready in the job directory as
+<code>output.mp4</code>.</p>
+<p class="muted">You can close this tab or start another job with
+<code>super-processor review</code>.</p>
 """
-    return _page("Done", body)
+    return _page("Done", body, phase="result")

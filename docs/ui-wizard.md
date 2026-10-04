@@ -1,8 +1,8 @@
 # Localhost Gemini Wizard
 
-This document is the screen inventory and contract for the wizard served by
-`super-processor review`. Implementation lives in `wizard.py`, `gemini.py`, and
-the review HTTP server.
+This document is the screen inventory and contract for the localhost website
+served by `super-processor review`. Implementation lives in `wizard.py`,
+`wizard_pages.py`, `gemini.py`, and the review HTTP server.
 
 ## Entry
 
@@ -20,15 +20,18 @@ review page when `segments.json` exists.
 
 | Step | Route | Purpose |
 |---|---|---|
-| Introduction | `GET /` (state `intro`) | Product pitch: enhance, do not generate |
-| Gemini setup | `GET/POST /setup` | Paste Google AI Studio API key |
+| Introduction | `GET /` (state `intro`) | Brand hero: enhance, do not generate |
+| LLM type | `GET/POST /llm` (state `llm_choice`) | A: no local LLM → Gemini; B: have local LLM → stub |
+| Local LLM stub | `GET/POST /local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
+| Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key |
 | Pick file | `GET/POST /pick` | Choose a local video path |
-| Analyzing | `GET /analyze` | Sample frames + Gemini split call (wait copy) |
-| Overview | `GET /overview` | Duration, resolution, audio, highlight bullets |
-| Split choice | `GET/POST /split` | Pick layout 3/4/5 or free-text revise |
-| Segment enhance | `GET/POST /segment/<i>` | Options + short preview + accept |
-| Rendering | `GET /render` | Encode parts + concat; show progress |
-| Result | `GET/POST /result` | Play output; happy or revise |
+| Analyzing | `GET /analyze` | Sample frames + Gemini split call (~1–3 min) |
+| Overview | `GET/POST /overview` | Duration, resolution, audio, highlight bullets |
+| Split choice | `GET/POST /split` | Layouts A… + Something else revise loop |
+| Segment enhance | `GET/POST /segment` | Options + short preview + Something else + accept |
+| Rendering | `GET /render` | Encode parts + concat (~5–10 min) |
+| Result | `GET/POST /result` | Play output; happy or Something else → split |
+| Done | `GET /` (state `done`) | Confirmation |
 
 Estimated waits shown in the UI:
 
@@ -38,22 +41,41 @@ Estimated waits shown in the UI:
 ## State machine
 
 ```text
-intro → setup → pick_file → analyzing → overview → choose_split
-                                              │
-                    free-text revise ←────────┤
-                                              ▼
-                                    enhance_segment(i) → next i
-                                              │
-                                              ▼
-                                         rendering
-                                              │
-                                              ▼
-                         result → happy → done
-                            │
-                            └── revise → choose_split
+intro → llm_choice ┬─ gemini → setup → pick_file → analyzing → overview
+                   └─ local  → local_llm_stub → setup ─┘
+                                                              │
+                         free-text revise ←───────────────────┤ choose_split
+                                                              ▼
+                                                    enhance_segment(i) → next i
+                                                              │
+                         Something else revise ←──────────────┤
+                                                              ▼
+                                                         rendering
+                                                              │
+                                                              ▼
+                                         result → happy → done
+                                            │
+                                            └── Something else → choose_split
 ```
 
 Persisted in the job directory as `wizard_state.json` and `gemini_chat.json`.
+
+## Something-else loops
+
+1. **Split** — Note revises layouts via `propose_splits(user_text=…)`. Stay on
+   `choose_split` until a layout is picked.
+2. **Enhance** — Note combines prior options + user text via
+   `revise_enhance` / `combine_enhance_revise_message`. Stay on the segment
+   until preview + accept (no production cap; tests cover five rounds).
+3. **Result** — “Something else” returns to `choose_split` with chat history
+   kept; segment choices are redone for the new pass.
+
+## LLM choice (sketch paths)
+
+- **A — I don’t have a local LLM** → Gemini setup (Google AI Studio key).
+- **B — I have a local LLM** → deferred stub screen (steps placeholder). The
+  only action is “Use Gemini instead”, which continues to Gemini setup.
+  No local inference is wired in this release.
 
 ## Gemini schemas
 
@@ -135,15 +157,6 @@ and starting analysis.
 }
 ```
 
-Free-text revise on split or enhance appends a user turn and re-calls Gemini
-with the same schema. On enhance, **Something else** combines the user note
-with the previous structured options (`revise_enhance` /
-`combine_enhance_revise_message`) and replaces the option set for that
-segment. The UI stays on the segment until the user previews and accepts an
-option (the revise loop has no fixed cap in production; tests cover five
-rounds). Happy→revise on the result screen returns to `choose_split` without
-wiping history.
-
 ## Job files
 
 | File | Meaning |
@@ -166,9 +179,25 @@ Chosen ops become a `Treatment` (ordered steps) for the existing
 `build_segment_argv` / `render_chosen_plan` path. Templates own the argv. The
 model never emits a shell string.
 
+## UI presentation
+
+Server-rendered HTML in `wizard_pages.py` (no SPA). Shared shell includes a
+step rail (Setup · File · Split · Enhance · Result), brand mark, and wait
+estimates. Intro is a single composition with Super Processor as the hero.
+Choice screens use lettered options (A–E) matching the product sketch.
+
+## CI coverage
+
+`tests/test_wizard_full_flow.py` posts through the live `WizardServer` from
+introduction → LLM choice → setup → pick → analyze → overview → split →
+enhance (preview + accept) → render → result → done. Assertions check
+screen titles, step-rail phases, and key CTAs so the localhost website stays
+aligned with this inventory. Matrix CI runs it with other unit tests
+(`-m "not gemini_live"`); Gemini responses are faked.
+
 ## Non-goals
 
-- Local LLM branch in setup (show deferred only)
+- Real local LLM inference (stub only)
 - Vertical social export as default
 - Classical CV diagnosis inside the wizard
-- Desktop shell
+- Desktop shell / separate SPA framework
