@@ -42,7 +42,7 @@ from .qa import analyze_preview, write_qa_report
 from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
 from .render import RenderError, ensure_encoder, render_chosen_plan
-from .review import ReviewError, ReviewServer
+from .review import ReviewError, ReviewServer, WizardServer
 from .segments import (
     SegmentError,
     TimelineSegment,
@@ -235,9 +235,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_cmd = subparsers.add_parser(
         "review",
-        help="serve the local split review page",
+        help="serve the localhost Gemini wizard (or a job review page)",
     )
-    review_cmd.add_argument("job_id", help="job identifier")
+    review_cmd.add_argument(
+        "job_id",
+        nargs="?",
+        default=None,
+        help="optional job id; omit to start the wizard",
+    )
 
     plans_cmd = subparsers.add_parser(
         "plans",
@@ -514,15 +519,19 @@ def _plans_from_assignments(
 
 
 def run_review_command(arguments: argparse.Namespace) -> int:
-    """Serve the split review page until interrupted."""
+    """Serve the Gemini wizard or a job review page until interrupted."""
     store = _store_from_args(arguments)
-    job_id = str(arguments.job_id)
-    store.load(job_id)
-    server = ReviewServer(
-        store.job_dir(job_id),
-        jobs_dir=store.root,
-        job_id=job_id,
-    )
+    job_id = getattr(arguments, "job_id", None)
+    if job_id:
+        store.load(str(job_id))
+        server: ReviewServer | WizardServer = ReviewServer(
+            store.job_dir(str(job_id)),
+            jobs_dir=store.root,
+            job_id=str(job_id),
+        )
+    else:
+        store.ensure_root()
+        server = WizardServer(store.root)
     print(server.start(), flush=True)
     try:
         server.wait()
