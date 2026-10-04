@@ -422,7 +422,7 @@ def test_client_pick_working_model_all_fail() -> None:
     client = GeminiClient(
         api_key="k",
         model="gemini-gone",
-        transport=transport,  # type: ignore[arg-type]
+        transport=transport,
     )
     with pytest.raises(GeminiError, match="usable quota"):
         client.pick_working_model()
@@ -434,7 +434,7 @@ def test_client_pick_working_model_skips_exhausted() -> None:
     client = GeminiClient(
         api_key="k",
         model="gemini-gone",
-        transport=transport,  # type: ignore[arg-type]
+        transport=transport,
     )
     picked = client.pick_working_model()
     assert picked == "gemini-3.8-flash"
@@ -467,7 +467,7 @@ def test_client_failsover_unavailable_model(tmp_path: Path) -> None:
     client = GeminiClient(
         api_key="k",
         model="gemini-gone",
-        transport=transport,  # type: ignore[arg-type]
+        transport=transport,
     )
     result = client.propose_enhance(
         frame_paths=[],
@@ -487,7 +487,7 @@ def test_client_generate_all_candidates_fail(tmp_path: Path) -> None:
     client = GeminiClient(
         api_key="k",
         model="gemini-gone",
-        transport=transport,  # type: ignore[arg-type]
+        transport=transport,
     )
     with pytest.raises(GeminiError, match="All candidate"):
         client.propose_enhance(
@@ -525,7 +525,7 @@ def test_client_non_retryable_error_raises(tmp_path: Path) -> None:
     client = GeminiClient(
         api_key="k",
         model="gemini-3.8-flash",
-        transport=BoomTransport(),  # type: ignore[arg-type]
+        transport=BoomTransport(),
     )
     with pytest.raises(GeminiError, match="bad request"):
         client.propose_enhance(
@@ -563,7 +563,7 @@ def test_candidate_models_honors_env_list(
     client = GeminiClient(
         api_key="k",
         model="gemini-3.8-flash",
-        transport=ListTransport(),  # type: ignore[arg-type]
+        transport=ListTransport(),
     )
     names = client.candidate_models(refresh=True)
     assert names[0] == "gemini-3.8-flash"

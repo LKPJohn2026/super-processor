@@ -542,16 +542,25 @@ def resolve_gemini_api_key() -> str | None:
 
 
 def store_gemini_api_key(api_key: str) -> None:
-    """Persist the key in the process env and optional OS keyring."""
+    """Persist the key in the process env and optional OS keyring.
+
+    Env is always set so headless CI (no Secret Service / keyring backend)
+    still works. Keyring persistence is best-effort.
+    """
     cleaned = api_key.strip()
     if not cleaned:
         raise GeminiError("API key is empty")
     os.environ[GEMINI_API_KEY_ENV] = cleaned
     try:
         import keyring
+        from keyring.errors import KeyringError
     except ImportError:
         return
-    keyring.set_password("super-processor", GEMINI_API_KEY_ENV, cleaned)
+    try:
+        keyring.set_password("super-processor", GEMINI_API_KEY_ENV, cleaned)
+    except KeyringError:
+        # e.g. keyring.backends.fail.Keyring on Ubuntu runners.
+        return
 
 
 def sample_fps_for_duration(duration_s: float) -> float:
