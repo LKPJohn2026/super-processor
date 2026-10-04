@@ -286,6 +286,17 @@ def test_parse_model_info_rpm_fraction() -> None:
     assert model_has_usable_rpm(info)
 
 
+def test_image_generation_models_rejected() -> None:
+    info = ModelInfo(
+        name="gemini-3.1-flash-image",
+        methods=("generateContent",),
+        description="image generation",
+        rpm_limit=10,
+        rpm_used=0,
+    )
+    assert not model_accepts_text_or_video(info)
+
+
 def test_model_rpm_zero_limit_rejected() -> None:
     info = ModelInfo(
         name="gemini-2.0-flash",
@@ -440,6 +451,80 @@ def test_client_pick_working_model_skips_exhausted() -> None:
     assert picked == "gemini-3.8-flash"
     assert client.model == "gemini-3.8-flash"
     assert transport.calls[0] == "gemini-gone"
+
+
+def test_client_retries_transient_503(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("super_processor.gemini.time.sleep", sleeps.append)
+    payload = {
+        "issues": ["low_light"],
+        "options": [
+            {
+                "id": "A",
+                "label": "lift",
+                "ops": [{"op": "contrast", "params": {"brightness": 0.1}}],
+            },
+            {
+                "id": "B",
+                "label": "denoise",
+                "ops": [{"op": "denoise", "params": {"strength": 0.3}}],
+            },
+            {
+                "id": "C",
+                "label": "sharpen",
+                "ops": [{"op": "sharpen", "params": {"luma_amount": 0.5}}],
+            },
+        ],
+    }
+
+    class FlakyTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_models(self, *, api_key: str) -> list[dict[str, Any]]:
+            del api_key
+            return [
+                {
+                    "name": "models/gemini-3.8-flash",
+                    "description": "multimodal image video",
+                    "supportedGenerationMethods": ["generateContent"],
+                    "rateLimits": {"rpm": "0/10"},
+                }
+            ]
+
+        def generate(
+            self,
+            *,
+            model: str,
+            api_key: str,
+            body: dict[str, Any],
+        ) -> dict[str, Any]:
+            del model, api_key, body
+            self.calls += 1
+            if self.calls < 3:
+                raise GeminiError("Gemini HTTP 503: Service Unavailable", status=503)
+            return {
+                "candidates": [{"content": {"parts": [{"text": json.dumps(payload)}]}}]
+            }
+
+    transport = FlakyTransport()
+    client = GeminiClient(
+        api_key="k",
+        model="gemini-3.8-flash",
+        transport=transport,
+    )
+    result = client.propose_enhance(
+        frame_paths=[],
+        segment_label="low_light",
+        start_s=0,
+        end_s=20,
+        job_dir=tmp_path,
+    )
+    assert len(result.options) == 3
+    assert transport.calls == 3
+    assert sleeps == [1.5, 3.0]
 
 
 def test_client_failsover_unavailable_model(tmp_path: Path) -> None:

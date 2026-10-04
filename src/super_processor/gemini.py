@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,11 +39,17 @@ _EXCLUDE_NAME_PARTS = (
     "tts",
     "imagen",
     "image-generation",
+    "-image",
     "aqa",
     "gecko",
     "learnlm",
+    "customtools",
 )
 _RETRYABLE_STATUS = frozenset({404, 429, 500, 503})
+_EXHAUSTING_STATUS = frozenset({404, 429})
+_TRANSIENT_STATUS = frozenset({500, 503})
+MAX_CANDIDATE_MODELS = 8
+_TRANSIENT_RETRIES = 2
 
 _ALLOWED_OPS = {
     OpName.WHITE_BALANCE.value,
@@ -259,6 +266,41 @@ def _is_retryable_error(exc: GeminiError) -> bool:
     )
 
 
+def _is_exhausting_error(exc: GeminiError) -> bool:
+    """Return True when the model should be skipped for the rest of the session."""
+    if exc.status in _EXHAUSTING_STATUS:
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "no longer available",
+            "not found",
+            "resource_exhausted",
+            "rate limit",
+            "quota",
+        )
+    )
+
+
+def _is_transient_error(exc: GeminiError) -> bool:
+    if exc.status in _TRANSIENT_STATUS:
+        return True
+    return (
+        "unavailable" in str(exc).lower() or "service unavailable" in str(exc).lower()
+    )
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> tuple[int, str]:
+    """Read and close an ``HTTPError`` so pytest does not see ResourceWarnings."""
+    try:
+        detail = exc.read().decode("utf-8", errors="replace")
+        status = int(exc.code)
+    finally:
+        exc.close()
+    return status, detail
+
+
 class UrllibGeminiTransport:
     """Default transport using ``urllib``."""
 
@@ -284,11 +326,11 @@ class UrllibGeminiTransport:
             with urllib.request.urlopen(req, timeout=120) as response:
                 parsed: object = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            status, detail = _http_error_detail(exc)
             raise GeminiError(
-                f"Gemini HTTP {exc.code}: {detail}",
-                status=int(exc.code),
-            ) from exc
+                f"Gemini HTTP {status}: {detail}",
+                status=status,
+            ) from None
         except (
             urllib.error.URLError,
             TimeoutError,
@@ -314,11 +356,11 @@ class UrllibGeminiTransport:
                 with urllib.request.urlopen(req, timeout=60) as response:
                     parsed: object = json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
+                status, detail = _http_error_detail(exc)
                 raise GeminiError(
-                    f"Gemini HTTP {exc.code}: {detail}",
-                    status=int(exc.code),
-                ) from exc
+                    f"Gemini HTTP {status}: {detail}",
+                    status=status,
+                ) from None
             except (
                 urllib.error.URLError,
                 TimeoutError,
@@ -855,10 +897,52 @@ class GeminiClient:
             clean = _strip_models_prefix(name)
             if not clean or clean in seen or clean in self._exhausted_models:
                 continue
+            # Skip image-generation / tool-specialist names even if env-listed.
+            probe = ModelInfo(
+                name=clean,
+                methods=("generateContent",),
+                description="multimodal image video",
+            )
+            if not model_accepts_text_or_video(probe):
+                continue
             ordered.append(clean)
             seen.add(clean)
+            if len(ordered) >= MAX_CANDIDATE_MODELS:
+                break
         self._candidate_models = ordered
         return list(ordered)
+
+    def _generate_with_failover(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Try candidate models, retrying transient 503s before moving on."""
+        errors: list[str] = []
+        for model in self.candidate_models():
+            last_exc: GeminiError | None = None
+            for attempt in range(_TRANSIENT_RETRIES + 1):
+                try:
+                    response = self.transport.generate(
+                        model=model,
+                        api_key=self.api_key,
+                        body=body,
+                    )
+                except GeminiError as exc:
+                    last_exc = exc
+                    if _is_exhausting_error(exc):
+                        self._exhausted_models.add(model)
+                        errors.append(f"{model}: {exc}")
+                        break
+                    if _is_transient_error(exc) and attempt < _TRANSIENT_RETRIES:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    if _is_retryable_error(exc):
+                        errors.append(f"{model}: {exc}")
+                        break
+                    raise
+                self.model = model
+                return response
+            if last_exc is not None and not _is_retryable_error(last_exc):
+                raise last_exc
+        detail = "; ".join(errors) if errors else "no candidates"
+        raise GeminiError(f"All candidate Gemini models failed: {detail}")
 
     def pick_working_model(self) -> str:
         """Probe candidates until one accepts a tiny structured generate call."""
@@ -883,31 +967,19 @@ class GeminiClient:
                 "responseSchema": probe_schema,
             },
         }
-        errors: list[str] = []
-        for model in self.candidate_models(refresh=True):
-            try:
-                response = self.transport.generate(
-                    model=model,
-                    api_key=self.api_key,
-                    body=body,
-                )
-                _parse_json_object(_extract_text(response))
-            except GeminiError as exc:
-                if _is_retryable_error(exc):
-                    self._exhausted_models.add(model)
-                    errors.append(f"{model}: {exc}")
-                    continue
-                raise
-            self.model = model
-            remaining = [
-                name
-                for name in (self._candidate_models or [])
-                if name != model and name not in self._exhausted_models
-            ]
-            self._candidate_models = [model, *remaining]
-            return model
-        detail = "; ".join(errors) if errors else "no multimodal candidates"
-        raise GeminiError(f"No Gemini model with usable quota: {detail}")
+        self.candidate_models(refresh=True)
+        try:
+            response = self._generate_with_failover(body)
+            _parse_json_object(_extract_text(response))
+        except GeminiError as exc:
+            raise GeminiError(f"No Gemini model with usable quota: {exc}") from exc
+        remaining = [
+            name
+            for name in (self._candidate_models or [])
+            if name != self.model and name not in self._exhausted_models
+        ]
+        self._candidate_models = [self.model, *remaining][:MAX_CANDIDATE_MODELS]
+        return self.model
 
     def _generate(
         self,
@@ -925,24 +997,8 @@ class GeminiClient:
                 "responseSchema": schema,
             },
         }
-        errors: list[str] = []
-        for model in self.candidate_models():
-            try:
-                response = self.transport.generate(
-                    model=model,
-                    api_key=self.api_key,
-                    body=body,
-                )
-            except GeminiError as exc:
-                if _is_retryable_error(exc):
-                    self._exhausted_models.add(model)
-                    errors.append(f"{model}: {exc}")
-                    continue
-                raise
-            self.model = model
-            return _parse_json_object(_extract_text(response))
-        detail = "; ".join(errors) if errors else "no candidates"
-        raise GeminiError(f"All candidate Gemini models failed: {detail}")
+        response = self._generate_with_failover(body)
+        return _parse_json_object(_extract_text(response))
 
     def propose_splits(
         self,
