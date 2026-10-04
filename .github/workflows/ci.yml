@@ -55,9 +55,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.10", "3.12", "3.14"]
-    env:
-      # Live Gemini tests skip when unset (forks / missing secret).
-      GEMINI_API_KEY: ${{ secrets.Gemini_API_Test }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -90,8 +87,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      # Never inject Gemini_API_Test here — live calls run only in gemini-live.
       - name: Run unit tests
-        run: python -m pytest --ignore=tests/test_gemini_live.py
+        run: python -m pytest -m "not gemini_live"
 
       - name: Smoke-test console entry point
         run: super-processor self-test --sample-size 1000
@@ -134,7 +132,9 @@ jobs:
       - name: Run live Gemini structured-output tests
         env:
           GEMINI_API_KEY: ${{ secrets.Gemini_API_Test }}
-        run: python -m pytest tests/test_gemini_live.py -v --cov-fail-under=0
+        run: >
+          python -m pytest tests/test_gemini_live.py
+          -m gemini_live -v --cov-fail-under=0
 
   package:
     name: Build distributions

@@ -24,8 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wizard product path uses Gemini for split/diagnosis; classical CV estimators
   are not used by the wizard. Export keeps source aspect (no vertical social
   default).
-- Matrix unit tests ignore `tests/test_gemini_live.py`; live calls run in the
-  dedicated Gemini job.
+- Matrix unit tests run with `-m "not gemini_live"` and never receive the
+  Gemini secret; live split/enhance/multi-turn checks run only in the dedicated
+  job.
 
 ## [2.3.1] - 2026-09-26
 
