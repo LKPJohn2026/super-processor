@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -162,7 +163,7 @@ def test_render_helpers_smoke() -> None:
 
 
 @pytest.mark.skipif(
-    subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0,
+    shutil.which("ffmpeg") is None,
     reason="ffmpeg required",
 )
 def test_extract_wizard_frames(tmp_path: Path) -> None:
@@ -192,7 +193,7 @@ def test_extract_wizard_frames(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(
-    subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0,
+    shutil.which("ffmpeg") is None,
     reason="ffmpeg required",
 )
 def test_wizard_enhance_preview_accept_and_render(

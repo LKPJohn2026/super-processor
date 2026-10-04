@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -145,7 +146,7 @@ def test_wizard_setup_and_pick_flow(
 
 
 @pytest.mark.skipif(
-    subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0,
+    shutil.which("ffmpeg") is None,
     reason="ffmpeg required",
 )
 def test_wizard_analyze_with_fake_gemini(
