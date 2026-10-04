@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+
+- Wire a real local LLM path behind the deferred stub screen (OpenAI-compatible
+  or native multimodal endpoint).
+
+## [2.6.0] - 2026-10-03
+
 ### Added
 
 - Localhost website UI for the wizard: polished server-rendered screens with
@@ -14,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   split/enhance options, and the full sketch flow through result/happy.
 - CI HTTP test drives the wizard website from introduction through done
   (FakeTransport Gemini + FFmpeg), asserting each screen’s copy and step rail.
+
+### Fixed
+
+- Wizard tests that encode tiny clips skip when `ffmpeg` is missing from
+  `PATH` (cibuildwheel / headless release environments).
 
 ## [2.5.0] - 2026-10-03
 

@@ -75,6 +75,7 @@ def test_pick_missing_file(tmp_path: Path) -> None:
     assert controller.current_state().error
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_enhance_note_and_overview_render(tmp_path: Path) -> None:
     clip = _clip(tmp_path / "c.mp4")
     enhance = {

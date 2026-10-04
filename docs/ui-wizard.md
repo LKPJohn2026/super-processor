@@ -16,6 +16,23 @@ Without a job id the server starts at the introduction screen. With a job id it
 resumes that job’s wizard state when present, otherwise shows the legacy split
 review page when `segments.json` exists.
 
+## Live dogfood (real Gemini)
+
+```bash
+python -m pip install -e ".[dev]"
+export GEMINI_API_KEY=…   # or paste on the setup screen
+mkdir -p .dogfood/jobs
+# Optional: use a short local clip under .dogfood/clips/
+super-processor doctor
+super-processor --jobs-dir .dogfood/jobs review
+```
+
+Walk introduction → LLM type (Gemini) → setup → pick file → wait for analyze →
+overview → split (try Something else once) → enhance (preview, optional
+Something else, Accept) → render → result (happy). Confirm `output.mp4` in the
+job directory. CI also runs `@pytest.mark.gemini_live` against
+`Gemini_API_Test` on main.
+
 ## Screen inventory
 
 | Step | Route | Purpose |

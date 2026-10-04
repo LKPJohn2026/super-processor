@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
+
+import pytest
 
 from super_processor.gemini import GeminiClient, SplitProposal
 from super_processor.jobs import JobState
@@ -221,6 +224,7 @@ def test_wizard_server_serves_still_bmp(tmp_path: Path) -> None:
         server.stop()
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_split_revise_note_path(tmp_path: Path) -> None:
     controller, job_id, job_dir = _seed_job(tmp_path)
     # Replace source with a real tiny media so revise can probe.
