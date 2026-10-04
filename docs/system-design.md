@@ -1,9 +1,10 @@
 # Super Processor — System Design
 
-Super Processor is a local-first command-line video processor. It enhances
-existing footage through measured, constrained FFmpeg pipelines. AI diagnoses
-problems and proposes recipes; it does not generate replacement frames or
-write arbitrary shell commands.
+Super Processor is a local-first video processor. It enhances existing footage
+through measured, constrained FFmpeg pipelines. A localhost wizard guides
+setup, Gemini-assisted segmentation, and per-segment enhancement. AI diagnoses
+problems and proposes structured operations; it does not generate replacement
+frames or write arbitrary shell commands.
 
 ## Market context
 
@@ -34,7 +35,7 @@ Super Processor targets a different market:
 | Typical duration | Short clips | Long-form files up to roughly two hours |
 | AI role | Pixel generator | Diagnoser and constrained planner |
 | Processing | Usually hosted | Local FFmpeg execution |
-| Main risk | Invented content and temporal drift | Over-processing, crop loss, or poor encode choices |
+| Main risk | Invented content and temporal drift | Over-processing or poor encode choices |
 | Recovery | Regenerate | Adjust a visible recipe and re-preview |
 | Trust model | Inspect final pixels | Validate plan, preview, approve, and reproduce |
 
@@ -47,169 +48,141 @@ operation inspectable.
 
 ### Enhancement instead of generation
 
-The first version processes source pixels only. It excludes text-to-video,
-diffusion inpainting, generative upscaling, face reenactment, and other forms
-of frame synthesis.
+The product processes source pixels only. It excludes text-to-video, diffusion
+inpainting, generative upscaling, face reenactment, and other forms of frame
+synthesis.
 
 This avoids the market's anatomy, physics, identity, and glyph-generation
-problems by construction. It also establishes a clear trust contract: the tool
-may transform footage, but it will not invent scene content.
+problems by construction. The tool may transform footage, but it will not
+invent scene content.
 
-### Command line before a desktop shell
+### Localhost wizard before a desktop shell
 
-The first interface is a CLI. Preview files open in VLC or `ffplay`; the
-project does not build an embedded player or Electron/Tauri shell initially.
+The primary interface is a multi-step wizard served on localhost by the CLI
+(`super-processor review`). There is no Electron/Tauri shell in this train.
 
-A CLI keeps jobs, manifests, diagnoses, and recipes explicit. It also supports
-automation and batch workflows while the processing model is still evolving.
-Using mature external players avoids coupling media-pipeline correctness to a
-new UI.
+The CLI remains available for automation and legacy job commands. The wizard
+binds to the same on-disk job store, so every choice stays inspectable as JSON
+and stills.
 
 ### Media remains local
 
-FFprobe, feature extraction, previews, and final FFmpeg encodes run on the
-user's machine. The expected inputs—roughly 4–10 GB and 90–120 minutes—make
-cloud upload expensive in time, bandwidth, privacy, and infrastructure cost.
+FFprobe, frame sampling, previews, and final FFmpeg encodes run on the user's
+machine. Expected inputs can be large (roughly 4–10 GB and 90–120 minutes);
+cloud upload of the full source is avoided.
 
-Model calls are separate from media execution. A remote vision model may
-receive sampled frames only after explicit user consent; it never receives the
-full source by default.
+Gemini receives only sampled frames the user has consented to send through the
+wizard. It never receives the full source file by default.
 
-### Local models and bring-your-own-key providers
+### Gemini-only planning for the wizard
 
-The planner and optional vision model use one provider-neutral contract. Users
-can select a local Ollama/LM Studio-compatible endpoint or configure their own
-cloud API credentials.
+The wizard uses a Google AI Studio (Gemini) API key. Local Ollama/LM Studio and
+other BYOK providers are deferred. Credentials come from the environment or OS
+keyring (`GEMINI_API_KEY`).
 
-The product's durable value is the validated processing control plane, not
-dependence on one model vendor. Local inference optimizes privacy and cost;
-cloud inference can optimize model capability.
+The durable product value remains the validated processing control plane, not
+dependence on one vendor. Additional providers can return later behind the same
+structured-ops contract.
 
-### Structured recipes instead of model-generated commands
+### Structured ops instead of model-generated shell
 
-Models emit versioned Recipe JSON. Engineering-owned templates translate a
-validated recipe into FFmpeg arguments.
+Gemini emits parseable JSON through
+[structured outputs](https://ai.google.dev/gemini-api/docs/structured-output).
+Schemas cover split layouts and per-segment enhancement options. Each option
+lists allowlisted operations and bounded parameters.
 
-The validator checks:
+Engineering-owned templates translate validated ops into FFmpeg argument lists.
+The model has no shell tool. This confines mistakes to a rejectable data
+structure and prevents invented filters or unsafe command strings from reaching
+a process boundary.
 
-- JSON schema and recipe version;
-- operation allowlist;
-- parameter ranges;
-- operation ordering and incompatibilities;
-- agreement with FFprobe facts;
-- disk, time, and output-size feasibility.
+### Gemini owns split and diagnosis
 
-This confines model mistakes to a rejectable data structure. It prevents
-invented filters, unsafe shell syntax, and unsupported parameter combinations
-from reaching a process boundary.
+Classical computer-vision estimators are retired from the product path for
+segmentation and diagnosis. The wizard samples frames with FFmpeg at a dynamic
+rate, sends them to Gemini, and presents structured proposals to the user.
 
-### Automatic diagnosis before natural-language refinement
+Legacy CLI diagnose/plan paths that used CV estimators may remain in the tree
+for compatibility until a later cleanup tag. The wizard does not call them.
 
-Computer-vision estimators inspect sampled windows and propose fixes. The user
-can accept or disable each recommendation. Natural language is secondary and
-patches an existing recipe—for example, “less denoise” or “warmer white
-balance.”
+### Split choice among Gemini layouts
 
-This interaction does not require users to name filters, but it also avoids
-turning an unconstrained prompt directly into a media pipeline.
+Gemini proposes several timeline layouts (typically three, four, or five
+segments). The user picks one layout or replies with free text (“something
+else”), which continues a multi-turn chat that returns a new structured layout
+set. Hard maximum: 20 segments.
 
-### Mandatory preview and explicit approval
+### Per-segment enhancement with short previews
 
-A final encode requires a successful preview and explicit approval. Previewing
-is essential because denoise strength, stabilization crop, white balance, and
-vertical framing are partly subjective. It also prevents an invalid choice
-from consuming hours of software encoding.
+For each accepted segment, Gemini proposes three to five enhancement options
+(structured ops). The user picks one or revises with free text. A short preview
+clip is encoded before the choice is committed. After every segment is accepted,
+segments are encoded and concatenated at the source aspect ratio.
 
-### Focused first-version operations
+### Wizard export: enhance and concat
 
-The first processing vocabulary is deliberately small:
+Wizard v1 keeps the source aspect. It does not default to full-timeline
+vertical social export or a size-cap floor. Those code paths may remain unused
+by the wizard; they are not part of the default render.
 
-| Operation | Measurement | Execution |
-|---|---|---|
-| Contrast | Luma percentiles, clipping, histogram shape | FFmpeg curves/equalization |
-| White balance | Neutral-pixel and color-cast estimates | FFmpeg color/temperature adjustment |
-| Denoise | Flat-region noise and detail estimates | Parameter-capped FFmpeg denoise |
-| Stabilize | Global motion and crop-loss estimates | Vid.stab or equivalent FFmpeg transform |
-| Social export | Classical saliency (edge energy) and aspect constraints | Vertical reframe, scale, and HEVC encode |
+### Mandatory preview and explicit completion
 
-These operations address common real-footage problems without requiring a
-model to redraw textures or objects.
+A segment choice requires a short preview. Final render starts only after every
+segment has an accepted option. The result screen asks whether the user is
+happy; a revise path returns to split choice with chat history preserved.
 
-### Classical computer vision before neural enhancement
+### Focused operations
 
-The first version uses classical vision and signal-processing estimators to
-select FFmpeg parameters. On-device neural denoise, reframe, or upscale models
-can be introduced later behind new capability and validation boundaries.
+The processing vocabulary stays allowlisted:
 
-Classical estimators are easier to inspect, test, and execute on long videos.
-Deferring neural enhancement also avoids introducing plastic skin, fabricated
-texture, and temporal inconsistency into the initial trust model.
+| Operation | Role |
+|---|---|
+| Contrast | Exposure / contrast / gamma |
+| White balance | Temperature / cast |
+| Denoise | Parameter-capped denoise |
+| Sharpen | Mild unsharp |
+| Stabilize | Optional motion reduction |
+| Trim | Keep at least five seconds |
+| Encode | Software `libx265` by default (hardware encoders optional) |
 
-### Software HEVC before hardware encoders
+`reframe_vertical` and `encode_hevc_size_cap` are out of wizard v1 defaults.
 
-Final HEVC output uses `libx265`. NVENC, QSV, AMF, and VideoToolbox are future
-accelerators.
+### Software HEVC with optional hardware
 
-One software path reduces the initial test matrix and provides a consistent
-quality reference. The CLI must expose realistic throughput estimates because
-two-hour encodes may run for several hours.
-
-### Full-timeline vertical export with a quality floor
-
-Social export processes the full timeline rather than selecting highlight
-clips. Before encoding, the planner calculates the bitrate available under the
-requested size cap.
-
-If duration, resolution, and size imply quality below a configured floor, the
-tool refuses the job or requires explicit acknowledgment. It must never meet a
-size target by silently producing unusable footage.
+Final HEVC output defaults to `libx265`. NVENC, QSV, AMF, and VideoToolbox may
+be selected when present. The software path remains the quality reference.
 
 ### Reference-based offline evaluation
 
-Offline evaluation begins with clean source clips, controlled degradations, and
-restored outputs. VMAF is used alongside operation-specific measurements:
-
-- clipping and histogram distance for contrast;
-- neutral and skin color error for white balance;
-- residual noise and retained edges for denoise;
-- residual camera motion and crop percentage for stabilization;
-- subject retention, text readability, aspect, and bytes for social export.
-
-Production footage usually has no clean reference. Runtime checks therefore
-focus on plan validity, detail loss, subject crop, introduced flicker, text
-readability, output structure, and user approval.
+Offline evaluation still uses clean→degraded fixtures and VMAF where available.
+Runtime success for the wizard is plan validity, successful previews, concat
+integrity, and user acceptance.
 
 ## Architecture
 
 ```text
-Input file
+Pick file (localhost wizard)
    │
    ▼
 FFprobe ──► versioned media facts
    │
    ▼
-Sampled feature extraction ──► CV estimates ──► optional VLM advice
+Dynamic-FPS frame sample ──► Gemini structured split layouts
    │
    ▼
-Diagnosis ──► planner LLM ──► Recipe JSON
-                              │
-                              ▼
-                    schema / policy validator
-                              │
-                  ┌───────────┴───────────┐
-                  ▼                       ▼
-             reject with errors      FFmpeg templates
-                                              │
-                                              ▼
-                                  preview file + runtime checks
-                                              │
-                                         user approval
-                                              │
-                                              ▼
-                                  full-timeline local encode
-                                              │
-                                              ▼
-                                  output probe + final report
+User picks layout (or multi-turn revise)
+   │
+   ▼
+Per segment: Gemini options ──► short preview ──► accept
+   │
+   ▼
+schema / policy validator ──► FFmpeg templates
+   │
+   ▼
+segment encodes + concat (same aspect)
+   │
+   ▼
+result player + happy / revise
 ```
 
 The model has no shell tool. Only the template layer creates process arguments,
@@ -221,85 +194,80 @@ interpolated shell strings.
 Each job has an on-disk directory containing:
 
 - source identity and FFprobe facts;
-- sampled feature data and contact sheets;
-- diagnosis and recipe JSON;
+- sampled frames / stills for Gemini and the UI;
+- `gemini_chat.json` multi-turn history;
+- split layouts and the accepted segment list;
+- per-segment chosen ops and preview clips;
 - validation reports;
-- preview files and runtime metrics;
-- cached stabilization analysis;
-- final output report and redacted logs.
+- final output and redacted logs.
 
-The state machine is:
+Wizard-oriented states reuse the job store where possible:
 
 ```text
-imported → probed → diagnosed → planned → validated
-         → previewed → approved → encoding → complete
+imported → probed → split_proposed → split_accepted
+         → plans_ready → plan_selected → encoding → complete
 ```
 
-Every transition is resumable. Cancellation terminates the FFmpeg process
-group, and final output is written atomically so interrupted jobs do not appear
-successful.
+Revise-from-result may return to `split_proposed` with preserved chat history.
+Cancellation terminates the FFmpeg process group; final output is written
+atomically.
 
-## Long-file strategy
+## Frame sampling for Gemini
 
-Diagnosis uses stratified windows rather than decoding the full timeline:
-opening, middle, closing, scene-change peaks, and windows with unusual feature
-scores. Full passes occur only when required, such as stabilization analysis or
-the final encode.
+Frame count is bounded by duration-dependent FPS:
 
-The orchestrator checks free space before starting, caches reusable analysis,
-streams media rather than buffering it in memory, and records progress through
-FFmpeg's machine-readable progress output.
+- duration ≤ 60 s → up to 10 FPS;
+- duration ≥ 600 s → 1 FPS;
+- durations in between interpolate;
+- a hard cap (about 120–180 frames) applies a further stride when needed.
+
+Only those frames (or a contact sheet derived from them) are eligible for
+upload after consent. Keyframe stills for the UI stay on disk locally.
 
 ## CLI direction
 
-The intended command vocabulary is:
-
 ```text
 super-processor doctor
+super-processor review              # localhost Gemini wizard
+super-processor review JOB          # open wizard / review for a job
 super-processor models
-super-processor diagnose INPUT
-super-processor plan JOB [--instruction TEXT]
-super-processor preview JOB [--start SECONDS] [--open vlc|ffplay]
-super-processor apply JOB --approve
 super-processor show JOB
 ```
 
-The initialized repository exposes `version` and `self-test` first so packaging,
-compiled extensions, and release automation can be verified independently of
-the media pipeline.
+Legacy `diagnose` / `plan` / `preview` / `apply` / `segment` / `plans` commands
+may remain for compatibility; the wizard is the primary product path.
 
 ## Security and privacy
 
-- API credentials come from environment variables or the OS keychain and are
+- Gemini API keys come from environment variables or the OS keychain and are
   redacted from logs.
 - The validator accepts only declared operations and bounded parameters.
 - User-selected paths are normalized and passed without invoking a shell.
-- Sampled frames leave the machine only through an explicitly enabled remote
-  vision provider.
+- Sampled frames leave the machine only through the Gemini path after setup.
 - Telemetry is opt-in and excludes media, secrets, and full filesystem paths.
 
-## First-version boundary
+## Boundary
 
-Included decisions:
+Included:
 
-- local CLI operation;
+- localhost wizard on the review server;
 - local FFmpeg/FFprobe processing;
-- CV-first diagnosis;
-- local-model or BYOK planning;
-- validated recipes and mandatory previews;
-- contrast, white balance, denoise, stabilization, and full-timeline vertical
-  HEVC export;
-- software encoding and reference-based regression evaluation.
+- Gemini structured split and per-segment options;
+- validated ops, short previews, enhance-and-concat render;
+- software encoding (optional hardware);
+- reference-based regression helpers where already present.
 
-Deferred decisions:
+Deferred:
 
-- desktop UI;
-- hardware encoder support;
-- neural enhancement models (including learned face/saliency trackers);
+- local LLM in the wizard;
+- model-emitted FFmpeg shell strings;
+- vertical social export as the wizard default;
+- desktop shell (Tauri/Electron);
+- classical CV as product diagnosis;
+- neural enhancement models;
 - cloud render workers;
 - generative video features;
-- multi-track nonlinear editing;
-- automatic highlight extraction.
+- multi-track nonlinear editing.
 
 Super Processor's market position follows directly from these choices: use AI
 to make deterministic video tools easier and safer, while refusing to invent
