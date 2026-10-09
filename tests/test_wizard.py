@@ -13,7 +13,6 @@ import pytest
 
 from super_processor.gemini import (
     GeminiClient,
-    SegmentEnhanceResult,
     SplitProposal,
     StructuredOp,
 )
@@ -244,10 +243,9 @@ def test_wizard_analyze_with_fake_gemini(
     assert state.step is WizardStep.OVERVIEW
     assert state.highlights == ["gray clip"]
     controller.handle_post("/overview", {})
-    controller.handle_post("/split", {"layout": ["0"]})
     state = controller.current_state()
-    assert state.step is WizardStep.ENHANCE
-    assert state.segment_index == 0
-    raw = state.enhance_cache["0"]
-    result = SegmentEnhanceResult.from_dict(raw)
-    assert len(result.options) == 3
+    assert state.step is WizardStep.RENDERING
+    raw = state.enhance_cache["upscale"]
+    assert raw["restore_strength"] == 0.15
+    assert raw["scale"] == 2
+    assert raw["vsr_quality"] == "MEDIUM"

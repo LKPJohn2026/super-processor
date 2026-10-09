@@ -184,30 +184,25 @@ def test_wizard_website_full_flow_intro_to_done(
         overview = _get(base, "/analyze?run=1")
         assert "Quick overview" in overview
         assert "gray CI clip" in overview
-        assert "Choose a split" in overview
+        assert "Enhance" in overview
         assert controller.current_state().step is WizardStep.OVERVIEW
 
-        split = _post(base, "/overview", {})
-        assert "How should we split this?" in split
-        assert "A. 1 segment" in split
-        assert "Please tell me something else" in split
-        assert 'class="step active">Split' in split
+        def _fake_upscale(
+            source: Path, destination: Path, params: object, **kwargs: object
+        ) -> Path:
+            del params, kwargs
+            destination.write_bytes(source.read_bytes())
+            return destination
 
-        enhance = _post(base, "/split", {"layout": "0"})
-        assert "Segment 1 of 1" in enhance
-        assert "A. light denoise" in enhance
-        assert "Preview this look" in enhance
-        assert 'class="step active">Enhance' in enhance
-        assert controller.current_state().step is WizardStep.ENHANCE
+        monkeypatch.setattr("super_processor.wizard.run_two_pass", _fake_upscale)
 
-        previewed = _post(base, "/segment", {"option": "A"})
-        assert "Short preview" in previewed
-        assert "<video" in previewed
-        assert "Accept and continue" in previewed
-
-        rendering = _post(base, "/segment", {"accept": "1"})
+        rendering = _post(base, "/overview", {})
         assert "<h1>Rendering</h1>" in rendering
+        assert "Restore strength" in rendering
+        assert "0.15" in rendering
+        assert "MEDIUM" in rendering
         assert "5–10 minutes" in rendering
+        assert 'class="step active">Enhance' in rendering
         assert controller.current_state().step is WizardStep.RENDERING
 
         result = _get(base, "/render?run=1")

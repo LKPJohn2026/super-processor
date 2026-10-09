@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Wizard quality path is a capped SeedVR2-3B restore (strength 0.0–0.35) plus
+  RTX Video Super Resolution (`LOW` / `MEDIUM` / `HIGH`), encoded with
+  `hevc_nvenc`. Notes that call the image artificial cannot raise those knobs.
+  Install needs an NVIDIA driver, an RTX GPU, `nvvfx`, and SeedVR2-3B weights.
+  ComfyUI is not used. Legacy CLI diagnose/plan/apply keep FFmpeg templates.
+
 ### Planned
 
 - Wire a real local LLM path behind the deferred stub screen (OpenAI-compatible

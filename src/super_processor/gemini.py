@@ -744,6 +744,19 @@ _ENHANCE_SCHEMA: dict[str, Any] = {
     "required": ["issues", "options"],
 }
 
+_UPSCALE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "restore_strength": {"type": "number"},
+        "scale": {"type": "integer"},
+        "vsr_quality": {
+            "type": "string",
+            "enum": ["LOW", "MEDIUM", "HIGH"],
+        },
+    },
+    "required": ["restore_strength", "scale", "vsr_quality"],
+}
+
 
 def validate_split_proposal(
     proposal: SplitProposal,
@@ -1194,3 +1207,55 @@ class GeminiClient:
             prior=prior,
             job_dir=job_dir,
         )
+
+    def propose_upscale_params(
+        self,
+        *,
+        prior: dict[str, Any],
+        user_note: str,
+        duration_s: float,
+        job_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        """Ask Gemini for allowlisted restore and RTX VSR knobs only.
+
+        The model must not return a prompt, a model name, or FFmpeg argv.
+        A time range in the note is context; the caller reprocesses the whole clip.
+        """
+        note = user_note.strip()
+        if not note:
+            raise GeminiError("revise note is empty")
+        prompt = (
+            "Revise restore and upscale settings for the whole clip. "
+            f"Media duration is {duration_s:.1f} seconds. "
+            "A time range in the note is context only. Reprocess the entire clip. "
+            f"Current settings JSON: {json.dumps(prior)}. "
+            f"User note: {note}. "
+            "Return only restore_strength (0.0 to 0.35), scale (2, 3, or 4), "
+            "and vsr_quality (LOW, MEDIUM, or HIGH). "
+            "Do not emit a prompt, a model name, or FFmpeg argv."
+        )
+        contents: list[dict[str, Any]] = []
+        if job_dir is not None:
+            for turn in load_chat(job_dir):
+                role = "user" if turn.role == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": turn.text}]})
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
+        data = self._generate(
+            contents=contents,
+            schema=_UPSCALE_SCHEMA,
+            system=(
+                "You retune allowlisted restore and RTX VSR knobs. "
+                "Never return a text prompt, a model name, or FFmpeg arguments."
+            ),
+        )
+        if job_dir is not None:
+            append_chat_turn(job_dir, ChatTurn(role="user", text=prompt))
+            append_chat_turn(
+                job_dir,
+                ChatTurn(
+                    role="model",
+                    text=json.dumps(data),
+                    structured=data,
+                ),
+            )
+        return data

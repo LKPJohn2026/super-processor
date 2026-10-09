@@ -154,7 +154,7 @@ def test_analyze_and_render_get_triggers(
         server.stop()
 
 
-def test_result_revise_returns_to_split(tmp_path: Path) -> None:
+def test_result_revise_without_note_stays_on_result(tmp_path: Path) -> None:
     controller = WizardController(tmp_path)
     source = tmp_path / "x.mp4"
     source.write_bytes(b"x")
@@ -164,4 +164,5 @@ def test_result_revise_returns_to_split(tmp_path: Path) -> None:
     save_job_wizard_state(job_dir, state)
     save_session_state(tmp_path, state)
     controller.handle_post("/result", {"mood": ["revise"]})
-    assert controller.current_state().step is WizardStep.CHOOSE_SPLIT
+    assert controller.current_state().step is WizardStep.RESULT
+    assert controller.current_state().error
