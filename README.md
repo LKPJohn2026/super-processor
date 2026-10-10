@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/LKPJohn2026/super-processor/actions/workflows/ci.yml/badge.svg)](https://github.com/LKPJohn2026/super-processor/actions/workflows/ci.yml)
 
-Local-first AI-assisted video processing without generative frame synthesis.
+Local-first AI video restoration: FlashVSR upscaling, with a strength
+control for how much new detail it adds.
 
 Super Processor enhances existing footage. A localhost wizard runs a local
 FlashVSR restoration upscale, then lets you revise a time range with a note;
