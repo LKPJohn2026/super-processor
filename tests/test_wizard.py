@@ -13,6 +13,7 @@ import pytest
 
 from super_processor.gemini import (
     GeminiClient,
+    SegmentEnhanceResult,
     SplitProposal,
     StructuredOp,
 )
@@ -237,15 +238,23 @@ def test_wizard_analyze_with_fake_gemini(
     controller.handle_post("/llm", {"choice": ["gemini"]})
     controller.handle_post("/setup", {"skip": ["1"]})
     controller.handle_post("/pick", {"path": [str(clip)]})
-    assert controller.current_state().step is WizardStep.ANALYZING
+    assert controller.current_state().step is WizardStep.RENDERING
+    state = controller.current_state()
+    state.step = WizardStep.ANALYZING
+    from super_processor.wizard import save_job_wizard_state, save_session_state
+
+    assert state.job_id
+    save_job_wizard_state(controller.store.job_dir(state.job_id), state)
+    save_session_state(tmp_path, state)
     controller.run_analyze()
     state = controller.current_state()
     assert state.step is WizardStep.OVERVIEW
     assert state.highlights == ["gray clip"]
     controller.handle_post("/overview", {})
+    controller.handle_post("/split", {"layout": ["0"]})
     state = controller.current_state()
-    assert state.step is WizardStep.RENDERING
-    raw = state.enhance_cache["upscale"]
-    assert raw["restore_strength"] == 0.15
-    assert raw["scale"] == 2
-    assert raw["vsr_quality"] == "MEDIUM"
+    assert state.step is WizardStep.ENHANCE
+    assert state.segment_index == 0
+    raw = state.enhance_cache["0"]
+    result = SegmentEnhanceResult.from_dict(raw)
+    assert len(result.options) == 3

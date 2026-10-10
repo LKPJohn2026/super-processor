@@ -7,18 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
 
-- Wizard quality path is a capped SeedVR2-3B restore (strength 0.0–0.35) plus
-  RTX Video Super Resolution (`LOW` / `MEDIUM` / `HIGH`), encoded with
-  `hevc_nvenc`. Notes that call the image artificial cannot raise those knobs.
-  Install needs an NVIDIA driver, an RTX GPU, `nvvfx`, and SeedVR2-3B weights.
-  ComfyUI is not used. Legacy CLI diagnose/plan/apply keep FFmpeg templates.
+- Local FlashVSR restoration upscale on the wizard picture path. FFmpeg trims,
+  splices, and copies audio. Gemini turns a result note into a time range,
+  scale, and strength, then the cited range is restored from the original source.
 
 ### Planned
 
 - Wire a real local LLM path behind the deferred stub screen (OpenAI-compatible
   or native multimodal endpoint).
+- Chunked FlashVSR execution for clips up to about 30 minutes.
 
 ## [2.6.0] - 2026-10-03
 

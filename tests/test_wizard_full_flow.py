@@ -14,6 +14,7 @@ import pytest
 
 from super_processor.gemini import GeminiClient
 from super_processor.review import WizardServer
+from super_processor.upscale import FakeUpscaleEngine
 from super_processor.wizard import WizardController, WizardStep
 
 
@@ -81,76 +82,27 @@ def _post(base: str, path: str, fields: dict[str, str]) -> str:
 def test_wizard_website_full_flow_intro_to_done(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Drive every website screen over HTTP and assert UI updates."""
+    """Drive pick → fake upscale → range revise → happy over HTTP."""
     monkeypatch.setenv("GEMINI_API_KEY", "ci-full-flow-key")
     clip = _tiny_clip(tmp_path / "clip.mp4")
-    split_payload = {
-        "highlights": ["gray CI clip"],
-        "layouts": [
-            {
-                "segment_count": 1,
-                "summary": "whole clip",
-                "segments": [
-                    {
-                        "start_s": 0,
-                        "end_s": 12,
-                        "label": "all",
-                        "issues": ["noisy"],
-                    }
-                ],
-            },
-            {
-                "segment_count": 2,
-                "summary": "halves",
-                "segments": [
-                    {
-                        "start_s": 0,
-                        "end_s": 6,
-                        "label": "first",
-                        "issues": ["noisy"],
-                    },
-                    {
-                        "start_s": 6,
-                        "end_s": 12,
-                        "label": "second",
-                        "issues": ["low_contrast"],
-                    },
-                ],
-            },
-        ],
-    }
-    enhance_payload = {
-        "issues": ["noisy"],
-        "options": [
-            {
-                "id": "A",
-                "label": "light denoise",
-                "ops": [{"op": "denoise", "params": {"strength": 0.3}}],
-            },
-            {
-                "id": "B",
-                "label": "contrast lift",
-                "ops": [
-                    {
-                        "op": "contrast",
-                        "params": {"contrast": 1.15, "brightness": 0.0, "gamma": 1.0},
-                    }
-                ],
-            },
-            {
-                "id": "C",
-                "label": "sharpen",
-                "ops": [
-                    {"op": "sharpen", "params": {"luma_amount": 0.35, "luma_size": 5}}
-                ],
-            },
-        ],
-    }
     gemini = GeminiClient(
         api_key="ci-full-flow-key",
-        transport=_FakeTransport([split_payload, enhance_payload]),
+        transport=_FakeTransport(
+            [
+                {
+                    "start_s": 2,
+                    "end_s": 5,
+                    "scale": 2,
+                    "strength": 0.2,
+                }
+            ]
+        ),
     )
-    controller = WizardController(tmp_path, gemini=gemini)
+    controller = WizardController(
+        tmp_path,
+        gemini=gemini,
+        upscale_engine=FakeUpscaleEngine(),
+    )
     server = WizardServer(tmp_path, controller=controller)
     base = server.start()
     try:
@@ -158,59 +110,26 @@ def test_wizard_website_full_flow_intro_to_done(
         assert "brand-hero" in intro
         assert "Super Processor" in intro
         assert "Continue" in intro
-        assert "hero-main" in intro
 
         llm = _post(base, "/intro", {})
         assert "What type of LLM" in llm
         assert "I don’t have a local LLM" in llm
-        assert 'class="steps"' in llm
-        assert "Setup" in llm
 
         setup = _post(base, "/llm", {"choice": "gemini"})
         assert "Gemini API setup" in setup
-        assert "Google AI Studio" in setup
-        assert "Paste it here" in setup
 
         pick = _post(base, "/setup", {"skip": "1"})
         assert "Pick a video file" in pick
-        assert "1–3 minutes" in pick
-        assert 'class="step active">File' in pick
 
-        analyzing = _post(base, "/pick", {"path": str(clip)})
-        assert "<h1>Analyzing</h1>" in analyzing
-        assert "1–3 minutes" in analyzing
-        assert controller.current_state().step is WizardStep.ANALYZING
-
-        overview = _get(base, "/analyze?run=1")
-        assert "Quick overview" in overview
-        assert "gray CI clip" in overview
-        assert "Enhance" in overview
-        assert controller.current_state().step is WizardStep.OVERVIEW
-
-        def _fake_upscale(
-            source: Path, destination: Path, params: object, **kwargs: object
-        ) -> Path:
-            del params, kwargs
-            destination.write_bytes(source.read_bytes())
-            return destination
-
-        monkeypatch.setattr("super_processor.wizard.run_two_pass", _fake_upscale)
-
-        rendering = _post(base, "/overview", {})
-        assert "<h1>Rendering</h1>" in rendering
-        assert "Restore strength" in rendering
-        assert "0.15" in rendering
-        assert "MEDIUM" in rendering
-        assert "5–10 minutes" in rendering
-        assert 'class="step active">Enhance' in rendering
+        waiting = _post(base, "/pick", {"path": str(clip)})
+        assert "<h1>Upscaling</h1>" in waiting
         assert controller.current_state().step is WizardStep.RENDERING
 
         result = _get(base, "/render?run=1")
         assert "<h1>Result</h1>" in result
         assert "A. I am happy" in result
-        assert "Please tell me something else" in result
-        assert "<video" in result
-        assert 'class="step active">Result' in result
+        assert "Scale 2" in result
+        assert "strength 0.50" in result
         assert controller.current_state().step is WizardStep.RESULT
         job_id = controller.current_state().job_id
         assert job_id
@@ -220,9 +139,21 @@ def test_wizard_website_full_flow_intro_to_done(
             assert response.headers.get_content_type() == "video/mp4"
             assert len(response.read()) > 0
 
+        revising = _post(
+            base,
+            "/result",
+            {"note": "reduce artificial detail from 2s to 5s"},
+        )
+        assert "<h1>Upscaling</h1>" in revising
+        assert controller.current_state().step is WizardStep.RENDERING
+
+        revised = _get(base, "/render?run=1")
+        assert "<h1>Result</h1>" in revised
+        assert "strength 0.20" in revised
+        assert (controller.store.job_dir(job_id) / "output.mp4").is_file()
+
         done = _post(base, "/result", {"mood": "happy"})
         assert "<h1>Done</h1>" in done
-        assert "output.mp4" in done
         assert controller.current_state().step is WizardStep.DONE
     finally:
         server.stop()

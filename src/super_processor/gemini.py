@@ -744,19 +744,6 @@ _ENHANCE_SCHEMA: dict[str, Any] = {
     "required": ["issues", "options"],
 }
 
-_UPSCALE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "restore_strength": {"type": "number"},
-        "scale": {"type": "integer"},
-        "vsr_quality": {
-            "type": "string",
-            "enum": ["LOW", "MEDIUM", "HIGH"],
-        },
-    },
-    "required": ["restore_strength", "scale", "vsr_quality"],
-}
-
 
 def validate_split_proposal(
     proposal: SplitProposal,
@@ -883,8 +870,20 @@ def _file_part(path: Path) -> dict[str, Any]:
     }
 
 
+_UPSCALE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "start_s": {"type": "number"},
+        "end_s": {"type": "number"},
+        "scale": {"type": "integer"},
+        "strength": {"type": "number"},
+    },
+    "required": ["start_s", "end_s", "scale", "strength"],
+}
+
+
 class GeminiClient:
-    """Call Gemini with structured schemas for split and enhance."""
+    """Call Gemini with structured schemas for split, enhance, and upscale notes."""
 
     def __init__(
         self,
@@ -1208,54 +1207,41 @@ class GeminiClient:
             job_dir=job_dir,
         )
 
-    def propose_upscale_params(
+    def revise_upscale_params(
         self,
         *,
-        prior: dict[str, Any],
-        user_note: str,
+        note: str,
+        prior_scale: int,
+        prior_strength: float,
+        prior_start_s: float,
+        prior_end_s: float,
         duration_s: float,
         job_dir: Path | None = None,
     ) -> dict[str, Any]:
-        """Ask Gemini for allowlisted restore and RTX VSR knobs only.
-
-        The model must not return a prompt, a model name, or FFmpeg argv.
-        A time range in the note is context; the caller reprocesses the whole clip.
-        """
-        note = user_note.strip()
-        if not note:
-            raise GeminiError("revise note is empty")
+        """Turn a result note into a bounded scale, strength, and time range."""
         prompt = (
-            "Revise restore and upscale settings for the whole clip. "
-            f"Media duration is {duration_s:.1f} seconds. "
-            "A time range in the note is context only. Reprocess the entire clip. "
-            f"Current settings JSON: {json.dumps(prior)}. "
-            f"User note: {note}. "
-            "Return only restore_strength (0.0 to 0.35), scale (2, 3, or 4), "
-            "and vsr_quality (LOW, MEDIUM, or HIGH). "
-            "Do not emit a prompt, a model name, or FFmpeg argv."
+            "We already restored and upscaled a video locally. "
+            f"Duration is {duration_s:.1f} seconds. Previous params: "
+            f"scale={prior_scale}, strength={prior_strength:.2f}, "
+            f"applied from {prior_start_s:.1f}s to {prior_end_s:.1f}s. "
+            f"The user said: {note.strip()}. "
+            "Return start_s, end_s, scale (only 2 or 4), and strength from "
+            "0 to 1. Lower strength means less invented texture. If they "
+            "name a time range, set start_s and end_s to that range. "
+            "Do not invent shell commands or a new model."
         )
-        contents: list[dict[str, Any]] = []
-        if job_dir is not None:
-            for turn in load_chat(job_dir):
-                role = "user" if turn.role == "user" else "model"
-                contents.append({"role": role, "parts": [{"text": turn.text}]})
-        contents.append({"role": "user", "parts": [{"text": prompt}]})
         data = self._generate(
-            contents=contents,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
             schema=_UPSCALE_SCHEMA,
             system=(
-                "You retune allowlisted restore and RTX VSR knobs. "
-                "Never return a text prompt, a model name, or FFmpeg arguments."
+                "You only retune restoration upscale parameters. "
+                "Return JSON matching the schema."
             ),
         )
         if job_dir is not None:
             append_chat_turn(job_dir, ChatTurn(role="user", text=prompt))
             append_chat_turn(
                 job_dir,
-                ChatTurn(
-                    role="model",
-                    text=json.dumps(data),
-                    structured=data,
-                ),
+                ChatTurn(role="model", text=json.dumps(data), structured=data),
             )
         return data

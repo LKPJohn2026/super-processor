@@ -1,4 +1,4 @@
-"""Localhost Gemini wizard: setup → overview → capped restore and RTX VSR."""
+"""Localhost Gemini wizard: setup → split → enhance → concat."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from .gemini import (
     EnhanceOption,
     GeminiClient,
     GeminiError,
+    SegmentEnhanceResult,
     SplitLayout,
     SplitProposal,
     StructuredOp,
@@ -24,14 +25,33 @@ from .gemini import (
     store_gemini_api_key,
 )
 from .jobs import JobError, JobState, JobStore
-from .probe import ProbeError, parse_frame_rate, probe_file
+from .preview import PreviewError, encode_preview
+from .probe import ProbeError, probe_file
 from .recipe import DEFAULT_OP_ORDER, OpName
-from .segments import STILLS_DIR_NAME, TimelineSegment
+from .render import RenderError, render_chosen_plan
+from .segments import (
+    STILLS_DIR_NAME,
+    TimelineSegment,
+    write_gray_still,
+    write_segments,
+)
 from .treatments import Treatment, TreatmentStep
-from .upscale import UpscaleError, UpscaleParams, enforce_note_direction, run_two_pass
+from .upscale import (
+    FlashVsrEngine,
+    UpscaleEngine,
+    UpscaleError,
+    UpscalePlan,
+    UpscaleSpan,
+    apply_range_revise,
+    default_span,
+    load_upscale_plan,
+    replace_overlapping,
+    save_upscale_plan,
+)
 from .wizard_pages import (
     render_analyzing,
     render_done,
+    render_enhance,
     render_intro,
     render_llm_choice,
     render_local_llm_stub,
@@ -40,6 +60,7 @@ from .wizard_pages import (
     render_rendering,
     render_result,
     render_setup,
+    render_split_choice,
 )
 
 WIZARD_STATE_FILE = "wizard_state.json"
@@ -304,12 +325,31 @@ def save_segment_choice(
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def params_from_state(state: WizardState) -> UpscaleParams:
-    """Return saved upscale knobs, or the capped defaults."""
-    raw = state.enhance_cache.get("upscale")
-    if isinstance(raw, dict):
-        return UpscaleParams.from_dict(raw)
-    return UpscaleParams()
+def _active_knobs(job_dir: Path) -> tuple[int | None, float | None]:
+    plan = load_upscale_plan(job_dir)
+    if plan is None or not plan.spans:
+        return None, None
+    span = plan.pending or plan.spans[-1]
+    return span.scale, span.strength
+
+
+def prepare_segment_stills(
+    source: Path,
+    job_dir: Path,
+    segments: list[TimelineSegment],
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+) -> None:
+    """Write gray stills for the review UI from keyframes."""
+    from .estimators import extract_gray_frame
+
+    for segment in segments:
+        gray = extract_gray_frame(
+            source,
+            at_s=segment.keyframe_s,
+            ffmpeg_bin=ffmpeg_bin,
+        )
+        write_gray_still(job_dir / segment.still_path, gray)
 
 
 class WizardController:
@@ -321,16 +361,23 @@ class WizardController:
         *,
         gemini: GeminiClient | None = None,
         ffmpeg_bin: str = "ffmpeg",
+        upscale_engine: UpscaleEngine | None = None,
     ) -> None:
         self.store = JobStore(jobs_dir)
         self.jobs_dir = self.store.root
         self.ffmpeg_bin = ffmpeg_bin
         self._gemini = gemini
+        self._upscale = upscale_engine
 
     def gemini(self) -> GeminiClient:
         if self._gemini is None:
             self._gemini = GeminiClient()
         return self._gemini
+
+    def upscale_engine(self) -> UpscaleEngine:
+        if self._upscale is None:
+            self._upscale = FlashVsrEngine()
+        return self._upscale
 
     def current_state(self) -> WizardState:
         """Return the active wizard state (job-scoped when a job exists)."""
@@ -370,30 +417,50 @@ class WizardController:
             assert state.job_id
             facts = probe_file(Path(self.store.load(state.job_id).source_path))
             return render_overview(facts=facts, highlights=state.highlights)
-        if state.step in {
-            WizardStep.CHOOSE_SPLIT,
-            WizardStep.ENHANCE,
-            WizardStep.RENDERING,
-        }:
-            params = params_from_state(state)
-            return render_rendering(
-                restore_strength=params.restore_strength,
-                scale=params.scale,
-                vsr_quality=params.vsr_quality,
-            )
+        if state.step is WizardStep.CHOOSE_SPLIT:
+            assert state.job_id
+            proposal = load_split_layouts(self.store.job_dir(state.job_id))
+            return render_split_choice(proposal=proposal, error=state.error)
+        if state.step is WizardStep.ENHANCE:
+            return self._render_enhance(state)
+        if state.step is WizardStep.RENDERING:
+            return render_rendering()
         if state.step is WizardStep.RESULT:
             assert state.job_id
-            params = params_from_state(state)
+            scale, strength = _active_knobs(self.store.job_dir(state.job_id))
             return render_result(
                 output_url="/output.mp4",
                 error=state.error,
-                restore_strength=params.restore_strength,
-                scale=params.scale,
-                vsr_quality=params.vsr_quality,
+                scale=scale,
+                strength=strength,
             )
         if state.step is WizardStep.DONE:
             return render_done()
         return render_intro()
+
+    def _render_enhance(self, state: WizardState) -> str:
+        assert state.job_id
+        job_dir = self.store.job_dir(state.job_id)
+        from .segments import load_segments
+
+        segments = load_segments(job_dir)
+        segment = segments[state.segment_index]
+        cache_key = str(state.segment_index)
+        raw = state.enhance_cache.get(cache_key)
+        if not isinstance(raw, dict):
+            raise WizardError("enhancement options missing; revise the segment")
+        result = SegmentEnhanceResult.from_dict(raw)
+        preview_url = None
+        chosen = state.enhance_cache.get(f"{cache_key}:preview")
+        if isinstance(chosen, str):
+            preview_url = chosen
+        return render_enhance(
+            segment=segment,
+            result=result,
+            preview_url=preview_url,
+            error=state.error,
+            segment_count=len(segments),
+        )
 
     def handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
         state = self._state()
@@ -438,10 +505,14 @@ class WizardController:
             self._pick_file(state, fields.get("path", [""])[0])
             return
         if path == "/overview":
-            if "upscale" not in state.enhance_cache:
-                state.enhance_cache["upscale"] = UpscaleParams().to_dict()
-            state.step = WizardStep.RENDERING
+            state.step = WizardStep.CHOOSE_SPLIT
             self._save(state)
+            return
+        if path == "/split":
+            self._choose_split(state, fields)
+            return
+        if path == "/segment":
+            self._enhance_post(state, fields)
             return
         if path == "/result":
             self._result_post(state, fields)
@@ -465,7 +536,7 @@ class WizardController:
             self._save(state)
             return
         state.job_id = manifest.job_id
-        state.step = WizardStep.ANALYZING
+        state.step = WizardStep.RENDERING
         self._save(state)
 
     def run_analyze(self) -> None:
@@ -503,62 +574,250 @@ class WizardController:
             state.step = WizardStep.PICK_FILE
         self._save(state)
 
+    def _choose_split(self, state: WizardState, fields: dict[str, list[str]]) -> None:
+        if not state.job_id:
+            raise WizardError("no job")
+        job_dir = self.store.job_dir(state.job_id)
+        note = fields.get("note", [""])[0].strip()
+        if note:
+            try:
+                source = Path(self.store.load(state.job_id).source_path)
+                facts = probe_file(source)
+                duration = float(facts.duration_s or 0.0)
+                frames = sorted((job_dir / WIZARD_FRAMES_DIR).glob("f_*.jpg"))[:24]
+                proposal = self.gemini().propose_splits(
+                    frame_paths=frames,
+                    duration_s=duration,
+                    user_text=note,
+                    job_dir=job_dir,
+                )
+                write_split_layouts(job_dir, proposal)
+                state.highlights = proposal.highlights
+                state.step = WizardStep.CHOOSE_SPLIT
+            except (GeminiError, ProbeError) as exc:
+                state.error = str(exc)
+            self._save(state)
+            return
+        layout_raw = fields.get("layout", [""])[0]
+        if layout_raw == "":
+            state.error = "pick a layout or enter a note"
+            self._save(state)
+            return
+        proposal = load_split_layouts(job_dir)
+        index = int(layout_raw)
+        if index < 0 or index >= len(proposal.layouts):
+            state.error = "invalid layout"
+            self._save(state)
+            return
+        layout = proposal.layouts[index]
+        segments = layout_to_segments(layout)
+        source = Path(self.store.load(state.job_id).source_path)
+        prepare_segment_stills(source, job_dir, segments, ffmpeg_bin=self.ffmpeg_bin)
+        write_segments(job_dir, segments)
+        manifest = self.store.load(state.job_id)
+        if manifest.state is JobState.SPLIT_PROPOSED:
+            self.store.transition(state.job_id, JobState.SPLIT_ACCEPTED)
+        state.layout_index = index
+        state.segment_index = 0
+        state.enhance_cache = {}
+        try:
+            self._ensure_enhance_options(state, segments[0])
+        except GeminiError as exc:
+            state.error = str(exc)
+            state.step = WizardStep.CHOOSE_SPLIT
+            self._save(state)
+            return
+        state.step = WizardStep.ENHANCE
+        self._save(state)
+
+    def _ensure_enhance_options(
+        self,
+        state: WizardState,
+        segment: TimelineSegment,
+    ) -> None:
+        assert state.job_id
+        job_dir = self.store.job_dir(state.job_id)
+        key = str(state.segment_index)
+        if key in state.enhance_cache:
+            return
+        still = job_dir / segment.still_path
+        frames = [still] if still.is_file() else []
+        jpg = job_dir / WIZARD_FRAMES_DIR
+        near = sorted(jpg.glob("f_*.jpg"))[:3]
+        frames = near or frames
+        result = self.gemini().propose_enhance(
+            frame_paths=frames,
+            segment_label=segment.problem,
+            start_s=segment.start_s,
+            end_s=segment.end_s,
+            job_dir=job_dir,
+        )
+        state.enhance_cache[key] = result.to_dict()
+
+    def _enhance_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
+        if not state.job_id:
+            raise WizardError("no job")
+        job_dir = self.store.job_dir(state.job_id)
+        from .segments import load_segments
+
+        segments = load_segments(job_dir)
+        segment = segments[state.segment_index]
+        note = fields.get("note", [""])[0].strip()
+        if note:
+            # Something-else loop: combine note + prior options, re-propose.
+            # Repeats until the user previews/accepts an option (no note).
+            try:
+                frames = sorted((job_dir / WIZARD_FRAMES_DIR).glob("f_*.jpg"))[:3]
+                key = str(state.segment_index)
+                raw_prior = state.enhance_cache.get(key)
+                prior = (
+                    SegmentEnhanceResult.from_dict(raw_prior)
+                    if isinstance(raw_prior, dict)
+                    else None
+                )
+                if prior is None:
+                    result = self.gemini().propose_enhance(
+                        frame_paths=frames,
+                        segment_label=segment.problem,
+                        start_s=segment.start_s,
+                        end_s=segment.end_s,
+                        user_text=note,
+                        job_dir=job_dir,
+                    )
+                else:
+                    result = self.gemini().revise_enhance(
+                        prior=prior,
+                        frame_paths=frames,
+                        segment_label=segment.problem,
+                        start_s=segment.start_s,
+                        end_s=segment.end_s,
+                        user_note=note,
+                        job_dir=job_dir,
+                    )
+                revise_key = f"{key}:revise_count"
+                prior_count = state.enhance_cache.get(revise_key, 0)
+                try:
+                    count = int(prior_count)
+                except (TypeError, ValueError):
+                    count = 0
+                state.enhance_cache[revise_key] = count + 1
+                state.enhance_cache[key] = result.to_dict()
+                state.enhance_cache.pop(f"{key}:preview", None)
+                state.enhance_cache.pop(f"{key}:option", None)
+                state.step = WizardStep.ENHANCE
+            except GeminiError as exc:
+                state.error = str(exc)
+            self._save(state)
+            return
+        if fields.get("accept", [""])[0] == "1":
+            preview_key = f"{state.segment_index}:option"
+            option_id = state.enhance_cache.get(preview_key)
+            raw = state.enhance_cache.get(str(state.segment_index))
+            if not isinstance(option_id, str) or not isinstance(raw, dict):
+                state.error = "preview an option before accepting"
+                self._save(state)
+                return
+            result = SegmentEnhanceResult.from_dict(raw)
+            option = next(
+                (item for item in result.options if item.id == option_id), None
+            )
+            if option is None:
+                state.error = "selected option is gone; preview again"
+                self._save(state)
+                return
+            save_segment_choice(job_dir, state.segment_index, option)
+            if state.segment_index + 1 < len(segments):
+                state.segment_index += 1
+                self._ensure_enhance_options(state, segments[state.segment_index])
+                state.step = WizardStep.ENHANCE
+            else:
+                state.step = WizardStep.RENDERING
+            self._save(state)
+            return
+        option_id = fields.get("option", [""])[0]
+        if not option_id:
+            state.error = "choose an option or enter a note"
+            self._save(state)
+            return
+        raw = state.enhance_cache.get(str(state.segment_index))
+        if not isinstance(raw, dict):
+            state.error = "options missing"
+            self._save(state)
+            return
+        result = SegmentEnhanceResult.from_dict(raw)
+        option = next((item for item in result.options if item.id == option_id), None)
+        if option is None:
+            state.error = "unknown option"
+            self._save(state)
+            return
+        treatment = treatment_from_ops(
+            option.ops,
+            treatment_id=f"wizard.{option.id}",
+            problem=segment.problem,
+        )
+        source = Path(self.store.load(state.job_id).source_path)
+        try:
+            clip = encode_preview(
+                job_dir,
+                source,
+                segment,
+                treatment,
+                ffmpeg_bin=self.ffmpeg_bin,
+            )
+        except (PreviewError, WizardError) as exc:
+            state.error = str(exc)
+            self._save(state)
+            return
+        rel = clip.path.relative_to(job_dir).as_posix()
+        state.enhance_cache[f"{state.segment_index}:preview"] = f"/{rel}"
+        state.enhance_cache[f"{state.segment_index}:option"] = option.id
+        self._save(state)
+
     def _result_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
         mood = fields.get("mood", [""])[0]
+        note = fields.get("note", [""])[0].strip()
         if mood == "happy":
             state.step = WizardStep.DONE
             self._save(state)
             return
-        if mood != "revise":
-            state.error = "choose happy or describe a change"
-            state.step = WizardStep.RESULT
-            self._save(state)
-            return
-        note = fields.get("note", [""])[0].strip()
         if not note:
-            state.error = "describe what to change"
+            state.error = (
+                "describe what to change, including a time range if you have one"
+            )
             state.step = WizardStep.RESULT
             self._save(state)
             return
         if not state.job_id:
-            raise WizardError("no job")
-        prior = params_from_state(state)
+            state.error = "no job to revise"
+            self._save(state)
+            return
+        job_dir = self.store.job_dir(state.job_id)
         source = Path(self.store.load(state.job_id).source_path)
         try:
             facts = probe_file(source)
             duration = float(facts.duration_s or 0.0)
-            raw = self.gemini().propose_upscale_params(
-                prior=prior.to_dict(),
-                user_note=note,
-                duration_s=duration,
-                job_dir=self.store.job_dir(state.job_id),
+            plan = load_upscale_plan(job_dir) or UpscalePlan(
+                spans=(default_span(duration),)
             )
-            proposed = UpscaleParams.from_dict(raw)
-            checked = enforce_note_direction(prior, proposed, note)
-        except (GeminiError, UpscaleError, ProbeError) as exc:
+            prior = plan.spans[-1]
+            raw = self.gemini().revise_upscale_params(
+                note=note,
+                prior_scale=prior.scale,
+                prior_strength=prior.strength,
+                prior_start_s=prior.start_s,
+                prior_end_s=prior.end_s,
+                duration_s=duration,
+                job_dir=job_dir,
+            )
+            patch = UpscaleSpan.from_dict(raw)
+            updated = replace_overlapping(plan, patch, duration)
+            save_upscale_plan(job_dir, updated)
+            state.error = None
+            state.step = WizardStep.RENDERING
+        except (UpscaleError, GeminiError, ProbeError, OSError, ValueError) as exc:
             state.error = str(exc)
             state.step = WizardStep.RESULT
-            self._save(state)
-            return
-        state.enhance_cache["upscale"] = checked.to_dict()
-        state.enhance_cache["upscale_note"] = note
-        state.error = None
-        state.step = WizardStep.RENDERING
         self._save(state)
-
-    def _advance_to_encoding(self, job_id: str) -> None:
-        current = self.store.load(job_id).state
-        order = (
-            JobState.SPLIT_PROPOSED,
-            JobState.SPLIT_ACCEPTED,
-            JobState.PLANS_READY,
-            JobState.PLAN_SELECTED,
-            JobState.ENCODING,
-        )
-        while current in order and current is not JobState.ENCODING:
-            nxt = order[order.index(current) + 1]
-            self.store.transition(job_id, nxt)
-            current = nxt
 
     def run_render(self) -> None:
         state = self._state()
@@ -566,29 +825,88 @@ class WizardController:
             return
         job_id = state.job_id
         job_dir = self.store.job_dir(job_id)
-        params = params_from_state(state)
+        choices = load_segment_choices(job_dir).get("choices") or {}
+        if isinstance(choices, dict) and choices:
+            self._render_ffmpeg_choices(state, job_dir, choices)
+            return
+        self._render_upscale(state, job_dir)
+
+    def _render_upscale(self, state: WizardState, job_dir: Path) -> None:
+        assert state.job_id
+        source = Path(self.store.load(state.job_id).source_path)
+        output = job_dir / "output.mp4"
         try:
-            source = Path(self.store.load(job_id).source_path)
             facts = probe_file(source)
-            video = facts.primary_video()
-            if video is None or not video.width or not video.height:
-                raise WizardError("source has no video stream")
-            fps = parse_frame_rate(video.avg_frame_rate) or 30.0
-            self._advance_to_encoding(job_id)
-            run_two_pass(
+            duration = float(facts.duration_s or 0.0)
+            plan = load_upscale_plan(job_dir)
+            if plan is None:
+                plan = UpscalePlan(spans=(default_span(duration),))
+                save_upscale_plan(job_dir, plan)
+            span = plan.pending or plan.spans[-1]
+            apply_range_revise(
                 source,
-                job_dir / "output.mp4",
-                params,
+                output,
+                span,
+                output,
+                engine=self.upscale_engine(),
                 ffmpeg_bin=self.ffmpeg_bin,
-                width=video.width,
-                height=video.height,
-                fps=fps,
+                duration_s=duration,
+            )
+            plan = UpscalePlan(spans=plan.spans, pending=None)
+            save_upscale_plan(job_dir, plan)
+            state.error = None
+            state.step = WizardStep.RESULT
+        except (UpscaleError, ProbeError, OSError, ValueError) as exc:
+            state.error = str(exc)
+            state.step = WizardStep.RESULT
+        self._save(state)
+
+    def _render_ffmpeg_choices(
+        self,
+        state: WizardState,
+        job_dir: Path,
+        choices: dict[str, Any],
+    ) -> None:
+        from .segments import load_segments
+
+        assert state.job_id
+        job_id = state.job_id
+        segments = load_segments(job_dir)
+        treatments: list[Treatment] = []
+        try:
+            for segment in segments:
+                raw = choices.get(str(segment.index))
+                if not isinstance(raw, dict):
+                    raise WizardError(f"missing choice for segment {segment.index}")
+                option = EnhanceOption.from_dict(raw)
+                treatments.append(
+                    treatment_from_ops(
+                        option.ops,
+                        treatment_id=f"wizard.{option.id}",
+                        problem=segment.problem,
+                    )
+                )
+            source = Path(self.store.load(job_id).source_path)
+            current = self.store.load(job_id).state
+            if current is JobState.SPLIT_ACCEPTED:
+                self.store.transition(job_id, JobState.PLANS_READY)
+                current = JobState.PLANS_READY
+            if current is JobState.PLANS_READY:
+                self.store.transition(job_id, JobState.PLAN_SELECTED)
+                current = JobState.PLAN_SELECTED
+            if current is JobState.PLAN_SELECTED:
+                self.store.transition(job_id, JobState.ENCODING)
+            render_chosen_plan(
+                job_dir,
+                source,
+                segments,
+                treatments,
+                ffmpeg_bin=self.ffmpeg_bin,
             )
             if self.store.load(job_id).state is JobState.ENCODING:
                 self.store.transition(job_id, JobState.COMPLETE)
-            state.error = None
             state.step = WizardStep.RESULT
-        except (WizardError, UpscaleError, ProbeError, JobError, OSError) as exc:
+        except (WizardError, RenderError, JobError, KeyError, ValueError) as exc:
             state.error = str(exc)
             try:
                 if self.store.load(job_id).state not in {

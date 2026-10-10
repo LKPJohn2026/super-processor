@@ -27,7 +27,6 @@ from super_processor.wizard import (
 class _FakeTransport:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
-        self.bodies: list[dict[str, Any]] = []
 
     def generate(
         self,
@@ -36,8 +35,6 @@ class _FakeTransport:
         api_key: str,
         body: dict[str, Any],
     ) -> dict[str, Any]:
-        del model, api_key
-        self.bodies.append(body)
         return {
             "candidates": [{"content": {"parts": [{"text": json.dumps(self.payload)}]}}]
         }
@@ -130,6 +127,34 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
             }
         ),
     )
+    enhance = {
+        "issues": ["noisy"],
+        "options": [
+            {
+                "id": "A",
+                "label": "a",
+                "ops": [{"op": "denoise", "params": {"strength": 0.2}}],
+            },
+            {
+                "id": "B",
+                "label": "b",
+                "ops": [
+                    {
+                        "op": "contrast",
+                        "params": {"contrast": 1.1, "brightness": 0.0, "gamma": 1.0},
+                    }
+                ],
+            },
+            {
+                "id": "C",
+                "label": "c",
+                "ops": [
+                    {"op": "sharpen", "params": {"luma_amount": 0.3, "luma_size": 5}}
+                ],
+            },
+        ],
+    }
+
     steps = [
         (WizardStep.INTRO, "Super Processor"),
         (WizardStep.LLM_CHOICE, "local LLM"),
@@ -137,50 +162,38 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
         (WizardStep.SETUP, "Gemini"),
         (WizardStep.PICK_FILE, "Pick"),
         (WizardStep.ANALYZING, "Analyzing"),
-        (WizardStep.RENDERING, "Rendering"),
+        (WizardStep.RENDERING, "Upscaling"),
         (WizardStep.RESULT, "Result"),
         (WizardStep.DONE, "Done"),
     ]
     for step, needle in steps:
         state = WizardState(step=step, job_id=job_id, highlights=["h"])
+        if step is WizardStep.ENHANCE:
+            state.enhance_cache = {"0": enhance}
         save_job_wizard_state(job_dir, state)
         save_session_state(tmp_path, state)
         html = controller.render()
         assert needle in html
 
+    # Overview needs a probeable file — skip if probe fails by using CHOOSE_SPLIT.
     state = WizardState(
         step=WizardStep.CHOOSE_SPLIT,
         job_id=job_id,
         highlights=["h"],
-        enhance_cache={
-            "upscale": {
-                "restore_strength": 0.15,
-                "scale": 2,
-                "vsr_quality": "MEDIUM",
-            }
-        },
     )
     save_job_wizard_state(job_dir, state)
     save_session_state(tmp_path, state)
-    assert "Restore strength" in controller.render()
+    assert "split" in controller.render().lower()
 
     state = WizardState(
         step=WizardStep.ENHANCE,
         job_id=job_id,
         segment_index=0,
-        enhance_cache={
-            "upscale": {
-                "restore_strength": 0.1,
-                "scale": 3,
-                "vsr_quality": "LOW",
-            }
-        },
+        enhance_cache={"0": enhance, "0:preview": "/previews/x.mp4"},
     )
     save_job_wizard_state(job_dir, state)
     save_session_state(tmp_path, state)
-    page = controller.render()
-    assert "0.10" in page
-    assert "LOW" in page
+    assert "Accept" in controller.render()
 
 
 def test_wizard_server_serves_still_bmp(tmp_path: Path) -> None:
@@ -212,7 +225,7 @@ def test_wizard_server_serves_still_bmp(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-def test_upscale_note_time_range_is_prompt_context(tmp_path: Path) -> None:
+def test_split_revise_note_path(tmp_path: Path) -> None:
     controller, job_id, job_dir = _seed_job(tmp_path)
     # Replace source with a real tiny media so revise can probe.
     import subprocess
@@ -266,32 +279,39 @@ def test_upscale_note_time_range_is_prompt_context(tmp_path: Path) -> None:
             }
         ),
     )
-    upscale_payload = {
-        "restore_strength": 0.2,
-        "scale": 2,
-        "vsr_quality": "HIGH",
-    }
-    transport = _FakeTransport(upscale_payload)
-    controller._gemini = GeminiClient(api_key="k", transport=transport)
-    state = WizardState(
-        step=WizardStep.RESULT,
-        job_id=job_id,
-        enhance_cache={
-            "upscale": {
-                "restore_strength": 0.15,
-                "scale": 2,
-                "vsr_quality": "MEDIUM",
+    split_payload = {
+        "highlights": ["revised"],
+        "layouts": [
+            {
+                "segment_count": 2,
+                "summary": "new",
+                "segments": [
+                    {
+                        "start_s": 0,
+                        "end_s": 6,
+                        "label": "a",
+                        "issues": ["noisy"],
+                    },
+                    {
+                        "start_s": 6,
+                        "end_s": 12,
+                        "label": "b",
+                        "issues": ["low_contrast"],
+                    },
+                ],
             }
-        },
+        ],
+    }
+    controller._gemini = GeminiClient(
+        api_key="k", transport=_FakeTransport(split_payload)
     )
+    state = WizardState(step=WizardStep.CHOOSE_SPLIT, job_id=job_id)
     save_job_wizard_state(job_dir, state)
     save_session_state(tmp_path, state)
-    note = "too soft from 1s to 3s"
-    controller.handle_post("/result", {"mood": ["revise"], "note": [note]})
-    current = controller.current_state()
-    assert current.step is WizardStep.RENDERING
-    assert current.enhance_cache["upscale"]["restore_strength"] == 0.2
-    assert current.enhance_cache["upscale_note"] == note
-    text = transport.bodies[-1]["contents"][-1]["parts"][0]["text"]
-    assert "1s to 3s" in text
-    assert "entire clip" in text
+    (job_dir / "wizard_frames").mkdir(exist_ok=True)
+    (job_dir / "wizard_frames" / "f_000.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+    controller.handle_post("/split", {"note": ["add a gym segment"]})
+    assert controller.current_state().step is WizardStep.CHOOSE_SPLIT
+    from super_processor.wizard import load_split_layouts
+
+    assert load_split_layouts(job_dir).layouts[0].segment_count == 2

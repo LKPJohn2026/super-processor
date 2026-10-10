@@ -1,10 +1,10 @@
 # Super Processor — System Design
 
-Super Processor is a local-first video processor. The localhost wizard quality
-path is a capped SeedVR2-3B restore followed by RTX Video Super Resolution.
-FFmpeg probes, decodes, and encodes with `hevc_nvenc`. Gemini may only retune
-allowlisted knobs. Legacy CLI diagnose/plan/apply keep their FFmpeg templates.
-The model does not receive a content prompt and does not write shell commands.
+Super Processor is a local-first video processor. It enhances existing footage
+through measured, constrained FFmpeg pipelines. A localhost wizard guides
+setup, Gemini-assisted segmentation, and per-segment enhancement. AI diagnoses
+problems and proposes structured operations; it does not generate replacement
+frames or write arbitrary shell commands.
 
 ## Market context
 
@@ -46,18 +46,19 @@ operation inspectable.
 
 ## Product decisions
 
-### Enhancement instead of generation
+### Restoration upscale instead of an FFmpeg grade
 
-The product processes source pixels only. It excludes text-to-video, inpainting,
-face swap, and any content prompt. The wizard quality path may run SeedVR2-3B
-at a hard strength cap of 0.35 (default 0.15; zero skips the restore) and then
-RTX Video Super Resolution at `LOW`, `MEDIUM`, or `HIGH` (default `MEDIUM`).
-`ULTRA` is not allowed. Scale (2, 3, or 4, default 2) is applied only by RTX
-VSR. A note that calls the picture artificial, plastic, over-sharpened, or not
-natural cannot raise restore strength or VSR quality.
+The wizard picture path is a local GPU restoration upscale (FlashVSR). FFmpeg
+probes, trims a cited time range, splices that range back, and copies audio.
+It does not choose the look. Gemini only turns a result note into `start_s`,
+`end_s`, `scale` (2 or 4), and `strength` (0–1). Re-runs read the original
+source for that range so detail does not stack.
 
-This keeps the restore from being told to add objects, change a face, or
-restyle the shot. FFmpeg look ops remain on the legacy CLI.
+Text-to-video, inpainting, and face reenactment stay out. A lower strength
+asks the restorer for less invented texture. The job stores
+`upscale_plan.json` with ordered spans so a later chunked runner can cover
+clips up to about 30 minutes (about 8s pieces with a short overlap). The
+prototype runs one span, then one range revise.
 
 ### Localhost wizard before a desktop shell
 
@@ -115,27 +116,24 @@ segments). The user picks one layout or replies with free text (“something
 else”), which continues a multi-turn chat that returns a new structured layout
 set. Hard maximum: 20 segments.
 
-### Wizard quality path: capped restore, then RTX VSR
+### Per-segment enhancement with short previews
 
-After the file is picked and the short overview is shown, the wizard runs one
-pass over the whole clip: SeedVR2-3B at source size when restore strength is
-above zero, then `nvvfx.VideoSuperRes`, then `hevc_nvenc`. Gemini does not emit
-a prompt, a model name, or FFmpeg argv. “Something else” asks Gemini for a new
-`UpscaleParams` object. The direction check runs before those params are saved.
-A revise reruns the whole clip. A time range in the note is prompt context only.
+For each accepted segment, Gemini proposes three to five enhancement options
+(structured ops). The user picks one or revises with free text. A short preview
+clip is encoded before the choice is committed. After every segment is accepted,
+segments are encoded and concatenated at the source aspect ratio.
 
-Install needs an NVIDIA driver, an RTX GPU, the `nvvfx` package, and SeedVR2-3B
-weights. ComfyUI is not required. Missing weights or `nvvfx` is a wizard error.
+### Wizard export: enhance and concat
 
-### Wizard export
+Wizard v1 keeps the source aspect. It does not default to full-timeline
+vertical social export or a size-cap floor. Those code paths may remain unused
+by the wizard; they are not part of the default render.
 
-Wizard output keeps the source aspect, scaled by the VSR factor, with dimensions
-rounded to a multiple of 8. It does not default to vertical social export.
+### Mandatory preview and explicit completion
 
-### Explicit completion
-
-The result screen asks whether the user is happy. A revise note returns to the
-same two-pass stack with checked knobs. Chat history is preserved.
+A segment choice requires a short preview. Final render starts only after every
+segment has an accepted option. The result screen asks whether the user is
+happy; a revise path returns to split choice with chat history preserved.
 
 ### Focused operations
 
@@ -170,23 +168,26 @@ integrity, and user acceptance.
 Pick file (localhost wizard)
    │
    ▼
-FFprobe ──► versioned media facts + short overview
+FFprobe ──► versioned media facts
    │
    ▼
-SeedVR2-3B restore at source size (skipped when strength is 0)
+Dynamic-FPS frame sample ──► Gemini structured split layouts
    │
    ▼
-RTX VSR scale (LOW / MEDIUM / HIGH) ──► hevc_nvenc
+User picks layout (or multi-turn revise)
    │
    ▼
-result player + happy / note
+Per segment: Gemini options ──► short preview ──► accept
    │
    ▼
-Gemini writes UpscaleParams ──► direction check ──► rerun whole clip
+schema / policy validator ──► FFmpeg templates
+   │
+   ▼
+segment encodes + concat (same aspect)
+   │
+   ▼
+result player + happy / revise
 ```
-
-Legacy CLI diagnose/plan/apply still translate allowlisted FFmpeg templates.
-The wizard quality path does not.
 
 The model has no shell tool. Only the template layer creates process arguments,
 and input/output paths are passed as argument-list elements rather than
@@ -255,9 +256,9 @@ Included:
 
 - localhost wizard on the review server;
 - local FFmpeg/FFprobe processing;
-- Gemini overview plus allowlisted upscale knobs;
-- capped SeedVR2 restore and RTX VSR on the wizard quality path;
-- `hevc_nvenc` encode after the two passes;
+- Gemini structured split and per-segment options;
+- validated ops, short previews, enhance-and-concat render;
+- software encoding (optional hardware);
 - reference-based regression helpers where already present.
 
 Deferred:
@@ -267,7 +268,7 @@ Deferred:
 - vertical social export as the wizard default;
 - desktop shell (Tauri/Electron);
 - classical CV as product diagnosis;
-- SeedVR2-7B, VSR `ULTRA`, FlashVSR, and ComfyUI;
+- neural enhancement models;
 - cloud render workers;
 - generative video features;
 - multi-track nonlinear editing.

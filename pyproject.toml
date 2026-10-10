@@ -36,6 +36,9 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+gpu = [
+  "torch>=2.4",
+]
 dev = [
   "Cython>=3.0,<4",
   "build>=1.2.2",

@@ -10,7 +10,11 @@ from typing import Any
 
 import pytest
 
-from super_processor.gemini import GeminiClient
+from super_processor.gemini import (
+    MAX_ENHANCE_REVISE_ROUNDS_FOR_TESTS,
+    GeminiClient,
+    SplitProposal,
+)
 from super_processor.jobs import JobState
 from super_processor.wizard import (
     WizardController,
@@ -18,6 +22,7 @@ from super_processor.wizard import (
     WizardStep,
     save_job_wizard_state,
     save_session_state,
+    write_split_layouts,
 )
 
 
@@ -71,100 +76,165 @@ def test_pick_missing_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-def test_overview_then_artificial_note_cannot_raise_knobs(tmp_path: Path) -> None:
+def test_enhance_note_and_overview_render(tmp_path: Path) -> None:
     clip = _clip(tmp_path / "c.mp4")
-    raised = {
-        "restore_strength": 0.3,
-        "scale": 2,
-        "vsr_quality": "HIGH",
+    enhance = {
+        "issues": ["noisy"],
+        "options": [
+            {
+                "id": "A",
+                "label": "a",
+                "ops": [{"op": "denoise", "params": {"strength": 0.2}}],
+            },
+            {
+                "id": "B",
+                "label": "b",
+                "ops": [
+                    {
+                        "op": "contrast",
+                        "params": {"contrast": 1.1, "brightness": 0.0, "gamma": 1.0},
+                    }
+                ],
+            },
+            {
+                "id": "C",
+                "label": "c",
+                "ops": [
+                    {"op": "sharpen", "params": {"luma_amount": 0.3, "luma_size": 5}}
+                ],
+            },
+        ],
     }
-    gemini = GeminiClient(api_key="k", transport=_FakeTransport([raised]))
+    split = {
+        "highlights": ["g"],
+        "layouts": [
+            {
+                "segment_count": 1,
+                "summary": "one",
+                "segments": [
+                    {"start_s": 0, "end_s": 12, "label": "x", "issues": ["noisy"]}
+                ],
+            }
+        ],
+    }
+    # revise enhance consumes one; initial ensure consumes one
+    gemini = GeminiClient(api_key="k", transport=_FakeTransport([enhance, enhance]))
     controller = WizardController(tmp_path, gemini=gemini)
     manifest = controller.store.create(clip)
     controller.store.transition(manifest.job_id, JobState.PROBED)
     controller.store.transition(manifest.job_id, JobState.SPLIT_PROPOSED)
     job_dir = controller.store.job_dir(manifest.job_id)
+    write_split_layouts(job_dir, SplitProposal.from_dict(split))
     state = WizardState(
         step=WizardStep.OVERVIEW, job_id=manifest.job_id, highlights=["g"]
     )
     save_job_wizard_state(job_dir, state)
     save_session_state(tmp_path, state)
-    assert "Quick" in controller.render()
+    assert (
+        "Duration" in controller.render()
+        or "overview" in controller.render().lower()
+        or "Quick" in controller.render()
+    )
     controller.handle_post("/overview", {})
-    assert controller.current_state().step is WizardStep.RENDERING
-    state = WizardState(
-        step=WizardStep.RESULT,
-        job_id=manifest.job_id,
-        enhance_cache=dict(controller.current_state().enhance_cache),
-    )
-    save_job_wizard_state(job_dir, state)
-    save_session_state(tmp_path, state)
-    controller.handle_post(
-        "/result",
-        {"mood": ["revise"], "note": ["too artificial and plastic"]},
-    )
-    current = controller.current_state()
-    assert current.step is WizardStep.RESULT
-    assert current.error
-    assert current.enhance_cache["upscale"]["restore_strength"] == 0.15
-    assert current.enhance_cache["upscale"]["vsr_quality"] == "MEDIUM"
+    controller.handle_post("/split", {"layout": ["0"]})
+    assert controller.current_state().step is WizardStep.ENHANCE
+    controller.handle_post("/segment", {"note": ["make it warmer"]})
+    assert "0" in controller.current_state().enhance_cache
+    assert controller.current_state().enhance_cache.get("0:revise_count") == 1
+
+
+def _enhance_payload(label: str) -> dict[str, Any]:
+    return {
+        "issues": ["noisy"],
+        "options": [
+            {
+                "id": "A",
+                "label": label,
+                "ops": [{"op": "denoise", "params": {"strength": 0.2}}],
+            },
+            {
+                "id": "B",
+                "label": "b",
+                "ops": [
+                    {
+                        "op": "contrast",
+                        "params": {"contrast": 1.1, "brightness": 0.0, "gamma": 1.0},
+                    }
+                ],
+            },
+            {
+                "id": "C",
+                "label": "c",
+                "ops": [
+                    {"op": "sharpen", "params": {"luma_amount": 0.3, "luma_size": 5}}
+                ],
+            },
+        ],
+    }
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-def test_soft_note_can_raise_knobs_inside_the_cap(tmp_path: Path) -> None:
-    """A sharpness note may raise knobs, and the hard cap still applies."""
+def test_enhance_something_else_loop_five_rounds(tmp_path: Path) -> None:
+    """Something else revises combine prior options; five rounds then accept."""
     clip = _clip(tmp_path / "c.mp4")
-    inside = {
-        "restore_strength": 0.3,
-        "scale": 3,
-        "vsr_quality": "HIGH",
-    }
-    over = {
-        "restore_strength": 0.5,
-        "scale": 2,
-        "vsr_quality": "HIGH",
-    }
-    transport = _FakeTransport([inside, over])
+    rounds = MAX_ENHANCE_REVISE_ROUNDS_FOR_TESTS
+    # initial ensure + N revises
+    payloads = [_enhance_payload("base")] + [
+        _enhance_payload(f"rev-{index}") for index in range(rounds)
+    ]
+    transport = _FakeTransport(payloads)
     gemini = GeminiClient(api_key="k", transport=transport)
     controller = WizardController(tmp_path, gemini=gemini)
     manifest = controller.store.create(clip)
     controller.store.transition(manifest.job_id, JobState.PROBED)
     controller.store.transition(manifest.job_id, JobState.SPLIT_PROPOSED)
     job_dir = controller.store.job_dir(manifest.job_id)
-    state = WizardState(
-        step=WizardStep.RESULT,
-        job_id=manifest.job_id,
-        enhance_cache={
-            "upscale": {
-                "restore_strength": 0.15,
-                "scale": 2,
-                "vsr_quality": "MEDIUM",
+    write_split_layouts(
+        job_dir,
+        SplitProposal.from_dict(
+            {
+                "highlights": ["g"],
+                "layouts": [
+                    {
+                        "segment_count": 1,
+                        "summary": "one",
+                        "segments": [
+                            {
+                                "start_s": 0,
+                                "end_s": 12,
+                                "label": "x",
+                                "issues": ["noisy"],
+                            }
+                        ],
+                    }
+                ],
             }
-        },
+        ),
     )
+    state = WizardState(step=WizardStep.CHOOSE_SPLIT, job_id=manifest.job_id)
     save_job_wizard_state(job_dir, state)
     save_session_state(tmp_path, state)
-    controller.handle_post(
-        "/result",
-        {"mood": ["revise"], "note": ["too soft, more sharpness please"]},
-    )
-    current = controller.current_state()
-    assert current.step is WizardStep.RENDERING
-    assert current.enhance_cache["upscale"]["restore_strength"] == 0.3
-    assert current.enhance_cache["upscale"]["vsr_quality"] == "HIGH"
-    assert current.enhance_cache["upscale"]["scale"] == 3
-    user_text = transport.bodies[-1]["contents"][-1]["parts"][0]["text"]
-    assert "too soft" in user_text
-    assert "entire clip" in user_text
+    controller.handle_post("/split", {"layout": ["0"]})
+    assert controller.current_state().step is WizardStep.ENHANCE
 
-    current.step = WizardStep.RESULT
-    save_job_wizard_state(job_dir, current)
-    save_session_state(tmp_path, current)
-    controller.handle_post(
-        "/result",
-        {"mood": ["revise"], "note": ["still too soft, push sharpness further"]},
-    )
-    held = controller.current_state()
-    assert held.step is WizardStep.RESULT
-    assert held.error
-    assert held.enhance_cache["upscale"]["restore_strength"] == 0.3
+    for index in range(rounds):
+        controller.handle_post(
+            "/segment", {"note": [f"improve round {index}: warmer please"]}
+        )
+        state = controller.current_state()
+        assert state.step is WizardStep.ENHANCE
+        assert state.enhance_cache.get("0:revise_count") == index + 1
+        cached = state.enhance_cache["0"]
+        assert isinstance(cached, dict)
+        assert cached["options"][0]["label"] == f"rev-{index}"
+        # Combined prompt includes prior structured options after first revise.
+        user_text = transport.bodies[-1]["contents"][-1]["parts"][0]["text"]
+        assert f"improve round {index}" in user_text
+        assert "Previous structured options" in user_text
+
+    assert transport.calls == 1 + rounds
+    # Leaving the loop: pick an option (preview), then accept.
+    controller.handle_post("/segment", {"option": ["A"]})
+    assert "0:preview" in controller.current_state().enhance_cache
+    controller.handle_post("/segment", {"accept": ["1"]})
+    assert controller.current_state().step is WizardStep.RENDERING

@@ -27,18 +27,9 @@ super-processor doctor
 super-processor --jobs-dir .dogfood/jobs review
 ```
 
-Install for the quality path: an NVIDIA driver, an RTX GPU, the `nvidia-vfx`
-package (`nvvfx`), and the SeedVR2 standalone runtime at
-`.seedvr/seedvr2_videoupscaler` (Python 3.13, not the upstream Torch 2.3
-checkout). `SEEDVR2_3B_WEIGHTS` still names a weight file. The first Enhance
-downloads `seedvr2_ema_3b_fp8_e4m3fn.safetensors` into that checkout. ComfyUI
-is not required. Missing `nvvfx` or weights is a wizard error. CI skips the
-real libraries and fakes both
-backends.
-
 Walk introduction → LLM type (Gemini) → setup → pick file → wait for analyze →
-overview → enhance (capped SeedVR2 restore, then RTX VSR) → result (happy, or
-one “too much detail” note and a second render). Confirm `output.mp4` in the
+overview → split (try Something else once) → enhance (preview, optional
+Something else, Accept) → render → result (happy). Confirm `output.mp4` in the
 job directory. CI also runs `@pytest.mark.gemini_live` against
 `Gemini_API_Test` on main.
 
@@ -50,11 +41,13 @@ job directory. CI also runs `@pytest.mark.gemini_live` against
 | LLM type | `GET/POST /llm` (state `llm_choice`) | A: no local LLM → Gemini; B: have local LLM → stub |
 | Local LLM stub | `GET/POST /local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
 | Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key |
-| Pick file | `GET/POST /pick` | Choose a local video path |
-| Analyzing | `GET /analyze` | Sample frames + Gemini split call (~1–3 min) |
-| Overview | `GET/POST /overview` | Duration, resolution, audio, highlight bullets, then Enhance |
-| Rendering | `GET /render` | Whole-clip SeedVR2 restore (if strength &gt; 0) and RTX VSR (~5–10 min) |
-| Result | `GET/POST /result` | Play output; shows strength, scale, and VSR quality; happy or a note |
+| Pick file | `GET/POST /pick` | Choose a local video path, then start the GPU pass |
+| Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims and splices |
+| Overview | `GET/POST /overview` | Duration, resolution, audio, highlight bullets |
+| Split choice | `GET/POST /split` | Layouts A… + Something else revise loop |
+| Segment enhance | `GET/POST /segment` | Options + short preview + Something else + accept |
+| Rendering | `GET /render` | Encode parts + concat (~5–10 min) |
+| Result | `GET/POST /result` | Play output; happy, or a note that retunes a time range |
 | Done | `GET /` (state `done`) | Confirmation |
 
 Estimated waits shown in the UI:
@@ -68,36 +61,31 @@ Estimated waits shown in the UI:
 intro → llm_choice ┬─ gemini → setup → pick_file → analyzing → overview
                    └─ local  → local_llm_stub → setup ─┘
                                                               │
+                         free-text revise ←───────────────────┤ choose_split
                                                               ▼
-                                         rendering (whole clip, once)
+                                                    enhance_segment(i) → next i
+                                                              │
+                         Something else revise ←──────────────┤
+                                                              ▼
+                                                         rendering
                                                               │
                                                               ▼
                                          result → happy → done
                                             │
-                                            └── note → Gemini UpscaleParams
-                                                       → direction check
-                                                       → rendering
+                                            └── Something else → choose_split
 ```
-
-The step rail is Setup, File, Enhance, Result. Rendering and the result screen
-show restore strength, scale, and VSR quality.
 
 Persisted in the job directory as `wizard_state.json` and `gemini_chat.json`.
 
-## Something-else loop
+## Something-else loops
 
-A result note asks Gemini for new `UpscaleParams` (`restore_strength`, `scale`,
-`vsr_quality` only). The direction check runs before the params are saved:
-
-- strength is 0.0–0.35 (default 0.15); 0 skips SeedVR2; a note cannot raise the cap
-- scale is 2, 3, or 4 (default 2), applied only by RTX VSR
-- quality is `LOW`, `MEDIUM`, or `HIGH` (default `MEDIUM`); `ULTRA` is rejected
-- notes that say artificial, plastic, over-sharpened, or not natural can only
-  hold or lower strength and VSR quality
-- a note that asks for more sharpness may raise those knobs only inside the caps
-
-A revise reruns the whole clip. A time range in the note is prompt context only.
-Gemini cannot emit a prompt, a model name, or FFmpeg argv.
+1. **Split** — Note revises layouts via `propose_splits(user_text=…)`. Stay on
+   `choose_split` until a layout is picked.
+2. **Enhance** — Note combines prior options + user text via
+   `revise_enhance` / `combine_enhance_revise_message`. Stay on the segment
+   until preview + accept (no production cap; tests cover five rounds).
+3. **Result** — “Something else” returns to `choose_split` with chat history
+   kept; segment choices are redone for the new pass.
 
 ## LLM choice (sketch paths)
 
@@ -202,27 +190,25 @@ and starting analysis.
 | `segment_encodes/` | Per-segment mp4 parts |
 | `output.mp4` | Concat result |
 
-## Wizard quality path
+## Mapping structured ops to FFmpeg
 
-The wizard calls the two-pass stack in `upscale.py`: FFmpeg decodes frame
-chunks, SeedVR2-3B restores at source size when strength is above 0, RTX VSR
-scales, and FFmpeg encodes with `hevc_nvenc`. Legacy CLI diagnose/plan/apply
-still use FFmpeg templates. The model never emits a shell string.
+Chosen ops become a `Treatment` (ordered steps) for the existing
+`build_segment_argv` / `render_chosen_plan` path. Templates own the argv. The
+model never emits a shell string.
 
 ## UI presentation
 
 Server-rendered HTML in `wizard_pages.py` (no SPA). Shared shell includes a
-step rail (Setup · File · Enhance · Result), brand mark, and wait estimates.
-Intro is a single composition with Super Processor as the hero. The enhance
-and result screens show restore strength, scale, and VSR quality.
+step rail (Setup · File · Split · Enhance · Result), brand mark, and wait
+estimates. Intro is a single composition with Super Processor as the hero.
+Choice screens use lettered options (A–E) matching the product sketch.
 
 ## CI coverage
 
 `tests/test_wizard_full_flow.py` posts through the live `WizardServer` from
-introduction → LLM choice → setup → pick → analyze → overview → render →
-result → done. `tests/test_upscale.py` fakes SeedVR2 and `nvvfx.VideoSuperRes`
-and skips real weights. Assertions check the strength cap and note direction.
-Matrix CI runs them with other unit tests (`-m "not gemini_live"`).
+introduction → LLM choice → setup → pick → local upscale → result note →
+range splice → done. The GPU engine is faked. Gemini, when the note is sent,
+returns only a time range plus scale and strength.
 
 ## Non-goals
 

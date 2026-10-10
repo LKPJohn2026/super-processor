@@ -91,6 +91,9 @@ def planner_available(endpoint: ModelEndpoint) -> bool:
             req.add_header("Authorization", f"Bearer {key}")
         with urllib.request.urlopen(req, timeout=1.5) as response:
             return int(getattr(response, "status", 200)) < 500
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        return False
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         return False
 
@@ -262,8 +265,12 @@ def _advisory_chat(endpoint: ModelEndpoint, instruction: str, recipe: Recipe) ->
         if not key:
             raise PlannerError(f"missing API key env {endpoint.api_key_env}")
         req.add_header("Authorization", f"Bearer {key}")
-    with urllib.request.urlopen(req, timeout=8) as response:
-        body = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise
     choices = body.get("choices") or []
     if not choices:
         return ""

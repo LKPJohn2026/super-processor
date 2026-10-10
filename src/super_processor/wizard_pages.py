@@ -4,17 +4,19 @@ from __future__ import annotations
 
 from html import escape
 
-from .gemini import SplitProposal
+from .gemini import SegmentEnhanceResult, SplitProposal
 from .probe import MediaFacts
+from .segments import TimelineSegment
 
 # Phase keys for the step rail (setup → result).
-_PHASE_ORDER = ("setup", "file", "enhance", "result")
+_PHASE_ORDER = ("setup", "file", "split", "enhance", "result")
 
 
 def _step_rail(active: str | None) -> str:
     labels = {
         "setup": "Setup",
         "file": "File",
+        "split": "Split",
         "enhance": "Enhance",
         "result": "Result",
     }
@@ -362,8 +364,8 @@ def render_pick(*, error: str | None = None) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
     body = f"""
 <h1>Pick a video file</h1>
-<p class="lede">Click below to choose which file to start. Sampling and Gemini
-analysis usually take about 1–3 minutes.</p>
+<p class="lede">Choose a short clip. A local GPU model restores and upscales it.
+The first pass usually covers the whole file.</p>
 {err}
 <form method="post" action="/pick">
 <label>Absolute path to video
@@ -408,10 +410,10 @@ def render_overview(
 Audio {audio}</p>
 <ul>{bullets}</ul>
 <form method="post" action="/overview">
-<button type="submit">Enhance</button>
+<button type="submit">Choose a split</button>
 </form>
 """
-    return _page("Overview", body, phase="file")
+    return _page("Overview", body, phase="split")
 
 
 def render_split_choice(
@@ -457,102 +459,111 @@ placeholder="e.g. add a segment for the lat pulldown"></textarea>
     return _page("Split choice", body, phase="split")
 
 
-def _knob_list(
-    *,
-    restore_strength: float,
-    scale: int,
-    vsr_quality: str,
-) -> str:
-    return (
-        '<dl class="knobs">'
-        f"<dt>Restore strength</dt><dd>{restore_strength:.2f}</dd>"
-        f"<dt>Scale</dt><dd>{scale}×</dd>"
-        f"<dt>VSR quality</dt><dd>{escape(vsr_quality)}</dd>"
-        "</dl>"
-    )
-
-
 def render_enhance(
     *,
-    restore_strength: float = 0.15,
-    scale: int = 2,
-    vsr_quality: str = "MEDIUM",
+    segment: TimelineSegment,
+    result: SegmentEnhanceResult,
+    preview_url: str | None,
     error: str | None = None,
+    segment_count: int | None = None,
 ) -> str:
-    """Show the capped restore and RTX VSR knobs for this pass."""
     err = f'<p class="error">{escape(error)}</p>' if error else ""
-    knobs = _knob_list(
-        restore_strength=restore_strength,
-        scale=scale,
-        vsr_quality=vsr_quality,
-    )
+    still = ""
+    if segment.still_path:
+        still = f'<img src="/{escape(segment.still_path[:-4])}.bmp" alt="keyframe">'
+    preview = ""
+    if preview_url:
+        preview = (
+            "<h2>Short preview</h2>"
+            f'<video controls src="{escape(preview_url)}"></video>'
+        )
+    options = []
+    for option in result.options:
+        options.append(
+            f'<form method="post" action="/segment">'
+            f'<input type="hidden" name="option" value="{escape(option.id)}">'
+            f'<button class="choice" type="submit">'
+            f"<strong>{escape(option.id)}. {escape(option.label)}</strong>"
+            f'<span class="muted">Preview this look</span>'
+            f"</button></form>"
+        )
+    accept = ""
+    if preview_url:
+        accept = (
+            '<form method="post" action="/segment">'
+            '<input type="hidden" name="accept" value="1">'
+            '<button type="submit" class="full">Accept and continue</button>'
+            "</form>"
+        )
+    span = f"{segment.start_s:.0f}–{segment.end_s:.0f}s"
+    total = segment_count if segment_count is not None else "?"
+    progress = f'<p class="seg-progress">Segment {segment.index + 1} of {total}</p>'
     body = f"""
-<h1>Enhance</h1>
-<p class="lede">A capped SeedVR2 restore recovers detail, then RTX Video
-Super Resolution scales the whole clip.</p>
+{progress}
+<h1>Working {escape(span)}</h1>
+<p class="lede">As Gemini sees it, there are several ways to enhance this
+stretch. Preview one to be sure, or tell me something else.</p>
+<p class="muted">{escape(segment.context)} · {escape(segment.problem)}</p>
+{still}
+<p>Issues: {escape(", ".join(result.issues) or "none listed")}</p>
 {err}
-{knobs}
-<p class="muted">Restore strength stays between 0 and 0.35. Scale is 2, 3,
-or 4. VSR quality is LOW, MEDIUM, or HIGH.</p>
+{"".join(options)}
+{preview}
+{accept}
+<form method="post" action="/segment" class="card">
+<label><strong>E. Please tell me something else</strong>
+<textarea name="note" rows="3"
+placeholder="e.g. warmer white balance, less denoise"></textarea>
+</label>
+<p class="muted">Describe how to improve these options. Gemini returns a new
+set; repeat until you preview and accept one.</p>
+<button type="submit">Revise options</button>
+</form>
 """
-    return _page("Enhance", body, phase="enhance")
+    return _page("Enhance segment", body, phase="enhance")
 
 
-def render_rendering(
-    *,
-    restore_strength: float = 0.15,
-    scale: int = 2,
-    vsr_quality: str = "MEDIUM",
-) -> str:
-    knobs = _knob_list(
-        restore_strength=restore_strength,
-        scale=scale,
-        vsr_quality=vsr_quality,
-    )
-    body = f"""
-<h1>Rendering</h1>
-<p class="lede">Restoring detail, then upscaling the whole clip with RTX
-Video Super Resolution…</p>
-{knobs}
-<p class="muted">This often takes about 5–10 minutes for a short clip; longer
-files take longer. The page will refresh.</p>
+def render_rendering() -> str:
+    body = """
+<h1>Upscaling</h1>
+<p class="lede">Restoring and upscaling on the local GPU. FFmpeg only trims,
+splices, and copies audio.</p>
+<p class="muted">A short clip finishes sooner than a longer one. The page
+will refresh.</p>
 <meta http-equiv="refresh" content="1;url=/render?run=1">
 """
-    return _page("Rendering", body, phase="enhance")
+    return _page("Upscaling", body, phase="result")
 
 
 def render_result(
     *,
     output_url: str,
     error: str | None = None,
-    restore_strength: float = 0.15,
-    scale: int = 2,
-    vsr_quality: str = "MEDIUM",
+    scale: int | None = None,
+    strength: float | None = None,
 ) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
-    knobs = _knob_list(
-        restore_strength=restore_strength,
-        scale=scale,
-        vsr_quality=vsr_quality,
-    )
+    knobs = ""
+    if scale is not None and strength is not None:
+        knobs = (
+            f'<p class="muted">Scale {scale}× · strength {strength:.2f}. '
+            "Lower strength means less invented texture.</p>"
+        )
     body = f"""
 <h1>Result</h1>
 {err}
 {knobs}
 <video controls src="{escape(output_url)}"></video>
-<p class="lede">Tell me what you think. Happy with this, or something else
-we can do with the result?</p>
+<p class="lede">Are you happy, or do you want to say something?</p>
 <form method="post" action="/result">
 <button type="submit" name="mood" value="happy">A. I am happy</button>
 </form>
 <form method="post" action="/result" class="card">
-<label><strong>B. Please tell me something else</strong>
+<label><strong>B. Tell me what to change</strong>
 <textarea name="note" rows="3"
-placeholder="e.g. too artificial, or a bit soft from 10s to 20s"></textarea>
+placeholder="e.g. reduce artificial detail from 00:30 to 00:40"></textarea>
 </label>
-<p class="muted">A note revises restore strength, scale, and VSR quality,
-then the whole clip is rendered again. A time range is context only.</p>
-<button type="submit" name="mood" value="revise">Revise</button>
+<button type="submit">Revise this range</button>
 </form>
 """
     return _page("Result", body, phase="result")
