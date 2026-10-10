@@ -334,6 +334,7 @@ function PickStep({
         Choose a clip on this machine. A local GPU model restores and upscales
         it. The first pass usually covers the whole file.
       </p>
+      <p className="muted">Up to 1080p and 30 minutes.</p>
       {message ? <Alert text={message} /> : null}
       <form onSubmit={submit}>
         <label htmlFor="video-path">

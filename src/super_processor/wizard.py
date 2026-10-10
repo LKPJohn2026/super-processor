@@ -28,10 +28,11 @@ from .gemini import (
 )
 from .jobs import JobError, JobState, JobStore
 from .preview import PreviewError, encode_preview
-from .probe import ProbeError, probe_file
+from .probe import MediaFacts, ProbeError, probe_file
 from .recipe import DEFAULT_OP_ORDER, OpName
 from .render import RenderError, render_chosen_plan
 from .segments import (
+    MAX_DURATION_S,
     STILLS_DIR_NAME,
     TimelineSegment,
     write_gray_still,
@@ -69,6 +70,11 @@ WIZARD_STATE_FILE = "wizard_state.json"
 SPLIT_LAYOUTS_FILE = "split_layouts.json"
 SEGMENT_CHOICES_FILE = "segment_choices.json"
 WIZARD_SCHEMA_VERSION = 1
+# Inputs are limited to 1080p (either orientation) and 30 minutes. FlashVSR
+# at 2x already makes 4K from 1080p; larger inputs exceed what one GPU pass
+# and the job directory are sized for.
+MAX_INPUT_LONG_EDGE = 1920
+MAX_INPUT_SHORT_EDGE = 1080
 
 
 class WizardError(RuntimeError):
@@ -129,6 +135,29 @@ class WizardState:
             error=data.get("error"),
             schema_version=int(data.get("schema_version", WIZARD_SCHEMA_VERSION)),
         )
+
+
+def input_limit_error(facts: MediaFacts) -> str | None:
+    """Why the wizard refuses this file, or ``None`` when it fits the limits."""
+    video = facts.primary_video()
+    if not facts.has_video or video is None:
+        return "this file has no video stream"
+    if not video.width or not video.height:
+        return "could not read the video resolution"
+    long_edge = max(video.width, video.height)
+    short_edge = min(video.width, video.height)
+    if long_edge > MAX_INPUT_LONG_EDGE or short_edge > MAX_INPUT_SHORT_EDGE:
+        return (
+            f"video is {video.width}x{video.height}; the limit is 1080p "
+            f"({MAX_INPUT_LONG_EDGE}x{MAX_INPUT_SHORT_EDGE} in either orientation)"
+        )
+    duration = float(facts.duration_s or 0.0)
+    if duration <= 0:
+        return "could not read the video duration"
+    if duration > MAX_DURATION_S:
+        minutes = duration / 60.0
+        return f"video is {minutes:.1f} minutes long; the limit is 30 minutes"
+    return None
 
 
 def session_state_path(jobs_dir: Path) -> Path:
@@ -613,8 +642,14 @@ class WizardController:
             self._save(state)
             return
         try:
+            facts = probe_file(source)
+            refusal = input_limit_error(facts)
+            if refusal is not None:
+                state.error = refusal
+                state.step = WizardStep.PICK_FILE
+                self._save(state)
+                return
             manifest = self.store.create(source)
-            probe_file(source)
             self.store.transition(manifest.job_id, JobState.PROBED)
         except (JobError, ProbeError) as exc:
             state.error = str(exc)

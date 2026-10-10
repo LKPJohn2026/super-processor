@@ -366,6 +366,7 @@ def render_pick(*, error: str | None = None) -> str:
 <h1>Pick a video file</h1>
 <p class="lede">Choose a short clip. A local GPU model restores and upscales it.
 The first pass usually covers the whole file.</p>
+<p class="muted">Up to 1080p and 30 minutes.</p>
 {err}
 <form method="post" action="/pick">
 <label>Absolute path to video

@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a rounded fps, is conformed losslessly; more raises before anything is
   spliced. A range revise that would change the output's total frame count
   is refused and the previous output is kept.
+- `output.mp4` and preview clips are streamed with HTTP Range support (206,
+  416, HEAD) instead of being read whole into memory, and sent with
+  `Cache-Control: no-store` so a revise is not hidden by the browser cache.
+  The final mux writes the `moov` atom first (`+faststart`).
+- The wizard refuses inputs above 1080p (1920x1080 in either orientation) or
+  longer than 30 minutes at the pick step, before a job is created.
 
 ### Planned
 

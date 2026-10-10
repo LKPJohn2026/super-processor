@@ -66,6 +66,21 @@ at 1.0 it is FlashVSR alone. FlashVSR always runs at its upstream settings
 (sparse ratio 2.0, local range 11). A note such as "less artificial detail
 from 2s to 5s" lowers strength for that range only.
 
+## Input limits
+
+The pick step probes the file and refuses it before a job is created when
+the video is larger than 1080p (long edge over 1920 or short edge over 1080,
+so portrait 1080x1920 is allowed) or longer than 30 minutes. A file with no
+video stream, or no readable resolution or duration, is refused too.
+
+## Serving output
+
+`/output.mp4` and files under `previews/` are streamed in 1 MiB chunks with
+single-range support (`206 Partial Content`, `416` for an unsatisfiable
+range, `HEAD`), so players can seek without the server loading the file into
+memory. Responses carry `Cache-Control: no-store` because a revise rewrites
+`output.mp4` in place. The final mux uses `-movflags +faststart`.
+
 ## Frame alignment
 
 Range revises and chunk joins cut by time, so each FlashVSR clip must hold
