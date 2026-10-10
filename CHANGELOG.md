@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   head and tail. Work clips handed to FlashVSR are lossless.
 - A Gemini call that times out moves on to the next candidate model instead
   of failing the request. The per-model read timeout is 60 seconds (was 120).
+- Upscale strength now does what it says. It is the share of the FlashVSR
+  picture in the output; the rest is a lanczos upscale of the same frames,
+  mixed in the delivery encode. 0.0 invents nothing, 1.0 is FlashVSR alone.
+  Before, strength only switched FlashVSR's attention settings, so every value
+  from 0.0 to 0.54 produced the same output. FlashVSR now always runs at its
+  upstream settings.
 
 ### Planned
 

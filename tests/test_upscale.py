@@ -19,7 +19,6 @@ from super_processor.upscale import (
     apply_range_revise,
     clamp_span,
     default_span,
-    flashvsr_knobs,
     is_delivery,
     load_upscale_plan,
     planned_chunks,
@@ -52,10 +51,6 @@ def test_plan_roundtrip_and_chunks(tmp_path: Path) -> None:
     assert len(chunks) >= 2
     assert chunks[0].end_s - chunks[0].start_s <= 8.05
     assert chunks[-1].end_s == 20
-    sparse, local = flashvsr_knobs(0.2)
-    assert sparse == 2.0
-    assert local == 11
-    assert flashvsr_knobs(0.9) == (1.5, 9)
 
 
 def test_replace_overlapping_keeps_scale_and_range() -> None:
@@ -424,3 +419,151 @@ def test_range_revise_converts_an_older_output_once(tmp_path: Path) -> None:
     )
     assert is_delivery(output)
     assert len(_frame_hashes(output)) == 6 * 24
+
+
+class _WhiteEngine:
+    """Invents an all-white picture, so any strength shows up in the mean."""
+
+    def upscale(self, request: UpscaleRequest) -> Path:
+        size = _frame_size_of(request.source)
+        frames = len(_frame_hashes(request.source))
+        rate = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=r_frame_rate",
+                "-of",
+                "csv=p=0",
+                str(request.source),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=white:size={size[0] * request.scale}x"
+                f"{size[1] * request.scale}:rate={rate}",
+                "-frames:v",
+                str(frames),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(request.output),
+            ],
+            check=True,
+        )
+        return request.output
+
+
+def _frame_size_of(path: Path) -> tuple[int, int]:
+    out = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    width, height = out.split(",")[:2]
+    return int(width), int(height)
+
+
+def _mean_luma(path: Path) -> float:
+    out = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"movie={path},signalstats",
+            "-show_entries",
+            "frame_tags=lavfi.signalstats.YAVG",
+            "-of",
+            "csv=p=0",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    values = [float(value.strip(",")) for value in out if value.strip(",")]
+    return sum(values) / len(values)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_strength_mixes_the_restored_picture_with_a_plain_upscale(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "gray.mp4"
+    _tiny(source, seconds=4)  # flat gray, 10 fps
+    means: dict[float, float] = {}
+    for strength in (0.0, 0.5, 1.0):
+        output = tmp_path / f"out_{strength}.mp4"
+        apply_range_revise(
+            source,
+            output,
+            UpscaleSpan(0, 4, strength=strength),
+            output,
+            engine=_WhiteEngine(),
+            duration_s=4,
+        )
+        assert len(_frame_hashes(output)) == 40
+        means[strength] = _mean_luma(output)
+    gray, white = means[0.0], means[1.0]
+    assert white > 230
+    assert abs(gray - _mean_luma(source)) < 2
+    assert abs(means[0.5] - (gray + white) / 2) < 3
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_range_revise_blends_only_the_named_range(tmp_path: Path) -> None:
+    source = tmp_path / "gray.mp4"
+    _tiny(source, seconds=6)
+    output = tmp_path / "output.mp4"
+    engine = _WhiteEngine()
+    apply_range_revise(
+        source,
+        output,
+        UpscaleSpan(0, 6, strength=1.0),
+        output,
+        engine=engine,
+        duration_s=6,
+    )
+    before = _frame_hashes(output)
+    apply_range_revise(
+        source,
+        output,
+        UpscaleSpan(2, 4, strength=0.0),
+        output,
+        engine=engine,
+        duration_s=6,
+    )
+    after = _frame_hashes(output)
+    assert len(after) == len(before) == 60
+    assert before[:20] == after[:20]
+    assert before[40:] == after[40:]
+    assert all(a != b for a, b in zip(before[20:40], after[20:40], strict=True))
