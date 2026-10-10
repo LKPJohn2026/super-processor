@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -11,19 +10,11 @@ from urllib.request import urlopen
 
 import pytest
 
-from super_processor.gemini import (
-    GeminiClient,
-    SegmentEnhanceResult,
-    SplitProposal,
-    StructuredOp,
-)
 from super_processor.review import WizardServer
 from super_processor.wizard import (
     WizardController,
     WizardStep,
-    layout_to_segments,
     load_session_state,
-    treatment_from_ops,
 )
 from super_processor.wizard_pages import render_intro
 
@@ -72,53 +63,6 @@ def test_intro_page_mentions_enhancement() -> None:
     assert "do not invent" in html.lower() or "Enhance" in html
 
 
-def test_treatment_from_ops_orders_steps() -> None:
-    treatment = treatment_from_ops(
-        [
-            StructuredOp("sharpen", {"luma_amount": 0.4, "luma_size": 5}),
-            StructuredOp(
-                "contrast", {"contrast": 1.2, "brightness": 0.0, "gamma": 1.0}
-            ),
-        ],
-        treatment_id="wizard.A",
-        problem="low_contrast",
-    )
-    assert treatment.steps[0].op.value == "contrast"
-    assert treatment.steps[1].op.value == "sharpen"
-
-
-def test_layout_to_segments_maps_issues() -> None:
-    proposal = SplitProposal.from_dict(
-        {
-            "highlights": [],
-            "layouts": [
-                {
-                    "segment_count": 2,
-                    "summary": "two",
-                    "segments": [
-                        {
-                            "start_s": 0,
-                            "end_s": 40,
-                            "label": "dark room",
-                            "issues": ["low light"],
-                        },
-                        {
-                            "start_s": 40,
-                            "end_s": 80,
-                            "label": "outside",
-                            "issues": ["too warm"],
-                        },
-                    ],
-                }
-            ],
-        }
-    )
-    segments = layout_to_segments(proposal.layouts[0])
-    assert segments[0].problem == "low_light"
-    assert segments[1].problem == "too_warm"
-    assert segments[0].end_s == 40
-
-
 def test_wizard_server_serves_intro(tmp_path: Path) -> None:
     server = WizardServer(tmp_path)
     base = server.start()
@@ -158,103 +102,3 @@ def test_wizard_llm_choice_gemini_direct(
     controller.handle_post("/intro", {})
     controller.handle_post("/llm", {"choice": ["gemini"]})
     assert controller.current_state().step is WizardStep.SETUP
-
-
-@pytest.mark.skipif(
-    shutil.which("ffmpeg") is None,
-    reason="ffmpeg required",
-)
-def test_wizard_analyze_with_fake_gemini(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("GEMINI_API_KEY", "unit-test-key")
-    clip = _tiny_clip(tmp_path / "clip.mp4", seconds=20)
-    split_payload = {
-        "highlights": ["gray clip"],
-        "layouts": [
-            {
-                "segment_count": 2,
-                "summary": "halves",
-                "segments": [
-                    {
-                        "start_s": 0,
-                        "end_s": 10,
-                        "label": "first",
-                        "issues": ["noisy"],
-                    },
-                    {
-                        "start_s": 10,
-                        "end_s": 20,
-                        "label": "second",
-                        "issues": ["low_contrast"],
-                    },
-                ],
-            },
-            {
-                "segment_count": 1,
-                "summary": "whole",
-                "segments": [
-                    {
-                        "start_s": 0,
-                        "end_s": 20,
-                        "label": "all",
-                        "issues": ["noisy"],
-                    }
-                ],
-            },
-        ],
-    }
-    enhance_payload = {
-        "issues": ["noisy"],
-        "options": [
-            {
-                "id": "A",
-                "label": "light denoise",
-                "ops": [{"op": "denoise", "params": {"strength": 0.3}}],
-            },
-            {
-                "id": "B",
-                "label": "contrast",
-                "ops": [
-                    {
-                        "op": "contrast",
-                        "params": {"contrast": 1.2, "brightness": 0.0, "gamma": 1.0},
-                    }
-                ],
-            },
-            {
-                "id": "C",
-                "label": "sharpen",
-                "ops": [
-                    {"op": "sharpen", "params": {"luma_amount": 0.4, "luma_size": 5}}
-                ],
-            },
-        ],
-    }
-    transport = _FakeTransport([split_payload, enhance_payload])
-    gemini = GeminiClient(api_key="unit-test-key", transport=transport)
-    controller = WizardController(tmp_path, gemini=gemini)
-    controller.handle_post("/intro", {})
-    controller.handle_post("/llm", {"choice": ["gemini"]})
-    controller.handle_post("/setup", {"skip": ["1"]})
-    controller.handle_post("/pick", {"path": [str(clip)]})
-    assert controller.current_state().step is WizardStep.RENDERING
-    state = controller.current_state()
-    state.step = WizardStep.ANALYZING
-    from super_processor.wizard import save_job_wizard_state, save_session_state
-
-    assert state.job_id
-    save_job_wizard_state(controller.store.job_dir(state.job_id), state)
-    save_session_state(tmp_path, state)
-    controller.run_analyze()
-    state = controller.current_state()
-    assert state.step is WizardStep.OVERVIEW
-    assert state.highlights == ["gray clip"]
-    controller.handle_post("/overview", {})
-    controller.handle_post("/split", {"layout": ["0"]})
-    state = controller.current_state()
-    assert state.step is WizardStep.ENHANCE
-    assert state.segment_index == 0
-    raw = state.enhance_cache["0"]
-    result = SegmentEnhanceResult.from_dict(raw)
-    assert len(result.options) == 3

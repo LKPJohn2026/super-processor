@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The wizard's Gemini split / FFmpeg enhance flow: the analyze, overview,
+  split choice, and per-segment enhance steps, their pages and API routes
+  (`/analyze`, `/overview`, `/split`, `/segment`, `/previews/`, stills), the
+  segment-choices render, and Gemini's split and enhance calls and schemas.
+  Since the switch to FlashVSR, picking a file goes straight to the upscale,
+  so none of it was reachable. A saved wizard state on one of those steps now
+  loads as the pick step. The CLI `diagnose`, `plan`, `segment`, and `plans`
+  commands are unchanged.
+
 ### Added
 
 - Local FlashVSR restoration upscale on the wizard picture path. FFmpeg trims,

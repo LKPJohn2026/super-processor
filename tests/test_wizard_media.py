@@ -1,4 +1,4 @@
-"""Range streaming for wizard media and the 1080p / 30 minute input limit."""
+"""Range streaming for output.mp4 and the 1080p / 30 minute input limit."""
 
 from __future__ import annotations
 
@@ -103,11 +103,9 @@ def test_output_is_streamed_with_ranges(tmp_path: Path) -> None:
         assert body == b""
         assert headers["Content-Length"] == str(len(payload))
 
-        status, headers, body = _request(
-            base, "GET", "/previews/p.mp4", {"Range": "bytes=10-19"}
-        )
-        assert status == 206
-        assert body == payload[10:20]
+        # Previews belonged to the removed enhance step.
+        status, _headers, _body = _request(base, "GET", "/previews/p.mp4")
+        assert status == 404
 
         status, _headers, _body = _request(base, "GET", "/previews/../../src.mp4")
         assert status == 404

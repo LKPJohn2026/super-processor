@@ -1,38 +1,31 @@
 """Gemini structured-output client for the localhost wizard.
 
 Uses the Generative Language REST API with ``responseMimeType`` /
-``responseSchema`` so replies stay parseable. The model emits structured ops
-only; FFmpeg argv is built elsewhere. Transport is injectable for tests.
+``responseSchema`` so replies stay parseable. The wizard only asks Gemini to
+turn a result note into a time range, scale, and strength for the FlashVSR
+upscale. Transport is injectable for tests.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
 from .models import resolve_secret
-from .recipe import OpName
 
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 GEMINI_MODEL_ENV = "SUPER_PROCESSOR_GEMINI_MODEL"
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 CHAT_FILE_NAME = "gemini_chat.json"
 CHAT_VERSION = 1
-MAX_SEGMENTS = 20
-MAX_LAYOUTS = 5
-MIN_SEGMENT_S = 5.0
-FRAME_CAP = 160
-WIZARD_FRAMES_DIR = "wizard_frames"
 # Production revise loops until the user picks an option; tests use this cap.
-MAX_ENHANCE_REVISE_ROUNDS_FOR_TESTS = 5
 _MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # Names that cannot diagnose frames/video for the wizard.
 _EXCLUDE_NAME_PARTS = (
@@ -55,15 +48,6 @@ _TRANSIENT_RETRIES = 2
 # Per-model read timeout. A model that stops answering is skipped for the next
 # candidate, so a full failover stays close to one slow call.
 _REQUEST_TIMEOUT_S = 60
-
-_ALLOWED_OPS = {
-    OpName.WHITE_BALANCE.value,
-    OpName.CONTRAST.value,
-    OpName.DENOISE.value,
-    OpName.SHARPEN.value,
-    OpName.STABILIZE.value,
-    OpName.TRIM.value,
-}
 
 
 class GeminiError(RuntimeError):
@@ -386,170 +370,6 @@ class UrllibGeminiTransport:
 
 
 @dataclass(slots=True)
-class StructuredOp:
-    """One allowlisted operation and parameters."""
-
-    op: str
-    params: dict[str, float] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"op": self.op, "params": dict(self.params)}
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> StructuredOp:
-        raw_params = data.get("params") or {}
-        if not isinstance(raw_params, dict):
-            raise GeminiError("op params must be an object")
-        params: dict[str, float] = {}
-        for key, value in raw_params.items():
-            params[str(key)] = float(value)
-        return cls(op=str(data["op"]), params=params)
-
-
-@dataclass(slots=True)
-class SegmentProposal:
-    """One proposed timeline segment."""
-
-    start_s: float
-    end_s: float
-    label: str
-    issues: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SegmentProposal:
-        issues = data.get("issues") or []
-        if not isinstance(issues, list):
-            raise GeminiError("segment issues must be a list")
-        return cls(
-            start_s=float(data["start_s"]),
-            end_s=float(data["end_s"]),
-            label=str(data.get("label", "")),
-            issues=[str(item) for item in issues],
-        )
-
-
-@dataclass(slots=True)
-class SplitLayout:
-    """One candidate split of the timeline."""
-
-    segment_count: int
-    summary: str
-    segments: list[SegmentProposal]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "segment_count": self.segment_count,
-            "summary": self.summary,
-            "segments": [item.to_dict() for item in self.segments],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SplitLayout:
-        raw = data.get("segments") or []
-        if not isinstance(raw, list):
-            raise GeminiError("layout segments must be a list")
-        segments = [
-            SegmentProposal.from_dict(item) for item in raw if isinstance(item, dict)
-        ]
-        return cls(
-            segment_count=int(data.get("segment_count", len(segments))),
-            summary=str(data.get("summary", "")),
-            segments=segments,
-        )
-
-
-@dataclass(slots=True)
-class SplitProposal:
-    """Gemini response for segmentation."""
-
-    layouts: list[SplitLayout]
-    highlights: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "layouts": [item.to_dict() for item in self.layouts],
-            "highlights": list(self.highlights),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SplitProposal:
-        raw_layouts = data.get("layouts") or []
-        raw_highlights = data.get("highlights") or []
-        if not isinstance(raw_layouts, list):
-            raise GeminiError("layouts must be a list")
-        if not isinstance(raw_highlights, list):
-            raise GeminiError("highlights must be a list")
-        layouts = [
-            SplitLayout.from_dict(item)
-            for item in raw_layouts
-            if isinstance(item, dict)
-        ]
-        return cls(
-            layouts=layouts,
-            highlights=[str(item) for item in raw_highlights],
-        )
-
-
-@dataclass(slots=True)
-class EnhanceOption:
-    """One enhancement choice for a segment."""
-
-    id: str
-    label: str
-    ops: list[StructuredOp]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "label": self.label,
-            "ops": [op.to_dict() for op in self.ops],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> EnhanceOption:
-        raw_ops = data.get("ops") or []
-        if not isinstance(raw_ops, list):
-            raise GeminiError("option ops must be a list")
-        ops = [
-            StructuredOp.from_dict(item) for item in raw_ops if isinstance(item, dict)
-        ]
-        return cls(id=str(data["id"]), label=str(data.get("label", "")), ops=ops)
-
-
-@dataclass(slots=True)
-class SegmentEnhanceResult:
-    """Gemini response for per-segment enhancement options."""
-
-    issues: list[str]
-    options: list[EnhanceOption]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "issues": list(self.issues),
-            "options": [item.to_dict() for item in self.options],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SegmentEnhanceResult:
-        raw_issues = data.get("issues") or []
-        raw_options = data.get("options") or []
-        if not isinstance(raw_issues, list) or not isinstance(raw_options, list):
-            raise GeminiError("enhance issues/options must be lists")
-        options = [
-            EnhanceOption.from_dict(item)
-            for item in raw_options
-            if isinstance(item, dict)
-        ]
-        return cls(
-            issues=[str(item) for item in raw_issues],
-            options=options,
-        )
-
-
-@dataclass(slots=True)
 class ChatTurn:
     """One persisted chat turn."""
 
@@ -611,41 +431,6 @@ def store_gemini_api_key(api_key: str) -> None:
         return
 
 
-def sample_fps_for_duration(duration_s: float) -> float:
-    """Return the target sample rate for Gemini frames."""
-    if duration_s <= 0:
-        return 1.0
-    if duration_s <= 60.0:
-        return 10.0
-    if duration_s >= 600.0:
-        return 1.0
-    # Linear interpolate 10 → 1 between 60s and 600s.
-    t = (duration_s - 60.0) / 540.0
-    return 10.0 + (1.0 - 10.0) * t
-
-
-def frame_timestamps(duration_s: float, *, frame_cap: int = FRAME_CAP) -> list[float]:
-    """Build sample timestamps with dynamic FPS and a hard frame cap."""
-    if duration_s <= 0:
-        return [0.0]
-    fps = sample_fps_for_duration(duration_s)
-    step = 1.0 / fps
-    stamps: list[float] = []
-    t = 0.0
-    while t < duration_s - 1e-6:
-        stamps.append(round(t, 3))
-        t += step
-    if not stamps or stamps[-1] < duration_s - 0.5:
-        stamps.append(round(max(0.0, duration_s - 0.05), 3))
-    if len(stamps) <= frame_cap:
-        return stamps
-    stride = max(1, len(stamps) // frame_cap)
-    reduced = stamps[::stride][:frame_cap]
-    if reduced[-1] != stamps[-1]:
-        reduced[-1] = stamps[-1]
-    return reduced
-
-
 def load_chat(job_dir: Path) -> list[ChatTurn]:
     """Load persisted Gemini chat turns for a job."""
     path = job_dir / CHAT_FILE_NAME
@@ -680,164 +465,6 @@ def append_chat_turn(job_dir: Path, turn: ChatTurn) -> list[ChatTurn]:
     return turns
 
 
-_SPLIT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "highlights": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "layouts": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "segment_count": {"type": "integer"},
-                    "summary": {"type": "string"},
-                    "segments": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start_s": {"type": "number"},
-                                "end_s": {"type": "number"},
-                                "label": {"type": "string"},
-                                "issues": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                            },
-                            "required": ["start_s", "end_s", "label", "issues"],
-                        },
-                    },
-                },
-                "required": ["segment_count", "summary", "segments"],
-            },
-        },
-    },
-    "required": ["layouts", "highlights"],
-}
-
-_ENHANCE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "issues": {"type": "array", "items": {"type": "string"}},
-        "options": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "label": {"type": "string"},
-                    "ops": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "op": {"type": "string"},
-                                "params": {"type": "object"},
-                            },
-                            "required": ["op", "params"],
-                        },
-                    },
-                },
-                "required": ["id", "label", "ops"],
-            },
-        },
-    },
-    "required": ["issues", "options"],
-}
-
-
-def validate_split_proposal(
-    proposal: SplitProposal,
-    *,
-    duration_s: float,
-) -> SplitProposal:
-    """Enforce layout and segment bounds for the wizard."""
-    if not proposal.layouts:
-        raise GeminiError("Gemini returned no split layouts")
-    if len(proposal.layouts) > MAX_LAYOUTS:
-        proposal = SplitProposal(
-            layouts=proposal.layouts[:MAX_LAYOUTS],
-            highlights=proposal.highlights,
-        )
-    cleaned: list[SplitLayout] = []
-    for layout in proposal.layouts:
-        segments = layout.segments
-        if not segments:
-            raise GeminiError("a layout has no segments")
-        if len(segments) > MAX_SEGMENTS:
-            raise GeminiError(f"layout exceeds {MAX_SEGMENTS} segments")
-        prev_end = 0.0
-        for index, segment in enumerate(segments):
-            if segment.end_s <= segment.start_s:
-                raise GeminiError("segment end must be after start")
-            if segment.end_s - segment.start_s < MIN_SEGMENT_S:
-                raise GeminiError(
-                    f"segment shorter than {MIN_SEGMENT_S:.0f}s is not allowed"
-                )
-            if segment.start_s < -1e-3 or segment.end_s > duration_s + 0.5:
-                raise GeminiError("segment is outside the media duration")
-            if index > 0 and segment.start_s + 1e-3 < prev_end:
-                raise GeminiError("segments overlap")
-            prev_end = segment.end_s
-        cleaned.append(
-            SplitLayout(
-                segment_count=len(segments),
-                summary=layout.summary,
-                segments=segments,
-            )
-        )
-    return SplitProposal(layouts=cleaned, highlights=proposal.highlights)
-
-
-def combine_enhance_revise_message(
-    *,
-    prior: SegmentEnhanceResult,
-    user_note: str,
-    segment_label: str,
-    start_s: float,
-    end_s: float,
-) -> str:
-    """Build the structured-revise prompt from prior options + user note.
-
-    Used by the Something-else loop: the user is improving or changing the
-    current option set, so Gemini must see both the request and the last JSON.
-    """
-    note = user_note.strip()
-    if not note:
-        raise GeminiError("revise note is empty")
-    prior_json = json.dumps(prior.to_dict(), indent=2)
-    return (
-        f"Act as a pro photographer. Segment {segment_label!r} runs from "
-        f"{start_s:.1f}s to {end_s:.1f}s.\n"
-        "The user wants to improve, enhance, or change the current options "
-        "(Something else).\n"
-        f"User request:\n{note}\n\n"
-        "Previous structured options (JSON):\n"
-        f"{prior_json}\n\n"
-        "Return a new set of 3 to 5 enhancement options that incorporate the "
-        "request. Keep ops allowlisted: white_balance, contrast, denoise, "
-        "sharpen, stabilize, trim. Do not invent shell commands."
-    )
-
-
-def validate_enhance_result(result: SegmentEnhanceResult) -> SegmentEnhanceResult:
-    """Enforce option count and allowlisted ops."""
-    if not (3 <= len(result.options) <= 5):
-        raise GeminiError("Gemini must return 3 to 5 enhancement options")
-    for option in result.options:
-        if not option.ops:
-            raise GeminiError(f"option {option.id} has no ops")
-        for op in option.ops:
-            if op.op not in _ALLOWED_OPS:
-                raise GeminiError(
-                    f"operation {op.op!r} is not allowlisted for the wizard"
-                )
-    return result
-
-
 def _extract_text(response: dict[str, Any]) -> str:
     try:
         candidates = response["candidates"]
@@ -861,19 +488,6 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     return data
 
 
-def _file_part(path: Path) -> dict[str, Any]:
-    raw = path.read_bytes()
-    mime = "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
-    if path.suffix.lower() == ".ppm":
-        mime = "image/png"
-    return {
-        "inline_data": {
-            "mime_type": mime,
-            "data": base64.b64encode(raw).decode("ascii"),
-        }
-    }
-
-
 _UPSCALE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -887,7 +501,7 @@ _UPSCALE_SCHEMA: dict[str, Any] = {
 
 
 class GeminiClient:
-    """Call Gemini with structured schemas for split, enhance, and upscale notes."""
+    """Call Gemini with a structured schema for upscale result notes."""
 
     def __init__(
         self,
@@ -1048,168 +662,6 @@ class GeminiClient:
         }
         response = self._generate_with_failover(body)
         return _parse_json_object(_extract_text(response))
-
-    def propose_splits(
-        self,
-        *,
-        frame_paths: list[Path],
-        duration_s: float,
-        user_text: str | None = None,
-        job_dir: Path | None = None,
-    ) -> SplitProposal:
-        """Ask Gemini for candidate timeline layouts."""
-        prompt = user_text or (
-            "Act as a pro video editor. Propose how to split this video into "
-            "independent enhancement segments. Return 3 to 5 alternate layouts "
-            f"with different segment counts when useful. Max {MAX_SEGMENTS} "
-            f"segments. Each segment must be at least {MIN_SEGMENT_S:.0f} seconds. "
-            f"Media duration is {duration_s:.1f} seconds."
-        )
-        parts: list[dict[str, Any]] = [{"text": prompt}]
-        refs: list[str] = []
-        for path in frame_paths:
-            if path.is_file():
-                parts.append(_file_part(path))
-                refs.append(path.name)
-        contents: list[dict[str, Any]] = []
-        if job_dir is not None:
-            for turn in load_chat(job_dir):
-                role = "user" if turn.role == "user" else "model"
-                contents.append({"role": role, "parts": [{"text": turn.text}]})
-        contents.append({"role": "user", "parts": parts})
-        data = self._generate(
-            contents=contents,
-            schema=_SPLIT_SCHEMA,
-            system=(
-                "You split videos for enhancement, not generation. "
-                "Return only structured JSON matching the schema."
-            ),
-        )
-        proposal = validate_split_proposal(
-            SplitProposal.from_dict(data),
-            duration_s=duration_s,
-        )
-        if job_dir is not None:
-            append_chat_turn(
-                job_dir,
-                ChatTurn(
-                    role="user",
-                    text=user_text if user_text else prompt,
-                    frame_refs=refs,
-                ),
-            )
-            append_chat_turn(
-                job_dir,
-                ChatTurn(
-                    role="model",
-                    text=json.dumps(proposal.to_dict()),
-                    structured=proposal.to_dict(),
-                ),
-            )
-        return proposal
-
-    def propose_enhance(
-        self,
-        *,
-        frame_paths: list[Path],
-        segment_label: str,
-        start_s: float,
-        end_s: float,
-        user_text: str | None = None,
-        prior: SegmentEnhanceResult | None = None,
-        job_dir: Path | None = None,
-    ) -> SegmentEnhanceResult:
-        """Ask Gemini for 3–5 allowlisted enhancement options.
-
-        When ``user_text`` and ``prior`` are both set, the prompt combines the
-        user's revise note with the previous structured options (Something else
-        loop). Otherwise this is the first proposal for the segment.
-        """
-        if user_text and prior is not None:
-            prompt = combine_enhance_revise_message(
-                prior=prior,
-                user_note=user_text,
-                segment_label=segment_label,
-                start_s=start_s,
-                end_s=end_s,
-            )
-        elif user_text:
-            prompt = (
-                f"Act as a pro photographer. Segment {segment_label!r} runs from "
-                f"{start_s:.1f}s to {end_s:.1f}s. The user wants different "
-                f"options: {user_text.strip()}. Return 3 to 5 enhancement "
-                "options. Ops must be from: white_balance, contrast, denoise, "
-                "sharpen, stabilize, trim. Do not invent shell commands."
-            )
-        else:
-            prompt = (
-                f"Act as a pro photographer. Segment {segment_label!r} runs from "
-                f"{start_s:.1f}s to {end_s:.1f}s. List issues and 3 to 5 "
-                "enhancement options. Ops must be from: white_balance, contrast, "
-                "denoise, sharpen, stabilize, trim. Do not invent shell commands."
-            )
-        parts: list[dict[str, Any]] = [{"text": prompt}]
-        refs: list[str] = []
-        for path in frame_paths:
-            if path.is_file():
-                parts.append(_file_part(path))
-                refs.append(path.name)
-        contents: list[dict[str, Any]] = []
-        if job_dir is not None:
-            for turn in load_chat(job_dir):
-                role = "user" if turn.role == "user" else "model"
-                contents.append({"role": role, "parts": [{"text": turn.text}]})
-        contents.append({"role": "user", "parts": parts})
-        data = self._generate(
-            contents=contents,
-            schema=_ENHANCE_SCHEMA,
-            system=(
-                "You enhance existing frames with structured ops only. "
-                "When revising, incorporate the user's request into a fresh "
-                "option set. Never propose generative edits or shell strings."
-            ),
-        )
-        result = validate_enhance_result(SegmentEnhanceResult.from_dict(data))
-        if job_dir is not None:
-            append_chat_turn(
-                job_dir,
-                ChatTurn(
-                    role="user",
-                    text=prompt,
-                    frame_refs=refs,
-                ),
-            )
-            append_chat_turn(
-                job_dir,
-                ChatTurn(
-                    role="model",
-                    text=json.dumps(result.to_dict()),
-                    structured=result.to_dict(),
-                ),
-            )
-        return result
-
-    def revise_enhance(
-        self,
-        *,
-        prior: SegmentEnhanceResult,
-        frame_paths: list[Path],
-        segment_label: str,
-        start_s: float,
-        end_s: float,
-        user_note: str,
-        job_dir: Path | None = None,
-    ) -> SegmentEnhanceResult:
-        """Combine a Something-else note with prior options and re-propose."""
-        return self.propose_enhance(
-            frame_paths=frame_paths,
-            segment_label=segment_label,
-            start_s=start_s,
-            end_s=end_s,
-            user_text=user_note,
-            prior=prior,
-            job_dir=job_dir,
-        )
 
     def revise_upscale_params(
         self,

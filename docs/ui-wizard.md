@@ -1,4 +1,4 @@
-# Localhost Gemini Wizard
+# Localhost Wizard
 
 This document is the screen inventory and contract for the localhost website
 served by `super-processor review`. Implementation lives in `wizard.py`,
@@ -27,10 +27,10 @@ super-processor doctor
 super-processor --jobs-dir .dogfood/jobs review
 ```
 
-Walk introduction → LLM type (Gemini) → setup → pick file → wait for analyze →
-overview → split (try Something else once) → enhance (preview, optional
-Something else, Accept) → render → result (happy). Confirm `output.mp4` in the
-job directory. CI also runs `@pytest.mark.gemini_live` against
+Walk introduction → LLM type (Gemini) → setup → pick file → upscale → result.
+Send one note with a time range (for example "less artificial detail from 2s
+to 5s"), wait for the range revise, then choose happy. Confirm `output.mp4` in
+the job directory. CI also runs `@pytest.mark.gemini_live` against
 `Gemini_API_Test` on main.
 
 ## Local-only server
@@ -42,7 +42,7 @@ Add origins, comma separated, with `SUPER_PROCESSOR_ALLOWED_ORIGINS`. A
 cross-site GET that would start work (for example an image tag pointing at
 `/render?run=1`) is refused.
 
-Analyze and upscale run on a single worker thread. `GET /render?run=1` and
+Upscale runs on a single worker thread. `GET /render?run=1` and
 `GET /api/render?run=1` start a pass when none is running and return at once.
 The page refreshes, and the React shell polls `/api/state` (which reports
 `busy`) until the step changes. Posts are refused while a pass runs.
@@ -95,55 +95,27 @@ frame count is refused and the previous `output.mp4` is kept.
 
 | Step | Route | Purpose |
 |---|---|---|
-| Introduction | `GET /` (state `intro`) | Brand hero: enhance, do not generate |
+| Introduction | `GET /` (state `intro`) | Brand hero |
 | LLM type | `GET/POST /llm` (state `llm_choice`) | A: no local LLM → Gemini; B: have local LLM → stub |
 | Local LLM stub | `GET/POST /local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
 | Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key |
-| Pick file | `GET/POST /pick` | Choose a local video path, then start the GPU pass |
-| Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims and splices |
-| Overview | `GET/POST /overview` | Duration, resolution, audio, highlight bullets |
-| Split choice | `GET/POST /split` | Layouts A… + Something else revise loop |
-| Segment enhance | `GET/POST /segment` | Options + short preview + Something else + accept |
-| Rendering | `GET /render` | Encode parts + concat (~5–10 min) |
+| Pick file | `GET/POST /pick` | Local video path (up to 1080p and 30 minutes) |
+| Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, or a note that retunes a time range |
 | Done | `GET /` (state `done`) | Confirmation |
-
-Estimated waits shown in the UI:
-
-- Analyze / upload-equivalent: about 1–3 minutes
-- Final render: about 5–10 minutes (scale copy with duration when known)
 
 ## State machine
 
 ```text
-intro → llm_choice ┬─ gemini → setup → pick_file → analyzing → overview
-                   └─ local  → local_llm_stub → setup ─┘
-                                                              │
-                         free-text revise ←───────────────────┤ choose_split
-                                                              ▼
-                                                    enhance_segment(i) → next i
-                                                              │
-                         Something else revise ←──────────────┤
-                                                              ▼
-                                                         rendering
-                                                              │
-                                                              ▼
-                                         result → happy → done
-                                            │
-                                            └── Something else → choose_split
+intro → llm_choice ┬─ gemini → setup → pick_file → rendering → result ─┬─ happy → done
+                   └─ local  → local_llm_stub → setup ─┘          ▲            │
+                                                                  └── note ────┘
 ```
 
-Persisted in the job directory as `wizard_state.json` and `gemini_chat.json`.
-
-## Something-else loops
-
-1. **Split** — Note revises layouts via `propose_splits(user_text=…)`. Stay on
-   `choose_split` until a layout is picked.
-2. **Enhance** — Note combines prior options + user text via
-   `revise_enhance` / `combine_enhance_revise_message`. Stay on the segment
-   until preview + accept (no production cap; tests cover five rounds).
-3. **Result** — “Something else” returns to `choose_split` with chat history
-   kept; segment choices are redone for the new pass.
+Persisted in the job directory as `wizard_state.json` (step, job id, last
+error) and `gemini_chat.json`. A state saved on a step of the removed split /
+enhance flow (`analyzing`, `overview`, `choose_split`, `enhance`) loads as
+`pick_file` with a message asking for the file again.
 
 ## LLM choice (sketch paths)
 
@@ -152,71 +124,16 @@ Persisted in the job directory as `wizard_state.json` and `gemini_chat.json`.
   only action is “Use Gemini instead”, which continues to Gemini setup.
   No local inference is wired in this release.
 
-## Gemini schemas
+## Gemini schema
 
-### Split layouts
-
-```json
-{
-  "layouts": [
-    {
-      "segment_count": 3,
-      "summary": "Indoor lift, outdoor daylight, closing dark",
-      "segments": [
-        {
-          "start_s": 0.0,
-          "end_s": 120.0,
-          "label": "indoor low light",
-          "issues": ["low_light", "low_contrast"]
-        }
-      ]
-    }
-  ],
-  "highlights": ["Dialogue-heavy opening", "Bright exterior mid"]
-}
-```
-
-Rules enforced after parse:
-
-- `1 ≤ layouts ≤ 5`
-- each layout `1 ≤ segment_count ≤ 20`
-- segments contiguous, non-overlapping, within media duration
-- each segment at least 5 seconds
-
-### Per-segment options
+The wizard makes one Gemini call: a result note becomes a range and knobs.
 
 ```json
-{
-  "issues": ["low_light", "soft_focus"],
-  "options": [
-    {
-      "id": "A",
-      "label": "Lift shadows and mild contrast",
-      "ops": [
-        {"op": "contrast", "params": {"contrast": 1.2, "brightness": 0.1, "gamma": 1.05}}
-      ]
-    }
-  ]
-}
+{"start_s": 2.0, "end_s": 5.0, "scale": 2, "strength": 0.3}
 ```
 
-Rules:
-
-- `3 ≤ options ≤ 5`
-- each `op` is allowlisted; params clamped by the validator bounds
-- no `reframe_vertical` / `encode_hevc_size_cap` from the wizard path
-
-## Sampling rules
-
-| Duration | Target sample rate |
-|---|---|
-| ≤ 60 s | up to 10 FPS |
-| 60–600 s | interpolate 10 → 1 FPS |
-| ≥ 600 s | 1 FPS |
-
-Apply a hard cap of 160 frames by increasing stride. Extract JPEG or PPM
-stills under `wizard_frames/`. Consent is implied by completing Gemini setup
-and starting analysis.
+`scale` must be 2 or 4 and `strength` 0–1; the range is clamped to the file.
+A scale change re-renders the whole clip (see Range revise above).
 
 ## Multi-turn chat
 
@@ -226,7 +143,7 @@ and starting analysis.
 {
   "version": 1,
   "turns": [
-    {"role": "user", "text": "…", "frame_refs": ["wizard_frames/f_000.jpg"]},
+    {"role": "user", "text": "…"},
     {"role": "model", "text": "…", "structured": { }}
   ]
 }
@@ -237,29 +154,19 @@ and starting analysis.
 | File | Meaning |
 |---|---|
 | `manifest.json` | Job id, source, state |
-| `probe.json` / media facts | FFprobe |
-| `wizard_state.json` | Wizard step, layout index, segment cursor |
-| `gemini_chat.json` | Multi-turn history |
-| `split_layouts.json` | Last Gemini layout set |
-| `segments.json` | Accepted timeline |
-| `segment_choices.json` | Chosen option id + ops per segment |
-| `segment_stills/` | UI stills |
-| `wizard_frames/` | Frames sent / eligible for Gemini |
-| `segment_encodes/` | Per-segment mp4 parts |
-| `output.mp4` | Concat result |
-
-## Mapping structured ops to FFmpeg
-
-Chosen ops become a `Treatment` (ordered steps) for the existing
-`build_segment_argv` / `render_chosen_plan` path. Templates own the argv. The
-model never emits a shell string.
+| `wizard_state.json` | Wizard step, job id, last error |
+| `gemini_chat.json` | Result-note history |
+| `upscale_plan.json` | Spans with scale and strength, plus the pending revise |
+| `output.mp4` | Current result |
+| `output.mp4.delivery.json` | Encode settings marker for keyframe splices |
+| `range_work/`, `flash_chunks/` | Work clips for revises and chunked FlashVSR |
 
 ## UI presentation
 
 Server-rendered HTML in `wizard_pages.py` remains the live localhost wizard.
-Shared shell includes a step rail (Setup · File · Split · Enhance · Result),
+Shared shell includes a step rail (Setup · File · Upscale · Result),
 brand mark, and wait estimates. Intro is a single composition with Super
-Processor as the hero. Choice screens use lettered options (A–E) matching the
+Processor as the hero. The LLM choice screen uses lettered options matching the
 product sketch.
 
 `web/` is a separate React shell. GitHub Pages serves it as a static preview

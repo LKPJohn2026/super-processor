@@ -4,10 +4,6 @@ export type WizardStep =
   | "local_llm_stub"
   | "setup"
   | "pick_file"
-  | "analyzing"
-  | "overview"
-  | "choose_split"
-  | "enhance"
   | "rendering"
   | "result"
   | "done";
@@ -30,10 +26,6 @@ const STEPS: readonly string[] = [
   "local_llm_stub",
   "setup",
   "pick_file",
-  "analyzing",
-  "overview",
-  "choose_split",
-  "enhance",
   "rendering",
   "result",
   "done",

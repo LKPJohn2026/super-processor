@@ -12,7 +12,7 @@ function railIndex(step: WizardView["step"]): number {
   if (step === "intro" || step === "llm_choice" || step === "local_llm_stub" || step === "setup") {
     return 0;
   }
-  if (step === "pick_file" || step === "analyzing" || step === "overview") return 1;
+  if (step === "pick_file") return 1;
   if (step === "rendering") return 2;
   return 3;
 }

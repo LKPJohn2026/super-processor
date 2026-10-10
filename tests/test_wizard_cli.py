@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
@@ -102,9 +103,7 @@ def test_run_review_with_job_id(
     assert code == 0
 
 
-def test_analyze_and_render_get_triggers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_render_get_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from super_processor.gemini import GeminiClient
 
     payload = {
@@ -128,26 +127,18 @@ def test_analyze_and_render_get_triggers(
     gemini = GeminiClient(api_key="k", transport=transport)
     controller = WizardController(tmp_path, gemini=gemini)
 
-    def _noop_analyze() -> None:
-        state = WizardState(step=WizardStep.PICK_FILE)
-        save_session_state(tmp_path, state)
-
     def _noop_render() -> None:
         state = WizardState(step=WizardStep.DONE)
         save_session_state(tmp_path, state)
 
-    monkeypatch.setattr(controller, "run_analyze", _noop_analyze)
     monkeypatch.setattr(controller, "run_render", _noop_render)
-    state = WizardState(step=WizardStep.ANALYZING)
-    save_session_state(tmp_path, state)
     server = WizardServer(tmp_path, controller=controller)
     base = server.start()
     try:
-        with urlopen(base + "/analyze?run=1") as response:
-            response.read()
-        assert controller.wait_idle(timeout=10)
-        with urlopen(base + "/") as response:
-            assert "Pick" in response.read().decode()
+        with pytest.raises(HTTPError) as retired:
+            urlopen(base + "/analyze?run=1")
+        assert retired.value.code == 404
+        retired.value.close()
         state = WizardState(step=WizardStep.RENDERING)
         save_session_state(tmp_path, state)
         with urlopen(base + "/render?run=1") as response:

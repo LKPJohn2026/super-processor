@@ -380,9 +380,6 @@ _API_POSTS = {
     "/api/local-llm": "/local-llm",
     "/api/setup": "/setup",
     "/api/pick": "/pick",
-    "/api/overview": "/overview",
-    "/api/split": "/split",
-    "/api/segment": "/segment",
     "/api/result": "/result",
 }
 
@@ -504,27 +501,10 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
         def _media_file(self, path: str) -> tuple[Path, str] | None:
             """Map a media URL to a file inside the job, or ``None``."""
             state = controller.current_state()
-            if not state.job_id:
+            if not state.job_id or path != "/output.mp4":
                 return None
-            job_dir = controller.store.job_dir(state.job_id)
-            if path == "/output.mp4":
-                output = job_dir / "output.mp4"
-                return (output, "video/mp4") if output.is_file() else None
-            served = path.startswith("/previews/") or path.startswith(
-                f"/{STILLS_DIR_NAME}/"
-            )
-            if not served or path.endswith(".bmp"):
-                return None
-            candidate = (job_dir / path.lstrip("/")).resolve()
-            root = job_dir.resolve()
-            if root not in candidate.parents or not candidate.is_file():
-                return None
-            ctype = (
-                "video/mp4"
-                if candidate.suffix == ".mp4"
-                else "application/octet-stream"
-            )
-            return candidate, ctype
+            output = controller.store.job_dir(state.job_id) / "output.mp4"
+            return (output, "video/mp4") if output.is_file() else None
 
         def do_HEAD(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
@@ -608,10 +588,6 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                     controller.start_render()
                     self._json(controller.api_view())
                     return
-                if path == "/analyze" and runs:
-                    controller.start_analyze()
-                    self._redirect("/")
-                    return
                 if path == "/render" and runs:
                     controller.start_render()
                     self._redirect("/")
@@ -619,32 +595,10 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                 if path == "/":
                     self._html(controller.render())
                     return
-                state = controller.current_state()
-                if state.job_id:
-                    job_dir = controller.store.job_dir(state.job_id)
-                    media = self._media_file(path)
-                    if media is not None:
-                        self._send_file(media[0], media[1], head=False)
-                        return
-                    if path.startswith("/previews/") or path.startswith(
-                        f"/{STILLS_DIR_NAME}/"
-                    ):
-                        if path.endswith(".bmp"):
-                            still = _still_file(job_dir, path[:-4] + ".ppm")
-                            if still is None:
-                                self.send_response(404)
-                                self.end_headers()
-                                return
-                            data = gray_ppm_to_bmp(still.read_bytes())
-                            self.send_response(200)
-                            self.send_header("Content-Type", "image/bmp")
-                            self.send_header("Content-Length", str(len(data)))
-                            self.end_headers()
-                            self.wfile.write(data)
-                            return
-                        self.send_response(404)
-                        self.end_headers()
-                        return
+                media = self._media_file(path)
+                if media is not None:
+                    self._send_file(media[0], media[1], head=False)
+                    return
                 self.send_response(404)
                 self.end_headers()
             except (WizardError, ReviewError, OSError) as exc:

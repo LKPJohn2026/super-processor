@@ -1,10 +1,11 @@
 # Super Processor — System Design
 
-Super Processor is a local-first video processor. It enhances existing footage
-through measured, constrained FFmpeg pipelines. A localhost wizard guides
-setup, Gemini-assisted segmentation, and per-segment enhancement. AI diagnoses
-problems and proposes structured operations; it does not generate replacement
-frames or write arbitrary shell commands.
+Super Processor is a local-first video processor. A localhost wizard runs a
+local FlashVSR restoration upscale on footage you already shot, then lets you
+revise a time range with a plain-language note. Gemini only turns that note
+into a bounded range, scale, and strength; FFmpeg trims, splices, encodes, and
+copies audio. No model writes shell commands. The CLI keeps the older
+FFmpeg-filter grade paths for automation.
 
 ## Market context
 
@@ -88,54 +89,39 @@ The durable product value remains the validated processing control plane, not
 dependence on one vendor. Additional providers can return later behind the same
 structured-ops contract.
 
-### Structured ops instead of model-generated shell
+### Structured output instead of model-generated shell
 
 Gemini emits parseable JSON through
 [structured outputs](https://ai.google.dev/gemini-api/docs/structured-output).
-Schemas cover split layouts and per-segment enhancement options. Each option
-lists allowlisted operations and bounded parameters.
+The wizard has one schema: a result note becomes `start_s`, `end_s`, `scale`
+(2 or 4), and `strength` (0–1). Values are validated and clamped to the file
+before anything runs. The model has no shell tool, and FFmpeg argument lists
+are built by engineering-owned code.
 
-Engineering-owned templates translate validated ops into FFmpeg argument lists.
-The model has no shell tool. This confines mistakes to a rejectable data
-structure and prevents invented filters or unsafe command strings from reaching
-a process boundary.
+### Result note and range revise
 
-### Gemini owns split and diagnosis
+The first pass restores the whole clip. The result screen asks whether the
+user is happy; otherwise a note such as "less artificial detail from 2s to
+5s" re-restores that range from the original source and splices it back.
+Untouched parts of the output are stream-copied and never re-encoded. A note
+that changes scale re-renders the whole clip. Strength is the share of the
+FlashVSR picture in the output; the rest is a lanczos upscale of the same
+frames.
 
-Classical computer-vision estimators are retired from the product path for
-segmentation and diagnosis. The wizard samples frames with FFmpeg at a dynamic
-rate, sends them to Gemini, and presents structured proposals to the user.
+### Inputs up to 1080p and 30 minutes
 
-Legacy CLI diagnose/plan paths that used CV estimators may remain in the tree
-for compatibility until a later cleanup tag. The wizard does not call them.
+The pick step refuses files above 1080p (either orientation) or longer than 30
+minutes, before a job is created.
 
-### Split choice among Gemini layouts
+### Gemini split and per-segment enhance (removed)
 
-Gemini proposes several timeline layouts (typically three, four, or five
-segments). The user picks one layout or replies with free text (“something
-else”), which continues a multi-turn chat that returns a new structured layout
-set. Hard maximum: 20 segments.
+An earlier wizard had Gemini propose timeline split layouts and per-segment
+FFmpeg filter options with short previews, then concatenated the graded
+segments. Once the picture path became a FlashVSR upscale, that flow was no
+longer reachable from the wizard, and it has been removed. The CLI `segment`
+and `plans` commands still provide a classical split and grade.
 
-### Per-segment enhancement with short previews
-
-For each accepted segment, Gemini proposes three to five enhancement options
-(structured ops). The user picks one or revises with free text. A short preview
-clip is encoded before the choice is committed. After every segment is accepted,
-segments are encoded and concatenated at the source aspect ratio.
-
-### Wizard export: enhance and concat
-
-Wizard v1 keeps the source aspect. It does not default to full-timeline
-vertical social export or a size-cap floor. Those code paths may remain unused
-by the wizard; they are not part of the default render.
-
-### Mandatory preview and explicit completion
-
-A segment choice requires a short preview. Final render starts only after every
-segment has an accepted option. The result screen asks whether the user is
-happy; a revise path returns to split choice with chat history preserved.
-
-### Focused operations
+### Focused operations (CLI grade path)
 
 The processing vocabulary stays allowlisted:
 
@@ -165,68 +151,50 @@ integrity, and user acceptance.
 ## Architecture
 
 ```text
-Pick file (localhost wizard)
+Pick file (localhost wizard) ──► FFprobe ──► 1080p / 30 min check
    │
    ▼
-FFprobe ──► versioned media facts
+FlashVSR restore + upscale (8 s chunks, frame count conformed)
    │
    ▼
-Dynamic-FPS frame sample ──► Gemini structured split layouts
+lanczos blend at strength ──► delivery encode (IDR every 1 s)
    │
    ▼
-User picks layout (or multi-turn revise)
-   │
-   ▼
-Per segment: Gemini options ──► short preview ──► accept
-   │
-   ▼
-schema / policy validator ──► FFmpeg templates
-   │
-   ▼
-segment encodes + concat (same aspect)
-   │
-   ▼
-result player + happy / revise
+result player ──► happy, or a note
+                      │
+                      ▼
+          Gemini: note → range, scale, strength
+                      │
+                      ▼
+          re-restore range from source ──► keyframe splice ──► result
 ```
 
-The model has no shell tool. Only the template layer creates process arguments,
-and input/output paths are passed as argument-list elements rather than
-interpolated shell strings.
+The model has no shell tool. Only engineering-owned code creates process
+arguments, and input/output paths are passed as argument-list elements rather
+than interpolated shell strings.
 
 ## Job model
 
 Each job has an on-disk directory containing:
 
 - source identity and FFprobe facts;
-- sampled frames / stills for Gemini and the UI;
-- `gemini_chat.json` multi-turn history;
-- split layouts and the accepted segment list;
-- per-segment chosen ops and preview clips;
-- validation reports;
-- final output and redacted logs.
+- `wizard_state.json` (step, job id, last error);
+- `gemini_chat.json` history of result notes;
+- `upscale_plan.json` spans with scale and strength;
+- `output.mp4` and its `output.mp4.delivery.json` encode marker;
+- work folders for chunks and range splices.
 
-Wizard-oriented states reuse the job store where possible:
+Wizard steps:
 
 ```text
-imported → probed → split_proposed → split_accepted
-         → plans_ready → plan_selected → encoding → complete
+intro → llm_choice → setup → pick_file → rendering → result ─┬─ happy → done
+                                             ▲               │
+                                             └──── note ─────┘
 ```
 
-Revise-from-result may return to `split_proposed` with preserved chat history.
-Cancellation terminates the FFmpeg process group; final output is written
-atomically.
-
-## Frame sampling for Gemini
-
-Frame count is bounded by duration-dependent FPS:
-
-- duration ≤ 60 s → up to 10 FPS;
-- duration ≥ 600 s → 1 FPS;
-- durations in between interpolate;
-- a hard cap (about 120–180 frames) applies a further stride when needed.
-
-Only those frames (or a contact sheet derived from them) are eligible for
-upload after consent. Keyframe stills for the UI stay on disk locally.
+A state file saved on a step of the removed split/enhance flow sends the user
+back to the pick step. Cancellation terminates the FFmpeg process group; final
+output is written atomically.
 
 ## CLI direction
 
@@ -255,9 +223,9 @@ may remain for compatibility; the wizard is the primary product path.
 Included:
 
 - localhost wizard on the review server;
-- local FFmpeg/FFprobe processing;
-- Gemini structured split and per-segment options;
-- validated ops, short previews, enhance-and-concat render;
+- local FlashVSR restoration upscale with FFmpeg trim, splice, and encode;
+- Gemini structured result notes (range, scale, strength);
+- CLI FFmpeg-filter grade paths (diagnose, plan, segment, plans);
 - software encoding (optional hardware);
 - reference-based regression helpers where already present.
 
@@ -268,7 +236,6 @@ Deferred:
 - vertical social export as the wizard default;
 - desktop shell (Tauri/Electron);
 - classical CV as product diagnosis;
-- neural enhancement models;
 - cloud render workers;
 - generative video features;
 - multi-track nonlinear editing.
