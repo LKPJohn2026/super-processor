@@ -52,6 +52,9 @@ _EXHAUSTING_STATUS = frozenset({404, 429})
 _TRANSIENT_STATUS = frozenset({500, 503})
 MAX_CANDIDATE_MODELS = 8
 _TRANSIENT_RETRIES = 2
+# Per-model read timeout. A model that stops answering is skipped for the next
+# candidate, so a full failover stays close to one slow call.
+_REQUEST_TIMEOUT_S = 60
 
 _ALLOWED_OPS = {
     OpName.WHITE_BALANCE.value,
@@ -264,6 +267,7 @@ def _is_retryable_error(exc: GeminiError) -> bool:
             "rate limit",
             "quota",
             "unavailable",
+            "timed out",
         )
     )
 
@@ -325,7 +329,7 @@ class UrllibGeminiTransport:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=120) as response:
+            with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as response:
                 parsed: object = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             status, detail = _http_error_detail(exc)

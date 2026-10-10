@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name. The upscaled picture is encoded once with a keyframe every second and
   no B-frames; a revise snaps out to those keyframes and stream-copies the
   head and tail. Work clips handed to FlashVSR are lossless.
+- A Gemini call that times out moves on to the next candidate model instead
+  of failing the request. The per-model read timeout is 60 seconds (was 120).
 
 ### Planned
 
