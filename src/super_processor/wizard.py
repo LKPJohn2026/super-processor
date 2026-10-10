@@ -438,6 +438,31 @@ class WizardController:
             return render_done()
         return render_intro()
 
+    def api_view(self) -> dict[str, Any]:
+        """JSON snapshot of the current step for a separate UI shell."""
+        state = self._state()
+        output_ready = False
+        output_url: str | None = None
+        scale: int | None = None
+        strength: float | None = None
+        if state.job_id and state.step in {WizardStep.RESULT, WizardStep.DONE}:
+            job_dir = self.store.job_dir(state.job_id)
+            if (job_dir / "output.mp4").is_file():
+                output_ready = True
+                output_url = "/output.mp4"
+            if state.step is WizardStep.RESULT:
+                scale, strength = _active_knobs(job_dir)
+        return {
+            "step": state.step.value,
+            "error": state.error,
+            "job_id": state.job_id,
+            "has_gemini_key": resolve_gemini_api_key() is not None,
+            "output_ready": output_ready,
+            "output_url": output_url,
+            "scale": scale,
+            "strength": strength,
+        }
+
     def _render_enhance(self, state: WizardState) -> str:
         assert state.job_id
         job_dir = self.store.job_dir(state.job_id)

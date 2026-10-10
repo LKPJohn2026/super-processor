@@ -259,6 +259,43 @@ def _legacy_handler(
     return Handler
 
 
+_API_POSTS = {
+    "/api/intro": "/intro",
+    "/api/llm": "/llm",
+    "/api/local-llm": "/local-llm",
+    "/api/setup": "/setup",
+    "/api/pick": "/pick",
+    "/api/overview": "/overview",
+    "/api/split": "/split",
+    "/api/segment": "/segment",
+    "/api/result": "/result",
+}
+
+
+def form_fields_from_body(raw: bytes, content_type: str) -> dict[str, list[str]]:
+    """Parse a wizard POST body from a form or a JSON object."""
+    if "application/json" in content_type:
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text:
+            return {}
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise WizardError("invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise WizardError("JSON body must be an object")
+        fields: dict[str, list[str]] = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                fields[str(key)] = ["1" if value else "0"]
+                continue
+            fields[str(key)] = [str(value)]
+        return fields
+    return parse_qs(raw.decode("utf-8", errors="replace"))
+
+
 def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -284,14 +321,58 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                 status=400,
             )
 
+        def _json(self, payload: object, status: int = 200) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            origin = self.headers.get("Origin")
+            if origin:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_fields(self) -> dict[str, list[str]]:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length)
+            return form_fields_from_body(raw, self.headers.get("Content-Type", ""))
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            if not path.startswith("/api/"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(204)
+            origin = self.headers.get("Origin")
+            self.send_header("Access-Control-Allow-Origin", origin or "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.end_headers()
+
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            fields = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
             try:
-                controller.handle_post(path, fields)
+                fields = self._read_fields()
             except WizardError as exc:
+                if path.startswith("/api/"):
+                    self._json({"error": str(exc)}, status=400)
+                    return
                 self._reject(str(exc))
+                return
+            action = _API_POSTS.get(path, path)
+            try:
+                controller.handle_post(action, fields)
+            except WizardError as exc:
+                if path.startswith("/api/"):
+                    self._json({"error": str(exc)}, status=400)
+                    return
+                self._reject(str(exc))
+                return
+            if path.startswith("/api/"):
+                self._json(controller.api_view())
                 return
             self._redirect("/")
 
@@ -300,6 +381,13 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             path = parsed.path
             query = parse_qs(parsed.query)
             try:
+                if path == "/api/state":
+                    self._json(controller.api_view())
+                    return
+                if path == "/api/render" and query.get("run", [""])[0] == "1":
+                    controller.run_render()
+                    self._json(controller.api_view())
+                    return
                 if path == "/analyze" and query.get("run", [""])[0] == "1":
                     controller.run_analyze()
                     self._redirect("/")
