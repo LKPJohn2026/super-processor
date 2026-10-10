@@ -2,6 +2,9 @@
 
 FFmpeg probes, trims, concatenates, and copies audio. It does not choose the
 look. Gemini may only return a time range plus ``scale`` and ``strength``.
+``strength`` is the share of the FlashVSR picture in the output; the rest is a
+plain lanczos upscale of the same frames, so 0.0 invents nothing and 1.0 is
+FlashVSR alone. FlashVSR itself always runs at its upstream settings.
 The real engine refuses to run without CUDA; tests use :class:`FakeUpscaleEngine`.
 
 Work clips handed to the engine are encoded losslessly. The engine output is
@@ -31,6 +34,10 @@ DELIVERY_VERSION = 1
 DELIVERY_CRF = 16
 KEYFRAME_INTERVAL_S = 1.0
 _KEY_EPSILON_S = 0.02
+# FlashVSR works in fixed-size frame blocks and may pad or drop a few frames
+# at the end of a clip. Up to this many (or 2% of the clip) are conformed back
+# to the source count; more than that means the clip is misaligned.
+FRAME_SLACK = 8
 _SCALES = frozenset({2, 4})
 # The upstream script is imported with a chdir into its folder, which is
 # process-wide. Only one FlashVSR load or inference may run at a time.
@@ -175,12 +182,10 @@ def planned_chunks(
     return spans
 
 
-def flashvsr_knobs(strength: float) -> tuple[float, int]:
-    """Map strength to FlashVSR stability knobs. Lower strength invents less."""
-    value = _require_strength(strength)
-    sparse_ratio = 2.0 if value < 0.75 else 1.5
-    local_range = 11 if value < 0.55 else 9
-    return sparse_ratio, local_range
+# Upstream FlashVSR v1.1 tiny defaults. These trade attention cost against
+# quality; they are not a restoration strength, so they stay fixed.
+FLASHVSR_SPARSE_RATIO = 2.0
+FLASHVSR_LOCAL_RANGE = 11
 
 
 def models_dir() -> Path:
@@ -404,10 +409,8 @@ def _infer_loaded(
     output: Path,
     *,
     scale: int,
-    strength: float,
 ) -> None:
     """Run one already-loaded pipeline on a short clip."""
-    sparse_ratio, local_range = flashvsr_knobs(strength)
     low, height, width, frames, fps = module.prepare_input_tensor(
         str(source),
         scale=float(scale),
@@ -426,9 +429,9 @@ def _infer_loaded(
         width=width,
         is_full_block=False,
         if_buffer=True,
-        topk_ratio=sparse_ratio * 768 * 1280 / (height * width),
+        topk_ratio=FLASHVSR_SPARSE_RATIO * 768 * 1280 / (height * width),
         kv_ratio=3.0,
-        local_range=local_range,
+        local_range=FLASHVSR_LOCAL_RANGE,
         color_fix=True,
     )
     pictures = module.tensor2video(video)
@@ -438,6 +441,99 @@ def _infer_loaded(
     empty = getattr(getattr(module.torch, "cuda", None), "empty_cache", None)
     if empty is not None:
         empty()
+    conform_frames(output, source)
+
+
+def video_stream_facts(video: Path, *, ffprobe_bin: str = "ffprobe") -> tuple[int, str]:
+    """Frame count (packets, no decode) and ``r_frame_rate`` of the video."""
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets,r_frame_rate",
+                "-of",
+                "json",
+                str(video),
+            ],
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UpscaleError(f"failed to start ffprobe: {exc}") from exc
+    try:
+        streams = json.loads(completed.stdout or b"{}").get("streams") or []
+        stream = streams[0]
+        return int(stream["nb_read_packets"]), str(stream["r_frame_rate"])
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise UpscaleError(
+            f"could not count the frames of {video}: {detail or exc}"
+        ) from exc
+
+
+def conform_frames(
+    restored: Path,
+    source: Path,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+) -> Path:
+    """Make ``restored`` hold exactly the source's frames at the source's rate.
+
+    The keyframe splice and the chunk overlap both cut by time, so a restored
+    clip that is a few frames short or long, or written at a rounded rate,
+    would shift everything after it. A small difference is fixed losslessly at
+    the end of the clip (trim, or repeat the last frame). A larger one raises
+    before anything is spliced.
+    """
+    want, rate = video_stream_facts(source, ffprobe_bin=ffprobe_bin)
+    have, have_rate = video_stream_facts(restored, ffprobe_bin=ffprobe_bin)
+    if have == want and have_rate == rate:
+        return restored
+    if abs(have - want) > max(FRAME_SLACK, int(want * 0.02)):
+        raise UpscaleError(
+            f"FlashVSR returned {have} frames for a {want}-frame clip "
+            f"({source.name}); refusing to splice a misaligned picture"
+        )
+    filters = [f"setpts=N/({rate})/TB"]
+    if have < want:
+        filters.append(f"tpad=stop_mode=clone:stop={want - have}")
+    tmp = restored.with_name(restored.stem + ".conform" + restored.suffix)
+    _run_ffmpeg(
+        [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(restored),
+            "-vf",
+            ",".join(filters),
+            "-r",
+            rate,
+            "-frames:v",
+            str(want),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            str(tmp),
+        ]
+    )
+    tmp.replace(restored)
+    return restored
 
 
 def _run_flashvsr(request: UpscaleRequest, *, home: Path, infer: Path) -> Path:
@@ -455,7 +551,6 @@ def _run_flashvsr(request: UpscaleRequest, *, home: Path, infer: Path) -> Path:
             request.source,
             request.output,
             scale=request.scale,
-            strength=request.strength,
         )
     except UpscaleError:
         raise
@@ -500,7 +595,6 @@ def _run_flashvsr_chunked(
                 clip,
                 raw,
                 scale=span.scale,
-                strength=span.strength,
             )
             # Every piece goes through the same lossless encode so the join
             # reads one set of codec parameters.
@@ -515,10 +609,16 @@ def _run_flashvsr_chunked(
         raise UpscaleError(f"FlashVSR failed: {exc}") from exc
     finally:
         _unload_flashvsr(previous, path_added)
-    # Join and encode once into the delivery settings, so the caller does not
-    # encode this picture a second time.
+    # Join, blend, and encode once into the delivery settings, so the caller
+    # does not encode this picture a second time.
     listing = _write_listing(work / "join.txt", pieces)
-    encode_delivery(listing, request.output, concat=True)
+    encode_delivery(
+        listing,
+        request.output,
+        concat=True,
+        blend_with=request.source,
+        strength=request.strength,
+    )
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
     return request.output
@@ -580,16 +680,48 @@ def _delivery_marker() -> dict[str, Any]:
     }
 
 
-def is_delivery(video: Path) -> bool:
-    """True when ``video`` was written by :func:`encode_delivery` (this version)."""
+def _read_marker(video: Path) -> dict[str, Any] | None:
     marker = delivery_marker_path(video)
     if not video.is_file() or not marker.is_file():
-        return False
+        return None
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def is_delivery(video: Path) -> bool:
+    """True when ``video`` was written by :func:`encode_delivery` (this version)."""
+    data = _read_marker(video)
+    if data is None:
         return False
-    return bool(data == _delivery_marker())
+    return all(data.get(key) == value for key, value in _delivery_marker().items())
+
+
+def _write_marker(video: Path, *, strength: float | None) -> None:
+    data = _delivery_marker()
+    if strength is not None:
+        data["strength"] = strength
+    delivery_marker_path(video).write_text(json.dumps(data) + "\n", encoding="utf-8")
+
+
+def blend_filter(width: int, height: int, strength: float) -> str:
+    """Mix the restored picture (input 0) with a lanczos upscale of input 1.
+
+    ``eof_action=pass`` ends on the restored picture, so the frame count the
+    keyframe splice relies on never changes. The base is padded by a second
+    of its last frame so a few missing frames do not leave the tail unmixed.
+    """
+    weight = _require_strength(strength)
+    return (
+        "[0:v]setpts=PTS-STARTPTS,format=yuv420p[up];"
+        "[1:v]setpts=PTS-STARTPTS,"
+        f"scale={width}:{height}:flags=lanczos,format=yuv420p,"
+        "tpad=stop_mode=clone:stop_duration=1[base];"
+        f"[up][base]blend=all_expr='A*{weight:.4f}+B*{1 - weight:.4f}'"
+        ":eof_action=pass[v]"
+    )
 
 
 def encode_delivery(
@@ -598,18 +730,25 @@ def encode_delivery(
     *,
     ffmpeg_bin: str = "ffmpeg",
     concat: bool = False,
+    blend_with: Path | None = None,
+    strength: float = 1.0,
 ) -> Path:
     """Encode a picture once into the settings every splice part shares.
 
     A forced IDR frame every second, and no B-frames, give a range revise
     clean points to cut the current output by stream copy. ``concat`` reads
-    ``source`` as a concat-demuxer listing.
+    ``source`` as a concat-demuxer listing. With ``blend_with`` and a strength
+    below 1, the picture is mixed with a lanczos upscale of ``blend_with`` in
+    the same encode (see :func:`blend_filter`).
     """
+    mixing = blend_with is not None and strength < 1.0
     if not concat and is_delivery(source):
-        if source != dest:
-            source.replace(dest)
-            delivery_marker_path(source).replace(delivery_marker_path(dest))
-        return dest
+        done = _read_marker(source) or {}
+        if not mixing or done.get("strength") == strength:
+            if source != dest:
+                source.replace(dest)
+                delivery_marker_path(source).replace(delivery_marker_path(dest))
+            return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     marker = delivery_marker_path(dest)
     marker.unlink(missing_ok=True)
@@ -621,6 +760,19 @@ def encode_delivery(
             str(source),
         ]
     )
+    picture = ["-map", "0:v:0"]
+    if mixing:
+        assert blend_with is not None
+        size = _frame_size(_first_part(source) if concat else source)
+        if size is None:
+            raise UpscaleError(f"could not read the frame size of {source}")
+        inputs.extend(["-i", str(blend_with)])
+        picture = [
+            "-filter_complex",
+            blend_filter(size[0], size[1], strength),
+            "-map",
+            "[v]",
+        ]
     tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
     _run_ffmpeg(
         [
@@ -630,8 +782,7 @@ def encode_delivery(
             "error",
             "-y",
             *inputs,
-            "-map",
-            "0:v:0",
+            *picture,
             "-c:v",
             "libx264",
             "-preset",
@@ -653,8 +804,17 @@ def encode_delivery(
         ]
     )
     tmp.replace(dest)
-    marker.write_text(json.dumps(_delivery_marker()) + "\n", encoding="utf-8")
+    _write_marker(dest, strength=strength if blend_with is not None else None)
     return dest
+
+
+def _first_part(listing: Path) -> Path:
+    """The first file named in a concat-demuxer listing."""
+    for line in listing.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("file "):
+            return Path(line[5:].strip().strip("'").replace("'\\''", "'"))
+    raise UpscaleError(f"empty concat listing {listing}")
 
 
 def keyframe_times(video: Path, *, ffprobe_bin: str = "ffprobe") -> list[float]:
@@ -777,7 +937,13 @@ def _upscale_full(
             source, work / "full_up.mp4", scale=span.scale, strength=span.strength
         )
     )
-    encode_delivery(raw, output, ffmpeg_bin=ffmpeg_bin)
+    encode_delivery(
+        raw,
+        output,
+        ffmpeg_bin=ffmpeg_bin,
+        blend_with=source,
+        strength=span.strength,
+    )
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
 
@@ -829,7 +995,13 @@ def apply_range_revise(
             strength=span.strength,
         )
     )
-    middle = encode_delivery(raw, work / "range_delivery.mp4", ffmpeg_bin=ffmpeg_bin)
+    middle = encode_delivery(
+        raw,
+        work / "range_delivery.mp4",
+        ffmpeg_bin=ffmpeg_bin,
+        blend_with=clip,
+        strength=span.strength,
+    )
     current_size = _frame_size(current)
     middle_size = _frame_size(middle)
     if current_size and middle_size and current_size != middle_size:
@@ -850,10 +1022,16 @@ def apply_range_revise(
         )
     silent = work / "spliced.mp4"
     _concat(parts, silent, ffmpeg_bin=ffmpeg_bin)
+    ffprobe_bin = _ffprobe_for(ffmpeg_bin)
+    before, _rate = video_stream_facts(current, ffprobe_bin=ffprobe_bin)
+    after, _rate = video_stream_facts(silent, ffprobe_bin=ffprobe_bin)
+    if after != before:
+        raise UpscaleError(
+            f"the revised output would have {after} frames instead of {before}; "
+            "the previous output is left unchanged"
+        )
     silent.replace(output)
-    delivery_marker_path(output).write_text(
-        json.dumps(_delivery_marker()) + "\n", encoding="utf-8"
-    )
+    _write_marker(output, strength=None)
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
 

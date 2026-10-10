@@ -57,6 +57,25 @@ stream-copied, so earlier parts of the output are never encoded again. A note
 that changes scale re-renders the whole clip. Clips handed to FlashVSR are
 encoded losslessly (`-qp 0`).
 
+## Strength
+
+`strength` (0.0–1.0) is how much of the FlashVSR picture reaches the output.
+The rest is a lanczos upscale of the same source frames, blended in the
+delivery encode. At 0.0 the output is a plain upscale with nothing invented;
+at 1.0 it is FlashVSR alone. FlashVSR always runs at its upstream settings
+(sparse ratio 2.0, local range 11). A note such as "less artificial detail
+from 2s to 5s" lowers strength for that range only.
+
+## Frame alignment
+
+Range revises and chunk joins cut by time, so each FlashVSR clip must hold
+exactly the frames it was given, at the source rate. After every FlashVSR
+call the clip is checked with ffprobe. A difference of up to 8 frames (or 2%)
+at the end of the clip, or a rounded frame rate, is fixed losslessly (trim,
+or repeat the last frame, and restamp at the source rate). A larger
+difference stops the job. A splice that would change the output's total
+frame count is refused and the previous `output.mp4` is kept.
+
 ## Screen inventory
 
 | Step | Route | Purpose |
