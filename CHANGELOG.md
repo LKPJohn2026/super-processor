@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The wizard's Gemini split / FFmpeg enhance flow: the analyze, overview,
+  split choice, and per-segment enhance steps, their pages and API routes
+  (`/analyze`, `/overview`, `/split`, `/segment`, `/previews/`, stills), the
+  segment-choices render, and Gemini's split and enhance calls and schemas.
+  Since the switch to FlashVSR, picking a file goes straight to the upscale,
+  so none of it was reachable. A saved wizard state on one of those steps now
+  loads as the pick step. The CLI `diagnose`, `plan`, `segment`, and `plans`
+  commands are unchanged.
+
 ### Added
 
 - Local FlashVSR restoration upscale on the wizard picture path. FFmpeg trims,
@@ -43,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a rounded fps, is conformed losslessly; more raises before anything is
   spliced. A range revise that would change the output's total frame count
   is refused and the previous output is kept.
+- `output.mp4` and preview clips are streamed with HTTP Range support (206,
+  416, HEAD) instead of being read whole into memory, and sent with
+  `Cache-Control: no-store` so a revise is not hidden by the browser cache.
+  The final mux writes the `moov` atom first (`+faststart`).
+- The wizard refuses inputs above 1080p (1920x1080 in either orientation) or
+  longer than 30 minutes at the pick step, before a job is created.
 
 ### Planned
 

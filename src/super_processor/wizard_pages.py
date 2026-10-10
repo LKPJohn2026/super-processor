@@ -4,20 +4,15 @@ from __future__ import annotations
 
 from html import escape
 
-from .gemini import SegmentEnhanceResult, SplitProposal
-from .probe import MediaFacts
-from .segments import TimelineSegment
-
 # Phase keys for the step rail (setup → result).
-_PHASE_ORDER = ("setup", "file", "split", "enhance", "result")
+_PHASE_ORDER = ("setup", "file", "upscale", "result")
 
 
 def _step_rail(active: str | None) -> str:
     labels = {
         "setup": "Setup",
         "file": "File",
-        "split": "Split",
-        "enhance": "Enhance",
+        "upscale": "Upscale",
         "result": "Result",
     }
     active_idx = _PHASE_ORDER.index(active) if active in _PHASE_ORDER else -1
@@ -366,6 +361,7 @@ def render_pick(*, error: str | None = None) -> str:
 <h1>Pick a video file</h1>
 <p class="lede">Choose a short clip. A local GPU model restores and upscales it.
 The first pass usually covers the whole file.</p>
+<p class="muted">Up to 1080p and 30 minutes.</p>
 {err}
 <form method="post" action="/pick">
 <label>Absolute path to video
@@ -377,152 +373,6 @@ The first pass usually covers the whole file.</p>
     return _page("Pick a video", body, phase="file")
 
 
-def render_analyzing() -> str:
-    body = """
-<h1>Analyzing</h1>
-<p class="lede">Sampling frames and asking Gemini for split layouts…</p>
-<p class="muted">This usually takes about 1–3 minutes. The page will refresh.</p>
-<meta http-equiv="refresh" content="2;url=/analyze?run=1">
-"""
-    return _page("Analyzing", body, phase="file")
-
-
-def render_overview(
-    *,
-    facts: MediaFacts,
-    highlights: list[str],
-) -> str:
-    bullets = "".join(f"<li>{escape(item)}</li>" for item in highlights) or (
-        "<li>No highlight bullets returned</li>"
-    )
-    audio = "yes" if facts.has_audio else "no"
-    video = facts.primary_video()
-    if video is not None and video.width and video.height:
-        size = f"{video.width}×{video.height}"
-        fps = video.avg_frame_rate or "?"
-        video_line = f"{size} @ {fps} fps"
-    else:
-        video_line = "unknown"
-    duration = facts.duration_s if facts.duration_s is not None else 0.0
-    body = f"""
-<h1>Quick overview</h1>
-<p class="muted">Duration {duration:.1f}s · Video {escape(video_line)} ·
-Audio {audio}</p>
-<ul>{bullets}</ul>
-<form method="post" action="/overview">
-<button type="submit">Choose a split</button>
-</form>
-"""
-    return _page("Overview", body, phase="split")
-
-
-def render_split_choice(
-    *,
-    proposal: SplitProposal,
-    error: str | None = None,
-) -> str:
-    err = f'<p class="error">{escape(error)}</p>' if error else ""
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    cards: list[str] = []
-    for index, layout in enumerate(proposal.layouts):
-        letter = letters[index] if index < len(letters) else str(index + 1)
-        segs = "".join(
-            f"<li>{escape(f'{seg.start_s:.0f}–{seg.end_s:.0f}s {seg.label}')}</li>"
-            for seg in layout.segments
-        )
-        count = layout.segment_count
-        count_label = "1 segment" if count == 1 else f"{count} segments"
-        cards.append(
-            f'<form method="post" action="/split">'
-            f'<input type="hidden" name="layout" value="{index}">'
-            f'<button class="choice" type="submit">'
-            f"<strong>{letter}. {count_label}</strong>"
-            f"<span>{escape(layout.summary)}</span>"
-            f"<ul>{segs}</ul>"
-            f"</button></form>"
-        )
-    else_letter = letters[len(proposal.layouts)] if len(proposal.layouts) < 26 else "E"
-    body = f"""
-<h1>How should we split this?</h1>
-<p class="lede">As Gemini sees it, this video has a few independent stretches.
-Tell me which description fits best — or say something else.</p>
-{err}
-{"".join(cards)}
-<form method="post" action="/split" class="card">
-<label><strong>{else_letter}. Please tell me something else</strong>
-<textarea name="note" rows="3"
-placeholder="e.g. add a segment for the lat pulldown"></textarea>
-</label>
-<button type="submit">Revise split</button>
-</form>
-"""
-    return _page("Split choice", body, phase="split")
-
-
-def render_enhance(
-    *,
-    segment: TimelineSegment,
-    result: SegmentEnhanceResult,
-    preview_url: str | None,
-    error: str | None = None,
-    segment_count: int | None = None,
-) -> str:
-    err = f'<p class="error">{escape(error)}</p>' if error else ""
-    still = ""
-    if segment.still_path:
-        still = f'<img src="/{escape(segment.still_path[:-4])}.bmp" alt="keyframe">'
-    preview = ""
-    if preview_url:
-        preview = (
-            "<h2>Short preview</h2>"
-            f'<video controls src="{escape(preview_url)}"></video>'
-        )
-    options = []
-    for option in result.options:
-        options.append(
-            f'<form method="post" action="/segment">'
-            f'<input type="hidden" name="option" value="{escape(option.id)}">'
-            f'<button class="choice" type="submit">'
-            f"<strong>{escape(option.id)}. {escape(option.label)}</strong>"
-            f'<span class="muted">Preview this look</span>'
-            f"</button></form>"
-        )
-    accept = ""
-    if preview_url:
-        accept = (
-            '<form method="post" action="/segment">'
-            '<input type="hidden" name="accept" value="1">'
-            '<button type="submit" class="full">Accept and continue</button>'
-            "</form>"
-        )
-    span = f"{segment.start_s:.0f}–{segment.end_s:.0f}s"
-    total = segment_count if segment_count is not None else "?"
-    progress = f'<p class="seg-progress">Segment {segment.index + 1} of {total}</p>'
-    body = f"""
-{progress}
-<h1>Working {escape(span)}</h1>
-<p class="lede">As Gemini sees it, there are several ways to enhance this
-stretch. Preview one to be sure, or tell me something else.</p>
-<p class="muted">{escape(segment.context)} · {escape(segment.problem)}</p>
-{still}
-<p>Issues: {escape(", ".join(result.issues) or "none listed")}</p>
-{err}
-{"".join(options)}
-{preview}
-{accept}
-<form method="post" action="/segment" class="card">
-<label><strong>E. Please tell me something else</strong>
-<textarea name="note" rows="3"
-placeholder="e.g. warmer white balance, less denoise"></textarea>
-</label>
-<p class="muted">Describe how to improve these options. Gemini returns a new
-set; repeat until you preview and accept one.</p>
-<button type="submit">Revise options</button>
-</form>
-"""
-    return _page("Enhance segment", body, phase="enhance")
-
-
 def render_rendering() -> str:
     body = """
 <h1>Upscaling</h1>
@@ -532,7 +382,7 @@ splices, and copies audio.</p>
 will refresh.</p>
 <meta http-equiv="refresh" content="2;url=/render?run=1">
 """
-    return _page("Upscaling", body, phase="result")
+    return _page("Upscaling", body, phase="upscale")
 
 
 def render_result(

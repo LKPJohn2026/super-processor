@@ -484,26 +484,26 @@ def _frame_size_of(path: Path) -> tuple[int, int]:
 
 
 def _mean_luma(path: Path) -> float:
-    out = subprocess.run(
+    """Average luma over every frame, decoded with plain ``-i`` (no lavfi path
+    escaping, so Windows drive paths work)."""
+    raw = subprocess.run(
         [
-            "ffprobe",
+            "ffmpeg",
             "-v",
             "error",
-            "-f",
-            "lavfi",
             "-i",
-            f"movie={path},signalstats",
-            "-show_entries",
-            "frame_tags=lavfi.signalstats.YAVG",
-            "-of",
-            "csv=p=0",
+            str(path),
+            "-vf",
+            "scale=16:16:flags=area,format=gray",
+            "-f",
+            "rawvideo",
+            "-",
         ],
         check=True,
         capture_output=True,
-        text=True,
-    ).stdout.split()
-    values = [float(value.strip(",")) for value in out if value.strip(",")]
-    return sum(values) / len(values)
+    ).stdout
+    assert raw, f"no frames decoded from {path}"
+    return sum(raw) / len(raw)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")

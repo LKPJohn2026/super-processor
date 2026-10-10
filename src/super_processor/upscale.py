@@ -1064,6 +1064,10 @@ def mux_source_audio(
             "-c:a",
             "aac",
             "-shortest",
+            # moov at the front, so a browser can start playing and seeking
+            # before the whole file has been read.
+            "-movflags",
+            "+faststart",
             str(mixed),
         ],
         check=False,

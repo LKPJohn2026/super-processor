@@ -23,6 +23,35 @@ class ReviewError(RuntimeError):
     """Raised when a review request cannot be served."""
 
 
+_STREAM_CHUNK = 1 << 20
+
+
+def parse_byte_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """Resolve a single ``Range: bytes=`` header to inclusive offsets.
+
+    ``None`` means serve the whole file: no header, a malformed one, another
+    unit, or several ranges (which a server may ignore). :class:`ValueError`
+    means the range cannot be satisfied and the answer is 416.
+    """
+    if not header:
+        return None
+    unit, _, spec = header.strip().partition("=")
+    first, dash, last = spec.strip().partition("-")
+    if unit.strip().lower() != "bytes" or "," in spec or not dash:
+        return None
+    if not (first.isdigit() or not first) or not (last.isdigit() or not last):
+        return None
+    if not first:
+        if not last or int(last) == 0 or size == 0:
+            raise ValueError("range not satisfiable")
+        return max(0, size - int(last)), size - 1
+    start = int(first)
+    end = int(last) if last else size - 1
+    if start >= size or end < start:
+        raise ValueError("range not satisfiable")
+    return start, min(end, size - 1)
+
+
 ALLOWED_ORIGINS_ENV = "SUPER_PROCESSOR_ALLOWED_ORIGINS"
 # The Vite dev and preview servers, and the published React shell, may drive a
 # local wizard. Add others (comma separated) with SUPER_PROCESSOR_ALLOWED_ORIGINS.
@@ -351,9 +380,6 @@ _API_POSTS = {
     "/api/local-llm": "/local-llm",
     "/api/setup": "/setup",
     "/api/pick": "/pick",
-    "/api/overview": "/overview",
-    "/api/split": "/split",
-    "/api/segment": "/segment",
     "/api/result": "/result",
 }
 
@@ -434,6 +460,63 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_file(self, path: Path, content_type: str, *, head: bool) -> None:
+            """Serve a file with single-range support, streamed in chunks."""
+            with path.open("rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                try:
+                    span = parse_byte_range(self.headers.get("Range"), size)
+                except ValueError:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start, end = span if span is not None else (0, size - 1)
+                length = max(0, end - start + 1)
+                self.send_response(206 if span is not None else 200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+                # output.mp4 is rewritten in place by a revise.
+                self.send_header("Cache-Control", "no-store")
+                if span is not None:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                if head:
+                    return
+                handle.seek(start)
+                remaining = length
+                try:
+                    while remaining > 0:
+                        chunk = handle.read(min(_STREAM_CHUNK, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Players drop a range request as soon as they seek.
+                    return
+
+        def _media_file(self, path: str) -> tuple[Path, str] | None:
+            """Map a media URL to a file inside the job, or ``None``."""
+            state = controller.current_state()
+            if not state.job_id or path != "/output.mp4":
+                return None
+            output = controller.store.job_dir(state.job_id) / "output.mp4"
+            return (output, "video/mp4") if output.is_file() else None
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            if self._refused(path, state_changing=False):
+                return
+            media = self._media_file(path)
+            if media is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self._send_file(media[0], media[1], head=True)
+
         def _read_fields(self) -> dict[str, list[str]]:
             length = int(self.headers.get("Content-Length", "0") or "0")
             raw = self.rfile.read(length)
@@ -505,10 +588,6 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                     controller.start_render()
                     self._json(controller.api_view())
                     return
-                if path == "/analyze" and runs:
-                    controller.start_analyze()
-                    self._redirect("/")
-                    return
                 if path == "/render" and runs:
                     controller.start_render()
                     self._redirect("/")
@@ -516,60 +595,10 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                 if path == "/":
                     self._html(controller.render())
                     return
-                state = controller.current_state()
-                if state.job_id:
-                    job_dir = controller.store.job_dir(state.job_id)
-                    if path == "/output.mp4":
-                        output = job_dir / "output.mp4"
-                        if not output.is_file():
-                            self.send_response(404)
-                            self.end_headers()
-                            return
-                        data = output.read_bytes()
-                        self.send_response(200)
-                        self.send_header("Content-Type", "video/mp4")
-                        self.send_header("Content-Length", str(len(data)))
-                        self.end_headers()
-                        self.wfile.write(data)
-                        return
-                    if path.startswith("/previews/") or path.startswith(
-                        f"/{STILLS_DIR_NAME}/"
-                    ):
-                        if path.endswith(".bmp"):
-                            still = _still_file(job_dir, path[:-4] + ".ppm")
-                            if still is None:
-                                self.send_response(404)
-                                self.end_headers()
-                                return
-                            data = gray_ppm_to_bmp(still.read_bytes())
-                            self.send_response(200)
-                            self.send_header("Content-Type", "image/bmp")
-                            self.send_header("Content-Length", str(len(data)))
-                            self.end_headers()
-                            self.wfile.write(data)
-                            return
-                        candidate = (job_dir / path.lstrip("/")).resolve()
-                        root = job_dir.resolve()
-                        if root not in candidate.parents and candidate != root:
-                            self.send_response(404)
-                            self.end_headers()
-                            return
-                        if not candidate.is_file():
-                            self.send_response(404)
-                            self.end_headers()
-                            return
-                        data = candidate.read_bytes()
-                        ctype = (
-                            "video/mp4"
-                            if candidate.suffix == ".mp4"
-                            else "application/octet-stream"
-                        )
-                        self.send_response(200)
-                        self.send_header("Content-Type", ctype)
-                        self.send_header("Content-Length", str(len(data)))
-                        self.end_headers()
-                        self.wfile.write(data)
-                        return
+                media = self._media_file(path)
+                if media is not None:
+                    self._send_file(media[0], media[1], head=False)
+                    return
                 self.send_response(404)
                 self.end_headers()
             except (WizardError, ReviewError, OSError) as exc:

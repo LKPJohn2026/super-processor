@@ -4,11 +4,11 @@
 
 Local-first AI-assisted video processing without generative frame synthesis.
 
-Super Processor enhances existing footage through measured, constrained FFmpeg
-pipelines. A localhost wizard uses Gemini structured outputs to propose
-timeline splits and per-segment ops; engineering-owned templates build FFmpeg
-argument lists. Models never write shell commands or generate replacement
-frames.
+Super Processor enhances existing footage. A localhost wizard runs a local
+FlashVSR restoration upscale, then lets you revise a time range with a note;
+Gemini structured output only turns that note into a range, scale, and
+strength. FFmpeg trims, splices, and encodes from engineering-owned argument
+lists. Models never write shell commands.
 
 ## Requirements
 
@@ -28,8 +28,9 @@ super-processor doctor
 super-processor review
 ```
 
-The wizard walks through Gemini setup, file pick, split choice, per-segment
-enhancement with short previews, then enhance-and-concat render (same aspect).
+The wizard walks through Gemini setup, file pick (up to 1080p and 30 minutes),
+a FlashVSR upscale on an NVIDIA GPU, and a result screen where a note re-runs
+one time range.
 
 Legacy single-grade and segment CLI commands remain available:
 
