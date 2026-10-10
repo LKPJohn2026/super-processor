@@ -31,6 +31,10 @@ src/super_processor/_version.py
 # Local SeedVR2 checkout, venv, and weights
 .seedvr/
 
+# Static wizard shell
+web/node_modules/
+web/dist/
+
 # Editors and operating systems
 .DS_Store
 .idea/

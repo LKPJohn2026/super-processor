@@ -44,6 +44,11 @@ super-processor show JOB_ID
 See [docs/ui-wizard.md](docs/ui-wizard.md) and
 [docs/system-design.md](docs/system-design.md).
 
+The `web/` app is a React shell for that wizard. GitHub Pages can host it as
+a static preview. The GPU upscale still runs only from `super-processor review`.
+Locally: `cd web && npm install && npm run dev` (proxy target
+`VITE_PROXY_TARGET`, default `http://127.0.0.1:45143`).
+
 ## Development checks
 
 ```bash

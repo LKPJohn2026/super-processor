@@ -198,10 +198,17 @@ model never emits a shell string.
 
 ## UI presentation
 
-Server-rendered HTML in `wizard_pages.py` (no SPA). Shared shell includes a
-step rail (Setup · File · Split · Enhance · Result), brand mark, and wait
-estimates. Intro is a single composition with Super Processor as the hero.
-Choice screens use lettered options (A–E) matching the product sketch.
+Server-rendered HTML in `wizard_pages.py` remains the live localhost wizard.
+Shared shell includes a step rail (Setup · File · Split · Enhance · Result),
+brand mark, and wait estimates. Intro is a single composition with Super
+Processor as the hero. Choice screens use lettered options (A–E) matching the
+product sketch.
+
+`web/` is a separate React shell. GitHub Pages serves it as a static preview
+of the same steps. When a local wizard is reachable (`/api/state`, a Vite
+proxy, or `?api=http://127.0.0.1:<port>`), that shell drives introduction,
+Gemini setup, file pick, GPU upscale, and the result. Pages itself cannot run
+the GPU.
 
 ## CI coverage
 
@@ -215,4 +222,4 @@ returns only a time range plus scale and strength.
 - Real local LLM inference (stub only)
 - Vertical social export as default
 - Classical CV diagnosis inside the wizard
-- Desktop shell / separate SPA framework
+- Running the GPU upscale from GitHub Pages
