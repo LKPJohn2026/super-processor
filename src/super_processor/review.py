@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import struct
 import threading
+from email.message import Message
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +21,75 @@ from .wizard import WizardController, WizardError, WizardStep, load_job_wizard_s
 
 class ReviewError(RuntimeError):
     """Raised when a review request cannot be served."""
+
+
+ALLOWED_ORIGINS_ENV = "SUPER_PROCESSOR_ALLOWED_ORIGINS"
+# The Vite dev and preview servers, and the published React shell, may drive a
+# local wizard. Add others (comma separated) with SUPER_PROCESSOR_ALLOWED_ORIGINS.
+DEFAULT_ALLOWED_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+    "https://lkpjohn2026.github.io",
+)
+_LOCAL_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+_TRUSTED_FETCH_SITES = frozenset({"same-origin", "none"})
+
+
+def _hostname(host_header: str) -> str:
+    value = host_header.strip().lower()
+    if value.startswith("["):
+        return value[1 : value.find("]")] if "]" in value else value[1:]
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+def _server_port(server: object) -> int:
+    address = getattr(server, "server_address", None)
+    if isinstance(address, tuple) and len(address) >= 2:
+        return int(address[1])
+    return 0
+
+
+def allowed_origins(port: int) -> frozenset[str]:
+    """Origins that may call the wizard: itself, the React shell, and env extras."""
+    own = {
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+        f"http://[::1]:{port}",
+    }
+    extra = {
+        item.strip().rstrip("/")
+        for item in os.environ.get(ALLOWED_ORIGINS_ENV, "").split(",")
+        if item.strip()
+    }
+    return frozenset({*DEFAULT_ALLOWED_ORIGINS, *own, *extra})
+
+
+def request_rejection(
+    headers: Message,
+    *,
+    port: int,
+    state_changing: bool,
+) -> str | None:
+    """Why a request must be refused, or ``None`` when it may proceed.
+
+    The Host check stops DNS rebinding. A browser always sends ``Origin`` on a
+    cross-site POST, and ``Sec-Fetch-Site`` on a cross-site GET such as an
+    image tag, so neither can start work from another page. Non-browser
+    clients send neither header and are local already.
+    """
+    host = headers.get("Host")
+    if host is not None and _hostname(host) not in _LOCAL_HOSTNAMES:
+        return "unexpected Host header"
+    origin = headers.get("Origin")
+    if origin is not None and origin.rstrip("/") not in allowed_origins(port):
+        return "origin not allowed"
+    if state_changing and origin is None:
+        site = headers.get("Sec-Fetch-Site")
+        if site is not None and site not in _TRUSTED_FETCH_SITES:
+            return "cross-site request refused"
+    return None
 
 
 def segment_review_payload(job_dir: Path) -> dict[str, object]:
@@ -166,15 +237,28 @@ def _legacy_handler(
             self.send_header("Location", "/")
             self.end_headers()
 
-        def _reject(self, message: str) -> None:
+        def _reject(self, message: str, status: int = 400) -> None:
             body = message.encode()
-            self.send_response(400)
+            self.send_response(status)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
+        def _refused(self, *, state_changing: bool) -> bool:
+            reason = request_rejection(
+                self.headers,
+                port=_server_port(self.server),
+                state_changing=state_changing,
+            )
+            if reason is None:
+                return False
+            self._reject(reason, status=403)
+            return True
+
         def do_POST(self) -> None:  # noqa: N802
+            if self._refused(state_changing=True):
+                return
             path = urlparse(self.path).path
             if jobs_dir is None or job_id is None or path not in {"/accept", "/note"}:
                 self.send_response(404)
@@ -196,6 +280,8 @@ def _legacy_handler(
             self._redirect()
 
         def do_GET(self) -> None:  # noqa: N802
+            if self._refused(state_changing=False):
+                return
             path = urlparse(self.path).path
             if path == "/":
                 try:
@@ -314,12 +400,27 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             self.end_headers()
             self.wfile.write(body)
 
-        def _reject(self, message: str) -> None:
+        def _reject(self, message: str, status: int = 400) -> None:
             self._html(
                 f"<!DOCTYPE html><html><body><p>{escape(message)}</p>"
                 f'<p><a href="/">Back</a></p></body></html>',
-                status=400,
+                status=status,
             )
+
+        def _port(self) -> int:
+            return _server_port(self.server)
+
+        def _refused(self, path: str, *, state_changing: bool) -> bool:
+            reason = request_rejection(
+                self.headers, port=self._port(), state_changing=state_changing
+            )
+            if reason is None:
+                return False
+            if path.startswith("/api/"):
+                self._json({"error": reason}, status=403)
+            else:
+                self._reject(reason, status=403)
+            return True
 
         def _json(self, payload: object, status: int = 200) -> None:
             body = json.dumps(payload).encode()
@@ -327,9 +428,9 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             origin = self.headers.get("Origin")
-            if origin:
+            if origin and origin.rstrip("/") in allowed_origins(self._port()):
                 self.send_header("Access-Control-Allow-Origin", origin)
-                self.send_header("Vary", "Origin")
+            self.send_header("Vary", "Origin")
             self.end_headers()
             self.wfile.write(body)
 
@@ -344,9 +445,17 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                 self.send_response(404)
                 self.end_headers()
                 return
-            self.send_response(204)
             origin = self.headers.get("Origin")
-            self.send_header("Access-Control-Allow-Origin", origin or "*")
+            if (
+                request_rejection(self.headers, port=self._port(), state_changing=False)
+                or origin is None
+            ):
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
             self.send_header("Access-Control-Max-Age", "600")
@@ -354,6 +463,8 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+            if self._refused(path, state_changing=True):
+                return
             try:
                 fields = self._read_fields()
             except WizardError as exc:
@@ -380,20 +491,26 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             parsed = urlparse(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            runs = query.get("run", [""])[0] == "1"
+            if self._refused(path, state_changing=runs):
+                return
             try:
                 if path == "/api/state":
                     self._json(controller.api_view())
                     return
-                if path == "/api/render" and query.get("run", [""])[0] == "1":
-                    controller.run_render()
+                # Long passes run on the controller's worker thread. These
+                # GETs start one when none is running and return at once;
+                # callers poll /api/state (or the page refreshes).
+                if path == "/api/render" and runs:
+                    controller.start_render()
                     self._json(controller.api_view())
                     return
-                if path == "/analyze" and query.get("run", [""])[0] == "1":
-                    controller.run_analyze()
+                if path == "/analyze" and runs:
+                    controller.start_analyze()
                     self._redirect("/")
                     return
-                if path == "/render" and query.get("run", [""])[0] == "1":
-                    controller.run_render()
+                if path == "/render" and runs:
+                    controller.start_render()
                     self._redirect("/")
                     return
                 if path == "/":

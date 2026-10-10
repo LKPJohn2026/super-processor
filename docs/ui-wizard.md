@@ -33,6 +33,30 @@ Something else, Accept) → render → result (happy). Confirm `output.mp4` in t
 job directory. CI also runs `@pytest.mark.gemini_live` against
 `Gemini_API_Test` on main.
 
+## Local-only server
+
+The wizard answers only requests whose `Host` is `127.0.0.1`, `localhost`, or
+`[::1]`. A request carrying an `Origin` must come from the wizard itself, the
+Vite dev or preview server (`:5173`, `:4173`), or the published React shell.
+Add origins, comma separated, with `SUPER_PROCESSOR_ALLOWED_ORIGINS`. A
+cross-site GET that would start work (for example an image tag pointing at
+`/render?run=1`) is refused.
+
+Analyze and upscale run on a single worker thread. `GET /render?run=1` and
+`GET /api/render?run=1` start a pass when none is running and return at once.
+The page refreshes, and the React shell polls `/api/state` (which reports
+`busy`) until the step changes. Posts are refused while a pass runs.
+
+## Range revise and re-encoding
+
+The upscaled picture is encoded once into delivery settings: libx264 CRF 16,
+a forced IDR frame every second, no B-frames. A sidecar
+`output.mp4.delivery.json` records those settings. A result note re-upscales
+its range widened out to the nearest keyframes, and the head and tail are
+stream-copied, so earlier parts of the output are never encoded again. A note
+that changes scale re-renders the whole clip. Clips handed to FlashVSR are
+encoded losslessly (`-qp 0`).
+
 ## Screen inventory
 
 | Step | Route | Purpose |

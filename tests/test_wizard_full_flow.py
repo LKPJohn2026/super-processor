@@ -125,7 +125,10 @@ def test_wizard_website_full_flow_intro_to_done(
         assert "<h1>Upscaling</h1>" in waiting
         assert controller.current_state().step is WizardStep.RENDERING
 
-        result = _get(base, "/render?run=1")
+        started = _get(base, "/render?run=1")
+        assert "<h1>Upscaling</h1>" in started
+        assert controller.wait_idle(timeout=60)
+        result = _get(base)
         assert "<h1>Result</h1>" in result
         assert "A. I am happy" in result
         assert "Scale 2" in result
@@ -147,7 +150,9 @@ def test_wizard_website_full_flow_intro_to_done(
         assert "<h1>Upscaling</h1>" in revising
         assert controller.current_state().step is WizardStep.RENDERING
 
-        revised = _get(base, "/render?run=1")
+        _get(base, "/render?run=1")
+        assert controller.wait_idle(timeout=60)
+        revised = _get(base)
         assert "<h1>Result</h1>" in revised
         assert "strength 0.20" in revised
         assert (controller.store.job_dir(job_id) / "output.mp4").is_file()

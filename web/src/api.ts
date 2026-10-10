@@ -14,6 +14,7 @@ export type WizardStep =
 
 export type WizardView = {
   step: WizardStep;
+  busy?: boolean;
   error: string | null;
   job_id: string | null;
   has_gemini_key: boolean;
@@ -107,15 +108,36 @@ export async function postAction(
 
 let renderInFlight: Promise<WizardView> | null = null;
 
+const RENDER_POLL_MS = 2000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function renderUntilDone(origin: string): Promise<WizardView> {
+  // The server starts the GPU pass on a worker thread and answers at once.
+  // Poll the state until the wizard leaves the rendering step.
+  let view = await readView(
+    await fetch(`${origin}/api/render?run=1`, {
+      headers: { Accept: "application/json" },
+    }),
+  );
+  while (view.step === "rendering") {
+    await sleep(RENDER_POLL_MS);
+    view = await readView(
+      await fetch(`${origin}/api/state`, {
+        headers: { Accept: "application/json" },
+      }),
+    );
+  }
+  return view;
+}
+
 export function runRender(origin: string): Promise<WizardView> {
   if (renderInFlight) return renderInFlight;
-  renderInFlight = fetch(`${origin}/api/render?run=1`, {
-    headers: { Accept: "application/json" },
-  })
-    .then(readView)
-    .finally(() => {
-      renderInFlight = null;
-    });
+  renderInFlight = renderUntilDone(origin).finally(() => {
+    renderInFlight = null;
+  });
   return renderInFlight;
 }
 
