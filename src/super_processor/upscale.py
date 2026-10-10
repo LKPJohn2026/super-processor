@@ -34,6 +34,10 @@ DELIVERY_VERSION = 1
 DELIVERY_CRF = 16
 KEYFRAME_INTERVAL_S = 1.0
 _KEY_EPSILON_S = 0.02
+# FlashVSR works in fixed-size frame blocks and may pad or drop a few frames
+# at the end of a clip. Up to this many (or 2% of the clip) are conformed back
+# to the source count; more than that means the clip is misaligned.
+FRAME_SLACK = 8
 _SCALES = frozenset({2, 4})
 # The upstream script is imported with a chdir into its folder, which is
 # process-wide. Only one FlashVSR load or inference may run at a time.
@@ -437,6 +441,99 @@ def _infer_loaded(
     empty = getattr(getattr(module.torch, "cuda", None), "empty_cache", None)
     if empty is not None:
         empty()
+    conform_frames(output, source)
+
+
+def video_stream_facts(video: Path, *, ffprobe_bin: str = "ffprobe") -> tuple[int, str]:
+    """Frame count (packets, no decode) and ``r_frame_rate`` of the video."""
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets,r_frame_rate",
+                "-of",
+                "json",
+                str(video),
+            ],
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UpscaleError(f"failed to start ffprobe: {exc}") from exc
+    try:
+        streams = json.loads(completed.stdout or b"{}").get("streams") or []
+        stream = streams[0]
+        return int(stream["nb_read_packets"]), str(stream["r_frame_rate"])
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise UpscaleError(
+            f"could not count the frames of {video}: {detail or exc}"
+        ) from exc
+
+
+def conform_frames(
+    restored: Path,
+    source: Path,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+) -> Path:
+    """Make ``restored`` hold exactly the source's frames at the source's rate.
+
+    The keyframe splice and the chunk overlap both cut by time, so a restored
+    clip that is a few frames short or long, or written at a rounded rate,
+    would shift everything after it. A small difference is fixed losslessly at
+    the end of the clip (trim, or repeat the last frame). A larger one raises
+    before anything is spliced.
+    """
+    want, rate = video_stream_facts(source, ffprobe_bin=ffprobe_bin)
+    have, have_rate = video_stream_facts(restored, ffprobe_bin=ffprobe_bin)
+    if have == want and have_rate == rate:
+        return restored
+    if abs(have - want) > max(FRAME_SLACK, int(want * 0.02)):
+        raise UpscaleError(
+            f"FlashVSR returned {have} frames for a {want}-frame clip "
+            f"({source.name}); refusing to splice a misaligned picture"
+        )
+    filters = [f"setpts=N/({rate})/TB"]
+    if have < want:
+        filters.append(f"tpad=stop_mode=clone:stop={want - have}")
+    tmp = restored.with_name(restored.stem + ".conform" + restored.suffix)
+    _run_ffmpeg(
+        [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(restored),
+            "-vf",
+            ",".join(filters),
+            "-r",
+            rate,
+            "-frames:v",
+            str(want),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            str(tmp),
+        ]
+    )
+    tmp.replace(restored)
+    return restored
 
 
 def _run_flashvsr(request: UpscaleRequest, *, home: Path, infer: Path) -> Path:
@@ -925,6 +1022,14 @@ def apply_range_revise(
         )
     silent = work / "spliced.mp4"
     _concat(parts, silent, ffmpeg_bin=ffmpeg_bin)
+    ffprobe_bin = _ffprobe_for(ffmpeg_bin)
+    before, _rate = video_stream_facts(current, ffprobe_bin=ffprobe_bin)
+    after, _rate = video_stream_facts(silent, ffprobe_bin=ffprobe_bin)
+    if after != before:
+        raise UpscaleError(
+            f"the revised output would have {after} frames instead of {before}; "
+            "the previous output is left unchanged"
+        )
     silent.replace(output)
     _write_marker(output, strength=None)
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)

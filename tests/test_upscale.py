@@ -26,6 +26,7 @@ from super_processor.upscale import (
     resolve_flashvsr_weights,
     save_upscale_plan,
     snap_to_keyframes,
+    video_stream_facts,
 )
 
 
@@ -64,49 +65,18 @@ def test_replace_overlapping_keeps_scale_and_range() -> None:
     assert clamped.end_s == 12
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_flashvsr_runner_writes_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = tmp_path / "FlashVSR"
-    wan = home / "examples" / "WanVSR"
-    weights = wan / "FlashVSR-v1.1"
-    weights.mkdir(parents=True)
-    for name in (
-        "diffusion_pytorch_model_streaming_dmd.safetensors",
-        "LQ_proj_in.ckpt",
-        "TCDecoder.ckpt",
-    ):
-        (weights / name).write_bytes(b"w")
-    infer = wan / "infer_flashvsr_v1.1_tiny.py"
-    infer.write_text(
-        "class _Cuda:\n"
-        "    @staticmethod\n"
-        "    def empty_cache():\n"
-        "        return None\n"
-        "class _Torch:\n"
-        "    bfloat16 = 'bf16'\n"
-        "    cuda = _Cuda()\n"
-        "torch = _Torch()\n"
-        "def init_pipeline():\n"
-        "    def pipe(**kwargs):\n"
-        "        return kwargs['LQ_video']\n"
-        "    return pipe\n"
-        "def prepare_input_tensor(path, scale, dtype, device):\n"
-        "    return ('lq', 8, 8, 1, 10)\n"
-        "def tensor2video(video):\n"
-        "    return [video]\n"
-        "def save_video(pictures, save_path, fps, quality):\n"
-        "    from pathlib import Path\n"
-        "    Path(save_path).write_bytes(b'ok')\n",
-        encoding="utf-8",
-    )
+    home, _script = _flashvsr_tree(tmp_path, _FAKE_INFER)
     monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
     monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
     source = tmp_path / "in.mp4"
-    source.write_bytes(b"src")
+    _tiny(source, seconds=4)
     output = tmp_path / "out" / "clip.mp4"
     FlashVsrEngine().upscale(UpscaleRequest(source, output, scale=2, strength=0.2))
-    assert output.read_bytes() == b"ok"
+    assert video_stream_facts(output) == (40, "10/1")
 
 
 def test_bad_plan_and_span_shapes() -> None:
@@ -203,38 +173,61 @@ def _flashvsr_tree(tmp_path: Path, script: str) -> tuple[Path, Path]:
 
 
 _FAKE_INFER = """
+import os
+import subprocess
+from pathlib import Path
+
+
 class _Cuda:
     @staticmethod
     def empty_cache():
         return None
 
+
 class _Torch:
     bfloat16 = "bf16"
     cuda = _Cuda()
 
+
 torch = _Torch()
+_SOURCE = {}
+
 
 def init_pipeline():
     def pipe(**kwargs):
         return kwargs["LQ_video"]
     return pipe
 
+
 def prepare_input_tensor(path, scale, dtype, device):
+    _SOURCE["path"] = path
+    _SOURCE["scale"] = int(scale)
     return ("lq", 8, 8, 1, 10)
+
 
 def tensor2video(video):
     return [video]
 
+
 def save_video(pictures, save_path, fps, quality):
-    import subprocess
-    from pathlib import Path
+    # Upscale the real input, then drop FAKE_DROP trailing frames and write
+    # at FAKE_RATE, the way a block-padded model or a rounded fps would.
+    drop = int(os.environ.get("FAKE_DROP", "0"))
+    rate = os.environ.get("FAKE_RATE", "10")
+    count = int(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0",
+         _SOURCE["path"]],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip())
+    scale = _SOURCE["scale"]
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", "color=c=gray:duration=3:size=32x18:rate=10",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", save_path,
-        ],
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-i", _SOURCE["path"],
+         "-vf", f"scale=iw*{scale}:ih*{scale},setpts=N/({rate})/TB",
+         "-r", rate, "-frames:v", str(max(1, count - drop)),
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", save_path],
         check=True,
     )
 """
@@ -251,8 +244,7 @@ def test_flashvsr_chunks_long_clips(
     _tiny(source, seconds=12)
     output = tmp_path / "out" / "clip.mp4"
     FlashVsrEngine().upscale(UpscaleRequest(source, output, scale=2, strength=0.2))
-    assert output.is_file()
-    assert output.stat().st_size > 0
+    assert video_stream_facts(output)[0] == 120
     assert str(home) not in sys.path
 
 
@@ -567,3 +559,91 @@ def test_range_revise_blends_only_the_named_range(tmp_path: Path) -> None:
     assert before[:20] == after[:20]
     assert before[40:] == after[40:]
     assert all(a != b for a, b in zip(before[20:40], after[20:40], strict=True))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+@pytest.mark.parametrize(("drop", "rate"), [(3, "10"), (0, "12"), (5, "12")])
+def test_flashvsr_output_is_conformed_to_the_source_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drop: int,
+    rate: str,
+) -> None:
+    home, _script = _flashvsr_tree(tmp_path, _FAKE_INFER)
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+    monkeypatch.setenv("FAKE_DROP", str(drop))
+    monkeypatch.setenv("FAKE_RATE", rate)
+    for seconds, frames in ((6, 60), (12, 120)):  # one pass, then chunked
+        source = tmp_path / f"in_{seconds}.mp4"
+        _tiny(source, seconds=seconds)
+        output = tmp_path / f"out_{seconds}" / "clip.mp4"
+        FlashVsrEngine().upscale(UpscaleRequest(source, output, scale=2))
+        assert video_stream_facts(output) == (frames, "10/1")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_flashvsr_refuses_a_badly_misaligned_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _script = _flashvsr_tree(tmp_path, _FAKE_INFER)
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+    monkeypatch.setenv("FAKE_DROP", "20")
+    source = tmp_path / "in.mp4"
+    _tiny(source, seconds=6)
+    with pytest.raises(UpscaleError, match="40 frames for a 60-frame clip"):
+        FlashVsrEngine().upscale(
+            UpscaleRequest(source, tmp_path / "out" / "clip.mp4", scale=2)
+        )
+
+
+class _ShortEngine(FakeUpscaleEngine):
+    """Returns two frames fewer than it was given."""
+
+    def upscale(self, request: UpscaleRequest) -> Path:
+        super().upscale(request)
+        frames, _rate = video_stream_facts(request.output)
+        trimmed = request.output.with_name("short_" + request.output.name)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(request.output),
+                "-frames:v",
+                str(frames - 2),
+                str(trimmed),
+            ],
+            check=True,
+        )
+        trimmed.replace(request.output)
+        return request.output
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_splice_refuses_to_change_the_frame_count(tmp_path: Path) -> None:
+    source = tmp_path / "in.mp4"
+    _moving(source, seconds=6)
+    output = tmp_path / "output.mp4"
+    apply_range_revise(
+        source,
+        output,
+        default_span(6),
+        output,
+        engine=FakeUpscaleEngine(),
+        duration_s=6,
+    )
+    before = _frame_hashes(output)
+    with pytest.raises(UpscaleError, match="previous output is left unchanged"):
+        apply_range_revise(
+            source,
+            output,
+            UpscaleSpan(2, 4),
+            output,
+            engine=_ShortEngine(),
+            duration_s=6,
+        )
+    assert _frame_hashes(output) == before
