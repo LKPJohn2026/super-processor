@@ -192,6 +192,14 @@ def rgb24_to_chw(frame: bytes, width: int, height: int) -> HostChwFrame:
     return HostChwFrame(bytes(out), 3, height, width)
 
 
+def _cuda_chw_to_rgb24(image: Any) -> bytes:
+    """Clone an ``nvvfx`` CHW float frame into RGB24 bytes."""
+    torch = importlib.import_module("torch")
+    tensor = torch.from_dlpack(image).detach().clone()
+    array = tensor.float().clamp(0, 1).mul(255).byte().permute(1, 2, 0).cpu()
+    return bytes(array.numpy().tobytes())
+
+
 def clone_dlpack_output(value: Any) -> bytes:
     """Copy a VSR DLPack buffer immediately so the producer can reuse it."""
     exporter = getattr(value, "__dlpack__", None)
@@ -249,11 +257,26 @@ class FrameEncoder(Protocol):
         """Finish the encode."""
 
 
+def bundled_seedvr2_weights() -> Path:
+    """FP8 3B file the standalone CLI downloads into its model directory."""
+    return (
+        seedvr_home()
+        / "models"
+        / "SEEDVR2"
+        / "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+    )
+
+
 def resolve_seedvr2_weights(path: Path | None = None) -> Path:
     """Locate SeedVR2-3B weights or raise a wizard-facing error."""
     if path is None:
-        raw = os.environ.get(_WEIGHTS_ENV, "").strip()
-        path = Path(raw).expanduser() if raw else None
+        if _WEIGHTS_ENV in os.environ and not os.environ[_WEIGHTS_ENV].strip():
+            path = None
+        else:
+            raw = os.environ.get(_WEIGHTS_ENV, "").strip()
+            path = Path(raw).expanduser() if raw else None
+            if path is None and bundled_seedvr2_weights().is_file():
+                return bundled_seedvr2_weights()
     if path is None or not path.is_file():
         where = str(path) if path is not None else f"${_WEIGHTS_ENV}"
         raise UpscaleError(
@@ -263,6 +286,35 @@ def resolve_seedvr2_weights(path: Path | None = None) -> Path:
             "An NVIDIA driver and an RTX GPU are required for the upscale pass."
         )
     return path
+
+
+def seedvr_home() -> Path:
+    """Checkout that contains ``inference_cli.py``. Override with ``SEEDVR2_HOME``."""
+    raw = os.environ.get("SEEDVR2_HOME", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(__file__).resolve().parents[2] / ".seedvr" / "seedvr2_videoupscaler"
+
+
+def seedvr_python() -> Path | None:
+    """Python for the SeedVR2 standalone runtime, when it is installed."""
+    raw = os.environ.get("SEEDVR2_PYTHON", "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+        return path if path.is_file() else None
+    candidate = seedvr_home() / ".venv" / "bin" / "python"
+    script = seedvr_home() / "inference_cli.py"
+    if candidate.is_file() and script.is_file():
+        return candidate
+    return None
+
+
+def _runtime_missing() -> UpscaleError:
+    return UpscaleError(
+        "SeedVR2-3B weights are present, but the local restore runtime "
+        "is not loaded. Install the standalone runtime at "
+        f"{seedvr_home()}. ComfyUI is not required."
+    )
 
 
 class SeedVR2Restorer:
@@ -280,11 +332,120 @@ class SeedVR2Restorer:
         strength: float,
     ) -> list[bytes]:
         del frames, width, height, strength
-        raise UpscaleError(
-            "SeedVR2-3B weights are present, but the local restore runtime "
-            "is not loaded. Install the SeedVR2-3B runtime next to those "
-            "weights. ComfyUI is not required."
+        raise _runtime_missing()
+
+    def restore_video(
+        self,
+        source: Path,
+        output: Path,
+        *,
+        width: int,
+        height: int,
+        strength: float,
+        fps: float,
+        ffmpeg_bin: str = "ffmpeg",
+    ) -> None:
+        """Run SeedVR2 at source size, then mix it back by ``strength``."""
+        del fps
+        python = seedvr_python()
+        if python is None:
+            raise _runtime_missing()
+        home = seedvr_home()
+        raw = output.with_suffix(".seedvr.mp4")
+        short_side = min(width, height)
+        command = [
+            str(python),
+            str(home / "inference_cli.py"),
+            str(source),
+            "--output",
+            str(raw),
+            "--resolution",
+            str(short_side),
+            "--max_resolution",
+            str(max(width, height)),
+            "--dit_model",
+            "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+            "--color_correction",
+            "lab",
+            "--cuda_device",
+            "0",
+            "--batch_size",
+            "5",
+            "--video_backend",
+            "ffmpeg",
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=home,
+            check=False,
+            capture_output=True,
+            text=True,
         )
+        if completed.returncode != 0 or not raw.is_file():
+            detail = (completed.stderr or completed.stdout).strip()
+            tail = detail[-2000:] or str(completed.returncode)
+            raise UpscaleError(f"SeedVR2 restore failed: {tail}")
+        blend = subprocess.run(
+            [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-i",
+                str(raw),
+                "-filter_complex",
+                (
+                    f"[1:v]scale={width}:{height}:flags=lanczos[restored];"
+                    f"[0:v][restored]blend=all_opacity={strength}"
+                ),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                str(output),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        raw.unlink(missing_ok=True)
+        if blend.returncode != 0 or not output.is_file():
+            detail = (blend.stderr or blend.stdout).strip()
+            raise UpscaleError(
+                "SeedVR2 blend failed: " + (detail[-2000:] or str(blend.returncode))
+            )
+
+
+class _NvvfxEffect:
+    """Adapter for the installed ``nvvfx.VideoSuperRes`` constructor."""
+
+    def __init__(self, factory: Any, *, quality: str) -> None:
+        levels = getattr(factory, "QualityLevel", None)
+        level = getattr(levels, quality, None) if levels is not None else None
+        if level is None:
+            raise UpscaleError(
+                f"nvvfx.VideoSuperRes has no quality level {quality}."
+            )
+        self._effect = factory(quality=level)
+        enter = getattr(self._effect, "__enter__", None)
+        if enter is not None:
+            enter()
+        self._loaded_size: tuple[int, int] | None = None
+
+    def prepare(self, out_width: int, out_height: int) -> None:
+        if self._loaded_size == (out_width, out_height):
+            return
+        self._effect.output_width = out_width
+        self._effect.output_height = out_height
+        self._effect.load()
+        self._loaded_size = (out_width, out_height)
+
+    def run(self, frame: Any) -> Any:
+        return self._effect.run(frame)
 
 
 def open_video_super_res(*, scale: int, quality: str) -> Any:
@@ -304,6 +465,13 @@ def open_video_super_res(*, scale: int, quality: str) -> Any:
         )
     try:
         return factory(scale=scale, quality=quality)
+    except TypeError:
+        try:
+            return _NvvfxEffect(factory, quality=quality)
+        except Exception as exc:
+            raise UpscaleError(
+                f"Could not start RTX Video Super Resolution: {exc}"
+            ) from exc
     except Exception as exc:
         raise UpscaleError(
             f"Could not start RTX Video Super Resolution: {exc}"
@@ -350,11 +518,16 @@ class NvvfxVsr:
         out_width: int,
         out_height: int,
     ) -> Any:
-        del scale, quality, out_width, out_height
+        del scale, quality
+        prepare = getattr(self._effect, "prepare", None)
+        if prepare is not None:
+            prepare(out_width, out_height)
         cuda_frame = host_chw_to_cuda(frame)
         produced = self._effect.run(cuda_frame)
-        cloned = clone_dlpack_output(produced)
-        return _ClonedDlpack(cloned)
+        image = getattr(produced, "image", None)
+        if image is not None:
+            return _ClonedDlpack(_cuda_chw_to_rgb24(image))
+        return _ClonedDlpack(clone_dlpack_output(produced))
 
 
 class _ClonedDlpack:
@@ -556,16 +729,31 @@ def run_two_pass(
         owned = None
         sink = encoder
     wrote = 0
+    decode_from = source
+    blended: Path | None = None
+    file_restore = getattr(restorer, "restore_video", None)
     try:
+        if params.restore_strength > 0 and file_restore is not None:
+            blended = output.with_suffix(".restore.mp4")
+            file_restore(
+                source,
+                blended,
+                width=width,
+                height=height,
+                strength=params.restore_strength,
+                fps=fps,
+                ffmpeg_bin=ffmpeg_bin,
+            )
+            decode_from = blended
         for chunk in decode_rgb_chunks(
-            source,
+            decode_from,
             ffmpeg_bin=ffmpeg_bin,
             width=width,
             height=height,
             chunk_frames=chunk_frames,
         ):
             frames = chunk
-            if params.restore_strength > 0:
+            if params.restore_strength > 0 and file_restore is None:
                 assert restorer is not None
                 frames = restorer.restore(
                     frames,
@@ -601,6 +789,9 @@ def run_two_pass(
         if owned is not None:
             _abandon_encoder(owned)
         raise
+    finally:
+        if blended is not None:
+            blended.unlink(missing_ok=True)
     if owned is not None:
         owned.close()
     elif encoder is not None:

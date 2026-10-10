@@ -27,9 +27,13 @@ super-processor doctor
 super-processor --jobs-dir .dogfood/jobs review
 ```
 
-Install for the quality path: an NVIDIA driver, an RTX GPU, the `nvvfx` package,
-and SeedVR2-3B weights (`SEEDVR2_3B_WEIGHTS`). ComfyUI is not required. Missing
-`nvvfx` or weights is a wizard error. CI skips the real libraries and fakes both
+Install for the quality path: an NVIDIA driver, an RTX GPU, the `nvidia-vfx`
+package (`nvvfx`), and the SeedVR2 standalone runtime at
+`.seedvr/seedvr2_videoupscaler` (Python 3.13, not the upstream Torch 2.3
+checkout). `SEEDVR2_3B_WEIGHTS` still names a weight file. The first Enhance
+downloads `seedvr2_ema_3b_fp8_e4m3fn.safetensors` into that checkout. ComfyUI
+is not required. Missing `nvvfx` or weights is a wizard error. CI skips the
+real libraries and fakes both
 backends.
 
 Walk introduction → LLM type (Gemini) → setup → pick file → wait for analyze →

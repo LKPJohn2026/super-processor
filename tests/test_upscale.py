@@ -206,14 +206,16 @@ def test_missing_seedvr2_weights(
 
 
 def test_missing_nvvfx_is_a_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_import = builtins.__import__
+    import super_processor.upscale as upscale
 
-    def _blocked(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "nvvfx":
+    real_import = upscale.importlib.import_module
+
+    def _blocked(name: str, package: str | None = None) -> Any:
+        if name == "nvvfx" or name.startswith("nvvfx."):
             raise ImportError("no nvvfx")
-        return real_import(name, *args, **kwargs)
+        return real_import(name, package)
 
-    monkeypatch.setattr(builtins, "__import__", _blocked)
+    monkeypatch.setattr(upscale.importlib, "import_module", _blocked)
     with pytest.raises(UpscaleError, match="nvvfx"):
         open_video_super_res(scale=2, quality="MEDIUM")
 
