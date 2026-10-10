@@ -521,6 +521,29 @@ def test_client_pick_working_model_skips_exhausted() -> None:
     assert transport.calls[0] == "gemini-gone"
 
 
+def test_client_fails_over_when_a_model_times_out() -> None:
+    class TimeoutTransport(_FailoverTransport):
+        def generate(
+            self,
+            *,
+            model: str,
+            api_key: str,
+            body: dict[str, Any],
+        ) -> dict[str, Any]:
+            if model == "gemini-gone":
+                self.calls.append(model)
+                raise GeminiError("Gemini request failed: The read operation timed out")
+            return super().generate(model=model, api_key=api_key, body=body)
+
+    transport = TimeoutTransport({"ok": True}, fail_models=set())
+    client = GeminiClient(api_key="k", model="gemini-gone", transport=transport)
+    assert client.pick_working_model() == "gemini-3.8-flash"
+    # One timeout moves on at once: no same-model retries, and the slow model
+    # is not marked exhausted for the rest of the session.
+    assert transport.calls == ["gemini-gone", "gemini-3.8-flash"]
+    assert "gemini-gone" not in client._exhausted_models
+
+
 def test_client_retries_transient_503(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
