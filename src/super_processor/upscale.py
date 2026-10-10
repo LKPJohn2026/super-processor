@@ -7,11 +7,13 @@ The real engine refuses to run without CUDA; tests use :class:`FakeUpscaleEngine
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.util
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -82,7 +84,7 @@ class UpscaleSpan:
 
 @dataclass(frozen=True, slots=True)
 class UpscalePlan:
-    """Ordered spans covering a job. Chunk execution is reserved, not run."""
+    """Ordered spans covering a job. Long clips run as overlapping chunks."""
 
     spans: tuple[UpscaleSpan, ...]
     pending: UpscaleSpan | None = None
@@ -143,7 +145,7 @@ def default_span(duration_s: float) -> UpscaleSpan:
 def planned_chunks(
     duration_s: float, *, scale: int = 2, strength: float = 0.5
 ) -> list[UpscaleSpan]:
-    """Span list for a later chunked runner (about 8s pieces, 0.5s overlap)."""
+    """About 8s pieces with 0.5s overlap, used when a clip is longer."""
     if duration_s <= 0:
         raise UpscaleError("media has no duration")
     if duration_s <= CHUNK_SECONDS:
@@ -304,55 +306,171 @@ class FlashVsrEngine:
                 f"{infer}. Clone OpenImagingLab/FlashVSR into {home}."
             )
         resolve_flashvsr_weights(home)
+        from .probe import ProbeError, probe_file
+
+        try:
+            duration = float(probe_file(request.source).duration_s or 0.0)
+        except ProbeError:
+            duration = 0.0
+        if duration > CHUNK_SECONDS + 0.05:
+            return _run_flashvsr_chunked(
+                request, home=home, infer=infer, duration_s=duration
+            )
         return _run_flashvsr(request, home=home, infer=infer)
 
 
-def _run_flashvsr(request: UpscaleRequest, *, home: Path, infer: Path) -> Path:
-    """Load the upstream tiny script and run one file. Weights stay relative."""
+def _load_flashvsr(home: Path, infer: Path) -> tuple[Any, Any, str, list[str]]:
+    """Import the tiny script with WanVSR and the repo root on ``sys.path``."""
     wan = infer.parent
-    sparse_ratio, local_range = flashvsr_knobs(request.strength)
-    spec_name = "flashvsr_infer_tiny"
-    loader = importlib.util.spec_from_file_location(spec_name, infer)
+    loader = importlib.util.spec_from_file_location("flashvsr_infer_tiny", infer)
     if loader is None or loader.loader is None:
         raise UpscaleError(f"could not load {infer}")
     module = importlib.util.module_from_spec(loader)
     previous = os.getcwd()
+    path_added = [entry for entry in (str(wan), str(home)) if entry not in sys.path]
+    sys.path[:0] = path_added
+    os.chdir(wan)
     try:
-        os.chdir(wan)
         loader.loader.exec_module(module)
         pipe = module.init_pipeline()
-        low, height, width, frames, fps = module.prepare_input_tensor(
-            str(request.source),
-            scale=float(request.scale),
-            dtype=module.torch.bfloat16,
-            device="cuda",
+    except Exception:
+        os.chdir(previous)
+        for entry in path_added:
+            with contextlib.suppress(ValueError):
+                sys.path.remove(entry)
+        raise
+    return module, pipe, previous, path_added
+
+
+def _unload_flashvsr(previous: str, path_added: list[str]) -> None:
+    os.chdir(previous)
+    for entry in path_added:
+        with contextlib.suppress(ValueError):
+            sys.path.remove(entry)
+
+
+def _infer_loaded(
+    module: Any,
+    pipe: Any,
+    source: Path,
+    output: Path,
+    *,
+    scale: int,
+    strength: float,
+) -> None:
+    """Run one already-loaded pipeline on a short clip."""
+    sparse_ratio, local_range = flashvsr_knobs(strength)
+    low, height, width, frames, fps = module.prepare_input_tensor(
+        str(source),
+        scale=float(scale),
+        dtype=module.torch.bfloat16,
+        device="cuda",
+    )
+    video = pipe(
+        prompt="",
+        negative_prompt="",
+        cfg_scale=1.0,
+        num_inference_steps=1,
+        seed=0,
+        LQ_video=low,
+        num_frames=frames,
+        height=height,
+        width=width,
+        is_full_block=False,
+        if_buffer=True,
+        topk_ratio=sparse_ratio * 768 * 1280 / (height * width),
+        kv_ratio=3.0,
+        local_range=local_range,
+        color_fix=True,
+    )
+    pictures = module.tensor2video(video)
+    del low, video
+    output.parent.mkdir(parents=True, exist_ok=True)
+    module.save_video(pictures, str(output), fps=fps, quality=6)
+    empty = getattr(getattr(module.torch, "cuda", None), "empty_cache", None)
+    if empty is not None:
+        empty()
+
+
+def _run_flashvsr(request: UpscaleRequest, *, home: Path, infer: Path) -> Path:
+    """Load the upstream tiny script and run one file. Weights stay relative."""
+    try:
+        module, pipe, previous, path_added = _load_flashvsr(home, infer)
+    except UpscaleError:
+        raise
+    except Exception as exc:
+        raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+    try:
+        _infer_loaded(
+            module,
+            pipe,
+            request.source,
+            request.output,
+            scale=request.scale,
+            strength=request.strength,
         )
-        video = pipe(
-            prompt="",
-            negative_prompt="",
-            cfg_scale=1.0,
-            num_inference_steps=1,
-            seed=0,
-            LQ_video=low,
-            num_frames=frames,
-            height=height,
-            width=width,
-            is_full_block=False,
-            if_buffer=True,
-            topk_ratio=sparse_ratio * 768 * 1280 / (height * width),
-            kv_ratio=3.0,
-            local_range=local_range,
-            color_fix=True,
-        )
-        pictures = module.tensor2video(video)
-        request.output.parent.mkdir(parents=True, exist_ok=True)
-        module.save_video(pictures, str(request.output), fps=fps, quality=6)
     except UpscaleError:
         raise
     except Exception as exc:
         raise UpscaleError(f"FlashVSR failed: {exc}") from exc
     finally:
-        os.chdir(previous)
+        _unload_flashvsr(previous, path_added)
+    if not request.output.is_file():
+        raise UpscaleError("FlashVSR produced no output")
+    return request.output
+
+
+def _run_flashvsr_chunked(
+    request: UpscaleRequest,
+    *,
+    home: Path,
+    infer: Path,
+    duration_s: float,
+) -> Path:
+    """Upscale overlapping ~8s pieces so the whole clip is not resident on GPU."""
+    from .probe import probe_file
+
+    chunks = planned_chunks(duration_s, scale=request.scale, strength=request.strength)
+    work = request.output.parent / "flash_chunks"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        module, pipe, previous, path_added = _load_flashvsr(home, infer)
+    except UpscaleError:
+        raise
+    except Exception as exc:
+        raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+    pieces: list[Path] = []
+    try:
+        for index, span in enumerate(chunks):
+            clip = trim_source(
+                request.source, work / f"in_{index}.mp4", span.start_s, span.end_s
+            )
+            raw = work / f"up_{index}.mp4"
+            _infer_loaded(
+                module,
+                pipe,
+                clip,
+                raw,
+                scale=span.scale,
+                strength=span.strength,
+            )
+            if index == 0:
+                pieces.append(raw)
+                continue
+            kept = work / f"keep_{index}.mp4"
+            raw_duration = float(probe_file(raw).duration_s or 0.0)
+            trim_source(raw, kept, CHUNK_OVERLAP_S, raw_duration)
+            pieces.append(kept)
+    except UpscaleError:
+        raise
+    except Exception as exc:
+        raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+    finally:
+        _unload_flashvsr(previous, path_added)
+    if len(pieces) == 1:
+        pieces[0].replace(request.output)
+    else:
+        _concat(pieces, request.output, ffmpeg_bin="ffmpeg")
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
     return request.output

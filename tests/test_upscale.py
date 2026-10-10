@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -57,14 +58,10 @@ def test_plan_roundtrip_and_chunks(tmp_path: Path) -> None:
 
 def test_replace_overlapping_keeps_scale_and_range() -> None:
     plan = UpscalePlan(spans=(default_span(12),))
-    updated = replace_overlapping(
-        plan, UpscaleSpan(2, 5, scale=2, strength=0.2), 12
-    )
+    updated = replace_overlapping(plan, UpscaleSpan(2, 5, scale=2, strength=0.2), 12)
     assert updated.pending is not None
     assert updated.pending.strength == 0.2
-    full = replace_overlapping(
-        plan, UpscaleSpan(0, 12, scale=4, strength=0.4), 12
-    )
+    full = replace_overlapping(plan, UpscaleSpan(0, 12, scale=4, strength=0.4), 12)
     assert full.spans[0].scale == 4
     clamped = clamp_span(UpscaleSpan(0, 99, scale=2, strength=0.5), 12)
     assert clamped.end_s == 12
@@ -85,8 +82,13 @@ def test_flashvsr_runner_writes_output(
         (weights / name).write_bytes(b"w")
     infer = wan / "infer_flashvsr_v1.1_tiny.py"
     infer.write_text(
+        "class _Cuda:\n"
+        "    @staticmethod\n"
+        "    def empty_cache():\n"
+        "        return None\n"
         "class _Torch:\n"
         "    bfloat16 = 'bf16'\n"
+        "    cuda = _Cuda()\n"
         "torch = _Torch()\n"
         "def init_pipeline():\n"
         "    def pipe(**kwargs):\n"
@@ -106,9 +108,7 @@ def test_flashvsr_runner_writes_output(
     source = tmp_path / "in.mp4"
     source.write_bytes(b"src")
     output = tmp_path / "out" / "clip.mp4"
-    FlashVsrEngine().upscale(
-        UpscaleRequest(source, output, scale=2, strength=0.2)
-    )
+    FlashVsrEngine().upscale(UpscaleRequest(source, output, scale=2, strength=0.2))
     assert output.read_bytes() == b"ok"
 
 
@@ -187,3 +187,92 @@ def test_fake_engine_range_splice(tmp_path: Path) -> None:
     )
     assert output.is_file()
     assert output.stat().st_size > 0
+
+
+def _flashvsr_tree(tmp_path: Path, script: str) -> tuple[Path, Path]:
+    home = tmp_path / "FlashVSR"
+    wan = home / "examples" / "WanVSR"
+    weights = wan / "FlashVSR-v1.1"
+    weights.mkdir(parents=True)
+    for name in (
+        "diffusion_pytorch_model_streaming_dmd.safetensors",
+        "LQ_proj_in.ckpt",
+        "TCDecoder.ckpt",
+    ):
+        (weights / name).write_bytes(b"w")
+    infer = wan / "infer_flashvsr_v1.1_tiny.py"
+    infer.write_text(script, encoding="utf-8")
+    return home, infer
+
+
+_FAKE_INFER = """
+class _Cuda:
+    @staticmethod
+    def empty_cache():
+        return None
+
+class _Torch:
+    bfloat16 = "bf16"
+    cuda = _Cuda()
+
+torch = _Torch()
+
+def init_pipeline():
+    def pipe(**kwargs):
+        return kwargs["LQ_video"]
+    return pipe
+
+def prepare_input_tensor(path, scale, dtype, device):
+    return ("lq", 8, 8, 1, 10)
+
+def tensor2video(video):
+    return [video]
+
+def save_video(pictures, save_path, fps, quality):
+    import subprocess
+    from pathlib import Path
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=gray:duration=3:size=32x18:rate=10",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", save_path,
+        ],
+        check=True,
+    )
+"""
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_flashvsr_chunks_long_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _script = _flashvsr_tree(tmp_path, _FAKE_INFER)
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+    source = tmp_path / "long.mp4"
+    _tiny(source, seconds=12)
+    output = tmp_path / "out" / "clip.mp4"
+    FlashVsrEngine().upscale(UpscaleRequest(source, output, scale=2, strength=0.2))
+    assert output.is_file()
+    assert output.stat().st_size > 0
+    assert str(home) not in sys.path
+
+
+def test_chunked_flashvsr_wraps_loader_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _script = _flashvsr_tree(tmp_path, "raise RuntimeError('boom')\n")
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+
+    class _Facts:
+        duration_s = 20.0
+
+    monkeypatch.setattr("super_processor.probe.probe_file", lambda _path: _Facts())
+    source = tmp_path / "in.mp4"
+    source.write_bytes(b"src")
+    with pytest.raises(UpscaleError, match="FlashVSR failed"):
+        FlashVsrEngine().upscale(
+            UpscaleRequest(source, tmp_path / "out.mp4", scale=2, strength=0.5)
+        )
