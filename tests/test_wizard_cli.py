@@ -144,11 +144,16 @@ def test_analyze_and_render_get_triggers(
     base = server.start()
     try:
         with urlopen(base + "/analyze?run=1") as response:
-            body = response.read().decode()
-        assert "Pick" in body
+            response.read()
+        assert controller.wait_idle(timeout=10)
+        with urlopen(base + "/") as response:
+            assert "Pick" in response.read().decode()
         state = WizardState(step=WizardStep.RENDERING)
         save_session_state(tmp_path, state)
         with urlopen(base + "/render?run=1") as response:
+            response.read()
+        assert controller.wait_idle(timeout=10)
+        with urlopen(base + "/") as response:
             assert "Done" in response.read().decode()
     finally:
         server.stop()

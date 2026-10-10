@@ -3,6 +3,11 @@
 FFmpeg probes, trims, concatenates, and copies audio. It does not choose the
 look. Gemini may only return a time range plus ``scale`` and ``strength``.
 The real engine refuses to run without CUDA; tests use :class:`FakeUpscaleEngine`.
+
+Work clips handed to the engine are encoded losslessly. The engine output is
+encoded once into the delivery settings, with a keyframe every second. A range
+revise snaps outward to those keyframes and stream-copies the head and tail, so
+the parts of the video a note did not name are never encoded again.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -21,7 +27,14 @@ from typing import Any, Protocol
 UPSCALE_PLAN_FILE = "upscale_plan.json"
 CHUNK_SECONDS = 8.0
 CHUNK_OVERLAP_S = 0.5
+DELIVERY_VERSION = 1
+DELIVERY_CRF = 16
+KEYFRAME_INTERVAL_S = 1.0
+_KEY_EPSILON_S = 0.02
 _SCALES = frozenset({2, 4})
+# The upstream script is imported with a chdir into its folder, which is
+# process-wide. Only one FlashVSR load or inference may run at a time.
+_FLASHVSR_LOCK = threading.Lock()
 _WEIGHT_FILES = (
     "diffusion_pytorch_model_streaming_dmd.safetensors",
     "LQ_proj_in.ckpt",
@@ -243,17 +256,43 @@ def clamp_span(span: UpscaleSpan, duration_s: float) -> UpscaleSpan:
 def replace_overlapping(
     plan: UpscalePlan, patch: UpscaleSpan, duration_s: float
 ) -> UpscalePlan:
-    """Store a range revise. A scale change replaces the whole timeline."""
+    """Store a range revise. A scale change replaces the whole timeline.
+
+    One output file has one resolution, so a new scale cannot be spliced into
+    part of it. The pending span then covers the whole file at the new scale
+    and the patch's strength. A same-scale patch trims the spans it overlaps
+    instead of dropping them.
+    """
     patch = clamp_span(patch, duration_s)
     scales = {span.scale for span in plan.spans}
     covers_all = patch.start_s <= 0.05 and patch.end_s >= duration_s - 0.05
     if covers_all or patch.scale not in scales:
-        return UpscalePlan(spans=(patch,), pending=patch)
-    kept = tuple(
-        span
-        for span in plan.spans
-        if span.end_s <= patch.start_s + 0.05 or span.start_s >= patch.end_s - 0.05
-    )
+        full = UpscaleSpan(0.0, duration_s, scale=patch.scale, strength=patch.strength)
+        return UpscalePlan(spans=(full,), pending=full)
+    kept: list[UpscaleSpan] = []
+    for span in plan.spans:
+        if span.end_s <= patch.start_s + 0.05 or span.start_s >= patch.end_s - 0.05:
+            kept.append(span)
+            continue
+        if patch.start_s - span.start_s > 0.05:
+            kept.append(
+                UpscaleSpan(
+                    span.start_s,
+                    patch.start_s,
+                    scale=span.scale,
+                    strength=span.strength,
+                )
+            )
+        if span.end_s - patch.end_s > 0.05:
+            kept.append(
+                UpscaleSpan(
+                    patch.end_s,
+                    span.end_s,
+                    scale=span.scale,
+                    strength=span.strength,
+                )
+            )
+    # The latest patch stays last; the wizard reads it as the prior knobs.
     return UpscalePlan(spans=(*kept, patch), pending=patch)
 
 
@@ -308,15 +347,24 @@ class FlashVsrEngine:
         resolve_flashvsr_weights(home)
         from .probe import ProbeError, probe_file
 
+        # The loader chdirs into the FlashVSR checkout; relative job paths
+        # would then point inside it.
+        request = UpscaleRequest(
+            request.source.resolve(),
+            request.output.resolve(),
+            scale=request.scale,
+            strength=request.strength,
+        )
         try:
             duration = float(probe_file(request.source).duration_s or 0.0)
         except ProbeError:
             duration = 0.0
-        if duration > CHUNK_SECONDS + 0.05:
-            return _run_flashvsr_chunked(
-                request, home=home, infer=infer, duration_s=duration
-            )
-        return _run_flashvsr(request, home=home, infer=infer)
+        with _FLASHVSR_LOCK:
+            if duration > CHUNK_SECONDS + 0.05:
+                return _run_flashvsr_chunked(
+                    request, home=home, infer=infer, duration_s=duration
+                )
+            return _run_flashvsr(request, home=home, infer=infer)
 
 
 def _load_flashvsr(home: Path, infer: Path) -> tuple[Any, Any, str, list[str]]:
@@ -454,12 +502,12 @@ def _run_flashvsr_chunked(
                 scale=span.scale,
                 strength=span.strength,
             )
-            if index == 0:
-                pieces.append(raw)
-                continue
+            # Every piece goes through the same lossless encode so the join
+            # reads one set of codec parameters.
             kept = work / f"keep_{index}.mp4"
             raw_duration = float(probe_file(raw).duration_s or 0.0)
-            trim_source(raw, kept, CHUNK_OVERLAP_S, raw_duration)
+            skip = 0.0 if index == 0 else CHUNK_OVERLAP_S
+            trim_source(raw, kept, skip, raw_duration)
             pieces.append(kept)
     except UpscaleError:
         raise
@@ -467,10 +515,10 @@ def _run_flashvsr_chunked(
         raise UpscaleError(f"FlashVSR failed: {exc}") from exc
     finally:
         _unload_flashvsr(previous, path_added)
-    if len(pieces) == 1:
-        pieces[0].replace(request.output)
-    else:
-        _concat(pieces, request.output, ffmpeg_bin="ffmpeg")
+    # Join and encode once into the delivery settings, so the caller does not
+    # encode this picture a second time.
+    listing = _write_listing(work / "join.txt", pieces)
+    encode_delivery(listing, request.output, concat=True)
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
     return request.output
@@ -484,7 +532,11 @@ def trim_source(
     *,
     ffmpeg_bin: str = "ffmpeg",
 ) -> Path:
-    """Cut a source range. Re-encode so the splice does not depend on keyframes."""
+    """Cut a range into a lossless work clip.
+
+    Frame-accurate, so it re-encodes, but at ``-qp 0`` so the engine and the
+    chunk join see the decoded pixels unchanged. Work clips are short-lived.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     _run_ffmpeg(
         [
@@ -501,6 +553,10 @@ def trim_source(
             str(source),
             "-c:v",
             "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
             "-pix_fmt",
             "yuv420p",
             "-an",
@@ -508,6 +564,222 @@ def trim_source(
         ]
     )
     return dest
+
+
+def delivery_marker_path(video: Path) -> Path:
+    return video.with_name(video.name + ".delivery.json")
+
+
+def _delivery_marker() -> dict[str, Any]:
+    return {
+        "version": DELIVERY_VERSION,
+        "bframes": 0,
+        "codec": "libx264",
+        "crf": DELIVERY_CRF,
+        "keyframe_s": KEYFRAME_INTERVAL_S,
+    }
+
+
+def is_delivery(video: Path) -> bool:
+    """True when ``video`` was written by :func:`encode_delivery` (this version)."""
+    marker = delivery_marker_path(video)
+    if not video.is_file() or not marker.is_file():
+        return False
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(data == _delivery_marker())
+
+
+def encode_delivery(
+    source: Path,
+    dest: Path,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    concat: bool = False,
+) -> Path:
+    """Encode a picture once into the settings every splice part shares.
+
+    A forced IDR frame every second, and no B-frames, give a range revise
+    clean points to cut the current output by stream copy. ``concat`` reads
+    ``source`` as a concat-demuxer listing.
+    """
+    if not concat and is_delivery(source):
+        if source != dest:
+            source.replace(dest)
+            delivery_marker_path(source).replace(delivery_marker_path(dest))
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    marker = delivery_marker_path(dest)
+    marker.unlink(missing_ok=True)
+    inputs = (
+        ["-f", "concat", "-safe", "0", "-i", str(source)]
+        if concat
+        else [
+            "-i",
+            str(source),
+        ]
+    )
+    tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
+    _run_ffmpeg(
+        [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            *inputs,
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            str(DELIVERY_CRF),
+            "-pix_fmt",
+            "yuv420p",
+            "-force_key_frames",
+            f"expr:gte(t,n_forced*{KEYFRAME_INTERVAL_S:g})",
+            "-forced-idr",
+            "1",
+            # No B-frames: presentation and decode order match, so a stream
+            # copy cut at a keyframe takes exactly the frames before it.
+            "-bf",
+            "0",
+            "-an",
+            str(tmp),
+        ]
+    )
+    tmp.replace(dest)
+    marker.write_text(json.dumps(_delivery_marker()) + "\n", encoding="utf-8")
+    return dest
+
+
+def keyframe_times(video: Path, *, ffprobe_bin: str = "ffprobe") -> list[float]:
+    """Presentation times of the video keyframes, ascending."""
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-skip_frame",
+                "nokey",
+                "-show_entries",
+                "frame=pts_time",
+                "-of",
+                "csv=p=0",
+                str(video),
+            ],
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UpscaleError(f"failed to start ffprobe: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise UpscaleError(detail or "ffprobe failed")
+    times: list[float] = []
+    for line in completed.stdout.decode("utf-8", errors="replace").splitlines():
+        value = line.strip().rstrip(",")
+        if not value or value == "N/A":
+            continue
+        try:
+            times.append(float(value))
+        except ValueError:
+            continue
+    return sorted(set(times))
+
+
+def snap_to_keyframes(
+    keys: list[float], start_s: float, end_s: float, duration_s: float
+) -> tuple[float, float | None]:
+    """Widen ``start_s``/``end_s`` out to keyframes. ``None`` means to the end."""
+    before = [key for key in keys if key <= start_s + _KEY_EPSILON_S]
+    start = before[-1] if before else 0.0
+    if start <= 0.05:
+        start = 0.0
+    after = [key for key in keys if key >= end_s - _KEY_EPSILON_S]
+    end = after[0] if after else None
+    if end is not None and end >= duration_s - 0.05:
+        end = None
+    return start, end
+
+
+def _ffprobe_for(ffmpeg_bin: str) -> str:
+    """The ffprobe that sits next to ``ffmpeg_bin``, else the one on PATH."""
+    path = Path(ffmpeg_bin)
+    if path.parent != Path("."):
+        sibling = path.with_name(path.name.replace("ffmpeg", "ffprobe"))
+        if sibling.is_file():
+            return str(sibling)
+    return "ffprobe"
+
+
+def _copy_range(
+    video: Path,
+    dest: Path,
+    start_s: float,
+    end_s: float | None,
+    *,
+    ffmpeg_bin: str,
+) -> Path:
+    """Stream-copy a keyframe-aligned range. No pixels are re-encoded."""
+    command = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
+    if start_s > 0:
+        command.extend(["-ss", f"{start_s:.6f}"])
+    command.extend(["-i", str(video)])
+    if end_s is not None:
+        command.extend(["-t", f"{end_s - start_s:.6f}"])
+    command.extend(
+        [
+            "-map",
+            "0:v:0",
+            "-c",
+            "copy",
+            "-an",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(dest),
+        ]
+    )
+    _run_ffmpeg(command)
+    return dest
+
+
+def _frame_size(video: Path) -> tuple[int, int] | None:
+    from .probe import ProbeError, probe_file
+
+    try:
+        stream = probe_file(video).primary_video()
+    except ProbeError:
+        return None
+    if stream is None or not stream.width or not stream.height:
+        return None
+    return stream.width, stream.height
+
+
+def _upscale_full(
+    source: Path,
+    output: Path,
+    span: UpscaleSpan,
+    work: Path,
+    *,
+    engine: UpscaleEngine,
+    ffmpeg_bin: str,
+) -> Path:
+    raw = engine.upscale(
+        UpscaleRequest(
+            source, work / "full_up.mp4", scale=span.scale, strength=span.strength
+        )
+    )
+    encode_delivery(raw, output, ffmpeg_bin=ffmpeg_bin)
+    mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
+    return output
 
 
 def apply_range_revise(
@@ -520,20 +792,36 @@ def apply_range_revise(
     ffmpeg_bin: str = "ffmpeg",
     duration_s: float,
 ) -> Path:
-    """Re-upscale ``span`` from the original source and splice it into ``current``."""
+    """Re-upscale ``span`` from the original source and splice it into ``current``.
+
+    The range widens out to the keyframes of ``current``. The head and tail are
+    stream-copied, so repeated revises never re-encode the untouched parts.
+    A ``current`` from before the delivery settings existed is encoded into
+    them once first.
+    """
     work = output.parent / "range_work"
     work.mkdir(parents=True, exist_ok=True)
     covers = span.start_s <= 0.05 and span.end_s >= duration_s - 0.05
     if covers or not current.is_file():
-        engine.upscale(
-            UpscaleRequest(source, output, scale=span.scale, strength=span.strength)
+        return _upscale_full(
+            source, output, span, work, engine=engine, ffmpeg_bin=ffmpeg_bin
         )
-        mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
-        return output
+    if not is_delivery(current):
+        current = encode_delivery(current, work / "current.mp4", ffmpeg_bin=ffmpeg_bin)
+    keys = keyframe_times(current, ffprobe_bin=_ffprobe_for(ffmpeg_bin))
+    start, end = snap_to_keyframes(keys, span.start_s, span.end_s, duration_s)
+    if start == 0.0 and end is None:
+        return _upscale_full(
+            source, output, span, work, engine=engine, ffmpeg_bin=ffmpeg_bin
+        )
     clip = trim_source(
-        source, work / "range.mp4", span.start_s, span.end_s, ffmpeg_bin=ffmpeg_bin
+        source,
+        work / "range.mp4",
+        start,
+        duration_s if end is None else end,
+        ffmpeg_bin=ffmpeg_bin,
     )
-    middle = engine.upscale(
+    raw = engine.upscale(
         UpscaleRequest(
             clip,
             work / "range_up.mp4",
@@ -541,19 +829,31 @@ def apply_range_revise(
             strength=span.strength,
         )
     )
+    middle = encode_delivery(raw, work / "range_delivery.mp4", ffmpeg_bin=ffmpeg_bin)
+    current_size = _frame_size(current)
+    middle_size = _frame_size(middle)
+    if current_size and middle_size and current_size != middle_size:
+        raise UpscaleError(
+            f"the revised range is {middle_size[0]}x{middle_size[1]} but the "
+            f"output is {current_size[0]}x{current_size[1]}; a scale change "
+            "must re-render the whole clip"
+        )
     parts: list[Path] = []
-    if span.start_s > 0.05:
-        head = work / "head.mp4"
-        trim_source(current, head, 0.0, span.start_s, ffmpeg_bin=ffmpeg_bin)
-        parts.append(head)
+    if start > 0:
+        parts.append(
+            _copy_range(current, work / "head.mp4", 0.0, start, ffmpeg_bin=ffmpeg_bin)
+        )
     parts.append(middle)
-    if span.end_s < duration_s - 0.05:
-        tail = work / "tail.mp4"
-        trim_source(current, tail, span.end_s, duration_s, ffmpeg_bin=ffmpeg_bin)
-        parts.append(tail)
+    if end is not None:
+        parts.append(
+            _copy_range(current, work / "tail.mp4", end, None, ffmpeg_bin=ffmpeg_bin)
+        )
     silent = work / "spliced.mp4"
     _concat(parts, silent, ffmpeg_bin=ffmpeg_bin)
     silent.replace(output)
+    delivery_marker_path(output).write_text(
+        json.dumps(_delivery_marker()) + "\n", encoding="utf-8"
+    )
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
 
@@ -597,10 +897,16 @@ def mux_source_audio(
     return video
 
 
-def _concat(parts: list[Path], dest: Path, *, ffmpeg_bin: str) -> None:
-    from .render import build_concat_argv, write_concat_list
+def _write_listing(path: Path, parts: list[Path]) -> Path:
+    from .render import write_concat_list
 
-    listing = write_concat_list(dest.parent / "splice.txt", parts)
+    return write_concat_list(path, parts)
+
+
+def _concat(parts: list[Path], dest: Path, *, ffmpeg_bin: str) -> None:
+    from .render import build_concat_argv
+
+    listing = _write_listing(dest.parent / "splice.txt", parts)
     _run_ffmpeg(build_concat_argv(listing, dest, ffmpeg_bin=ffmpeg_bin))
 
 

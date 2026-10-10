@@ -382,7 +382,7 @@ def render_analyzing() -> str:
 <h1>Analyzing</h1>
 <p class="lede">Sampling frames and asking Gemini for split layouts…</p>
 <p class="muted">This usually takes about 1–3 minutes. The page will refresh.</p>
-<meta http-equiv="refresh" content="1;url=/analyze?run=1">
+<meta http-equiv="refresh" content="2;url=/analyze?run=1">
 """
     return _page("Analyzing", body, phase="file")
 
@@ -530,7 +530,7 @@ def render_rendering() -> str:
 splices, and copies audio.</p>
 <p class="muted">A short clip finishes sooner than a longer one. The page
 will refresh.</p>
-<meta http-equiv="refresh" content="1;url=/render?run=1">
+<meta http-equiv="refresh" content="2;url=/render?run=1">
 """
     return _page("Upscaling", body, phase="result")
 

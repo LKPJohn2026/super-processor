@@ -13,6 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   splices, and copies audio. Gemini turns a result note into a time range,
   scale, and strength, then the cited range is restored from the original source.
 
+### Fixed
+
+- The wizard serves only localhost: a foreign `Host`, a foreign `Origin`, or
+  a cross-site request that would start work is refused with 403. CORS answers
+  only the wizard itself, the Vite dev/preview ports, and the published React
+  shell; add origins with `SUPER_PROCESSOR_ALLOWED_ORIGINS`.
+- Upscale and analyze passes run on one worker thread. `/render?run=1` and
+  `/api/render?run=1` start a pass and return at once; a reload or a second
+  tab no longer starts a second GPU pass on the same job. Posts are refused
+  while a pass runs. FlashVSR loads are serialized process-wide.
+- A result note that changes scale on part of the video re-renders the whole
+  clip at that scale instead of splicing two resolutions into one stream.
+  A same-scale note trims the spans it overlaps instead of dropping them.
+- Range revises no longer re-encode the parts of the video the note did not
+  name. The upscaled picture is encoded once with a keyframe every second and
+  no B-frames; a revise snaps out to those keyframes and stream-copies the
+  head and tail. Work clips handed to FlashVSR are lossless.
+
 ### Planned
 
 - Wire a real local LLM path behind the deferred stub screen (OpenAI-compatible

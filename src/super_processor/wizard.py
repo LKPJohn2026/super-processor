@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -368,6 +370,12 @@ class WizardController:
         self.ffmpeg_bin = ffmpeg_bin
         self._gemini = gemini
         self._upscale = upscale_engine
+        # One analyze or render at a time. The HTTP server is threaded, and a
+        # reload or a second tab must not start a second GPU pass on the
+        # same job directory.
+        self._work_lock = threading.Lock()
+        self._worker_guard = threading.Lock()
+        self._worker: threading.Thread | None = None
 
     def gemini(self) -> GeminiClient:
         if self._gemini is None:
@@ -391,6 +399,56 @@ class WizardController:
 
     def _state(self) -> WizardState:
         return self.current_state()
+
+    def busy(self) -> bool:
+        """True while an analyze or render pass is running."""
+        return self._work_lock.locked()
+
+    def start_render(self) -> bool:
+        """Run :meth:`run_render` on a worker thread. False if not started."""
+        return self._start_worker(WizardStep.RENDERING, self.run_render)
+
+    def start_analyze(self) -> bool:
+        """Run :meth:`run_analyze` on a worker thread. False if not started."""
+        return self._start_worker(WizardStep.ANALYZING, self.run_analyze)
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until the worker finishes. True when nothing is running."""
+        with self._worker_guard:
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
+        return not self.busy()
+
+    def _start_worker(self, step: WizardStep, target: Callable[[], None]) -> bool:
+        with self._worker_guard:
+            if self._worker is not None and self._worker.is_alive():
+                return False
+            if self.busy():
+                return False
+            if self._state().step is not step:
+                return False
+            worker = threading.Thread(
+                target=self._run_worker,
+                args=(target,),
+                name=f"wizard-{step.value}",
+                daemon=True,
+            )
+            self._worker = worker
+            worker.start()
+            return True
+
+    def _run_worker(self, target: Callable[[], None]) -> None:
+        try:
+            target()
+        except Exception as exc:  # noqa: BLE001 - surfaced on the page
+            state = self._state()
+            state.error = str(exc) or type(exc).__name__
+            if state.step is WizardStep.RENDERING:
+                state.step = WizardStep.RESULT
+            elif state.step is WizardStep.ANALYZING:
+                state.step = WizardStep.PICK_FILE
+            self._save(state)
 
     def _save(self, state: WizardState) -> None:
         save_session_state(self.jobs_dir, state)
@@ -454,6 +512,7 @@ class WizardController:
                 scale, strength = _active_knobs(job_dir)
         return {
             "step": state.step.value,
+            "busy": self.busy(),
             "error": state.error,
             "job_id": state.job_id,
             "has_gemini_key": resolve_gemini_api_key() is not None,
@@ -488,6 +547,8 @@ class WizardController:
         )
 
     def handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
+        if self.busy():
+            raise WizardError("a render or analysis is still running; wait for it")
         state = self._state()
         state.error = None
         if path == "/intro":
@@ -565,6 +626,14 @@ class WizardController:
         self._save(state)
 
     def run_analyze(self) -> None:
+        if not self._work_lock.acquire(blocking=False):
+            return
+        try:
+            self._run_analyze()
+        finally:
+            self._work_lock.release()
+
+    def _run_analyze(self) -> None:
         state = self._state()
         if state.step is not WizardStep.ANALYZING or not state.job_id:
             return
@@ -845,6 +914,14 @@ class WizardController:
         self._save(state)
 
     def run_render(self) -> None:
+        if not self._work_lock.acquire(blocking=False):
+            return
+        try:
+            self._run_render()
+        finally:
+            self._work_lock.release()
+
+    def _run_render(self) -> None:
         state = self._state()
         if state.step is not WizardStep.RENDERING or not state.job_id:
             return

@@ -172,8 +172,12 @@ def test_json_api_drives_upscale_flow(
             base, "POST", "/api/pick", {"path": str(clip)}
         )
         assert waiting["step"] == "rendering"
-        _status, result, _origin = _json_request(base, "GET", "/api/render?run=1")
+        _status, started, _origin = _json_request(base, "GET", "/api/render?run=1")
+        assert started["step"] == "rendering"
+        assert controller.wait_idle(timeout=60)
+        _status, result, _origin = _json_request(base, "GET", "/api/state")
         assert result["step"] == "result"
+        assert result["busy"] is False
         assert result["output_ready"] is True
         assert result["output_url"] == "/output.mp4"
         assert result["scale"] == 2
@@ -187,7 +191,9 @@ def test_json_api_drives_upscale_flow(
             {"note": "reduce artificial detail from 1s to 3s"},
         )
         assert again["step"] == "rendering"
-        _status, revised, _origin = _json_request(base, "GET", "/api/render?run=1")
+        _json_request(base, "GET", "/api/render?run=1")
+        assert controller.wait_idle(timeout=60)
+        _status, revised, _origin = _json_request(base, "GET", "/api/state")
         assert revised["step"] == "result"
         assert revised["strength"] == 0.2
         _status, done, _origin = _json_request(
