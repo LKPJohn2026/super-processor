@@ -4,9 +4,11 @@ FFmpeg probes, trims, concatenates, and copies audio. Each span (a shot) also
 carries a :class:`~super_processor.look.ShotLook`: bounded FFmpeg clean-up
 before FlashVSR and finishing after it, always in that order. Gemini may only
 return a time range plus ``scale`` and ``strength``.
-``strength`` is the share of the FlashVSR picture in the output; the rest is a
-plain lanczos upscale of the same (cleaned) frames, so 0.0 invents nothing and
-1.0 is FlashVSR alone. FlashVSR itself always runs at its upstream settings.
+Shapes, colour, and layout always come from a plain lanczos upscale of the
+same (cleaned) frames; ``strength`` is how much of FlashVSR's fine detail is
+added on top, so 0.0 invents nothing and 1.0 adds all of it. Inside protected
+regions (faces, hands, text) the share is lower. FlashVSR itself always runs
+at its upstream settings.
 The real engine refuses to run without CUDA; tests use :class:`FakeUpscaleEngine`.
 
 Work clips handed to the engine are encoded losslessly. The engine output is
@@ -31,6 +33,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .look import LookError, ShotLook
+from .regions import Region, regions_from_dicts, strength_expr
 
 UPSCALE_PLAN_FILE = "upscale_plan.json"
 CHUNK_SECONDS = 8.0
@@ -43,6 +46,11 @@ _KEY_EPSILON_S = 0.02
 # at the end of a clip. Up to this many (or 2% of the clip) are conformed back
 # to the source count; more than that means the clip is misaligned.
 FRAME_SLACK = 8
+# Shapes, colour, and layout come from the plain upscale of the source; only
+# detail finer than this (a Gaussian sigma, in source pixels) comes from
+# FlashVSR. FlashVSR can sharpen what is there but cannot move, reshape, or
+# recolour it.
+STRUCTURE_SIGMA = 1.5
 _SCALES = frozenset({2, 4})
 # The upstream script is imported with a chdir into its folder, which is
 # process-wide. Only one FlashVSR load or inference may run at a time.
@@ -68,6 +76,7 @@ class UpscaleSpan:
     strength: float = 0.5
     source: str = "original"
     look: ShotLook = field(default_factory=ShotLook)
+    regions: tuple[Region, ...] = ()
 
     def __post_init__(self) -> None:
         scale = _require_scale(self.scale)
@@ -91,6 +100,7 @@ class UpscaleSpan:
             "strength": self.strength,
             "source": self.source,
             "look": self.look.to_dict(),
+            "regions": [region.to_dict() for region in self.regions],
         }
 
     @classmethod
@@ -109,6 +119,7 @@ class UpscaleSpan:
                 strength=float(data.get("strength", 0.5)),
                 source=str(data.get("source", "original")),
                 look=look,
+                regions=regions_from_dicts(data.get("regions")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise UpscaleError("upscale span is missing start_s or end_s") from exc
@@ -155,6 +166,7 @@ class UpscaleRequest:
     scale: int = 2
     strength: float = 0.5
     look: ShotLook = field(default_factory=ShotLook)
+    regions: tuple[Region, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scale", _require_scale(self.scale))
@@ -275,12 +287,18 @@ def clamp_span(span: UpscaleSpan, duration_s: float) -> UpscaleSpan:
     return replace(span, start_s=start, end_s=end)
 
 
-def look_at(plan: UpscalePlan, time_s: float) -> ShotLook:
-    """The look of the latest span covering ``time_s``, or a neutral one."""
+def span_at(plan: UpscalePlan, time_s: float) -> UpscaleSpan | None:
+    """The latest span covering ``time_s``."""
     for span in reversed(plan.spans):
         if span.start_s - 0.05 <= time_s < span.end_s:
-            return span.look
-    return ShotLook()
+            return span
+    return None
+
+
+def look_at(plan: UpscalePlan, time_s: float) -> ShotLook:
+    """The look of the latest span covering ``time_s``, or a neutral one."""
+    span = span_at(plan, time_s)
+    return span.look if span is not None else ShotLook()
 
 
 def _covers_all(span: UpscaleSpan, duration_s: float) -> bool:
@@ -731,6 +749,7 @@ def _run_flashvsr_chunked(
         blend_with=request.source,
         strength=request.strength,
         look=request.look,
+        regions=request.regions,
     )
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
@@ -818,29 +837,55 @@ def is_delivery(video: Path) -> bool:
 
 
 def _write_marker(
-    video: Path, *, strength: float | None, look: ShotLook | None = None
+    video: Path,
+    *,
+    blend: dict[str, Any] | None = None,
+    look: ShotLook | None = None,
 ) -> None:
     data = _delivery_marker()
-    if strength is not None:
-        data["strength"] = strength
+    if blend is not None:
+        data["blend"] = blend
     if look is not None:
         data["look"] = look.to_dict()
     delivery_marker_path(video).write_text(json.dumps(data) + "\n", encoding="utf-8")
 
 
+def _blend_record(strength: float, regions: tuple[Region, ...]) -> dict[str, Any]:
+    """What a blended encode was made with, so an identical one can be skipped."""
+    return {
+        "strength": strength,
+        "structure_sigma": STRUCTURE_SIGMA,
+        "regions": [region.to_dict() for region in regions],
+    }
+
+
 def blend_filter(
-    width: int, height: int, strength: float, look: ShotLook | None = None
+    width: int,
+    height: int,
+    strength: float,
+    look: ShotLook | None = None,
+    *,
+    regions: tuple[Region, ...] = (),
+    sigma: float = 0.0,
 ) -> str:
     """Mix the restored picture (input 0) with a lanczos upscale of input 1.
 
-    ``eof_action=pass`` ends on the restored picture, so the frame count the
-    keyframe splice relies on never changes. The base is padded by a second
-    of its last frame so a few missing frames do not leave the tail unmixed.
-    The base gets the look's clean step, as the engine input did, and the mix
-    gets its finish step.
+    With ``sigma`` (in output pixels), the restored picture's coarse layer is
+    swapped for the base's before the mix: the result is
+    ``base + s * (detail(restored) - detail(base))``, where ``detail`` is a
+    frame minus its Gaussian blur. At strength 0 that is the base; at 1 it is
+    the base's shapes and colour with FlashVSR's fine detail. The strength
+    ``s`` is per pixel: lower inside protected ``regions``.
+
+    Every blend takes the restored picture's branch as its first (main) input
+    with ``eof_action=pass``, so the frame count the keyframe splice relies
+    on never changes. The base is padded by a second of its last frame so a
+    few missing frames do not leave the tail unmixed. The base gets the look's
+    clean step, as the engine input did, and the mix gets its finish step.
     """
-    weight = _require_strength(strength)
+    _require_strength(strength)
     look = look or ShotLook()
+    share = strength_expr(strength, regions)
     base = _join_filters(
         "setpts=PTS-STARTPTS",
         look.clean_filter(),
@@ -849,11 +894,24 @@ def blend_filter(
     )
     finish = look.finish_filter()
     mixed = "[mix];[mix]" + finish + "[v]" if finish else "[v]"
+    mix = f"blend=all_expr='B+(A-B)*({share})':eof_action=pass{mixed}"
+    if sigma <= 0:
+        return (
+            "[0:v]setpts=PTS-STARTPTS,format=yuv420p[up];"
+            f"[1:v]{base}[base];"
+            f"[up][base]{mix}"
+        )
+    blur = f"gblur=sigma={sigma:.3f}"
     return (
-        "[0:v]setpts=PTS-STARTPTS,format=yuv420p[up];"
-        f"[1:v]{base}[base];"
-        f"[up][base]blend=all_expr='A*{weight:.4f}+B*{1 - weight:.4f}'"
-        f":eof_action=pass{mixed}"
+        "[0:v]setpts=PTS-STARTPTS,format=yuv420p,split[up][upc];"
+        f"[upc]{blur}[uplow];"
+        f"[1:v]{base},split[basec][basemix];"
+        f"[basec]{blur}[baselow];"
+        # Restored detail, offset to mid grey so negative values survive.
+        "[up][uplow]blend=all_expr='A-B+128':eof_action=pass[detail];"
+        # The base's coarse layer with the restored detail on top.
+        "[detail][baselow]blend=all_expr='B+A-128':eof_action=pass[rebuilt];"
+        f"[rebuilt][basemix]{mix}"
     )
 
 
@@ -870,23 +928,24 @@ def encode_delivery(
     blend_with: Path | None = None,
     strength: float = 1.0,
     look: ShotLook | None = None,
+    regions: tuple[Region, ...] = (),
 ) -> Path:
     """Encode a picture once into the settings every splice part shares.
 
     A forced IDR frame every second, and no B-frames, give a range revise
     clean points to cut the current output by stream copy. ``concat`` reads
-    ``source`` as a concat-demuxer listing. With ``blend_with`` and a strength
-    below 1, the picture is mixed with a lanczos upscale of ``blend_with`` in
-    the same encode (see :func:`blend_filter`). The look's finish step runs in
-    this encode too.
+    ``source`` as a concat-demuxer listing. With ``blend_with``, the picture
+    is mixed with a lanczos upscale of ``blend_with`` in the same encode,
+    taking its coarse layer from that base (see :func:`blend_filter`). The
+    look's finish step runs in this encode too.
     """
     look = look or ShotLook()
-    mixing = blend_with is not None and strength < 1.0
+    record = _blend_record(strength, regions) if blend_with is not None else None
     finish = look.finish_filter()
     if not concat and is_delivery(source):
         done = _read_marker(source) or {}
         same_look = done.get("look", ShotLook().to_dict()) == look.to_dict()
-        if (not mixing or done.get("strength") == strength) and same_look:
+        if done.get("blend") == record and same_look:
             if source != dest:
                 source.replace(dest)
                 delivery_marker_path(source).replace(delivery_marker_path(dest))
@@ -903,15 +962,20 @@ def encode_delivery(
         ]
     )
     picture = ["-map", "0:v:0"]
-    if mixing:
-        assert blend_with is not None
+    if blend_with is not None:
         size = _frame_size(_first_part(source) if concat else source)
         if size is None:
             raise UpscaleError(f"could not read the frame size of {source}")
+        base_size = _frame_size(blend_with)
+        if base_size is None:
+            raise UpscaleError(f"could not read the frame size of {blend_with}")
+        sigma = STRUCTURE_SIGMA * size[0] / base_size[0]
         inputs.extend(["-i", str(blend_with)])
         picture = [
             "-filter_complex",
-            blend_filter(size[0], size[1], strength, look),
+            blend_filter(
+                size[0], size[1], strength, look, regions=regions, sigma=sigma
+            ),
             "-map",
             "[v]",
         ]
@@ -948,11 +1012,7 @@ def encode_delivery(
         ]
     )
     tmp.replace(dest)
-    _write_marker(
-        dest,
-        strength=strength if blend_with is not None else None,
-        look=None if look.is_neutral() else look,
-    )
+    _write_marker(dest, blend=record, look=None if look.is_neutral() else look)
     return dest
 
 
@@ -1087,6 +1147,7 @@ def _upscale_full(
             scale=span.scale,
             strength=span.strength,
             look=span.look,
+            regions=span.regions,
         )
     )
     encode_delivery(
@@ -1096,6 +1157,7 @@ def _upscale_full(
         blend_with=source,
         strength=span.strength,
         look=span.look,
+        regions=span.regions,
     )
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
@@ -1146,6 +1208,7 @@ def apply_range_revise(
             scale=span.scale,
             strength=span.strength,
             look=span.look,
+            regions=span.regions,
         )
     )
     middle = encode_delivery(
@@ -1155,6 +1218,7 @@ def apply_range_revise(
         blend_with=clip,
         strength=span.strength,
         look=span.look,
+        regions=span.regions,
     )
     current_size = _frame_size(current)
     middle_size = _frame_size(middle)
@@ -1185,7 +1249,7 @@ def apply_range_revise(
             "the previous output is left unchanged"
         )
     silent.replace(output)
-    _write_marker(output, strength=None)
+    _write_marker(output)
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
 
@@ -1257,11 +1321,12 @@ def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
     out: list[UpscaleSpan] = []
     for span in ordered:
         last = out[-1] if out else None
-        if last is not None and (last.scale, last.strength, last.look) == (
-            span.scale,
-            span.strength,
-            span.look,
-        ):
+        if last is not None and (
+            last.scale,
+            last.strength,
+            last.look,
+            last.regions,
+        ) == (span.scale, span.strength, span.look, span.regions):
             out[-1] = replace(last, end_s=span.end_s)
         else:
             out.append(span)
@@ -1319,6 +1384,7 @@ def render_shots(
                 scale=span.scale,
                 strength=span.strength,
                 look=span.look,
+                regions=span.regions,
             )
         )
         parts.append(
@@ -1329,6 +1395,7 @@ def render_shots(
                 blend_with=clip,
                 strength=span.strength,
                 look=span.look,
+                regions=span.regions,
             )
         )
     silent = work / "shots.mp4"
@@ -1340,7 +1407,7 @@ def render_shots(
             "the previous output is left unchanged"
         )
     silent.replace(output)
-    _write_marker(output, strength=None)
+    _write_marker(output)
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
 

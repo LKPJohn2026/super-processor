@@ -22,6 +22,7 @@ from .gemini import (
 from .jobs import JobError, JobState, JobStore
 from .look import LOOK_BOUNDS
 from .probe import MediaFacts, ProbeError, probe_file
+from .regions import MAX_REGIONS, REGION_STRENGTH
 from .segments import MAX_DURATION_S
 from .shot_plan import (
     CHECK_PROBLEMS,
@@ -31,10 +32,13 @@ from .shot_plan import (
     allowed_scales,
     apply_checks,
     apply_proposals,
+    apply_regions,
     check_stills,
     fallback_recipe,
     finish,
     load_plan,
+    locate_stills,
+    locate_targets,
     new_plan,
     render_previews,
     request_redo,
@@ -61,10 +65,10 @@ from .upscale import (
     UpscaleSpan,
     default_span,
     load_upscale_plan,
-    look_at,
     render_plan,
     replace_overlapping,
     save_upscale_plan,
+    span_at,
 )
 from .wizard_pages import (
     render_done,
@@ -726,6 +730,8 @@ class WizardController:
         # The scale is chosen once, on the first pass; every shot shares it.
         first = not any(recipe.reason for recipe in plan.recipes)
         scales = tuple(sorted({2, plan.scale})) if first else (plan.scale,)
+        if first:
+            shots = self._locate(shots, source, job_dir, warnings)
         try:
             reply = self.gemini().propose_looks(
                 shots=shots_payload(shots, plan, indexes),
@@ -764,6 +770,45 @@ class WizardController:
         state.error = None
         state.step = WizardStep.LOOKS
         self._save(state)
+
+    def _locate(
+        self, shots: ShotList, source: Path, job_dir: Path, warnings: list[str]
+    ) -> ShotList:
+        """Box faces, hands, and text so the blend can hold FlashVSR down there."""
+        targets = locate_targets(shots)
+        if not targets:
+            return shots
+        try:
+            stills = locate_stills(
+                source, job_dir, shots, targets, ffmpeg_bin=self.ffmpeg_bin
+            )
+            found = self.gemini().locate_regions(
+                shots=[
+                    {
+                        "index": index,
+                        "label": shots.shots[index].label,
+                        "contains": [
+                            kind
+                            for kind in shots.shots[index].contains
+                            if kind in REGION_STRENGTH
+                        ],
+                    }
+                    for index in targets
+                ],
+                stills=stills,
+                kinds=tuple(REGION_STRENGTH),
+                max_regions=MAX_REGIONS,
+                job_dir=job_dir,
+            )
+        except (GeminiError, ShotError) as exc:
+            warnings.append(
+                f"Gemini could not box faces, hands, and text ({exc}); those "
+                f"shots are capped at strength {PROTECTED_STRENGTH:g} overall"
+            )
+            return shots
+        shots = apply_regions(shots, found, targets)
+        save_shots(job_dir, shots)
+        return shots
 
     def _check(
         self,
@@ -836,6 +881,7 @@ class WizardController:
                     "end_s": shot.end_s,
                     "label": shot.label,
                     "contains": list(shot.contains),
+                    "regions": [region.to_dict() for region in shot.regions],
                     "strength": recipe.strength,
                     "look": recipe.look.to_dict(),
                     "reason": recipe.reason,
@@ -909,8 +955,11 @@ class WizardController:
                 job_dir=job_dir,
             )
             patch = UpscaleSpan.from_dict(raw)
-            # A note retunes scale and strength; the shot keeps its look.
-            patch = replace(patch, look=look_at(plan, patch.start_s))
+            # A note retunes scale and strength; the shot keeps its look and
+            # its protected regions.
+            under = span_at(plan, patch.start_s)
+            if under is not None:
+                patch = replace(patch, look=under.look, regions=under.regions)
             updated = replace_overlapping(plan, patch, duration)
             save_upscale_plan(job_dir, updated)
             state.error = None

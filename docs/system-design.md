@@ -68,7 +68,7 @@ settings that always run in the same order.
 | Stage | Settings | Why |
 |---|---|---|
 | Clean | `deblock`, `denoise` (0–1) | FlashVSR treats blocks and noise as detail; removing them first leaves it less to invent from |
-| Restore | `scale`, `strength` | FlashVSR, mixed with a cleaned plain upscale |
+| Restore | `scale`, `strength`, protected regions | FlashVSR's fine detail on the cleaned plain upscale's shapes and colour; held down inside face, hand, and text boxes |
 | Finish | `contrast`, `brightness`, `saturation`, `gamma`, `grain` | Grade and texture on the restored picture |
 
 Filter text is built from the numbers in code; model output never reaches

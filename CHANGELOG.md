@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Protected regions. Before planning, Gemini boxes the faces, hands, and text
+  in each shot that has them, from stills at its start, middle, and end. In
+  the delivery blend the FlashVSR share is held to 0.3 inside face and hand
+  boxes and 0.15 inside text boxes, feathered so there is no seam. The Looks
+  screen draws the boxes over the previews. A shot whose boxes could not be
+  placed falls back to the whole-shot 0.6 cap.
+
 - Per-shot looks (loop 2). After the shot list is approved, Gemini proposes a
   strength and look for each shot (and one scale for the video), each shot
   gets a short before/after preview, and Gemini checks the previews for
@@ -47,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The strength blend now takes shapes, colour, and layout from the plain
+  upscale of the source and only fine detail (below a 1.5 source-pixel
+  Gaussian) from FlashVSR. FlashVSR can sharpen what is there but can no
+  longer move, reshape, or recolour it, at any strength. Strength 1.0 is no
+  longer "FlashVSR alone"; it is the source's structure with all of
+  FlashVSR's fine detail.
+- The 0.6 strength cap on shots with faces, hands, or text now applies only
+  when no protection boxes were placed.
 - A scale change on part of the clip keeps every shot's strength and look
   and only changes the scale, instead of collapsing the plan into one span.
   A result note keeps the look of the shot it names.

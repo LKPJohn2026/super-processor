@@ -282,7 +282,24 @@ button:disabled {
 }
 
 .pair video {
-  margin: 0.2rem 0 0;
+  margin: 0;
+}
+
+.frame {
+  position: relative;
+  margin-top: 0.2rem;
+  line-height: 0;
+}
+
+.box {
+  position: absolute;
+  border: 2px solid #e8b44a;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+
+.box.text {
+  border-color: #6fc3df;
 }
 
 video {

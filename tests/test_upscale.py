@@ -420,8 +420,13 @@ def test_range_revise_converts_an_older_output_once(tmp_path: Path) -> None:
     assert len(_frame_hashes(output)) == 6 * 24
 
 
-class _WhiteEngine:
-    """Invents an all-white picture, so any strength shows up in the mean."""
+class _TextureEngine:
+    """Invents a brighter picture covered in a fine checkerboard.
+
+    The brightness is a change to the coarse layer, which the blend always
+    takes from the source; the checkerboard is fine detail, which comes
+    through in proportion to strength.
+    """
 
     def upscale(self, request: UpscaleRequest) -> Path:
         size = _frame_size_of(request.source)
@@ -453,8 +458,10 @@ class _WhiteEngine:
                 "-f",
                 "lavfi",
                 "-i",
-                f"color=c=white:size={size[0] * request.scale}x"
+                f"nullsrc=size={size[0] * request.scale}x"
                 f"{size[1] * request.scale}:rate={rate}",
+                "-vf",
+                "geq=lum='188+50*(mod(floor(X/2)+floor(Y/2),2)*2-1)':cb=128:cr=128",
                 "-frames:v",
                 str(frames),
                 "-c:v",
@@ -490,6 +497,32 @@ def _frame_size_of(path: Path) -> tuple[int, int]:
     return int(width), int(height)
 
 
+def _detail(path: Path) -> float:
+    """Mean absolute difference between horizontal neighbours, first frame."""
+    width, _height = _frame_size_of(path)
+    raw = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-frames:v",
+            "1",
+            "-vf",
+            "format=gray",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    rows = [raw[i : i + width] for i in range(0, len(raw), width)]
+    diffs = [abs(row[x + 1] - row[x]) for row in rows for x in range(width - 1)]
+    return sum(diffs) / len(diffs)
+
+
 def _mean_luma(path: Path) -> float:
     """Average luma over every frame, decoded with plain ``-i`` (no lavfi path
     escaping, so Windows drive paths work)."""
@@ -519,7 +552,7 @@ def test_strength_mixes_the_restored_picture_with_a_plain_upscale(
 ) -> None:
     source = tmp_path / "gray.mp4"
     _tiny(source, seconds=4)  # flat gray, 10 fps
-    means: dict[float, float] = {}
+    detail: dict[float, float] = {}
     for strength in (0.0, 0.5, 1.0):
         output = tmp_path / f"out_{strength}.mp4"
         apply_range_revise(
@@ -527,15 +560,17 @@ def test_strength_mixes_the_restored_picture_with_a_plain_upscale(
             output,
             UpscaleSpan(0, 4, strength=strength),
             output,
-            engine=_WhiteEngine(),
+            engine=_TextureEngine(),
             duration_s=4,
         )
         assert len(_frame_hashes(output)) == 40
-        means[strength] = _mean_luma(output)
-    gray, white = means[0.0], means[1.0]
-    assert white > 230
-    assert abs(gray - _mean_luma(source)) < 2
-    assert abs(means[0.5] - (gray + white) / 2) < 3
+        # FlashVSR's brightening is a coarse change: it never reaches the output.
+        assert abs(_mean_luma(output) - _mean_luma(source)) < 3
+        detail[strength] = _detail(output)
+    # Its fine texture does, in proportion to strength.
+    assert detail[0.0] < 3
+    assert detail[1.0] > 30
+    assert 0.35 < detail[0.5] / detail[1.0] < 0.65
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
@@ -543,7 +578,7 @@ def test_range_revise_blends_only_the_named_range(tmp_path: Path) -> None:
     source = tmp_path / "gray.mp4"
     _tiny(source, seconds=6)
     output = tmp_path / "output.mp4"
-    engine = _WhiteEngine()
+    engine = _TextureEngine()
     apply_range_revise(
         source,
         output,
