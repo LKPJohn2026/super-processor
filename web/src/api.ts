@@ -52,6 +52,7 @@ export type LookShot = {
   look: ShotLook;
   reason: string;
   check: ShotCheck;
+  shimmer?: number | null;
   before_url: string | null;
   after_url: string | null;
 };
@@ -75,6 +76,8 @@ export type WizardView = {
   shots?: Shot[] | null;
   label_error?: string | null;
   looks?: Looks | null;
+  seams?: { time_s: number; score: number }[];
+  seam_error?: string | null;
 };
 
 const STEPS: readonly string[] = [

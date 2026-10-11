@@ -579,7 +579,7 @@ poster="{escape(_poster(after))}"></video>{boxes}</div></figure>
 <p class="tags"><strong>{escape(summary)}</strong></p>
 {_protected_line(_items(shot, "regions"), _items(shot, "contains"))}
 <p class="tags">{escape(str(shot.get("reason") or ""))}</p>
-<p class="tags muted">{escape(check_summary(check))}</p>
+<p class="tags muted">{escape(check_summary(check))}{_shimmer_text(shot.get("shimmer"))}</p>
 <form method="post" action="/looks">
 <input type="hidden" name="action" value="redo">
 <input type="hidden" name="index" value="{index}">
@@ -608,6 +608,13 @@ in one shot.</p>
 </form>
 """
     return _page("Looks", body, phase="looks")
+
+
+def _shimmer_text(value: object) -> str:
+    """The measured shimmer, next to the check result."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ""
+    return f" Texture stability: {float(value):.1f}× as jumpy as the source."
 
 
 def _boxes(regions: list[object]) -> str:
@@ -677,8 +684,11 @@ def render_result(
     error: str | None = None,
     scale: int | None = None,
     strength: float | None = None,
+    seams: list[dict[str, object]] | None = None,
+    seam_error: str | None = None,
 ) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
+    seam_note = _seam_note(seams or [], seam_error)
     knobs = ""
     if scale is not None and strength is not None:
         knobs = (
@@ -690,6 +700,7 @@ def render_result(
 {err}
 {knobs}
 <video controls src="{escape(output_url)}"></video>
+{seam_note}
 <p class="lede">Are you happy, or do you want to say something?</p>
 <form method="post" action="/result">
 <button type="submit" name="mood" value="happy">A. I am happy</button>
@@ -704,6 +715,28 @@ placeholder="e.g. reduce artificial detail from 00:30 to 00:40"></textarea>
 {_NEW_JOB_FORM}
 """
     return _page("Result", body, phase="result")
+
+
+def _seam_note(seams: list[dict[str, object]], error: str | None) -> str:
+    """Where the seam check saw a jump the source does not have."""
+    if error:
+        return f'<p class="muted">{escape(error)}</p>'
+    times = [
+        float(str(seam.get("time_s")))
+        for seam in seams
+        if seam.get("time_s") is not None
+    ]
+    if not times:
+        return ""
+    listed = ", ".join(format_time(t) for t in times)
+    first = times[0]
+    example = f"smooth {format_time(max(0.0, first - 1))} to {format_time(first + 1)}"
+    return (
+        f'<p class="card">Possible seam{"s" if len(times) > 1 else ""} at '
+        f"{escape(listed)}: the picture jumps there and the source does not. "
+        "To re-render across one in a single pass, write a note like "
+        f"&ldquo;{escape(example)}&rdquo;.</p>"
+    )
 
 
 _NEW_JOB_FORM = """<form method="post" action="/new">

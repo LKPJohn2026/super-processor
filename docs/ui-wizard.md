@@ -195,10 +195,37 @@ Then every shot gets a preview: up to 3 s from its middle, rendered with its
 recipe (FlashVSR loads once for all of them), plus the same seconds of the
 source. Gemini compares a still from each before/after pair for
 `identity_change`, `bad_anatomy`, `garbled_text`, `waxy_skin`,
-`oversharpened`, `halos`, `fake_texture`, `color_shift`, and `too_soft`. A
-shot that fails comes back with corrected settings and its preview is redone
-once (no second check). The Looks screen shows both previews, the settings
-that differ from neutral, Gemini's reason, and the check result.
+`oversharpened`, `halos`, `fake_texture`, `color_shift`, `too_soft`, and
+`flicker`. A shot that fails comes back with corrected settings and its
+preview is redone once (no second check). The Looks screen shows both
+previews, the settings that differ from neutral, Gemini's reason, the check
+result, and the measured shimmer.
+
+### Shimmer
+
+A still cannot show texture that crawls, so each preview is also measured
+(`stability.py`). For the restored clip and for the source scaled to the same
+size, take the fine-detail layer (a frame minus a Gaussian blur of 1.5 source
+pixels) and measure how much detail there is and how much it changes from one
+frame to the next. The shimmer index is the restored clip's change-to-detail
+ratio over the source's, so camera and subject motion, which move both,
+cancel out. About 1 means the texture is as stable as the footage; a static
+added texture scores lower. Above 1.6 the preview fails as `flicker`
+whatever Gemini said, its strength drops by 0.15, and the preview is redone.
+Gemini also sees the number. A clip with almost no fine detail is not judged.
+
+### Seams
+
+FlashVSR starts again at every chunk (every 7.5 s inside a long part), at
+every boundary between shots with different settings, and at the edges of a
+revised range. After each render, a 1 s window around each of those times is
+read from the output and the source at 320 pixels wide. The largest
+frame-to-frame jump in the output's window, relative to its median, is
+compared with the source's at the same frame; a jump at least 2.5× what the
+source does there (and at least 2 grey levels) is a seam. The Result screen
+lists them with a ready-made note ("smooth 0:15 to 0:17"); that revise
+re-renders the range in one pass, and the next render checks its new edges.
+The check never fails a render; if it cannot run, the Result screen says so.
 
 A note on one shot ("skin looks waxy") marks only that shot stale: Gemini
 re-plans it with the note and its current settings, it gets a new preview and
@@ -268,6 +295,7 @@ A scale change re-renders the whole clip (see Range revise above).
 | `previews/` | `shot_NNN_rN_before/after.mp4` and check stills, served at `/previews/<name>` |
 | `upscale_plan.json` | Spans (one per approved shot) with scale, strength, and look, plus the pending revise |
 | `output.mp4` | Current result |
+| `render_report.json` | Seam check of the latest render: times checked and seams found |
 | `output.mp4.delivery.json` | Encode settings marker for keyframe splices |
 | `range_work/`, `flash_chunks/` | Work clips for revises and chunked FlashVSR |
 

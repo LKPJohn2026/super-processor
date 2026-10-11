@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Shimmer check. Each preview's fine-detail layer is measured for how much
+  it changes frame to frame relative to how much there is, against the
+  source. A preview whose texture is over 1.6x less stable than the source's
+  fails as `flicker` even when Gemini passed it, loses 0.15 strength, and is
+  redone; Gemini also sees the number. The Looks screen shows it.
+- Seam check. After every render, each place FlashVSR restarted (chunk
+  boundaries, boundaries between unlike shots, revise edges) is compared
+  with the source; a frame jump 2.5x beyond the source's is reported on the
+  Result screen with a ready-made "smooth" note. Results are in
+  `render_report.json`.
+
 - Protected regions. Before planning, Gemini boxes the faces, hands, and text
   in each shot that has them, from stills at its start, middle, and end. In
   the delivery blend the FlashVSR share is held to 0.3 inside face and hand
