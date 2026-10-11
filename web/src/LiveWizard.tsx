@@ -470,6 +470,7 @@ function ResultStep({
       ) : (
         <p>The result file is not ready yet.</p>
       )}
+      <SeamNote seams={view.seams ?? []} error={view.seam_error ?? null} />
       <p className="lede">Are you happy, or do you want to say something?</p>
       {message ? <Alert text={message} /> : null}
       <div className="actions">
@@ -672,6 +673,27 @@ function Protected({ regions, contains }: { regions: Region[]; contains: string[
   );
 }
 
+function SeamNote({
+  seams,
+  error,
+}: {
+  seams: { time_s: number; score: number }[];
+  error: string | null;
+}) {
+  if (error) return <p className="muted">{error}</p>;
+  if (!seams.length) return null;
+  const listed = seams.map((seam) => formatTime(seam.time_s)).join(", ");
+  const first = seams[0].time_s;
+  const example = `smooth ${formatTime(Math.max(0, first - 1))} to ${formatTime(first + 1)}`;
+  return (
+    <p className="muted">
+      Possible seam{seams.length > 1 ? "s" : ""} at {listed}: the picture jumps
+      there and the source does not. To re-render across one in a single pass,
+      write a note like “{example}”.
+    </p>
+  );
+}
+
 function poster(videoUrl: string | null): string | null {
   // Each preview has a still of the same name, saved for the check.
   return videoUrl ? videoUrl.replace(/\.mp4$/, ".jpg") : null;
@@ -765,7 +787,12 @@ function LooksStep({
             </p>
             <Protected regions={shot.regions ?? []} contains={shot.contains} />
             <p>{shot.reason}</p>
-            <p className="muted">{checkSummary(shot.check)}</p>
+            <p className="muted">
+              {checkSummary(shot.check)}
+              {typeof shot.shimmer === "number"
+                ? ` Texture stability: ${shot.shimmer.toFixed(1)}× as jumpy as the source.`
+                : ""}
+            </p>
             <form onSubmit={(event) => redo(event, shot.index)}>
               <label htmlFor={`note-${shot.index}`}>
                 Not right? Tell me what to change in this shot

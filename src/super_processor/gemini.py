@@ -958,7 +958,11 @@ class GeminiClient:
             "Pass a shot that simply looks better. For a failed shot, return "
             "corrected strength and look (usually lower strength, or more "
             "deblock/denoise for fake texture); for a passed shot return its "
-            "settings unchanged. Keep the note to one sentence."
+            "settings unchanged. Each shot's 'shimmer' is measured on the "
+            "moving previews: how much less stable its added texture is than "
+            "the source's (1 is the same, above 1.6 visibly crawls; null when "
+            "there is too little texture to tell). Fail a high one as flicker. "
+            "Keep the note to one sentence."
         )
         parts: list[dict[str, Any]] = [{"text": intro}]
         for shot, (before, after) in zip(shots, pairs, strict=True):

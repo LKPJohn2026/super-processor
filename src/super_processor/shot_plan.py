@@ -26,6 +26,7 @@ from typing import Any
 from .look import LOOK_BOUNDS, ShotLook
 from .regions import MAX_REGIONS, Region, region_from_model
 from .shots import STILLS_DIR, Shot, ShotError, ShotList, extract_still
+from .stability import SHIMMER_LIMIT, StabilityError, shimmer_index, video_size
 from .upscale import (
     UpscaleEngine,
     UpscalePlan,
@@ -58,7 +59,10 @@ CHECK_PROBLEMS = (
     "fake_texture",
     "color_shift",
     "too_soft",
+    "flicker",
 )
+# How far strength drops when the measured shimmer flags a preview.
+SHIMMER_STEP = 0.15
 PREVIEW_NAME = re.compile(r"shot_(\d{3})_r(\d+)_(before|after)\.(mp4|jpg)")
 
 
@@ -107,6 +111,8 @@ class ShotRecipe:
     rev: int = 0
     stale: bool = True
     note: str = ""
+    # Measured on the latest preview: see :func:`.stability.shimmer_index`.
+    shimmer: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -117,6 +123,7 @@ class ShotRecipe:
             "rev": self.rev,
             "stale": self.stale,
             "note": self.note,
+            "shimmer": self.shimmer,
         }
 
     @classmethod
@@ -131,6 +138,7 @@ class ShotRecipe:
             rev=int(data.get("rev", 0)),
             stale=bool(data.get("stale", True)),
             note=str(data.get("note", "")),
+            shimmer=_optional_number(data.get("shimmer")),
         )
 
 
@@ -194,6 +202,12 @@ def _known(raw: Any, allowed: tuple[str, ...]) -> tuple[str, ...]:
         if name in allowed and name not in seen:
             seen.append(name)
     return tuple(seen)
+
+
+def _optional_number(raw: Any) -> float | None:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw)
 
 
 def _clamp(raw: Any, low: float, high: float, default: float) -> float:
@@ -544,6 +558,70 @@ def _remove_old_previews(folder: Path, index: int) -> None:
         # The delivery encode leaves a ``.delivery.json`` marker beside each.
         if PREVIEW_NAME.fullmatch(old.name.removesuffix(".delivery.json")):
             old.unlink(missing_ok=True)
+
+
+def measure_shimmer(
+    job_dir: Path, plan: ShotPlan, indexes: list[int], *, ffmpeg_bin: str = "ffmpeg"
+) -> ShotPlan:
+    """Store each preview's shimmer index; ``None`` when it cannot be judged."""
+    recipes = list(plan.recipes)
+    folder = job_dir / PREVIEWS_DIR
+    for index in indexes:
+        rev = recipes[index].rev
+        before = folder / preview_name(index, rev, "before")
+        after = folder / preview_name(index, rev, "after")
+        try:
+            value = shimmer_index(
+                before,
+                after,
+                scale=plan.scale,
+                after_size=video_size(after),
+                ffmpeg_bin=ffmpeg_bin,
+            )
+        except StabilityError:
+            value = None
+        recipes[index] = replace(
+            recipes[index], shimmer=None if value is None else round(value, 2)
+        )
+    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
+
+
+def guard_shimmer(
+    plan: ShotPlan, indexes: list[int], already: list[int]
+) -> tuple[ShotPlan, list[int]]:
+    """Fail previews whose texture crawls, and lower their strength.
+
+    This runs after Gemini's check, whatever it said: a still cannot show
+    shimmer. A shot in ``already`` had its settings changed by the check,
+    so it only gets the problem added. Returns the shots to preview again.
+    """
+    recipes = list(plan.recipes)
+    changed: list[int] = []
+    for index in indexes:
+        recipe = recipes[index]
+        if recipe.shimmer is None or recipe.shimmer <= SHIMMER_LIMIT:
+            continue
+        note = (
+            f"The added texture crawls from frame to frame "
+            f"({recipe.shimmer:.1f}x less stable than the source)."
+        )
+        problems = tuple(dict.fromkeys((*recipe.check.problems, "flicker")))
+        check = replace(
+            recipe.check,
+            ok=False,
+            problems=problems,
+            note=recipe.check.note if recipe.check.ok is False else note,
+        )
+        if index in already or recipe.strength <= 0:
+            recipes[index] = replace(recipe, check=check)
+            continue
+        recipes[index] = replace(
+            recipe,
+            strength=round(max(0.0, recipe.strength - SHIMMER_STEP), 3),
+            check=replace(check, adjusted=True),
+        )
+        changed.append(index)
+    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error), changed
 
 
 def check_stills(job_dir: Path, plan: ShotPlan, index: int) -> tuple[Path, Path]:

@@ -36,9 +36,11 @@ from .shot_plan import (
     check_stills,
     fallback_recipe,
     finish,
+    guard_shimmer,
     load_plan,
     locate_stills,
     locate_targets,
+    measure_shimmer,
     new_plan,
     render_previews,
     request_redo,
@@ -57,6 +59,7 @@ from .shots import (
     save_shots,
     split_at,
 )
+from .stability import StabilityError, find_seams, seam_candidates
 from .upscale import (
     FlashVsrEngine,
     UpscaleEngine,
@@ -256,6 +259,30 @@ def _fallback_plan(plan: ShotPlan, shots: ShotList, indexes: list[int]) -> ShotP
     return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
 
 
+RENDER_REPORT_FILE = "render_report.json"
+
+
+def load_render_report(job_dir: Path) -> dict[str, Any]:
+    """The seam check of the latest render: ``seams`` and ``error``."""
+    empty: dict[str, Any] = {"seams": [], "error": None}
+    path = job_dir / RENDER_REPORT_FILE
+    if not path.is_file():
+        return empty
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    seams = [
+        seam
+        for seam in data.get("seams") or []
+        if isinstance(seam, dict) and isinstance(seam.get("time_s"), (int, float))
+    ]
+    error = data.get("error")
+    return {"seams": seams, "error": str(error) if error else None}
+
+
 def parse_time(raw: str) -> float:
     """Seconds from ``"75"``, ``"1:15"``, or ``"0:01:15.5"``."""
     text = raw.strip()
@@ -426,12 +453,16 @@ class WizardController:
             return render_rendering()
         if state.step is WizardStep.RESULT:
             assert state.job_id
-            scale, strength = _active_knobs(self.store.job_dir(state.job_id))
+            job_dir = self.store.job_dir(state.job_id)
+            scale, strength = _active_knobs(job_dir)
+            report = load_render_report(job_dir)
             return render_result(
                 output_url="/output.mp4",
                 error=state.error,
                 scale=scale,
                 strength=strength,
+                seams=report["seams"],
+                seam_error=report["error"],
             )
         if state.step is WizardStep.DONE:
             return render_done()
@@ -444,6 +475,8 @@ class WizardController:
         output_url: str | None = None
         scale: int | None = None
         strength: float | None = None
+        seams: list[dict[str, Any]] = []
+        seam_error: str | None = None
         if state.job_id and state.step in {WizardStep.RESULT, WizardStep.DONE}:
             job_dir = self.store.job_dir(state.job_id)
             if (job_dir / "output.mp4").is_file():
@@ -451,6 +484,8 @@ class WizardController:
                 output_url = "/output.mp4"
             if state.step is WizardStep.RESULT:
                 scale, strength = _active_knobs(job_dir)
+                report = load_render_report(job_dir)
+                seams, seam_error = report["seams"], report["error"]
         shots: list[dict[str, Any]] | None = None
         label_error: str | None = None
         if state.job_id and state.step is WizardStep.SHOTS:
@@ -474,6 +509,8 @@ class WizardController:
             "shots": shots,
             "label_error": label_error,
             "looks": looks,
+            "seams": seams,
+            "seam_error": seam_error,
         }
 
     def handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
@@ -758,8 +795,16 @@ class WizardController:
                 engine=self.upscale_engine(),
                 ffmpeg_bin=self.ffmpeg_bin,
             )
-            if not warnings:
-                plan = self._check(plan, shots, indexes, source, job_dir, warnings)
+            plan = measure_shimmer(job_dir, plan, indexes, ffmpeg_bin=self.ffmpeg_bin)
+            plan = self._check(
+                plan,
+                shots,
+                indexes,
+                source,
+                job_dir,
+                warnings,
+                ask_gemini=not warnings,
+            )
         except (UpscaleError, ShotError, OSError) as exc:
             self._plan_failed(state, str(exc))
             return
@@ -818,39 +863,66 @@ class WizardController:
         source: Path,
         job_dir: Path,
         warnings: list[str],
+        *,
+        ask_gemini: bool,
     ) -> ShotPlan:
-        """Gemini compares each preview; failed shots are fixed and redone once."""
-        try:
-            verdicts = self.gemini().check_previews(
-                shots=[
-                    {
-                        "index": index,
-                        "label": shots.shots[index].label,
-                        "contains": list(shots.shots[index].contains),
-                        "strength": plan.recipes[index].strength,
-                        "look": plan.recipes[index].look.to_dict(),
-                    }
-                    for index in indexes
-                ],
-                pairs=[check_stills(job_dir, plan, index) for index in indexes],
-                problems=CHECK_PROBLEMS,
-                job_dir=job_dir,
-            )
-        except GeminiError as exc:
-            warnings.append(f"Gemini could not check the previews ({exc})")
-            return plan
-        plan, changed = apply_checks(plan, shots, verdicts, indexes)
-        if changed:
+        """Check each preview; failed shots are fixed and redone once.
+
+        Gemini compares the stills (with the measured shimmer alongside);
+        then the shimmer guard fails any preview whose texture crawls,
+        whatever Gemini said, since a still cannot show that.
+        """
+        changed: list[int] = []
+        if ask_gemini:
+            try:
+                verdicts = self.gemini().check_previews(
+                    shots=[
+                        {
+                            "index": index,
+                            "label": shots.shots[index].label,
+                            "contains": list(shots.shots[index].contains),
+                            "strength": plan.recipes[index].strength,
+                            "look": plan.recipes[index].look.to_dict(),
+                            "shimmer": plan.recipes[index].shimmer,
+                        }
+                        for index in indexes
+                    ],
+                    pairs=[check_stills(job_dir, plan, index) for index in indexes],
+                    problems=CHECK_PROBLEMS,
+                    job_dir=job_dir,
+                )
+                plan, changed = apply_checks(plan, shots, verdicts, indexes)
+            except GeminiError as exc:
+                warnings.append(f"Gemini could not check the previews ({exc})")
+        plan, flickering = guard_shimmer(plan, indexes, changed)
+        redo = sorted({*changed, *flickering})
+        if redo:
             plan = render_previews(
                 source,
                 job_dir,
                 shots,
                 plan,
-                changed,
+                redo,
                 engine=self.upscale_engine(),
                 ffmpeg_bin=self.ffmpeg_bin,
             )
+            plan = measure_shimmer(job_dir, plan, redo, ffmpeg_bin=self.ffmpeg_bin)
         return plan
+
+    def _check_seams(
+        self, job_dir: Path, output: Path, source: Path, candidates: list[float]
+    ) -> None:
+        """Record likely seams in the new output. Never fails the render."""
+        report: dict[str, Any] = {"checked": candidates, "seams": [], "error": None}
+        try:
+            report["seams"] = find_seams(
+                output, source, candidates, ffmpeg_bin=self.ffmpeg_bin
+            )
+        except StabilityError as exc:
+            report["error"] = f"The seam check could not run: {exc}"
+        (job_dir / RENDER_REPORT_FILE).write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
 
     def _plan_failed(self, state: WizardState, detail: str) -> None:
         """Planning failed (usually the GPU); go back to the shot list."""
@@ -886,6 +958,7 @@ class WizardController:
                     "look": recipe.look.to_dict(),
                     "reason": recipe.reason,
                     "check": recipe.check.to_dict(),
+                    "shimmer": recipe.shimmer,
                     "before_url": before if recipe.rev else None,
                     "after_url": after if recipe.rev else None,
                 }
@@ -1002,8 +1075,12 @@ class WizardController:
                 ffmpeg_bin=self.ffmpeg_bin,
                 duration_s=duration,
             )
+            # Candidates include the pending revise's edges, so read them
+            # before the pending span is cleared.
+            candidates = seam_candidates(plan, duration)
             plan = UpscalePlan(spans=plan.spans, pending=None)
             save_upscale_plan(job_dir, plan)
+            self._check_seams(job_dir, output, source, candidates)
             state.error = None
             state.step = WizardStep.RESULT
         except (UpscaleError, ProbeError, OSError, ValueError) as exc:
