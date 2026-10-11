@@ -7,6 +7,7 @@ import {
   runScan,
   type LookShot,
   type Looks,
+  type Region,
   type Shot,
   type WizardView,
 } from "./api";
@@ -636,6 +637,41 @@ export function settingsSummary(strength: number, look: Record<string, number>):
   return parts.join(" · ");
 }
 
+function Boxes({ regions }: { regions: Region[] }) {
+  return (
+    <>
+      {regions.map((region, i) => (
+        <span
+          key={`${region.kind}-${i}`}
+          className={`box ${region.kind}`}
+          title={region.kind}
+          style={{
+            left: `${region.x0 * 100}%`,
+            top: `${region.y0 * 100}%`,
+            width: `${(region.x1 - region.x0) * 100}%`,
+            height: `${(region.y1 - region.y0) * 100}%`,
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
+function Protected({ regions, contains }: { regions: Region[]; contains: string[] }) {
+  const kinds = [...new Set(regions.map((region) => region.kind))].sort();
+  if (kinds.length) {
+    return <p className="muted">Protected inside the boxes: {kinds.join(", ")}.</p>;
+  }
+  const flagged = contains.filter((item) => ["faces", "hands", "text"].includes(item));
+  if (!flagged.length) return null;
+  return (
+    <p className="muted">
+      Contains {flagged.join(", ")} but no boxes were placed, so the whole shot
+      is held to a lower strength.
+    </p>
+  );
+}
+
 function poster(videoUrl: string | null): string | null {
   // Each preview has a still of the same name, saved for the check.
   return videoUrl ? videoUrl.replace(/\.mp4$/, ".jpg") : null;
@@ -694,33 +730,40 @@ function LooksStep({
               <div className="pair">
                 <figure>
                   <figcaption>Before</figcaption>
-                  <video
-                    controls
-                    muted
-                    loop
-                    preload="metadata"
-                    src={outputSrc(origin, shot.before_url) ?? undefined}
-                    poster={outputSrc(origin, poster(shot.before_url)) ?? undefined}
-                    aria-label={`Shot ${shot.index + 1} before`}
-                  />
+                  <div className="frame">
+                    <video
+                      controls
+                      muted
+                      loop
+                      preload="metadata"
+                      src={outputSrc(origin, shot.before_url) ?? undefined}
+                      poster={outputSrc(origin, poster(shot.before_url)) ?? undefined}
+                      aria-label={`Shot ${shot.index + 1} before`}
+                    />
+                    <Boxes regions={shot.regions ?? []} />
+                  </div>
                 </figure>
                 <figure>
                   <figcaption>After</figcaption>
-                  <video
-                    controls
-                    muted
-                    loop
-                    preload="metadata"
-                    src={outputSrc(origin, shot.after_url) ?? undefined}
-                    poster={outputSrc(origin, poster(shot.after_url)) ?? undefined}
-                    aria-label={`Shot ${shot.index + 1} after`}
-                  />
+                  <div className="frame">
+                    <video
+                      controls
+                      muted
+                      loop
+                      preload="metadata"
+                      src={outputSrc(origin, shot.after_url) ?? undefined}
+                      poster={outputSrc(origin, poster(shot.after_url)) ?? undefined}
+                      aria-label={`Shot ${shot.index + 1} after`}
+                    />
+                    <Boxes regions={shot.regions ?? []} />
+                  </div>
                 </figure>
               </div>
             ) : null}
             <p>
               <strong>{settingsSummary(shot.strength, shot.look)}</strong>
             </p>
+            <Protected regions={shot.regions ?? []} contains={shot.contains} />
             <p>{shot.reason}</p>
             <p className="muted">{checkSummary(shot.check)}</p>
             <form onSubmit={(event) => redo(event, shot.index)}>

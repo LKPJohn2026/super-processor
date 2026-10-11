@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .regions import Region, regions_from_dicts
 from .upscale import UpscalePlan, UpscaleSpan
 
 SHOTS_FILE = "shots.json"
@@ -152,6 +153,8 @@ class Shot:
     issues: tuple[str, ...] = ()
     contains: tuple[str, ...] = ()
     still: str = ""
+    # Protection boxes, placed while planning (see :mod:`.regions`).
+    regions: tuple[Region, ...] = ()
 
     @property
     def duration_s(self) -> float:
@@ -166,6 +169,7 @@ class Shot:
             "issues": list(self.issues),
             "contains": list(self.contains),
             "still": self.still,
+            "regions": [region.to_dict() for region in self.regions],
         }
 
     @classmethod
@@ -185,6 +189,7 @@ class Shot:
             issues=_known(data.get("issues"), ISSUES),
             contains=_known(data.get("contains"), CONTENTS),
             still=str(data.get("still", "")),
+            regions=regions_from_dicts(data.get("regions")),
         )
 
 

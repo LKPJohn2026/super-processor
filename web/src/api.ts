@@ -33,12 +33,21 @@ export type ShotCheck = {
   adjusted?: boolean;
 };
 
+export type Region = {
+  kind: "faces" | "hands" | "text";
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+};
+
 export type LookShot = {
   index: number;
   start_s: number;
   end_s: number;
   label: string;
   contains: string[];
+  regions?: Region[];
   strength: number;
   look: ShotLook;
   reason: string;

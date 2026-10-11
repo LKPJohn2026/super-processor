@@ -59,12 +59,28 @@ encoded losslessly (`-qp 0`).
 
 ## Strength
 
-`strength` (0.0–1.0) is how much of the FlashVSR picture reaches the output.
-The rest is a lanczos upscale of the same source frames, blended in the
-delivery encode. At 0.0 the output is a plain upscale with nothing invented;
-at 1.0 it is FlashVSR alone. FlashVSR always runs at its upstream settings
+`strength` (0.0–1.0) is how much of FlashVSR's fine detail reaches the
+output. Shapes, colour, and layout always come from a lanczos upscale of the
+(cleaned) source: the blend splits both pictures at a Gaussian blur of 1.5
+source pixels and keeps the source's coarse layer, so the result is
+`base + strength × (detail(FlashVSR) − detail(base))`. At 0.0 the output is a
+plain upscale with nothing invented; at 1.0 it is the source's structure with
+all of FlashVSR's fine detail. FlashVSR can sharpen what is there but cannot
+move, reshape, or recolour it. FlashVSR always runs at its upstream settings
 (sparse ratio 2.0, local range 11). A note such as "less artificial detail
 from 2s to 5s" lowers strength for that range only.
+
+### Protected regions
+
+Before the first proposal, every shot whose contents include faces, hands,
+or text gets three stills (10%, 50%, 90% through it), and Gemini boxes them
+so one box covers the thing's whole path. Boxes are padded by 3% of the
+frame. Inside a box, the FlashVSR share is held to 0.3 for faces and hands
+and 0.15 for text (or the shot's strength, if lower), and it rises back to
+the shot's strength over a 3% feather outside the box, so there is no seam.
+The Looks screen draws the boxes over both previews. A shot that contains
+faces, hands, or text but got no boxes (Gemini failed or found none) is held
+to 0.6 as a whole instead. Boxes are per shot, not tracked frame by frame.
 
 ## Input limits
 
@@ -171,8 +187,9 @@ settings render as one FlashVSR pass.
 Each approved shot gets a recipe: a FlashVSR `strength` and a look (the
 bounded clean-up and finishing settings in `look.py`). The whole video shares
 one scale; Gemini picks it on the first pass, and 4× is only offered when the
-source's long edge is 960 pixels or less. Strength is capped at 0.6 on shots
-whose contents include faces, hands, or text.
+source's long edge is 960 pixels or less. Faces, hands, and text are boxed
+and held down inside the boxes (see Protected regions); a shot that contains
+them without boxes is capped at 0.6 as a whole.
 
 Then every shot gets a preview: up to 3 s from its middle, rendered with its
 recipe (FlashVSR loads once for all of them), plus the same seconds of the

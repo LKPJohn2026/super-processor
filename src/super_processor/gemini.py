@@ -560,6 +560,36 @@ _PROPOSE_SCHEMA: dict[str, Any] = {
     },
     "required": ["scale", "shots"],
 }
+_REGIONS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "shots": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "regions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "box_2d": {
+                                    "type": "array",
+                                    "items": {"type": "number"},
+                                },
+                            },
+                            "required": ["kind", "box_2d"],
+                        },
+                    },
+                },
+                "required": ["index", "regions"],
+            },
+        }
+    },
+    "required": ["shots"],
+}
 _CHECK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -826,16 +856,20 @@ class GeminiClient:
         intro = (
             "You plan a restoration of an editor's footage. Each shot goes "
             "through fixed FFmpeg clean-up (deblock, denoise), then FlashVSR "
-            "upscaling mixed with a plain upscale by 'strength' (0 is a plain "
-            "upscale, 1 is FlashVSR alone), then fixed FFmpeg finishing "
+            "upscaling, whose fine detail is added to a plain upscale by "
+            "'strength' (0 adds none, 1 adds all of it), then fixed FFmpeg finishing "
             "(contrast, brightness, saturation, gamma, grain). FlashVSR treats "
             "blocks and noise as detail and sharpens them into texture, so "
             "clean those first and do not ask for more strength than the shot "
             "needs. The goal is footage that looks well shot, not AI made: no "
             "waxy skin, no crunchy edges, no invented patterns, faces and text "
             "unchanged. Set only what the shot needs; leave the rest at its "
-            f"no-change value. Ranges: {limits}. Shots that contain faces, "
-            f"hands, or text are capped at strength {protected_strength:g}. "
+            f"no-change value. Ranges: {limits}. Shapes and colour always "
+            "come from the source; strength only sets how much of FlashVSR's "
+            "fine detail is added. A shot listing protected boxes is held "
+            "down inside them automatically, so its strength can suit the "
+            "rest of the frame; a shot that contains faces, hands, or text "
+            f"without boxes is capped at strength {protected_strength:g}. "
             f"Pick one scale for the whole video from {list(scales)}. If a "
             "shot has an editor_note, follow it; current shows its settings "
             "now. Return a short reason per shot in plain words."
@@ -856,6 +890,50 @@ class GeminiClient:
             raise GeminiError("Gemini returned no shot recipes")
         self._log(job_dir, intro + f" ({len(shots)} shots)", reply)
         return reply
+
+    def locate_regions(
+        self,
+        *,
+        shots: list[dict[str, Any]],
+        stills: list[list[Path]],
+        kinds: tuple[str, ...],
+        max_regions: int,
+        job_dir: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Box the faces, hands, and text in each shot.
+
+        Each shot comes with stills from its start, middle, and end; one box
+        should cover where the thing is across all of them.
+        """
+        if len(stills) != len(shots):
+            raise GeminiError("locate_regions needs stills for every shot")
+        intro = (
+            "For each shot below you get stills from its start, middle, and "
+            "end. Draw boxes around every "
+            f"{', '.join(kinds)} that is clearly visible, as kind plus box_2d "
+            "[ymin, xmin, ymax, xmax] scaled 0 to 1000. Each box must cover "
+            "where that thing is in all three stills, so a moving face gets "
+            "one box over its whole path. Use only these kinds: "
+            f"{', '.join(kinds)}. At most {max_regions} boxes per shot; "
+            "merge small neighbours. Return an empty list when there are none."
+        )
+        parts: list[dict[str, Any]] = [{"text": intro}]
+        for shot, frames in zip(shots, stills, strict=True):
+            parts.append({"text": f"Shot: {json.dumps(shot)}"})
+            parts.extend(_jpeg_part(frame) for frame in frames)
+        reply = self._generate(
+            contents=[{"role": "user", "parts": parts}],
+            schema=_REGIONS_SCHEMA,
+            system=(
+                "You locate faces, hands, and text in video stills. Return "
+                "JSON matching the schema."
+            ),
+        )
+        found = reply.get("shots")
+        if not isinstance(found, list):
+            raise GeminiError("Gemini returned no regions")
+        self._log(job_dir, intro + f" ({len(shots)} shots)", reply)
+        return [item for item in found if isinstance(item, dict)]
 
     def check_previews(
         self,

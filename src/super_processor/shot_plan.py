@@ -8,9 +8,11 @@ short before/after preview, Gemini compares the two for the usual restoration
 mistakes, and may correct the recipe once. The editor approves the lot or
 writes a note on one shot, which sends only that shot round again.
 
-Model numbers are clamped into :data:`~super_processor.look.LOOK_BOUNDS`, and
-shots that contain faces, hands, or text are capped at
-:data:`PROTECTED_STRENGTH`, because those are where invented detail shows.
+Model numbers are clamped into :data:`~super_processor.look.LOOK_BOUNDS`.
+Faces, hands, and text are where invented detail shows, so before the first
+proposal Gemini boxes them (:func:`locate_targets`) and the blend holds
+FlashVSR down inside the boxes. A shot that contains them but got no boxes is
+capped at :data:`PROTECTED_STRENGTH` as a whole instead.
 """
 
 from __future__ import annotations
@@ -22,7 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from .look import LOOK_BOUNDS, ShotLook
-from .shots import Shot, ShotError, ShotList, extract_still
+from .regions import MAX_REGIONS, Region, region_from_model
+from .shots import STILLS_DIR, Shot, ShotError, ShotList, extract_still
 from .upscale import (
     UpscaleEngine,
     UpscalePlan,
@@ -175,6 +178,7 @@ class ShotPlan:
                     scale=self.scale,
                     strength=recipe.strength,
                     look=recipe.look,
+                    regions=shot.regions,
                 )
                 for shot, recipe in zip(shots.shots, self.recipes, strict=True)
             )
@@ -218,10 +222,74 @@ def allowed_scales(width: int, height: int) -> tuple[int, ...]:
 
 
 def cap_strength(strength: float, shot: Shot) -> float:
-    """Hold strength down on shots with faces, hands, or text."""
-    if PROTECTED_CONTENTS.intersection(shot.contains):
+    """Hold strength down on shots with faces, hands, or text but no boxes."""
+    if PROTECTED_CONTENTS.intersection(shot.contains) and not shot.regions:
         return min(strength, PROTECTED_STRENGTH)
     return strength
+
+
+def locate_targets(shots: ShotList) -> list[int]:
+    """Shots whose contents include something worth boxing."""
+    return [
+        index
+        for index, shot in enumerate(shots.shots)
+        if PROTECTED_CONTENTS.intersection(shot.contains)
+    ]
+
+
+LOCATE_STILL_WIDTH = 768
+
+
+def locate_stills(
+    source: Path,
+    job_dir: Path,
+    shots: ShotList,
+    indexes: list[int],
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+) -> list[list[Path]]:
+    """Stills from 10%, 50%, and 90% through each shot, for boxing."""
+    out: list[list[Path]] = []
+    for index in indexes:
+        shot = shots.shots[index]
+        frames: list[Path] = []
+        for k, share in enumerate((0.1, 0.5, 0.9)):
+            frames.append(
+                extract_still(
+                    source,
+                    shot.start_s + shot.duration_s * share,
+                    job_dir / STILLS_DIR / f"locate_{index:03d}_{k}.jpg",
+                    ffmpeg_bin=ffmpeg_bin,
+                    width=LOCATE_STILL_WIDTH,
+                )
+            )
+        out.append(frames)
+    return out
+
+
+def apply_regions(
+    shots: ShotList, found: list[dict[str, Any]], indexes: list[int]
+) -> ShotList:
+    """Store Gemini's boxes on ``indexes``; kinds the shot lacks are dropped."""
+    by_index = {
+        item.get("index"): item
+        for item in found
+        if isinstance(item.get("index"), int)
+        and not isinstance(item.get("index"), bool)
+    }
+    updated = list(shots.shots)
+    for index in indexes:
+        shot = updated[index]
+        raw = by_index.get(index, {}).get("regions")
+        regions: list[Region] = []
+        for box in raw if isinstance(raw, list) else []:
+            if not isinstance(box, dict):
+                continue
+            region = region_from_model(box.get("kind"), box.get("box_2d"))
+            if region is not None and region.kind in shot.contains:
+                regions.append(region)
+        updated[index] = replace(shot, regions=tuple(regions[:MAX_REGIONS]))
+    return ShotList(shots=updated, label_error=shots.label_error)
 
 
 def fallback_recipe(shot: Shot) -> ShotRecipe:
@@ -346,6 +414,7 @@ def shots_payload(
             "issues": list(shot.issues),
             "contains": list(shot.contains),
             "metrics": shot.metrics.to_dict(),
+            "protected_boxes": [region.kind for region in shot.regions],
         }
         if plan is not None and index < len(plan.recipes):
             recipe = plan.recipes[index]
@@ -434,6 +503,7 @@ def render_previews(
                 scale=plan.scale,
                 strength=recipe.strength,
                 look=recipe.look,
+                regions=shots.shots[index].regions,
             )
         )
     raws = upscale_all(engine, requests)
@@ -449,6 +519,7 @@ def render_previews(
             blend_with=clips[index],
             strength=recipe.strength,
             look=recipe.look,
+            regions=shots.shots[index].regions,
         )
         encode_delivery(clips[index], before, ffmpeg_bin=ffmpeg_bin)
         for side, video in (("before", before), ("after", after)):
