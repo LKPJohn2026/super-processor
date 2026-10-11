@@ -22,6 +22,11 @@ const TOUR = [
     body: "Give the absolute path of a video on the computer running the wizard. A local GPU model restores and upscales it. You set scale and strength.",
   },
   {
+    id: "shots",
+    title: "Shots",
+    body: "FFmpeg finds where each shot starts and measures how blocky, noisy, soft, dark, or flat it is. Gemini labels each shot from one still. You merge or split shots, then approve the list.",
+  },
+  {
     id: "upscale",
     title: "Upscaling",
     body: "FlashVSR restores and upscales on the local GPU. FFmpeg only trims, splices, and copies audio. A long clip is processed in overlapping pieces so it can fit in GPU memory.",

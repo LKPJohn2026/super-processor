@@ -3,18 +3,21 @@ import {
   outputSrc,
   postAction,
   runRender,
+  runScan,
+  type Shot,
   type WizardView,
 } from "./api";
 
-const RAIL = ["Setup", "File", "Upscale", "Result"] as const;
+const RAIL = ["Setup", "File", "Shots", "Upscale", "Result"] as const;
 
 function railIndex(step: WizardView["step"]): number {
   if (step === "intro" || step === "llm_choice" || step === "local_llm_stub" || step === "setup") {
     return 0;
   }
   if (step === "pick_file") return 1;
-  if (step === "rendering") return 2;
-  return 3;
+  if (step === "finding_shots" || step === "shots") return 2;
+  if (step === "rendering") return 3;
+  return 4;
 }
 
 type LiveWizardProps = {
@@ -42,16 +45,17 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   }
 
   useEffect(() => {
-    if (view.step !== "rendering") return;
+    if (view.step !== "rendering" && view.step !== "finding_shots") return;
     let cancelled = false;
     setLocalError(null);
-    runRender(origin)
+    const run = view.step === "rendering" ? runRender : runScan;
+    run(origin)
       .then((next) => {
         if (!cancelled) onView(next);
       })
       .catch((error: unknown) => {
         if (!cancelled) {
-          setLocalError(error instanceof Error ? error.message : "Upscale failed");
+          setLocalError(error instanceof Error ? error.message : "The step failed");
         }
       });
     return () => {
@@ -180,6 +184,33 @@ function WizardStepView({
 
   if (view.step === "pick_file") {
     return <PickStep busy={busy} message={message} onSend={onSend} />;
+  }
+
+  if (view.step === "finding_shots") {
+    return (
+      <>
+        <h1>Finding the shots</h1>
+        <p className="lede" role="status">
+          FFmpeg is finding where each shot starts and measuring how blocky,
+          noisy, soft, dark, or flat it is. Gemini then labels each shot from
+          one still.
+        </p>
+        {message ? <Alert text={message} /> : null}
+      </>
+    );
+  }
+
+  if (view.step === "shots") {
+    return (
+      <ShotsStep
+        origin={origin}
+        shots={view.shots ?? []}
+        labelError={view.label_error ?? null}
+        busy={busy}
+        message={message}
+        onSend={onSend}
+      />
+    );
   }
 
   if (view.step === "rendering") {
@@ -358,7 +389,7 @@ function PickStep({
         </label>
         <div className="actions">
           <button type="submit" disabled={busy}>
-            Start upscale
+            Find the shots
           </button>
         </div>
       </form>
@@ -443,6 +474,111 @@ function ResultStep({
           onClick={() => void onSend("new", {})}
         >
           Start a new video
+        </button>
+      </div>
+    </>
+  );
+}
+
+export function formatTime(seconds: number): string {
+  const rounded = Math.round(Math.max(0, seconds) * 10) / 10;
+  const minutes = Math.floor(rounded / 60);
+  const rest = rounded - minutes * 60;
+  const text = Number.isInteger(rest)
+    ? String(rest).padStart(2, "0")
+    : rest.toFixed(1).padStart(4, "0");
+  return `${minutes}:${text}`;
+}
+
+function words(items: string[]): string {
+  return items.map((item) => item.replace(/_/g, " ")).join(", ");
+}
+
+function ShotsStep({
+  origin,
+  shots,
+  labelError,
+  busy,
+  message,
+  onSend,
+}: {
+  origin: string;
+  shots: Shot[];
+  labelError: string | null;
+  busy: boolean;
+  message: string | null;
+  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+}) {
+  const [splitAt, setSplitAt] = useState<Record<number, string>>({});
+
+  function split(event: FormEvent, index: number) {
+    event.preventDefault();
+    void onSend("shots", { action: "split", index: String(index), at: splitAt[index] ?? "" });
+  }
+
+  return (
+    <>
+      <h1>Shots</h1>
+      <p className="lede">
+        These are the shots found and what looks wrong in each. Merge shots
+        that belong together or split one that changes partway, then approve
+        the list.
+      </p>
+      {message ? <Alert text={message} /> : null}
+      {labelError ? <p className="muted">{labelError}</p> : null}
+      <ol className="shots">
+        {shots.map((shot, index) => (
+          <li key={`${shot.start_s}-${shot.end_s}`} className="shot">
+            {shot.still ? (
+              <img
+                src={outputSrc(origin, `/${shot.still}`) ?? undefined}
+                alt={`Still from shot ${index + 1}`}
+              />
+            ) : null}
+            <div>
+              <h2>
+                {index + 1}. {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
+                {shot.label || "Unlabelled shot"}
+              </h2>
+              <p>Problems: {words(shot.issues) || "none found"}</p>
+              <p className="muted">Contains: {words(shot.contains) || "nothing flagged"}</p>
+              <form className="actions" onSubmit={(event) => split(event, index)}>
+                {index < shots.length - 1 ? (
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() =>
+                      void onSend("shots", { action: "merge", index: String(index) })
+                    }
+                  >
+                    Merge with next
+                  </button>
+                ) : null}
+                <input
+                  type="text"
+                  aria-label={`Split shot ${index + 1} at`}
+                  placeholder={formatTime((shot.start_s + shot.end_s) / 2)}
+                  value={splitAt[index] ?? ""}
+                  onChange={(event) =>
+                    setSplitAt({ ...splitAt, [index]: event.target.value })
+                  }
+                />
+                <button type="submit" className="secondary" disabled={busy}>
+                  Split here
+                </button>
+              </form>
+            </div>
+          </li>
+        ))}
+      </ol>
+      <div className="actions">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void onSend("shots", { action: "approve" })}
+        >
+          Approve shots and upscale
         </button>
       </div>
     </>

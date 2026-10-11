@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import struct
 import threading
 from email.message import Message
@@ -16,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .estimators import EstimatorError
 from .jobs import JobError
 from .segments import STILLS_DIR_NAME, SegmentError, load_segments
+from .shots import STILLS_DIR
 from .wizard import WizardController, WizardError, WizardStep, load_job_wizard_state
 
 
@@ -374,6 +376,9 @@ def _legacy_handler(
     return Handler
 
 
+# Shot stills are named by their start time in milliseconds.
+_STILL_URL = re.compile(r"/shot_stills/(\d{9}\.jpg)")
+
 _API_POSTS = {
     "/api/intro": "/intro",
     "/api/llm": "/llm",
@@ -381,6 +386,7 @@ _API_POSTS = {
     "/api/setup": "/setup",
     "/api/pick": "/pick",
     "/api/new": "/new",
+    "/api/shots": "/shots",
     "/api/result": "/result",
 }
 
@@ -502,10 +508,17 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
         def _media_file(self, path: str) -> tuple[Path, str] | None:
             """Map a media URL to a file inside the job, or ``None``."""
             state = controller.current_state()
-            if not state.job_id or path != "/output.mp4":
+            if not state.job_id:
                 return None
-            output = controller.store.job_dir(state.job_id) / "output.mp4"
-            return (output, "video/mp4") if output.is_file() else None
+            job_dir = controller.store.job_dir(state.job_id)
+            if path == "/output.mp4":
+                output = job_dir / "output.mp4"
+                return (output, "video/mp4") if output.is_file() else None
+            still = _STILL_URL.fullmatch(path)
+            if still is not None:
+                image = job_dir / STILLS_DIR / still.group(1)
+                return (image, "image/jpeg") if image.is_file() else None
+            return None
 
         def do_HEAD(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
@@ -591,6 +604,14 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                     return
                 if path == "/render" and runs:
                     controller.start_render()
+                    self._redirect("/")
+                    return
+                if path == "/api/scan" and runs:
+                    controller.start_scan()
+                    self._json(controller.api_view())
+                    return
+                if path == "/shots" and runs:
+                    controller.start_scan()
                     self._redirect("/")
                     return
                 if path == "/":

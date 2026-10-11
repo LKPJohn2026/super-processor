@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from super_processor.gemini import GeminiError
 from super_processor.jobs import JobState
 from super_processor.review import WizardServer
 from super_processor.upscale import UpscaleError
@@ -42,6 +43,8 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
         (WizardStep.LOCAL_LLM_STUB, "Local LLM"),
         (WizardStep.SETUP, "Gemini"),
         (WizardStep.PICK_FILE, "Pick"),
+        (WizardStep.FINDING_SHOTS, "Finding the shots"),
+        (WizardStep.SHOTS, "Approve shots"),
         (WizardStep.RENDERING, "Upscaling"),
         (WizardStep.RESULT, "Result"),
         (WizardStep.DONE, "Done"),
@@ -115,6 +118,11 @@ class _BrokenEngine:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+class _NoLabels:
+    def label_shots(self, **_kwargs: object) -> list[dict[str, object]]:
+        raise GeminiError("no key in tests")
+
+
 def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
     clip = tmp_path / "real.mp4"
     subprocess.run(
@@ -135,11 +143,19 @@ def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
         ],
         check=True,
     )
-    controller = WizardController(tmp_path / "jobs", upscale_engine=_BrokenEngine())
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_NoLabels(),  # type: ignore[arg-type]
+        upscale_engine=_BrokenEngine(),
+    )
     save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
     controller.handle_post("/pick", {"path": [str(clip)]})
     job_id = controller.current_state().job_id
     assert job_id is not None
+    assert controller.current_state().step is WizardStep.FINDING_SHOTS
+    controller.run_scan()
+    assert controller.current_state().step is WizardStep.SHOTS
+    controller.handle_post("/shots", {"action": ["approve"]})
     controller.run_render()
     state = controller.current_state()
     assert state.step is WizardStep.PICK_FILE

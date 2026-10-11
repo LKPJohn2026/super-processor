@@ -1,10 +1,12 @@
 # Super Processor — System Design
 
-Super Processor is a local-first video processor. A localhost wizard runs a
-local FlashVSR restoration upscale on footage you already shot, then lets you
-revise a time range with a plain-language note. Gemini only turns that note
-into a bounded range, scale, and strength; FFmpeg trims, splices, encodes, and
-copies audio. No model writes shell commands. The CLI keeps the older
+Super Processor is a local-first video processor. A localhost wizard finds
+and measures the shots in footage you already shot, has Gemini label them for
+you to approve, runs a local FlashVSR restoration upscale, then lets you revise
+a time range with a plain-language note. Gemini only labels shots from fixed
+lists and turns a note into a bounded range, scale, and strength; FFmpeg
+detects, measures, trims, splices, encodes, and copies audio. No model writes
+shell commands. The CLI keeps the older
 FFmpeg-filter grade paths for automation.
 
 ## Market context
@@ -51,8 +53,10 @@ operation inspectable.
 
 The wizard picture path is a local GPU restoration upscale (FlashVSR). FFmpeg
 probes, trims a cited time range, splices that range back, and copies audio.
-Gemini only turns a result note into `start_s`, `end_s`, `scale` (2 or 4), and
-`strength` (0–1). Re-runs read the original source for that range so detail
+Before the first render, FFmpeg splits the clip into shots and measures each
+one, Gemini labels them, and the editor approves the list (see
+`docs/ui-wizard.md`, Shots). Gemini only turns a result note into `start_s`,
+`end_s`, `scale` (2 or 4), and `strength` (0–1). Re-runs read the original source for that range so detail
 does not stack.
 
 Each span in the plan is a shot with its own look (`look.py`): bounded FFmpeg

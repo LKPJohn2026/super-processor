@@ -8,6 +8,7 @@ import subprocess
 from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -171,7 +172,26 @@ def test_json_api_drives_upscale_flow(
         _status, waiting, _origin = _json_request(
             base, "POST", "/api/pick", {"path": str(clip)}
         )
-        assert waiting["step"] == "rendering"
+        assert waiting["step"] == "finding_shots"
+        _json_request(base, "GET", "/api/scan?run=1")
+        assert controller.wait_idle(timeout=60)
+        _status, shots, _origin = _json_request(base, "GET", "/api/state")
+        assert shots["step"] == "shots"
+        assert len(shots["shots"]) == 1
+        assert shots["shots"][0]["still"].startswith("shot_stills/")
+        # This transport only knows upscale params, so labelling fails softly.
+        assert "could not label" in shots["label_error"]
+        with urlopen(base + "/" + shots["shots"][0]["still"]) as response:
+            assert response.headers.get_content_type() == "image/jpeg"
+        for bad in ("/shot_stills/../shots.json", "/shot_stills/1.jpg"):
+            with pytest.raises(HTTPError) as missing:
+                urlopen(base + bad)
+            assert missing.value.code == 404
+            missing.value.close()
+        _status, approved, _origin = _json_request(
+            base, "POST", "/api/shots", {"action": "approve"}
+        )
+        assert approved["step"] == "rendering"
         _status, started, _origin = _json_request(base, "GET", "/api/render?run=1")
         assert started["step"] == "rendering"
         assert controller.wait_idle(timeout=60)

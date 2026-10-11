@@ -4,9 +4,20 @@ export type WizardStep =
   | "local_llm_stub"
   | "setup"
   | "pick_file"
+  | "finding_shots"
+  | "shots"
   | "rendering"
   | "result"
   | "done";
+
+export type Shot = {
+  start_s: number;
+  end_s: number;
+  label: string;
+  issues: string[];
+  contains: string[];
+  still: string;
+};
 
 export type WizardView = {
   step: WizardStep;
@@ -18,6 +29,8 @@ export type WizardView = {
   output_url: string | null;
   scale: number | null;
   strength: number | null;
+  shots?: Shot[] | null;
+  label_error?: string | null;
 };
 
 const STEPS: readonly string[] = [
@@ -26,6 +39,8 @@ const STEPS: readonly string[] = [
   "local_llm_stub",
   "setup",
   "pick_file",
+  "finding_shots",
+  "shots",
   "rendering",
   "result",
   "done",
@@ -98,24 +113,28 @@ export async function postAction(
   return readView(response);
 }
 
-let renderInFlight: Promise<WizardView> | null = null;
+const inFlight = new Map<string, Promise<WizardView>>();
 
-const RENDER_POLL_MS = 2000;
+const POLL_MS = 2000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function renderUntilDone(origin: string): Promise<WizardView> {
-  // The server starts the GPU pass on a worker thread and answers at once.
-  // Poll the state until the wizard leaves the rendering step.
+async function runUntilDone(
+  origin: string,
+  route: "render" | "scan",
+  step: WizardView["step"],
+): Promise<WizardView> {
+  // The server starts the long pass on a worker thread and answers at once.
+  // Poll the state until the wizard leaves that step.
   let view = await readView(
-    await fetch(`${origin}/api/render?run=1`, {
+    await fetch(`${origin}/api/${route}?run=1`, {
       headers: { Accept: "application/json" },
     }),
   );
-  while (view.step === "rendering") {
-    await sleep(RENDER_POLL_MS);
+  while (view.step === step) {
+    await sleep(POLL_MS);
     view = await readView(
       await fetch(`${origin}/api/state`, {
         headers: { Accept: "application/json" },
@@ -125,12 +144,26 @@ async function renderUntilDone(origin: string): Promise<WizardView> {
   return view;
 }
 
-export function runRender(origin: string): Promise<WizardView> {
-  if (renderInFlight) return renderInFlight;
-  renderInFlight = renderUntilDone(origin).finally(() => {
-    renderInFlight = null;
+function once(
+  origin: string,
+  route: "render" | "scan",
+  step: WizardView["step"],
+): Promise<WizardView> {
+  const running = inFlight.get(route);
+  if (running) return running;
+  const next = runUntilDone(origin, route, step).finally(() => {
+    inFlight.delete(route);
   });
-  return renderInFlight;
+  inFlight.set(route, next);
+  return next;
+}
+
+export function runRender(origin: string): Promise<WizardView> {
+  return once(origin, "render", "rendering");
+}
+
+export function runScan(origin: string): Promise<WizardView> {
+  return once(origin, "scan", "finding_shots");
 }
 
 export function outputSrc(origin: string, outputUrl: string | null): string | null {

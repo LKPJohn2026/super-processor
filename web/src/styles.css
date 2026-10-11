@@ -213,6 +213,45 @@ button:disabled {
   font-size: 1rem;
 }
 
+.shots {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0;
+}
+
+.shot {
+  display: grid;
+  grid-template-columns: minmax(0, 9rem) minmax(0, 1fr);
+  gap: 0.85rem;
+  align-items: start;
+  padding: 0.85rem 0;
+  border-top: 1px solid #c9c1b2;
+}
+
+.shot img {
+  width: 100%;
+  background: #111;
+}
+
+.shot h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+.shot p {
+  margin: 0.2rem 0;
+}
+
+.shot .actions {
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.shot input {
+  width: 6.5rem;
+  margin-top: 0;
+}
+
 video {
   width: 100%;
   margin: 0.8rem 0;
@@ -240,5 +279,9 @@ video {
 
   .panel {
     padding: 1.15rem 0.9rem 1.3rem;
+  }
+
+  .shot {
+    grid-template-columns: 1fr;
   }
 }

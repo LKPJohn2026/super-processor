@@ -5,13 +5,14 @@ from __future__ import annotations
 from html import escape
 
 # Phase keys for the step rail (setup → result).
-_PHASE_ORDER = ("setup", "file", "upscale", "result")
+_PHASE_ORDER = ("setup", "file", "shots", "upscale", "result")
 
 
 def _step_rail(active: str | None) -> str:
     labels = {
         "setup": "Setup",
         "file": "File",
+        "shots": "Shots",
         "upscale": "Upscale",
         "result": "Result",
     }
@@ -236,6 +237,17 @@ img, video {{
   margin: 0.7rem 0 1rem;
   background: #1a1a1a;
 }}
+.shot {{
+  display: grid;
+  grid-template-columns: minmax(0, 9rem) minmax(0, 1fr);
+  gap: 0.85rem;
+  align-items: start;
+}}
+.shot img {{ margin: 0; width: 100%; }}
+.shot h2 {{ margin-top: 0; font-size: 1rem; }}
+.shot form {{ display: inline; }}
+.shot input[type=text] {{ width: 6rem; margin: 0 0.3rem 0 0; }}
+.tags {{ margin: 0.2rem 0; font-size: 0.9rem; }}
 .seg-progress {{
   font-size: 0.85rem;
   letter-spacing: 0.06em;
@@ -245,6 +257,7 @@ img, video {{
 }}
 @media (max-width: 520px) {{
   .shell {{ padding: 0.85rem 0.75rem 2.5rem; }}
+  .shot {{ grid-template-columns: 1fr; }}
   .panel {{ padding: 1.35rem 1rem 1.6rem; }}
 }}
 </style>
@@ -372,6 +385,94 @@ The first pass usually covers the whole file.</p>
 </form>
 """
     return _page("Pick a video", body, phase="file")
+
+
+def render_finding_shots() -> str:
+    body = """
+<h1>Finding the shots</h1>
+<p class="lede">FFmpeg is finding where each shot starts and measuring how
+blocky, noisy, soft, dark, or flat it is. Gemini then labels each shot from
+one still.</p>
+<p class="muted">This reads the whole file once. The page will refresh.</p>
+<meta http-equiv="refresh" content="2;url=/shots?run=1">
+"""
+    return _page("Finding shots", body, phase="shots")
+
+
+def format_time(seconds: float) -> str:
+    """``75.5`` as ``1:15.5``; whole seconds drop the fraction."""
+    minutes, rest = divmod(round(max(0.0, seconds), 1), 60.0)
+    text = f"{rest:04.1f}" if round(rest % 1, 1) else f"{int(round(rest)):02d}"
+    return f"{int(minutes)}:{text}"
+
+
+def render_shots(
+    shots: list[dict[str, object]],
+    *,
+    error: str | None = None,
+    label_error: str | None = None,
+) -> str:
+    err = f'<p class="error">{escape(error)}</p>' if error else ""
+    warn = f'<p class="muted">{escape(label_error)}</p>' if label_error else ""
+    cards: list[str] = []
+    for index, shot in enumerate(shots):
+        start = float(str(shot.get("start_s", 0)))
+        end = float(str(shot.get("end_s", 0)))
+        label = escape(str(shot.get("label") or "Unlabelled shot"))
+        issues = ", ".join(str(i).replace("_", " ") for i in _items(shot, "issues"))
+        contains = ", ".join(str(i).replace("_", " ") for i in _items(shot, "contains"))
+        still = str(shot.get("still") or "")
+        image = (
+            f'<img src="/{escape(still)}" alt="Still from shot {index + 1}">'
+            if still
+            else ""
+        )
+        merge = (
+            f"""<form method="post" action="/shots">
+<input type="hidden" name="action" value="merge">
+<input type="hidden" name="index" value="{index}">
+<button type="submit" class="secondary">Merge with next</button>
+</form>"""
+            if index < len(shots) - 1
+            else ""
+        )
+        cards.append(
+            f"""<div class="card shot">
+{image}
+<div>
+<h2>{index + 1}. {format_time(start)}–{format_time(end)} · {label}</h2>
+<p class="tags">Problems: {escape(issues) or "none found"}</p>
+<p class="tags muted">Contains: {escape(contains) or "nothing flagged"}</p>
+{merge}
+<form method="post" action="/shots">
+<input type="hidden" name="action" value="split">
+<input type="hidden" name="index" value="{index}">
+<input type="text" name="at" placeholder="{format_time((start + end) / 2)}"
+aria-label="Split shot {index + 1} at">
+<button type="submit" class="secondary">Split here</button>
+</form>
+</div>
+</div>"""
+        )
+    body = f"""
+<h1>Shots</h1>
+<p class="lede">These are the shots found and what looks wrong in each.
+Merge shots that belong together or split one that changes partway, then
+approve the list.</p>
+{err}
+{warn}
+{"".join(cards)}
+<form method="post" action="/shots">
+<input type="hidden" name="action" value="approve">
+<button type="submit" class="full">Approve shots and upscale</button>
+</form>
+"""
+    return _page("Shots", body, phase="shots")
+
+
+def _items(shot: dict[str, object], key: str) -> list[object]:
+    value = shot.get(key)
+    return list(value) if isinstance(value, list) else []
 
 
 def render_rendering() -> str:

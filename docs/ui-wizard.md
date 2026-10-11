@@ -100,6 +100,8 @@ frame count is refused and the previous `output.mp4` is kept.
 | Local LLM stub | `GET/POST /local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
 | Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key |
 | Pick file | `GET/POST /pick` | Local video path (up to 1080p and 30 minutes) |
+| Finding shots | `GET /shots?run=1` (`/api/scan?run=1`) | FFmpeg finds the cuts and measures each shot; Gemini labels each shot from one still |
+| Shots | `POST /shots` (`/api/shots`) | Review the shot list: merge with next, split at a time, approve |
 | Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, or a note that retunes a time range |
 | Done | `GET /` (state `done`) | Confirmation |
@@ -108,13 +110,16 @@ frame count is refused and the previous `output.mp4` is kept.
 ## State machine
 
 ```text
-intro → llm_choice ┬─ gemini → setup → pick_file → rendering → result ─┬─ happy → done
-                   └─ local  → local_llm_stub → setup ─┘          ▲            │
-                                                                  └── note ────┘
+intro → llm_choice ┬─ gemini → setup → pick_file → finding_shots → shots → rendering → result ─┬─ happy → done
+                   └─ local  → local_llm_stub → setup ─┘                                ▲            │
+                                                                                        └── note ────┘
 ```
 
 Persisted in the job directory as `wizard_state.json` (step, job id, last
-error) and `gemini_chat.json`. If the first upscale fails, the job is marked
+error) and `gemini_chat.json`. If finding the shots fails (FFmpeg cannot read
+the file), the job is marked failed and the wizard returns to `pick_file`. If
+only Gemini labelling fails, the shots keep the hints from the measurements and
+the shots screen says why. If the first upscale fails, the job is marked
 failed and the wizard returns to `pick_file` with the error; a failed revise
 stays on `result` with the previous output. "Start a new video" on Done or
 Result goes back to `pick_file`. A state saved on a step of the removed split /
@@ -128,9 +133,40 @@ enhance flow (`analyzing`, `overview`, `choose_split`, `enhance`) loads as
   only action is “Use Gemini instead”, which continues to Gemini setup.
   No local inference is wired in this release.
 
+## Shots (loop 1)
+
+FFmpeg finds the cuts with `scdet` on a 320-pixel-wide copy. Shots shorter
+than 1 s join a neighbour, and at most 40 shots are kept (the shortest merge
+first). Each shot is then measured in its own short pass at 2 frames a second,
+so filters that average over everything they have seen (`blockdetect`) do not
+mix shots. Measurements are medians:
+
+| Metric | From | Hint when |
+|---|---|---|
+| `blockiness` | `blockdetect` | ≥ 18 → `blocky` |
+| `blur` | `blurdetect` | ≥ 6 → `soft` |
+| `noise` | RMS difference from a spatially denoised copy (`hqdn3d` + `psnr`) | ≥ 2 → `noisy` |
+| `brightness` | `signalstats` YAVG / 255 | < 0.25 → `dark`, > 0.75 → `overexposed` |
+| `contrast` | `signalstats` (YHIGH − YLOW) / 255 | < 0.35 → `flat` |
+
+The thresholds are rough and only seed the list. Gemini sees one still per shot
+next to the numbers and returns a short label, the problems from a fixed list
+(`blocky`, `noisy`, `soft`, `dark`, `overexposed`, `flat`, `color_cast`,
+`shaky`), and what the shot contains from another (`faces`, `hands`, `text`,
+`fine_pattern`). Names outside the lists are dropped. Merging two shots keeps
+the first label and joins both lists; splitting measures both halves again.
+Approving writes one upscale span per shot. Neighbouring spans with the same
+settings render as one FlashVSR pass.
+
 ## Gemini schema
 
-The wizard makes one Gemini call: a result note becomes a range and knobs.
+The shot labels:
+
+```json
+{"shots": [{"index": 0, "label": "night street, neon sign", "issues": ["noisy", "dark"], "contains": ["text"]}]}
+```
+
+A result note becomes a range and knobs.
 
 ```json
 {"start_s": 2.0, "end_s": 5.0, "scale": 2, "strength": 0.3}
@@ -160,7 +196,9 @@ A scale change re-renders the whole clip (see Range revise above).
 | `manifest.json` | Job id, source, state |
 | `wizard_state.json` | Wizard step, job id, last error |
 | `gemini_chat.json` | Result-note history |
-| `upscale_plan.json` | Spans with scale and strength, plus the pending revise |
+| `shots.json` | Shot ranges, measurements, labels, and still names |
+| `shot_stills/` | One JPEG per shot, served at `/shot_stills/<name>.jpg` |
+| `upscale_plan.json` | Spans (one per approved shot) with scale, strength, and look, plus the pending revise |
 | `output.mp4` | Current result |
 | `output.mp4.delivery.json` | Encode settings marker for keyframe splices |
 | `range_work/`, `flash_chunks/` | Work clips for revises and chunked FlashVSR |
