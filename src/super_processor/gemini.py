@@ -1,13 +1,15 @@
 """Gemini structured-output client for the localhost wizard.
 
 Uses the Generative Language REST API with ``responseMimeType`` /
-``responseSchema`` so replies stay parseable. The wizard only asks Gemini to
+``responseSchema`` so replies stay parseable. The wizard asks Gemini to label
+the shots FFmpeg found (from one still each plus the measurements), and to
 turn a result note into a time range, scale, and strength for the FlashVSR
 upscale. Transport is injectable for tests.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -500,6 +502,27 @@ _UPSCALE_SCHEMA: dict[str, Any] = {
 }
 
 
+_SHOT_LABELS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "shots": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "label": {"type": "string"},
+                    "issues": {"type": "array", "items": {"type": "string"}},
+                    "contains": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["index", "label", "issues", "contains"],
+            },
+        }
+    },
+    "required": ["shots"],
+}
+
+
 class GeminiClient:
     """Call Gemini with a structured schema for upscale result notes."""
 
@@ -662,6 +685,66 @@ class GeminiClient:
         }
         response = self._generate_with_failover(body)
         return _parse_json_object(_extract_text(response))
+
+    def label_shots(
+        self,
+        *,
+        shots: list[dict[str, Any]],
+        stills: list[Path],
+        issues: tuple[str, ...],
+        contains: tuple[str, ...],
+        job_dir: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Label each shot from its still and measurements.
+
+        ``shots`` are plain dicts (``start_s``, ``end_s``, ``metrics``,
+        ``hints``); ``stills`` holds one JPEG per shot, in the same order.
+        Returns ``[{index, label, issues, contains}]``; the caller drops any
+        name outside ``issues`` and ``contains``.
+        """
+        if len(stills) != len(shots):
+            raise GeminiError("label_shots needs one still per shot")
+        intro = (
+            "These are the shots of one video an editor wants restored and "
+            "upscaled. Each shot has one still from its middle and FFmpeg "
+            "measurements: blockiness (compression blocks, higher is worse), "
+            "blur (higher is softer), noise (higher is noisier), brightness "
+            "and contrast (0 to 1). 'hints' are what the numbers alone "
+            "suggest; correct them from what you see. For every shot return "
+            "its index, a label of at most eight words saying what is in it, "
+            f"the problems it has from this list only: {', '.join(issues)}; "
+            "and what it contains from this list only, where restoration "
+            f"mistakes would be obvious: {', '.join(contains)}."
+        )
+        parts: list[dict[str, Any]] = [{"text": intro}]
+        for index, (shot, still) in enumerate(zip(shots, stills, strict=True)):
+            parts.append({"text": f"Shot {index}: {json.dumps(shot)}"})
+            try:
+                data = base64.b64encode(still.read_bytes()).decode("ascii")
+            except OSError as exc:
+                raise GeminiError(f"could not read {still.name}: {exc}") from exc
+            parts.append({"inlineData": {"mimeType": "image/jpeg", "data": data}})
+        reply = self._generate(
+            contents=[{"role": "user", "parts": parts}],
+            schema=_SHOT_LABELS_SCHEMA,
+            system=(
+                "You label shots for a video restoration tool. You never "
+                "suggest commands or settings. Return JSON matching the schema."
+            ),
+        )
+        labels = reply.get("shots")
+        if not isinstance(labels, list):
+            raise GeminiError("Gemini returned no shot labels")
+        if job_dir is not None:
+            append_chat_turn(
+                job_dir,
+                ChatTurn(role="user", text=intro + f" ({len(shots)} shots)"),
+            )
+            append_chat_turn(
+                job_dir,
+                ChatTurn(role="model", text=json.dumps(reply), structured=reply),
+            )
+        return [item for item in labels if isinstance(item, dict)]
 
     def revise_upscale_params(
         self,

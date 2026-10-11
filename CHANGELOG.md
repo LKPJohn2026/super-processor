@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Shot review (loop 1). After a file is picked, FFmpeg finds the cuts
+  (`scdet`), measures each shot in its own pass (blockiness, blur, noise,
+  brightness, contrast), and saves a still per shot. Gemini labels each shot
+  from its still and numbers, using fixed lists of problems and contents. The
+  new Shots screen lets the editor merge or split shots and approve the list;
+  approval writes one upscale span per shot. If Gemini cannot label the
+  shots, the list keeps the measurement hints and says why. New steps
+  `finding_shots` and `shots`, routes `/shots`, `/api/scan`, `/api/shots`,
+  and `/shot_stills/`.
+
 - Per-shot looks. Each span in `upscale_plan.json` now carries a `look` of
   bounded FFmpeg settings applied in a fixed order around FlashVSR: clean
   (`deblock`, `denoise`) before it, finish (`contrast`, `brightness`,
@@ -18,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Plans without a `look` load as neutral, so existing jobs render as before.
 - A plan with several shots renders each shot on its own and joins them by
   stream copy. Shot edges snap to source frames, and the join is checked to
-  hold exactly the source's frame count.
+  hold exactly the source's frame count. Neighbouring shots with the same
+  settings render as one part, so FlashVSR loads once per run of alike shots.
 
 ### Changed
 

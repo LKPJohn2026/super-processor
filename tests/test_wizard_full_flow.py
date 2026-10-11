@@ -90,11 +90,21 @@ def test_wizard_website_full_flow_intro_to_done(
         transport=_FakeTransport(
             [
                 {
+                    "shots": [
+                        {
+                            "index": 0,
+                            "label": "flat gray card",
+                            "issues": ["flat", "made_up"],
+                            "contains": [],
+                        }
+                    ]
+                },
+                {
                     "start_s": 2,
                     "end_s": 5,
                     "scale": 2,
                     "strength": 0.2,
-                }
+                },
             ]
         ),
     )
@@ -121,7 +131,18 @@ def test_wizard_website_full_flow_intro_to_done(
         pick = _post(base, "/setup", {"skip": "1"})
         assert "Pick a video file" in pick
 
-        waiting = _post(base, "/pick", {"path": str(clip)})
+        scanning = _post(base, "/pick", {"path": str(clip)})
+        assert "Finding the shots" in scanning
+        assert controller.current_state().step is WizardStep.FINDING_SHOTS
+        _get(base, "/shots?run=1")
+        assert controller.wait_idle(timeout=60)
+        shots = _get(base)
+        assert "<h1>Shots</h1>" in shots
+        assert "flat gray card" in shots
+        assert "Problems: flat" in shots
+        assert "made_up" not in shots
+
+        waiting = _post(base, "/shots", {"action": "approve"})
         assert "<h1>Upscaling</h1>" in waiting
         assert controller.current_state().step is WizardStep.RENDERING
 

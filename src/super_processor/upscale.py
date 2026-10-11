@@ -1177,6 +1177,22 @@ def shot_timeline(
     return ordered
 
 
+def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
+    """Join neighbouring spans whose scale, strength, and look match."""
+    out: list[UpscaleSpan] = []
+    for span in ordered:
+        last = out[-1] if out else None
+        if last is not None and (last.scale, last.strength, last.look) == (
+            span.scale,
+            span.strength,
+            span.look,
+        ):
+            out[-1] = replace(last, end_s=span.end_s)
+        else:
+            out.append(span)
+    return out
+
+
 def render_shots(
     source: Path,
     output: Path,
@@ -1190,9 +1206,11 @@ def render_shots(
 
     Shot edges snap to source frames, so the parts hold every source frame
     exactly once. Each part goes through the delivery encode, which starts it
-    on a keyframe, and the parts are joined by stream copy.
+    on a keyframe, and the parts are joined by stream copy. Neighbouring
+    shots with the same settings render as one part, so FlashVSR is not
+    loaded once per shot when most shots look alike.
     """
-    ordered = shot_timeline(spans, duration_s)
+    ordered = _coalesce(shot_timeline(spans, duration_s))
     work = output.parent / "shot_work"
     work.mkdir(parents=True, exist_ok=True)
     if len(ordered) == 1:

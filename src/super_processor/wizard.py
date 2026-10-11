@@ -1,4 +1,4 @@
-"""Localhost wizard: setup → pick → FlashVSR upscale → result note → revise."""
+"""Localhost wizard: setup → pick → shots → FlashVSR upscale → result → revise."""
 
 from __future__ import annotations
 
@@ -22,6 +22,17 @@ from .gemini import (
 from .jobs import JobError, JobState, JobStore
 from .probe import MediaFacts, ProbeError, probe_file
 from .segments import MAX_DURATION_S
+from .shots import (
+    CONTENTS,
+    ISSUES,
+    ShotError,
+    apply_labels,
+    find_shots,
+    load_shots,
+    merge_with_next,
+    save_shots,
+    split_at,
+)
 from .upscale import (
     FlashVsrEngine,
     UpscaleEngine,
@@ -37,6 +48,7 @@ from .upscale import (
 )
 from .wizard_pages import (
     render_done,
+    render_finding_shots,
     render_intro,
     render_llm_choice,
     render_local_llm_stub,
@@ -44,6 +56,7 @@ from .wizard_pages import (
     render_rendering,
     render_result,
     render_setup,
+    render_shots,
 )
 
 WIZARD_STATE_FILE = "wizard_state.json"
@@ -67,6 +80,8 @@ class WizardStep(str, Enum):
     LOCAL_LLM_STUB = "local_llm_stub"
     SETUP = "setup"
     PICK_FILE = "pick_file"
+    FINDING_SHOTS = "finding_shots"
+    SHOTS = "shots"
     RENDERING = "rendering"
     RESULT = "result"
     DONE = "done"
@@ -203,6 +218,22 @@ def save_job_wizard_state(job_dir: Path, state: WizardState) -> None:
     _write_state_file(job_state_path(job_dir), state)
 
 
+def parse_time(raw: str) -> float:
+    """Seconds from ``"75"``, ``"1:15"``, or ``"0:01:15.5"``."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("give a time to split at, like 1:15")
+    total = 0.0
+    try:
+        for part in text.split(":"):
+            total = total * 60 + float(part)
+    except ValueError as exc:
+        raise ValueError(f"could not read the time {text!r}") from exc
+    if total < 0 or text.count(":") > 2:
+        raise ValueError(f"could not read the time {text!r}")
+    return total
+
+
 def _active_knobs(job_dir: Path) -> tuple[int | None, float | None]:
     plan = load_upscale_plan(job_dir)
     if plan is None or not plan.spans:
@@ -258,12 +289,16 @@ class WizardController:
         return self.current_state()
 
     def busy(self) -> bool:
-        """True while a render pass is running."""
+        """True while a shot scan or a render pass is running."""
         return self._work_lock.locked()
 
     def start_render(self) -> bool:
         """Run :meth:`run_render` on a worker thread. False if not started."""
         return self._start_worker(WizardStep.RENDERING, self.run_render)
+
+    def start_scan(self) -> bool:
+        """Run :meth:`run_scan` on a worker thread. False if not started."""
+        return self._start_worker(WizardStep.FINDING_SHOTS, self.run_scan)
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Block until the worker finishes. True when nothing is running."""
@@ -300,6 +335,9 @@ class WizardController:
             if state.step is WizardStep.RENDERING:
                 self._render_failed(state, str(exc) or type(exc).__name__)
                 return
+            if state.step is WizardStep.FINDING_SHOTS:
+                self._scan_failed(state, str(exc) or type(exc).__name__)
+                return
             self._save(state)
 
     def _save(self, state: WizardState) -> None:
@@ -321,6 +359,16 @@ class WizardController:
             )
         if state.step is WizardStep.PICK_FILE:
             return render_pick(error=state.error)
+        if state.step is WizardStep.FINDING_SHOTS:
+            return render_finding_shots()
+        if state.step is WizardStep.SHOTS:
+            assert state.job_id
+            shots = load_shots(self.store.job_dir(state.job_id))
+            return render_shots(
+                [shot.to_dict() for shot in shots.shots] if shots else [],
+                error=state.error,
+                label_error=shots.label_error if shots else None,
+            )
         if state.step is WizardStep.RENDERING:
             return render_rendering()
         if state.step is WizardStep.RESULT:
@@ -350,6 +398,13 @@ class WizardController:
                 output_url = "/output.mp4"
             if state.step is WizardStep.RESULT:
                 scale, strength = _active_knobs(job_dir)
+        shots: list[dict[str, Any]] | None = None
+        label_error: str | None = None
+        if state.job_id and state.step is WizardStep.SHOTS:
+            found = load_shots(self.store.job_dir(state.job_id))
+            if found is not None:
+                shots = [shot.to_dict() for shot in found.shots]
+                label_error = found.label_error
         return {
             "step": state.step.value,
             "busy": self.busy(),
@@ -360,11 +415,13 @@ class WizardController:
             "output_url": output_url,
             "scale": scale,
             "strength": strength,
+            "shots": shots,
+            "label_error": label_error,
         }
 
     def handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
         if self.busy():
-            raise WizardError("a render is still running; wait for it")
+            raise WizardError("the last step is still running; wait for it")
         state = self._state()
         state.error = None
         if path == "/intro":
@@ -408,6 +465,9 @@ class WizardController:
             return
         if path == "/new":
             self.start_new_job()
+            return
+        if path == "/shots":
+            self._shots_post(state, fields)
             return
         if path == "/result":
             self._result_post(state, fields)
@@ -470,7 +530,104 @@ class WizardController:
             self._save(state)
             return
         state.job_id = manifest.job_id
-        state.step = WizardStep.RENDERING
+        state.step = WizardStep.FINDING_SHOTS
+        self._save(state)
+
+    def run_scan(self) -> None:
+        if not self._work_lock.acquire(blocking=False):
+            return
+        try:
+            state = self._state()
+            if state.step is WizardStep.FINDING_SHOTS and state.job_id:
+                self._scan(state)
+        finally:
+            self._work_lock.release()
+
+    def _scan(self, state: WizardState) -> None:
+        """Loop 1: find and measure the shots, then ask Gemini to label them.
+
+        A labelling failure is not fatal: the shots keep the hints from the
+        measurements, and the review screen says why the labels are missing.
+        """
+        assert state.job_id
+        job_dir = self.store.job_dir(state.job_id)
+        source = Path(self.store.load(state.job_id).source_path)
+        try:
+            duration = float(probe_file(source).duration_s or 0.0)
+            shots = find_shots(source, job_dir, duration, ffmpeg_bin=self.ffmpeg_bin)
+        except (ShotError, ProbeError, OSError) as exc:
+            self._scan_failed(state, str(exc))
+            return
+        try:
+            labels = self.gemini().label_shots(
+                shots=[
+                    {
+                        "start_s": round(shot.start_s, 2),
+                        "end_s": round(shot.end_s, 2),
+                        "metrics": shot.metrics.to_dict(),
+                        "hints": list(shot.issues),
+                    }
+                    for shot in shots.shots
+                ],
+                stills=[job_dir / shot.still for shot in shots.shots],
+                issues=ISSUES,
+                contains=CONTENTS,
+                job_dir=job_dir,
+            )
+            shots = apply_labels(shots, labels)
+        except GeminiError as exc:
+            shots.label_error = f"Gemini could not label the shots: {exc}"
+        save_shots(job_dir, shots)
+        state.error = None
+        state.step = WizardStep.SHOTS
+        self._save(state)
+
+    def _scan_failed(self, state: WizardState, detail: str) -> None:
+        """Finding the shots failed; mark the job failed and go back to pick."""
+        assert state.job_id
+        job_id = state.job_id
+        with contextlib.suppress(JobError):
+            self.store.transition(job_id, JobState.FAILED)
+        message = f"Finding the shots failed: {detail}"
+        save_job_wizard_state(
+            self.store.job_dir(job_id),
+            WizardState(step=WizardStep.PICK_FILE, job_id=job_id, error=message),
+        )
+        self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
+
+    def _shots_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
+        """Approve the shot list, or merge or split a shot and stay on it."""
+        if state.step is not WizardStep.SHOTS or not state.job_id:
+            raise WizardError("there is no shot list to change")
+        job_dir = self.store.job_dir(state.job_id)
+        shots = load_shots(job_dir)
+        if shots is None:
+            raise WizardError("the shot list is missing; pick the file again")
+        action = fields.get("action", [""])[0]
+        try:
+            if action == "approve":
+                save_upscale_plan(job_dir, shots.to_plan())
+                state.step = WizardStep.RENDERING
+                self._save(state)
+                return
+            index = int(fields.get("index", [""])[0])
+            if action == "merge":
+                shots = merge_with_next(shots, index)
+            elif action == "split":
+                source = Path(self.store.load(state.job_id).source_path)
+                shots = split_at(
+                    shots,
+                    index,
+                    parse_time(fields.get("at", [""])[0]),
+                    source=source,
+                    job_dir=job_dir,
+                    ffmpeg_bin=self.ffmpeg_bin,
+                )
+            else:
+                raise ValueError(f"unknown shot action {action!r}")
+            save_shots(job_dir, shots)
+        except (ShotError, ValueError, UpscaleError) as exc:
+            state.error = str(exc)
         self._save(state)
 
     def _result_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
