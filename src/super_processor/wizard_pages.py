@@ -265,8 +265,9 @@ img, video {{
 def render_intro() -> str:
     body = """
 <p class="brand-hero">Super Processor</p>
-<p class="lede">Enhance the video you already shot. Gemini diagnoses issues;
-FFmpeg applies allowlisted repairs — no invented frames, faces, or scenes.</p>
+<p class="lede">Enhance the video you already shot. FlashVSR restores and
+upscales it on your GPU and adds fine detail; strength sets how much, and 0 is
+a plain upscale. Every frame and its timing are kept — no new scenes.</p>
 <p class="muted">Localhost website · media stays on your machine</p>
 <form method="post" action="/intro">
 <button type="submit" class="full">Continue</button>

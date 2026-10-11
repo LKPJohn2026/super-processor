@@ -60,7 +60,8 @@ def _tiny_clip(path: Path, seconds: int = 20) -> Path:
 def test_intro_page_mentions_enhancement() -> None:
     html = render_intro()
     assert "Super Processor" in html
-    assert "do not invent" in html.lower() or "Enhance" in html
+    assert "strength" in html
+    assert "no invented frames" not in html
 
 
 def test_wizard_server_serves_intro(tmp_path: Path) -> None:
