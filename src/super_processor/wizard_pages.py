@@ -559,6 +559,7 @@ def render_looks(view: dict[str, object], *, error: str | None = None) -> str:
         summary = settings_summary(float(shot.get("strength", 0.5)), look)
         raw_check = shot.get("check")
         check = raw_check if isinstance(raw_check, dict) else {}
+        shimmer = _shimmer_text(shot.get("shimmer"))
         videos = ""
         if shot.get("after_url"):
             before = str(shot.get("before_url"))
@@ -579,7 +580,7 @@ poster="{escape(_poster(after))}"></video>{boxes}</div></figure>
 <p class="tags"><strong>{escape(summary)}</strong></p>
 {_protected_line(_items(shot, "regions"), _items(shot, "contains"))}
 <p class="tags">{escape(str(shot.get("reason") or ""))}</p>
-<p class="tags muted">{escape(check_summary(check))}{_shimmer_text(shot.get("shimmer"))}</p>
+<p class="tags muted">{escape(check_summary(check))}{shimmer}</p>
 <form method="post" action="/looks">
 <input type="hidden" name="action" value="redo">
 <input type="hidden" name="index" value="{index}">
