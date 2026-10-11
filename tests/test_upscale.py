@@ -271,7 +271,14 @@ def test_scale_change_on_a_range_rerenders_the_whole_clip() -> None:
     plan = UpscalePlan(spans=(default_span(20),))
     updated = replace_overlapping(plan, UpscaleSpan(5, 10, scale=4, strength=0.4), 20)
     assert updated.pending == UpscaleSpan(0, 20, scale=4, strength=0.4)
-    assert updated.spans == (updated.pending,)
+    # Every shot takes the new scale; the others keep their own strength.
+    assert [
+        (span.start_s, span.end_s, span.scale, span.strength) for span in updated.spans
+    ] == [
+        (0.0, 5.0, 4, 0.5),
+        (10.0, 20.0, 4, 0.5),
+        (5.0, 10.0, 4, 0.4),
+    ]
 
 
 def test_same_scale_patch_trims_the_spans_it_overlaps() -> None:

@@ -51,9 +51,22 @@ operation inspectable.
 
 The wizard picture path is a local GPU restoration upscale (FlashVSR). FFmpeg
 probes, trims a cited time range, splices that range back, and copies audio.
-It does not choose the look. Gemini only turns a result note into `start_s`,
-`end_s`, `scale` (2 or 4), and `strength` (0–1). Re-runs read the original
-source for that range so detail does not stack.
+Gemini only turns a result note into `start_s`, `end_s`, `scale` (2 or 4), and
+`strength` (0–1). Re-runs read the original source for that range so detail
+does not stack.
+
+Each span in the plan is a shot with its own look (`look.py`): bounded FFmpeg
+settings that always run in the same order.
+
+| Stage | Settings | Why |
+|---|---|---|
+| Clean | `deblock`, `denoise` (0–1) | FlashVSR treats blocks and noise as detail; removing them first leaves it less to invent from |
+| Restore | `scale`, `strength` | FlashVSR, mixed with a cleaned plain upscale |
+| Finish | `contrast`, `brightness`, `saturation`, `gamma`, `grain` | Grade and texture on the restored picture |
+
+Filter text is built from the numbers in code; model output never reaches
+FFmpeg as text. None of these filters changes the frame count, and a
+multi-shot render checks the joined result against the source's frame count.
 
 Text-to-video, inpainting, and face reenactment stay out. A lower strength
 asks the restorer for less invented texture. The job stores

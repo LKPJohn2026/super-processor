@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Per-shot looks. Each span in `upscale_plan.json` now carries a `look` of
+  bounded FFmpeg settings applied in a fixed order around FlashVSR: clean
+  (`deblock`, `denoise`) before it, finish (`contrast`, `brightness`,
+  `saturation`, `gamma`, `grain`) after it. Cleaning first gives FlashVSR
+  fewer compression blocks and less noise to sharpen into made-up texture.
+  The plain-upscale base of the strength blend is cleaned the same way.
+  Plans without a `look` load as neutral, so existing jobs render as before.
+- A plan with several shots renders each shot on its own and joins them by
+  stream copy. Shot edges snap to source frames, and the join is checked to
+  hold exactly the source's frame count.
+
+### Changed
+
+- A scale change on part of the clip keeps every shot's strength and look
+  and only changes the scale, instead of collapsing the plan into one span.
+  A result note keeps the look of the shot it names.
+
 ### Fixed
 
 - The wizard no longer traps the user after Done. Done and Result have a
