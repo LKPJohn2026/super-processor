@@ -523,6 +523,66 @@ _SHOT_LABELS_SCHEMA: dict[str, Any] = {
 }
 
 
+_LOOK_PROPERTIES: dict[str, Any] = {
+    name: {"type": "number"}
+    for name in (
+        "deblock",
+        "denoise",
+        "contrast",
+        "brightness",
+        "saturation",
+        "gamma",
+        "grain",
+    )
+}
+_LOOK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": _LOOK_PROPERTIES,
+    "required": list(_LOOK_PROPERTIES),
+}
+_PROPOSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "scale": {"type": "integer"},
+        "shots": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "strength": {"type": "number"},
+                    "look": _LOOK_SCHEMA,
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "strength", "look", "reason"],
+            },
+        },
+    },
+    "required": ["scale", "shots"],
+}
+_CHECK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "shots": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "ok": {"type": "boolean"},
+                    "problems": {"type": "array", "items": {"type": "string"}},
+                    "note": {"type": "string"},
+                    "strength": {"type": "number"},
+                    "look": _LOOK_SCHEMA,
+                },
+                "required": ["index", "ok", "problems", "note", "strength", "look"],
+            },
+        }
+    },
+    "required": ["shots"],
+}
+
+
 class GeminiClient:
     """Call Gemini with a structured schema for upscale result notes."""
 
@@ -719,11 +779,7 @@ class GeminiClient:
         parts: list[dict[str, Any]] = [{"text": intro}]
         for index, (shot, still) in enumerate(zip(shots, stills, strict=True)):
             parts.append({"text": f"Shot {index}: {json.dumps(shot)}"})
-            try:
-                data = base64.b64encode(still.read_bytes()).decode("ascii")
-            except OSError as exc:
-                raise GeminiError(f"could not read {still.name}: {exc}") from exc
-            parts.append({"inlineData": {"mimeType": "image/jpeg", "data": data}})
+            parts.append(_jpeg_part(still))
         reply = self._generate(
             contents=[{"role": "user", "parts": parts}],
             schema=_SHOT_LABELS_SCHEMA,
@@ -745,6 +801,114 @@ class GeminiClient:
                 ChatTurn(role="model", text=json.dumps(reply), structured=reply),
             )
         return [item for item in labels if isinstance(item, dict)]
+
+    def propose_looks(
+        self,
+        *,
+        shots: list[dict[str, Any]],
+        stills: list[Path],
+        bounds: dict[str, tuple[float, float, float]],
+        scales: tuple[int, ...],
+        protected_strength: float,
+        job_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        """Propose a strength and look per shot, and one scale for the video.
+
+        ``shots`` carry their label, problems, contents, measurements, and,
+        on a redo, the current settings and the editor's note.
+        """
+        if len(stills) != len(shots):
+            raise GeminiError("propose_looks needs one still per shot")
+        limits = "; ".join(
+            f"{name} {low:g} to {high:g} (no change at {neutral:g})"
+            for name, (low, high, neutral) in bounds.items()
+        )
+        intro = (
+            "You plan a restoration of an editor's footage. Each shot goes "
+            "through fixed FFmpeg clean-up (deblock, denoise), then FlashVSR "
+            "upscaling mixed with a plain upscale by 'strength' (0 is a plain "
+            "upscale, 1 is FlashVSR alone), then fixed FFmpeg finishing "
+            "(contrast, brightness, saturation, gamma, grain). FlashVSR treats "
+            "blocks and noise as detail and sharpens them into texture, so "
+            "clean those first and do not ask for more strength than the shot "
+            "needs. The goal is footage that looks well shot, not AI made: no "
+            "waxy skin, no crunchy edges, no invented patterns, faces and text "
+            "unchanged. Set only what the shot needs; leave the rest at its "
+            f"no-change value. Ranges: {limits}. Shots that contain faces, "
+            f"hands, or text are capped at strength {protected_strength:g}. "
+            f"Pick one scale for the whole video from {list(scales)}. If a "
+            "shot has an editor_note, follow it; current shows its settings "
+            "now. Return a short reason per shot in plain words."
+        )
+        parts: list[dict[str, Any]] = [{"text": intro}]
+        for shot, still in zip(shots, stills, strict=True):
+            parts.append({"text": f"Shot: {json.dumps(shot)}"})
+            parts.append(_jpeg_part(still))
+        reply = self._generate(
+            contents=[{"role": "user", "parts": parts}],
+            schema=_PROPOSE_SCHEMA,
+            system=(
+                "You choose bounded numbers for a fixed video pipeline. You "
+                "never write commands. Return JSON matching the schema."
+            ),
+        )
+        if not isinstance(reply.get("shots"), list):
+            raise GeminiError("Gemini returned no shot recipes")
+        self._log(job_dir, intro + f" ({len(shots)} shots)", reply)
+        return reply
+
+    def check_previews(
+        self,
+        *,
+        shots: list[dict[str, Any]],
+        pairs: list[tuple[Path, Path]],
+        problems: tuple[str, ...],
+        job_dir: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Compare each before/after still for restoration mistakes.
+
+        For a shot that fails, the reply carries corrected settings.
+        """
+        if len(pairs) != len(shots):
+            raise GeminiError("check_previews needs one still pair per shot")
+        intro = (
+            "Each shot below has a BEFORE still (the source) and an AFTER "
+            "still (restored and upscaled with the settings shown). Compare "
+            "them like a picky editor. Fail a shot only for a real mistake "
+            f"from this list: {', '.join(problems)}. Look hardest at faces "
+            "(eyes, irises, teeth, symmetry), hands (finger count), and text. "
+            "Pass a shot that simply looks better. For a failed shot, return "
+            "corrected strength and look (usually lower strength, or more "
+            "deblock/denoise for fake texture); for a passed shot return its "
+            "settings unchanged. Keep the note to one sentence."
+        )
+        parts: list[dict[str, Any]] = [{"text": intro}]
+        for shot, (before, after) in zip(shots, pairs, strict=True):
+            parts.append({"text": f"Shot: {json.dumps(shot)}. BEFORE:"})
+            parts.append(_jpeg_part(before))
+            parts.append({"text": "AFTER:"})
+            parts.append(_jpeg_part(after))
+        reply = self._generate(
+            contents=[{"role": "user", "parts": parts}],
+            schema=_CHECK_SCHEMA,
+            system=(
+                "You check restoration previews for visible mistakes. Return "
+                "JSON matching the schema."
+            ),
+        )
+        verdicts = reply.get("shots")
+        if not isinstance(verdicts, list):
+            raise GeminiError("Gemini returned no preview checks")
+        self._log(job_dir, intro + f" ({len(shots)} shots)", reply)
+        return [item for item in verdicts if isinstance(item, dict)]
+
+    def _log(self, job_dir: Path | None, prompt: str, reply: dict[str, Any]) -> None:
+        if job_dir is None:
+            return
+        append_chat_turn(job_dir, ChatTurn(role="user", text=prompt))
+        append_chat_turn(
+            job_dir, ChatTurn(role="model", text=json.dumps(reply), structured=reply)
+        )
 
     def revise_upscale_params(
         self,
@@ -784,3 +948,11 @@ class GeminiClient:
                 ChatTurn(role="model", text=json.dumps(data), structured=data),
             )
         return data
+
+
+def _jpeg_part(path: Path) -> dict[str, Any]:
+    try:
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError as exc:
+        raise GeminiError(f"could not read {path.name}: {exc}") from exc
+    return {"inlineData": {"mimeType": "image/jpeg", "data": data}}

@@ -100,6 +100,45 @@ def test_wizard_website_full_flow_intro_to_done(
                     ]
                 },
                 {
+                    "scale": 2,
+                    "shots": [
+                        {
+                            "index": 0,
+                            "strength": 0.4,
+                            "look": {
+                                "deblock": 0.2,
+                                "denoise": 0,
+                                "contrast": 1.05,
+                                "brightness": 0,
+                                "saturation": 1,
+                                "gamma": 1,
+                                "grain": 0,
+                            },
+                            "reason": "Flat card; light deblock, a touch of contrast.",
+                        }
+                    ],
+                },
+                {
+                    "shots": [
+                        {
+                            "index": 0,
+                            "ok": True,
+                            "problems": [],
+                            "note": "Cleaner, nothing invented.",
+                            "strength": 0.4,
+                            "look": {
+                                "deblock": 0.2,
+                                "denoise": 0,
+                                "contrast": 1.05,
+                                "brightness": 0,
+                                "saturation": 1,
+                                "gamma": 1,
+                                "grain": 0,
+                            },
+                        }
+                    ]
+                },
+                {
                     "start_s": 2,
                     "end_s": 5,
                     "scale": 2,
@@ -142,7 +181,21 @@ def test_wizard_website_full_flow_intro_to_done(
         assert "Problems: flat" in shots
         assert "made_up" not in shots
 
-        waiting = _post(base, "/shots", {"action": "approve"})
+        planning = _post(base, "/shots", {"action": "approve"})
+        assert "Planning each shot" in planning
+        _get(base, "/looks?run=1")
+        assert controller.wait_idle(timeout=60)
+        looks = _get(base)
+        assert "<h1>Looks</h1>" in looks
+        assert "strength 0.40 · deblock 0.20 · contrast 1.05" in looks
+        assert "Flat card; light deblock" in looks
+        assert "Check passed. Cleaner, nothing invented." in looks
+        assert 'src="/previews/shot_000_r1_after.mp4"' in looks
+        assert 'poster="/previews/shot_000_r1_after.jpg"' in looks
+        with urlopen(base + "/previews/shot_000_r1_after.jpg") as response:
+            assert response.headers.get_content_type() == "image/jpeg"
+
+        waiting = _post(base, "/looks", {"action": "approve"})
         assert "<h1>Upscaling</h1>" in waiting
         assert controller.current_state().step is WizardStep.RENDERING
 
@@ -153,7 +206,7 @@ def test_wizard_website_full_flow_intro_to_done(
         assert "<h1>Result</h1>" in result
         assert "A. I am happy" in result
         assert "Scale 2" in result
-        assert "strength 0.50" in result
+        assert "strength 0.40" in result
         assert controller.current_state().step is WizardStep.RESULT
         job_id = controller.current_state().job_id
         assert job_id

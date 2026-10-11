@@ -252,6 +252,39 @@ button:disabled {
   margin-top: 0;
 }
 
+.look {
+  padding: 0.85rem 0;
+  border-top: 1px solid #c9c1b2;
+}
+
+.look h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+.look p {
+  margin: 0.25rem 0;
+}
+
+.pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.pair figure {
+  margin: 0;
+}
+
+.pair figcaption {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.pair video {
+  margin: 0.2rem 0 0;
+}
+
 video {
   width: 100%;
   margin: 0.8rem 0;
@@ -281,7 +314,8 @@ video {
     padding: 1.15rem 0.9rem 1.3rem;
   }
 
-  .shot {
+  .shot,
+  .pair {
     grid-template-columns: 1fr;
   }
 }

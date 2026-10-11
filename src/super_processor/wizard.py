@@ -1,4 +1,4 @@
-"""Localhost wizard: setup → pick → shots → FlashVSR upscale → result → revise."""
+"""Localhost wizard: setup → pick → shots → looks → FlashVSR upscale → result."""
 
 from __future__ import annotations
 
@@ -20,12 +20,32 @@ from .gemini import (
     store_gemini_api_key,
 )
 from .jobs import JobError, JobState, JobStore
+from .look import LOOK_BOUNDS
 from .probe import MediaFacts, ProbeError, probe_file
 from .segments import MAX_DURATION_S
+from .shot_plan import (
+    CHECK_PROBLEMS,
+    PROTECTED_STRENGTH,
+    ShotPlan,
+    ShotPlanError,
+    allowed_scales,
+    apply_checks,
+    apply_proposals,
+    check_stills,
+    fallback_recipe,
+    finish,
+    load_plan,
+    new_plan,
+    render_previews,
+    request_redo,
+    save_plan,
+    shots_payload,
+)
 from .shots import (
     CONTENTS,
     ISSUES,
     ShotError,
+    ShotList,
     apply_labels,
     find_shots,
     load_shots,
@@ -52,7 +72,9 @@ from .wizard_pages import (
     render_intro,
     render_llm_choice,
     render_local_llm_stub,
+    render_looks,
     render_pick,
+    render_planning,
     render_rendering,
     render_result,
     render_setup,
@@ -82,6 +104,8 @@ class WizardStep(str, Enum):
     PICK_FILE = "pick_file"
     FINDING_SHOTS = "finding_shots"
     SHOTS = "shots"
+    PLANNING = "planning"
+    LOOKS = "looks"
     RENDERING = "rendering"
     RESULT = "result"
     DONE = "done"
@@ -218,6 +242,16 @@ def save_job_wizard_state(job_dir: Path, state: WizardState) -> None:
     _write_state_file(job_state_path(job_dir), state)
 
 
+def _fallback_plan(plan: ShotPlan, shots: ShotList, indexes: list[int]) -> ShotPlan:
+    """Recipes from the measurements, keeping each shot's preview count."""
+    recipes = list(plan.recipes)
+    for index in indexes:
+        recipes[index] = replace(
+            fallback_recipe(shots.shots[index]), rev=recipes[index].rev
+        )
+    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
+
+
 def parse_time(raw: str) -> float:
     """Seconds from ``"75"``, ``"1:15"``, or ``"0:01:15.5"``."""
     text = raw.strip()
@@ -300,6 +334,10 @@ class WizardController:
         """Run :meth:`run_scan` on a worker thread. False if not started."""
         return self._start_worker(WizardStep.FINDING_SHOTS, self.run_scan)
 
+    def start_plan(self) -> bool:
+        """Run :meth:`run_plan` on a worker thread. False if not started."""
+        return self._start_worker(WizardStep.PLANNING, self.run_plan)
+
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Block until the worker finishes. True when nothing is running."""
         with self._worker_guard:
@@ -338,6 +376,9 @@ class WizardController:
             if state.step is WizardStep.FINDING_SHOTS:
                 self._scan_failed(state, str(exc) or type(exc).__name__)
                 return
+            if state.step is WizardStep.PLANNING:
+                self._plan_failed(state, str(exc) or type(exc).__name__)
+                return
             self._save(state)
 
     def _save(self, state: WizardState) -> None:
@@ -368,6 +409,14 @@ class WizardController:
                 [shot.to_dict() for shot in shots.shots] if shots else [],
                 error=state.error,
                 label_error=shots.label_error if shots else None,
+            )
+        if state.step is WizardStep.PLANNING:
+            return render_planning()
+        if state.step is WizardStep.LOOKS:
+            assert state.job_id
+            return render_looks(
+                self._looks_view(self.store.job_dir(state.job_id)),
+                error=state.error,
             )
         if state.step is WizardStep.RENDERING:
             return render_rendering()
@@ -405,6 +454,9 @@ class WizardController:
             if found is not None:
                 shots = [shot.to_dict() for shot in found.shots]
                 label_error = found.label_error
+        looks: dict[str, Any] | None = None
+        if state.job_id and state.step is WizardStep.LOOKS:
+            looks = self._looks_view(self.store.job_dir(state.job_id))
         return {
             "step": state.step.value,
             "busy": self.busy(),
@@ -417,6 +469,7 @@ class WizardController:
             "strength": strength,
             "shots": shots,
             "label_error": label_error,
+            "looks": looks,
         }
 
     def handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
@@ -468,6 +521,9 @@ class WizardController:
             return
         if path == "/shots":
             self._shots_post(state, fields)
+            return
+        if path == "/looks":
+            self._looks_post(state, fields)
             return
         if path == "/result":
             self._result_post(state, fields)
@@ -606,8 +662,14 @@ class WizardController:
         action = fields.get("action", [""])[0]
         try:
             if action == "approve":
-                save_upscale_plan(job_dir, shots.to_plan())
-                state.step = WizardStep.RENDERING
+                source = Path(self.store.load(state.job_id).source_path)
+                video = probe_file(source).primary_video()
+                scales = allowed_scales(
+                    (video.width or 0) if video else 0,
+                    (video.height or 0) if video else 0,
+                )
+                save_plan(job_dir, new_plan(shots, max(scales)))
+                state.step = WizardStep.PLANNING
                 self._save(state)
                 return
             index = int(fields.get("index", [""])[0])
@@ -626,7 +688,187 @@ class WizardController:
             else:
                 raise ValueError(f"unknown shot action {action!r}")
             save_shots(job_dir, shots)
-        except (ShotError, ValueError, UpscaleError) as exc:
+        except (ShotError, ValueError, UpscaleError, ProbeError) as exc:
+            state.error = str(exc)
+        self._save(state)
+
+    def run_plan(self) -> None:
+        if not self._work_lock.acquire(blocking=False):
+            return
+        try:
+            state = self._state()
+            if state.step is WizardStep.PLANNING and state.job_id:
+                self._plan(state)
+        finally:
+            self._work_lock.release()
+
+    def _plan(self, state: WizardState) -> None:
+        """Loop 2: propose recipes, render previews, and self-check them.
+
+        Only shots marked stale are worked on: all of them the first time,
+        one after an editor note. Gemini failures fall back to recipes from
+        the measurements and skip the check; the looks screen says so.
+        """
+        assert state.job_id
+        job_dir = self.store.job_dir(state.job_id)
+        source = Path(self.store.load(state.job_id).source_path)
+        shots = load_shots(job_dir)
+        plan = load_plan(job_dir)
+        if shots is None or plan is None:
+            self._plan_failed(state, "the shot list is missing; pick the file again")
+            return
+        indexes = plan.stale_indexes()
+        if not indexes:
+            state.step = WizardStep.LOOKS
+            self._save(state)
+            return
+        warnings: list[str] = []
+        # The scale is chosen once, on the first pass; every shot shares it.
+        first = not any(recipe.reason for recipe in plan.recipes)
+        scales = tuple(sorted({2, plan.scale})) if first else (plan.scale,)
+        try:
+            reply = self.gemini().propose_looks(
+                shots=shots_payload(shots, plan, indexes),
+                stills=[job_dir / shots.shots[i].still for i in indexes],
+                bounds=LOOK_BOUNDS,
+                scales=scales,
+                protected_strength=PROTECTED_STRENGTH,
+                job_dir=job_dir,
+            )
+            scale = reply.get("scale")
+            plan.scale = scale if first and scale in scales else min(scales)
+            plan = apply_proposals(plan, shots, list(reply["shots"]), indexes)
+        except GeminiError as exc:
+            warnings.append(f"Gemini could not propose settings ({exc})")
+            plan.scale = min(scales)
+            plan = _fallback_plan(plan, shots, indexes)
+        try:
+            plan = render_previews(
+                source,
+                job_dir,
+                shots,
+                plan,
+                indexes,
+                engine=self.upscale_engine(),
+                ffmpeg_bin=self.ffmpeg_bin,
+            )
+            if not warnings:
+                plan = self._check(plan, shots, indexes, source, job_dir, warnings)
+        except (UpscaleError, ShotError, OSError) as exc:
+            self._plan_failed(state, str(exc))
+            return
+        plan = finish(plan, indexes)
+        if warnings:
+            plan.error = "; ".join(warnings) + "."
+        save_plan(job_dir, plan)
+        state.error = None
+        state.step = WizardStep.LOOKS
+        self._save(state)
+
+    def _check(
+        self,
+        plan: ShotPlan,
+        shots: ShotList,
+        indexes: list[int],
+        source: Path,
+        job_dir: Path,
+        warnings: list[str],
+    ) -> ShotPlan:
+        """Gemini compares each preview; failed shots are fixed and redone once."""
+        try:
+            verdicts = self.gemini().check_previews(
+                shots=[
+                    {
+                        "index": index,
+                        "label": shots.shots[index].label,
+                        "contains": list(shots.shots[index].contains),
+                        "strength": plan.recipes[index].strength,
+                        "look": plan.recipes[index].look.to_dict(),
+                    }
+                    for index in indexes
+                ],
+                pairs=[check_stills(job_dir, plan, index) for index in indexes],
+                problems=CHECK_PROBLEMS,
+                job_dir=job_dir,
+            )
+        except GeminiError as exc:
+            warnings.append(f"Gemini could not check the previews ({exc})")
+            return plan
+        plan, changed = apply_checks(plan, shots, verdicts, indexes)
+        if changed:
+            plan = render_previews(
+                source,
+                job_dir,
+                shots,
+                plan,
+                changed,
+                engine=self.upscale_engine(),
+                ffmpeg_bin=self.ffmpeg_bin,
+            )
+        return plan
+
+    def _plan_failed(self, state: WizardState, detail: str) -> None:
+        """Planning failed (usually the GPU); go back to the shot list."""
+        state.error = f"The previews failed: {detail}"
+        state.step = WizardStep.SHOTS
+        self._save(state)
+
+    def _looks_view(self, job_dir: Path) -> dict[str, Any]:
+        shots = load_shots(job_dir)
+        plan = load_plan(job_dir)
+        if shots is None or plan is None:
+            return {"scale": None, "error": None, "shots": []}
+        items: list[dict[str, Any]] = []
+        for index, (shot, recipe) in enumerate(
+            zip(shots.shots, plan.recipes, strict=False)
+        ):
+            before, after = (
+                f"/previews/{name}"
+                for name in (
+                    f"shot_{index:03d}_r{recipe.rev}_before.mp4",
+                    f"shot_{index:03d}_r{recipe.rev}_after.mp4",
+                )
+            )
+            items.append(
+                {
+                    "index": index,
+                    "start_s": shot.start_s,
+                    "end_s": shot.end_s,
+                    "label": shot.label,
+                    "contains": list(shot.contains),
+                    "strength": recipe.strength,
+                    "look": recipe.look.to_dict(),
+                    "reason": recipe.reason,
+                    "check": recipe.check.to_dict(),
+                    "before_url": before if recipe.rev else None,
+                    "after_url": after if recipe.rev else None,
+                }
+            )
+        return {"scale": plan.scale, "error": plan.error, "shots": items}
+
+    def _looks_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
+        """Approve every shot's settings, or send one shot back with a note."""
+        if state.step is not WizardStep.LOOKS or not state.job_id:
+            raise WizardError("there are no shot settings to change")
+        job_dir = self.store.job_dir(state.job_id)
+        shots = load_shots(job_dir)
+        plan = load_plan(job_dir)
+        if shots is None or plan is None:
+            raise WizardError("the shot settings are missing; pick the file again")
+        action = fields.get("action", [""])[0]
+        try:
+            if action == "approve":
+                save_upscale_plan(job_dir, plan.to_upscale_plan(shots))
+                state.step = WizardStep.RENDERING
+            elif action == "redo":
+                index = int(fields.get("index", [""])[0])
+                save_plan(
+                    job_dir, request_redo(plan, index, fields.get("note", [""])[0])
+                )
+                state.step = WizardStep.PLANNING
+            else:
+                raise ValueError(f"unknown action {action!r}")
+        except (ShotPlanError, ValueError) as exc:
             state.error = str(exc)
         self._save(state)
 

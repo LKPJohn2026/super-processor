@@ -357,23 +357,98 @@ class FakeUpscaleEngine:
         return request.output
 
 
+def _flashvsr_ready() -> tuple[Path, Path]:
+    """The FlashVSR checkout and its tiny script, or a wizard-facing error."""
+    if not cuda_available():
+        raise UpscaleError(
+            "FlashVSR needs an NVIDIA GPU with CUDA. Refusing to fall "
+            "back to an FFmpeg grade. Install the gpu extra and a driver."
+        )
+    home = flashvsr_home()
+    infer = home / "examples" / "WanVSR" / "infer_flashvsr_v1.1_tiny.py"
+    if not infer.is_file():
+        raise UpscaleError(
+            "FlashVSR checkout is missing "
+            f"{infer}. Clone OpenImagingLab/FlashVSR into {home}."
+        )
+    resolve_flashvsr_weights(home)
+    return home, infer
+
+
+def upscale_all(engine: UpscaleEngine, requests: list[UpscaleRequest]) -> list[Path]:
+    """Run several short requests, loading the model once when the engine can."""
+    many = getattr(engine, "upscale_many", None)
+    if callable(many):
+        return list(many(requests))
+    return [engine.upscale(request) for request in requests]
+
+
 class FlashVsrEngine:
     """Temporal restoration via the FlashVSR v1.1 tiny pipeline."""
 
+    def upscale_many(self, requests: list[UpscaleRequest]) -> list[Path]:
+        """Restore several short clips (previews) with one model load."""
+        if not requests:
+            return []
+        home, infer = _flashvsr_ready()
+        from .probe import ProbeError, probe_file
+
+        ready: list[UpscaleRequest] = []
+        for request in requests:
+            request = replace(
+                request,
+                source=request.source.resolve(),
+                output=request.output.resolve(),
+            )
+            try:
+                duration = float(probe_file(request.source).duration_s or 0.0)
+            except ProbeError:
+                duration = 0.0
+            if duration > CHUNK_SECONDS + 0.05:
+                raise UpscaleError(
+                    f"{request.source.name} is {duration:.1f}s; batched clips "
+                    f"must be at most {CHUNK_SECONDS:g}s"
+                )
+            clean = request.look.clean_filter()
+            if clean:
+                cleaned = trim_source(
+                    request.source,
+                    request.output.with_name(request.output.stem + ".clean.mp4"),
+                    0.0,
+                    duration,
+                    video_filter=clean,
+                )
+                request = replace(request, source=cleaned)
+            ready.append(request)
+        with _FLASHVSR_LOCK:
+            try:
+                module, pipe, previous, path_added = _load_flashvsr(home, infer)
+            except UpscaleError:
+                raise
+            except Exception as exc:
+                raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+            try:
+                for request in ready:
+                    _infer_loaded(
+                        module,
+                        pipe,
+                        request.source,
+                        request.output,
+                        scale=request.scale,
+                    )
+            except UpscaleError:
+                raise
+            except Exception as exc:
+                raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+            finally:
+                _unload_flashvsr(previous, path_added)
+        missing = [r.output.name for r in ready if not r.output.is_file()]
+        if missing:
+            raise UpscaleError(f"FlashVSR produced no output for {missing[0]}")
+        return [request.output for request in ready]
+
     def upscale(self, request: UpscaleRequest) -> Path:
-        if not cuda_available():
-            raise UpscaleError(
-                "FlashVSR needs an NVIDIA GPU with CUDA. Refusing to fall "
-                "back to an FFmpeg grade. Install the gpu extra and a driver."
-            )
-        home = flashvsr_home()
-        infer = home / "examples" / "WanVSR" / "infer_flashvsr_v1.1_tiny.py"
-        if not infer.is_file():
-            raise UpscaleError(
-                "FlashVSR checkout is missing "
-                f"{infer}. Clone OpenImagingLab/FlashVSR into {home}."
-            )
-        resolve_flashvsr_weights(home)
+        home, infer = _flashvsr_ready()
         from .probe import ProbeError, probe_file
 
         # The loader chdirs into the FlashVSR checkout; relative job paths

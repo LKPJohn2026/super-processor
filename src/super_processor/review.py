@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .estimators import EstimatorError
 from .jobs import JobError
 from .segments import STILLS_DIR_NAME, SegmentError, load_segments
+from .shot_plan import PREVIEW_NAME, PREVIEWS_DIR
 from .shots import STILLS_DIR
 from .wizard import WizardController, WizardError, WizardStep, load_job_wizard_state
 
@@ -387,6 +388,7 @@ _API_POSTS = {
     "/api/pick": "/pick",
     "/api/new": "/new",
     "/api/shots": "/shots",
+    "/api/looks": "/looks",
     "/api/result": "/result",
 }
 
@@ -518,6 +520,14 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             if still is not None:
                 image = job_dir / STILLS_DIR / still.group(1)
                 return (image, "image/jpeg") if image.is_file() else None
+            if path.startswith("/previews/"):
+                name = path.removeprefix("/previews/")
+                match = PREVIEW_NAME.fullmatch(name)
+                if match is None:
+                    return None
+                preview = job_dir / PREVIEWS_DIR / name
+                kind = "video/mp4" if match.group(4) == "mp4" else "image/jpeg"
+                return (preview, kind) if preview.is_file() else None
             return None
 
         def do_HEAD(self) -> None:  # noqa: N802
@@ -612,6 +622,14 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                     return
                 if path == "/shots" and runs:
                     controller.start_scan()
+                    self._redirect("/")
+                    return
+                if path == "/api/plan" and runs:
+                    controller.start_plan()
+                    self._json(controller.api_view())
+                    return
+                if path == "/looks" and runs:
+                    controller.start_plan()
                     self._redirect("/")
                     return
                 if path == "/":

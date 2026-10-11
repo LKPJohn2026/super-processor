@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-shot looks (loop 2). After the shot list is approved, Gemini proposes a
+  strength and look for each shot (and one scale for the video), each shot
+  gets a short before/after preview, and Gemini checks the previews for
+  identity changes, bad anatomy, garbled text, waxy skin, oversharpening,
+  halos, fake texture, colour shifts, and softness. A failed shot gets
+  corrected settings and a new preview. The new Looks screen shows each pair;
+  the editor approves all or writes a note that redoes one shot. Strength is
+  capped at 0.6 on shots with faces, hands, or text, and 4x is only offered
+  for sources up to 960 pixels on the long edge. Without Gemini the recipes
+  come from the measurements. New steps `planning` and `looks`, routes
+  `/looks`, `/api/plan`, `/api/looks`, and `/previews/`.
+- `FlashVsrEngine.upscale_many` restores several short clips with one model
+  load; the previews use it.
+
 - Shot review (loop 1). After a file is picked, FFmpeg finds the cuts
   (`scdet`), measures each shot in its own pass (blockiness, blur, noise,
   brightness, contrast), and saves a still per shot. Gemini labels each shot

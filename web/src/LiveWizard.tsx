@@ -2,13 +2,16 @@ import { useEffect, useState, type FormEvent } from "react";
 import {
   outputSrc,
   postAction,
+  runPlan,
   runRender,
   runScan,
+  type LookShot,
+  type Looks,
   type Shot,
   type WizardView,
 } from "./api";
 
-const RAIL = ["Setup", "File", "Shots", "Upscale", "Result"] as const;
+const RAIL = ["Setup", "File", "Shots", "Looks", "Upscale", "Result"] as const;
 
 function railIndex(step: WizardView["step"]): number {
   if (step === "intro" || step === "llm_choice" || step === "local_llm_stub" || step === "setup") {
@@ -16,8 +19,9 @@ function railIndex(step: WizardView["step"]): number {
   }
   if (step === "pick_file") return 1;
   if (step === "finding_shots" || step === "shots") return 2;
-  if (step === "rendering") return 3;
-  return 4;
+  if (step === "planning" || step === "looks") return 3;
+  if (step === "rendering") return 4;
+  return 5;
 }
 
 type LiveWizardProps = {
@@ -45,10 +49,11 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   }
 
   useEffect(() => {
-    if (view.step !== "rendering" && view.step !== "finding_shots") return;
+    const runners = { rendering: runRender, finding_shots: runScan, planning: runPlan };
+    if (!(view.step in runners)) return;
     let cancelled = false;
     setLocalError(null);
-    const run = view.step === "rendering" ? runRender : runScan;
+    const run = runners[view.step as keyof typeof runners];
     run(origin)
       .then((next) => {
         if (!cancelled) onView(next);
@@ -206,6 +211,33 @@ function WizardStepView({
         origin={origin}
         shots={view.shots ?? []}
         labelError={view.label_error ?? null}
+        busy={busy}
+        message={message}
+        onSend={onSend}
+      />
+    );
+  }
+
+  if (view.step === "planning") {
+    return (
+      <>
+        <h1>Planning each shot</h1>
+        <p className="lede" role="status">
+          Gemini is choosing clean-up, strength, and finishing for each shot.
+          Each shot then gets a short before/after preview on the local GPU,
+          and Gemini checks the previews for faces, hands, text, and texture
+          that went wrong.
+        </p>
+        {message ? <Alert text={message} /> : null}
+      </>
+    );
+  }
+
+  if (view.step === "looks") {
+    return (
+      <LooksStep
+        origin={origin}
+        looks={view.looks ?? { scale: null, error: null, shots: [] }}
         busy={busy}
         message={message}
         onSend={onSend}
@@ -579,6 +611,145 @@ function ShotsStep({
           onClick={() => void onSend("shots", { action: "approve" })}
         >
           Approve shots and upscale
+        </button>
+      </div>
+    </>
+  );
+}
+
+const NEUTRAL: Record<string, number> = {
+  deblock: 0,
+  denoise: 0,
+  contrast: 1,
+  brightness: 0,
+  saturation: 1,
+  gamma: 1,
+  grain: 0,
+};
+
+export function settingsSummary(strength: number, look: Record<string, number>): string {
+  const parts = [`strength ${strength.toFixed(2)}`];
+  for (const [name, neutral] of Object.entries(NEUTRAL)) {
+    const value = look[name] ?? neutral;
+    if (Math.abs(value - neutral) > 1e-6) parts.push(`${name} ${value.toFixed(2)}`);
+  }
+  return parts.join(" · ");
+}
+
+function poster(videoUrl: string | null): string | null {
+  // Each preview has a still of the same name, saved for the check.
+  return videoUrl ? videoUrl.replace(/\.mp4$/, ".jpg") : null;
+}
+
+function checkSummary(check: LookShot["check"]): string {
+  let note = (check.note || "").trim();
+  if (note && !/[.!?]$/.test(note)) note += ".";
+  if (check.ok === null) return "Not checked.";
+  if (check.ok) return note ? `Check passed. ${note}` : "Check passed.";
+  let text = `Check found: ${words(check.problems) || "a problem"}.`;
+  if (note) text += ` ${note}`;
+  if (check.adjusted) text += " Settings were adjusted and the preview redone.";
+  return text;
+}
+
+function LooksStep({
+  origin,
+  looks,
+  busy,
+  message,
+  onSend,
+}: {
+  origin: string;
+  looks: Looks;
+  busy: boolean;
+  message: string | null;
+  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+}) {
+  const [notes, setNotes] = useState<Record<number, string>>({});
+
+  function redo(event: FormEvent, index: number) {
+    event.preventDefault();
+    void onSend("looks", { action: "redo", index: String(index), note: notes[index] ?? "" });
+  }
+
+  return (
+    <>
+      <h1>Looks</h1>
+      <p className="lede">
+        Each shot has its own settings and a short before/after preview.
+        Approve them all to render the whole video, or tell me what to change
+        in one shot.
+      </p>
+      {looks.scale ? <p className="muted">The whole video is upscaled {looks.scale}×.</p> : null}
+      {message ? <Alert text={message} /> : null}
+      {looks.error ? <p className="muted">{looks.error}</p> : null}
+      <ol className="shots">
+        {looks.shots.map((shot) => (
+          <li key={shot.index} className="look">
+            <h2>
+              {shot.index + 1}. {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
+              {shot.label || "Unlabelled shot"}
+            </h2>
+            {shot.after_url ? (
+              <div className="pair">
+                <figure>
+                  <figcaption>Before</figcaption>
+                  <video
+                    controls
+                    muted
+                    loop
+                    preload="metadata"
+                    src={outputSrc(origin, shot.before_url) ?? undefined}
+                    poster={outputSrc(origin, poster(shot.before_url)) ?? undefined}
+                    aria-label={`Shot ${shot.index + 1} before`}
+                  />
+                </figure>
+                <figure>
+                  <figcaption>After</figcaption>
+                  <video
+                    controls
+                    muted
+                    loop
+                    preload="metadata"
+                    src={outputSrc(origin, shot.after_url) ?? undefined}
+                    poster={outputSrc(origin, poster(shot.after_url)) ?? undefined}
+                    aria-label={`Shot ${shot.index + 1} after`}
+                  />
+                </figure>
+              </div>
+            ) : null}
+            <p>
+              <strong>{settingsSummary(shot.strength, shot.look)}</strong>
+            </p>
+            <p>{shot.reason}</p>
+            <p className="muted">{checkSummary(shot.check)}</p>
+            <form onSubmit={(event) => redo(event, shot.index)}>
+              <label htmlFor={`note-${shot.index}`}>
+                Not right? Tell me what to change in this shot
+                <input
+                  id={`note-${shot.index}`}
+                  type="text"
+                  value={notes[shot.index] ?? ""}
+                  placeholder="e.g. skin looks waxy, keep it softer"
+                  onChange={(event) => setNotes({ ...notes, [shot.index]: event.target.value })}
+                />
+              </label>
+              <div className="actions">
+                <button type="submit" className="secondary" disabled={busy}>
+                  Redo this shot
+                </button>
+              </div>
+            </form>
+          </li>
+        ))}
+      </ol>
+      <div className="actions">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void onSend("looks", { action: "approve" })}
+        >
+          Approve all and render
         </button>
       </div>
     </>

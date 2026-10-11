@@ -102,6 +102,8 @@ frame count is refused and the previous `output.mp4` is kept.
 | Pick file | `GET/POST /pick` | Local video path (up to 1080p and 30 minutes) |
 | Finding shots | `GET /shots?run=1` (`/api/scan?run=1`) | FFmpeg finds the cuts and measures each shot; Gemini labels each shot from one still |
 | Shots | `POST /shots` (`/api/shots`) | Review the shot list: merge with next, split at a time, approve |
+| Planning | `GET /looks?run=1` (`/api/plan?run=1`) | Gemini proposes each shot's settings; short previews render; Gemini checks them |
+| Looks | `POST /looks` (`/api/looks`) | Before/after preview per shot: approve all, or a note that redoes one shot |
 | Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, or a note that retunes a time range |
 | Done | `GET /` (state `done`) | Confirmation |
@@ -110,16 +112,22 @@ frame count is refused and the previous `output.mp4` is kept.
 ## State machine
 
 ```text
-intro → llm_choice ┬─ gemini → setup → pick_file → finding_shots → shots → rendering → result ─┬─ happy → done
-                   └─ local  → local_llm_stub → setup ─┘                                ▲            │
-                                                                                        └── note ────┘
+intro → llm_choice ┬─ gemini → setup → pick_file → finding_shots → shots → planning ⇄ looks → rendering → result ─┬─ happy → done
+                   └─ local  → local_llm_stub → setup ─┘                                             ▲            │
+                                                                                                     └── note ────┘
 ```
+
+`planning ⇄ looks`: a note on one shot in Looks sends only that shot back
+through planning.
 
 Persisted in the job directory as `wizard_state.json` (step, job id, last
 error) and `gemini_chat.json`. If finding the shots fails (FFmpeg cannot read
 the file), the job is marked failed and the wizard returns to `pick_file`. If
 only Gemini labelling fails, the shots keep the hints from the measurements and
-the shots screen says why. If the first upscale fails, the job is marked
+the shots screen says why. If the previews fail (usually no GPU), the wizard
+goes back to `shots` with the error. If Gemini cannot plan or check, the
+recipes come from the measurements, the check is skipped, and the looks screen
+says so. If the first upscale fails, the job is marked
 failed and the wizard returns to `pick_file` with the error; a failed revise
 stays on `result` with the previous output. "Start a new video" on Done or
 Result goes back to `pick_file`. A state saved on a step of the removed split /
@@ -158,6 +166,33 @@ the first label and joins both lists; splitting measures both halves again.
 Approving writes one upscale span per shot. Neighbouring spans with the same
 settings render as one FlashVSR pass.
 
+## Looks (loop 2)
+
+Each approved shot gets a recipe: a FlashVSR `strength` and a look (the
+bounded clean-up and finishing settings in `look.py`). The whole video shares
+one scale; Gemini picks it on the first pass, and 4× is only offered when the
+source's long edge is 960 pixels or less. Strength is capped at 0.6 on shots
+whose contents include faces, hands, or text.
+
+Then every shot gets a preview: up to 3 s from its middle, rendered with its
+recipe (FlashVSR loads once for all of them), plus the same seconds of the
+source. Gemini compares a still from each before/after pair for
+`identity_change`, `bad_anatomy`, `garbled_text`, `waxy_skin`,
+`oversharpened`, `halos`, `fake_texture`, `color_shift`, and `too_soft`. A
+shot that fails comes back with corrected settings and its preview is redone
+once (no second check). The Looks screen shows both previews, the settings
+that differ from neutral, Gemini's reason, and the check result.
+
+A note on one shot ("skin looks waxy") marks only that shot stale: Gemini
+re-plans it with the note and its current settings, it gets a new preview and
+check, and the others are left alone. Preview files carry a revision number
+(`shot_002_r3_after.mp4`), so a browser never shows an older one. Approving
+writes one upscale span per shot with its scale, strength, and look.
+
+Without Gemini, recipes come from the measurements: deblock for `blocky`,
+denoise for `noisy`, a lift for `dark`, contrast for `flat`, and slightly
+lower strength where there was damage to clean.
+
 ## Gemini schema
 
 The shot labels:
@@ -165,6 +200,20 @@ The shot labels:
 ```json
 {"shots": [{"index": 0, "label": "night street, neon sign", "issues": ["noisy", "dark"], "contains": ["text"]}]}
 ```
+
+A recipe per shot (and, on the first pass, the scale):
+
+```json
+{"scale": 2, "shots": [{"index": 0, "strength": 0.4, "look": {"deblock": 0.3, "denoise": 0.2, "contrast": 1.05, "brightness": 0, "saturation": 1, "gamma": 1, "grain": 0}, "reason": "Blocky street at night; clean before upscaling."}]}
+```
+
+A preview check, with corrected settings for a failed shot:
+
+```json
+{"shots": [{"index": 0, "ok": false, "problems": ["waxy_skin"], "note": "Cheeks look plastic.", "strength": 0.3, "look": {"...": 0}}]}
+```
+
+Out-of-range numbers are clamped and unknown names dropped.
 
 A result note becomes a range and knobs.
 
@@ -198,6 +247,8 @@ A scale change re-renders the whole clip (see Range revise above).
 | `gemini_chat.json` | Result-note history |
 | `shots.json` | Shot ranges, measurements, labels, and still names |
 | `shot_stills/` | One JPEG per shot, served at `/shot_stills/<name>.jpg` |
+| `shot_plan.json` | Per-shot recipe, reason, check result, preview revision, pending editor note |
+| `previews/` | `shot_NNN_rN_before/after.mp4` and check stills, served at `/previews/<name>` |
 | `upscale_plan.json` | Spans (one per approved shot) with scale, strength, and look, plus the pending revise |
 | `output.mp4` | Current result |
 | `output.mp4.delivery.json` | Encode settings marker for keyframe splices |
