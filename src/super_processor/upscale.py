@@ -1,10 +1,12 @@
 """Local FlashVSR restoration upscale.
 
-FFmpeg probes, trims, concatenates, and copies audio. It does not choose the
-look. Gemini may only return a time range plus ``scale`` and ``strength``.
+FFmpeg probes, trims, concatenates, and copies audio. Each span (a shot) also
+carries a :class:`~super_processor.look.ShotLook`: bounded FFmpeg clean-up
+before FlashVSR and finishing after it, always in that order. Gemini may only
+return a time range plus ``scale`` and ``strength``.
 ``strength`` is the share of the FlashVSR picture in the output; the rest is a
-plain lanczos upscale of the same frames, so 0.0 invents nothing and 1.0 is
-FlashVSR alone. FlashVSR itself always runs at its upstream settings.
+plain lanczos upscale of the same (cleaned) frames, so 0.0 invents nothing and
+1.0 is FlashVSR alone. FlashVSR itself always runs at its upstream settings.
 The real engine refuses to run without CUDA; tests use :class:`FakeUpscaleEngine`.
 
 Work clips handed to the engine are encoded losslessly. The engine output is
@@ -23,9 +25,12 @@ import os
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
+
+from .look import LookError, ShotLook
 
 UPSCALE_PLAN_FILE = "upscale_plan.json"
 CHUNK_SECONDS = 8.0
@@ -62,6 +67,7 @@ class UpscaleSpan:
     scale: int = 2
     strength: float = 0.5
     source: str = "original"
+    look: ShotLook = field(default_factory=ShotLook)
 
     def __post_init__(self) -> None:
         scale = _require_scale(self.scale)
@@ -77,13 +83,14 @@ class UpscaleSpan:
         object.__setattr__(self, "start_s", start)
         object.__setattr__(self, "end_s", end)
 
-    def to_dict(self) -> dict[str, float | int | str]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "start_s": self.start_s,
             "end_s": self.end_s,
             "scale": self.scale,
             "strength": self.strength,
             "source": self.source,
+            "look": self.look.to_dict(),
         }
 
     @classmethod
@@ -91,12 +98,17 @@ class UpscaleSpan:
         if not isinstance(data, dict):
             raise UpscaleError("upscale span must be an object")
         try:
+            look = ShotLook.from_dict(data.get("look"))
+        except LookError as exc:
+            raise UpscaleError(f"invalid shot look: {exc}") from exc
+        try:
             return cls(
                 start_s=float(data["start_s"]),
                 end_s=float(data["end_s"]),
                 scale=int(data.get("scale", 2)),
                 strength=float(data.get("strength", 0.5)),
                 source=str(data.get("source", "original")),
+                look=look,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise UpscaleError("upscale span is missing start_s or end_s") from exc
@@ -142,6 +154,7 @@ class UpscaleRequest:
     output: Path
     scale: int = 2
     strength: float = 0.5
+    look: ShotLook = field(default_factory=ShotLook)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scale", _require_scale(self.scale))
@@ -149,7 +162,11 @@ class UpscaleRequest:
 
 
 class UpscaleEngine(Protocol):
-    """Restore and upscale a clip. Implementations must not invent a grade."""
+    """Restore and upscale a clip.
+
+    Implementations apply ``request.look.clean_filter()`` to the frames they
+    read and nothing else; finishing happens in the delivery encode.
+    """
 
     def upscale(self, request: UpscaleRequest) -> Path:
         """Write ``request.output`` and return that path."""
@@ -255,50 +272,54 @@ def clamp_span(span: UpscaleSpan, duration_s: float) -> UpscaleSpan:
     """Keep a Gemini patch inside the file."""
     start = min(max(0.0, span.start_s), max(0.0, duration_s - 0.1))
     end = min(max(start + 0.1, span.end_s), duration_s)
-    return UpscaleSpan(start, end, scale=span.scale, strength=span.strength)
+    return replace(span, start_s=start, end_s=end)
+
+
+def look_at(plan: UpscalePlan, time_s: float) -> ShotLook:
+    """The look of the latest span covering ``time_s``, or a neutral one."""
+    for span in reversed(plan.spans):
+        if span.start_s - 0.05 <= time_s < span.end_s:
+            return span.look
+    return ShotLook()
+
+
+def _covers_all(span: UpscaleSpan, duration_s: float) -> bool:
+    return span.start_s <= 0.05 and span.end_s >= duration_s - 0.05
 
 
 def replace_overlapping(
     plan: UpscalePlan, patch: UpscaleSpan, duration_s: float
 ) -> UpscalePlan:
-    """Store a range revise. A scale change replaces the whole timeline.
+    """Store a range revise. A scale change re-renders the whole timeline.
 
-    One output file has one resolution, so a new scale cannot be spliced into
-    part of it. The pending span then covers the whole file at the new scale
-    and the patch's strength. A same-scale patch trims the spans it overlaps
-    instead of dropping them.
+    The patch trims the spans it overlaps instead of dropping them, so every
+    other shot keeps its strength and look. One output file has one
+    resolution, so a new scale cannot be spliced into part of it: every span
+    takes the new scale, and the pending span covers the whole file, which
+    :func:`render_plan` reads as "render every shot again".
     """
     patch = clamp_span(patch, duration_s)
-    scales = {span.scale for span in plan.spans}
-    covers_all = patch.start_s <= 0.05 and patch.end_s >= duration_s - 0.05
-    if covers_all or patch.scale not in scales:
-        full = UpscaleSpan(0.0, duration_s, scale=patch.scale, strength=patch.strength)
+    if _covers_all(patch, duration_s):
+        full = replace(patch, start_s=0.0, end_s=duration_s)
         return UpscalePlan(spans=(full,), pending=full)
+    spans = plan.spans
+    rescale = patch.scale not in {span.scale for span in spans}
+    if rescale:
+        spans = tuple(replace(span, scale=patch.scale) for span in spans)
     kept: list[UpscaleSpan] = []
-    for span in plan.spans:
+    for span in spans:
         if span.end_s <= patch.start_s + 0.05 or span.start_s >= patch.end_s - 0.05:
             kept.append(span)
             continue
         if patch.start_s - span.start_s > 0.05:
-            kept.append(
-                UpscaleSpan(
-                    span.start_s,
-                    patch.start_s,
-                    scale=span.scale,
-                    strength=span.strength,
-                )
-            )
+            kept.append(replace(span, end_s=patch.start_s))
         if span.end_s - patch.end_s > 0.05:
-            kept.append(
-                UpscaleSpan(
-                    patch.end_s,
-                    span.end_s,
-                    scale=span.scale,
-                    strength=span.strength,
-                )
-            )
+            kept.append(replace(span, start_s=patch.end_s))
+    pending = patch
+    if rescale:
+        pending = replace(patch, start_s=0.0, end_s=duration_s)
     # The latest patch stays last; the wizard reads it as the prior knobs.
-    return UpscalePlan(spans=(*kept, patch), pending=patch)
+    return UpscalePlan(spans=(*kept, patch), pending=pending)
 
 
 class FakeUpscaleEngine:
@@ -319,7 +340,10 @@ class FakeUpscaleEngine:
                 "-i",
                 str(request.source),
                 "-vf",
-                f"scale=iw*{request.scale}:ih*{request.scale}",
+                _join_filters(
+                    request.look.clean_filter(),
+                    f"scale=iw*{request.scale}:ih*{request.scale}",
+                ),
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -354,11 +378,10 @@ class FlashVsrEngine:
 
         # The loader chdirs into the FlashVSR checkout; relative job paths
         # would then point inside it.
-        request = UpscaleRequest(
-            request.source.resolve(),
-            request.output.resolve(),
-            scale=request.scale,
-            strength=request.strength,
+        request = replace(
+            request,
+            source=request.source.resolve(),
+            output=request.output.resolve(),
         )
         try:
             duration = float(probe_file(request.source).duration_s or 0.0)
@@ -369,6 +392,16 @@ class FlashVsrEngine:
                 return _run_flashvsr_chunked(
                     request, home=home, infer=infer, duration_s=duration
                 )
+            clean = request.look.clean_filter()
+            if clean:
+                cleaned = trim_source(
+                    request.source,
+                    request.output.with_name(request.output.stem + ".clean.mp4"),
+                    0.0,
+                    duration,
+                    video_filter=clean,
+                )
+                request = replace(request, source=cleaned)
             return _run_flashvsr(request, home=home, infer=infer)
 
 
@@ -586,7 +619,11 @@ def _run_flashvsr_chunked(
     try:
         for index, span in enumerate(chunks):
             clip = trim_source(
-                request.source, work / f"in_{index}.mp4", span.start_s, span.end_s
+                request.source,
+                work / f"in_{index}.mp4",
+                span.start_s,
+                span.end_s,
+                video_filter=request.look.clean_filter(),
             )
             raw = work / f"up_{index}.mp4"
             _infer_loaded(
@@ -618,6 +655,7 @@ def _run_flashvsr_chunked(
         concat=True,
         blend_with=request.source,
         strength=request.strength,
+        look=request.look,
     )
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
@@ -631,13 +669,17 @@ def trim_source(
     end_s: float,
     *,
     ffmpeg_bin: str = "ffmpeg",
+    video_filter: str = "",
 ) -> Path:
     """Cut a range into a lossless work clip.
 
     Frame-accurate, so it re-encodes, but at ``-qp 0`` so the engine and the
     chunk join see the decoded pixels unchanged. Work clips are short-lived.
+    ``video_filter`` (a look's clean step, or a timestamp reset) must not
+    change the frame count.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
+    filters = ["-vf", video_filter] if video_filter else []
     _run_ffmpeg(
         [
             ffmpeg_bin,
@@ -646,11 +688,12 @@ def trim_source(
             "error",
             "-y",
             "-ss",
-            f"{start_s:.3f}",
+            f"{start_s:.6f}",
             "-to",
-            f"{end_s:.3f}",
+            f"{end_s:.6f}",
             "-i",
             str(source),
+            *filters,
             "-c:v",
             "libx264",
             "-preset",
@@ -699,29 +742,48 @@ def is_delivery(video: Path) -> bool:
     return all(data.get(key) == value for key, value in _delivery_marker().items())
 
 
-def _write_marker(video: Path, *, strength: float | None) -> None:
+def _write_marker(
+    video: Path, *, strength: float | None, look: ShotLook | None = None
+) -> None:
     data = _delivery_marker()
     if strength is not None:
         data["strength"] = strength
+    if look is not None:
+        data["look"] = look.to_dict()
     delivery_marker_path(video).write_text(json.dumps(data) + "\n", encoding="utf-8")
 
 
-def blend_filter(width: int, height: int, strength: float) -> str:
+def blend_filter(
+    width: int, height: int, strength: float, look: ShotLook | None = None
+) -> str:
     """Mix the restored picture (input 0) with a lanczos upscale of input 1.
 
     ``eof_action=pass`` ends on the restored picture, so the frame count the
     keyframe splice relies on never changes. The base is padded by a second
     of its last frame so a few missing frames do not leave the tail unmixed.
+    The base gets the look's clean step, as the engine input did, and the mix
+    gets its finish step.
     """
     weight = _require_strength(strength)
+    look = look or ShotLook()
+    base = _join_filters(
+        "setpts=PTS-STARTPTS",
+        look.clean_filter(),
+        f"scale={width}:{height}:flags=lanczos,format=yuv420p",
+        "tpad=stop_mode=clone:stop_duration=1",
+    )
+    finish = look.finish_filter()
+    mixed = "[mix];[mix]" + finish + "[v]" if finish else "[v]"
     return (
         "[0:v]setpts=PTS-STARTPTS,format=yuv420p[up];"
-        "[1:v]setpts=PTS-STARTPTS,"
-        f"scale={width}:{height}:flags=lanczos,format=yuv420p,"
-        "tpad=stop_mode=clone:stop_duration=1[base];"
+        f"[1:v]{base}[base];"
         f"[up][base]blend=all_expr='A*{weight:.4f}+B*{1 - weight:.4f}'"
-        ":eof_action=pass[v]"
+        f":eof_action=pass{mixed}"
     )
+
+
+def _join_filters(*parts: str) -> str:
+    return ",".join(part for part in parts if part)
 
 
 def encode_delivery(
@@ -732,6 +794,7 @@ def encode_delivery(
     concat: bool = False,
     blend_with: Path | None = None,
     strength: float = 1.0,
+    look: ShotLook | None = None,
 ) -> Path:
     """Encode a picture once into the settings every splice part shares.
 
@@ -739,12 +802,16 @@ def encode_delivery(
     clean points to cut the current output by stream copy. ``concat`` reads
     ``source`` as a concat-demuxer listing. With ``blend_with`` and a strength
     below 1, the picture is mixed with a lanczos upscale of ``blend_with`` in
-    the same encode (see :func:`blend_filter`).
+    the same encode (see :func:`blend_filter`). The look's finish step runs in
+    this encode too.
     """
+    look = look or ShotLook()
     mixing = blend_with is not None and strength < 1.0
+    finish = look.finish_filter()
     if not concat and is_delivery(source):
         done = _read_marker(source) or {}
-        if not mixing or done.get("strength") == strength:
+        same_look = done.get("look", ShotLook().to_dict()) == look.to_dict()
+        if (not mixing or done.get("strength") == strength) and same_look:
             if source != dest:
                 source.replace(dest)
                 delivery_marker_path(source).replace(delivery_marker_path(dest))
@@ -769,10 +836,12 @@ def encode_delivery(
         inputs.extend(["-i", str(blend_with)])
         picture = [
             "-filter_complex",
-            blend_filter(size[0], size[1], strength),
+            blend_filter(size[0], size[1], strength, look),
             "-map",
             "[v]",
         ]
+    elif finish:
+        picture = ["-filter_complex", f"[0:v]{finish}[v]", "-map", "[v]"]
     tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
     _run_ffmpeg(
         [
@@ -804,7 +873,11 @@ def encode_delivery(
         ]
     )
     tmp.replace(dest)
-    _write_marker(dest, strength=strength if blend_with is not None else None)
+    _write_marker(
+        dest,
+        strength=strength if blend_with is not None else None,
+        look=None if look.is_neutral() else look,
+    )
     return dest
 
 
@@ -934,7 +1007,11 @@ def _upscale_full(
 ) -> Path:
     raw = engine.upscale(
         UpscaleRequest(
-            source, work / "full_up.mp4", scale=span.scale, strength=span.strength
+            source,
+            work / "full_up.mp4",
+            scale=span.scale,
+            strength=span.strength,
+            look=span.look,
         )
     )
     encode_delivery(
@@ -943,6 +1020,7 @@ def _upscale_full(
         ffmpeg_bin=ffmpeg_bin,
         blend_with=source,
         strength=span.strength,
+        look=span.look,
     )
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
@@ -967,8 +1045,7 @@ def apply_range_revise(
     """
     work = output.parent / "range_work"
     work.mkdir(parents=True, exist_ok=True)
-    covers = span.start_s <= 0.05 and span.end_s >= duration_s - 0.05
-    if covers or not current.is_file():
+    if _covers_all(span, duration_s) or not current.is_file():
         return _upscale_full(
             source, output, span, work, engine=engine, ffmpeg_bin=ffmpeg_bin
         )
@@ -993,6 +1070,7 @@ def apply_range_revise(
             work / "range_up.mp4",
             scale=span.scale,
             strength=span.strength,
+            look=span.look,
         )
     )
     middle = encode_delivery(
@@ -1001,6 +1079,7 @@ def apply_range_revise(
         ffmpeg_bin=ffmpeg_bin,
         blend_with=clip,
         strength=span.strength,
+        look=span.look,
     )
     current_size = _frame_size(current)
     middle_size = _frame_size(middle)
@@ -1028,6 +1107,143 @@ def apply_range_revise(
     if after != before:
         raise UpscaleError(
             f"the revised output would have {after} frames instead of {before}; "
+            "the previous output is left unchanged"
+        )
+    silent.replace(output)
+    _write_marker(output, strength=None)
+    mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
+    return output
+
+
+def render_plan(
+    source: Path,
+    output: Path,
+    plan: UpscalePlan,
+    *,
+    engine: UpscaleEngine,
+    ffmpeg_bin: str = "ffmpeg",
+    duration_s: float,
+) -> Path:
+    """Render what ``plan`` asks for into ``output``.
+
+    A pending range on an existing output is spliced in by
+    :func:`apply_range_revise`. Anything else (the first render, a pending
+    span over the whole file, a scale change) renders every shot again.
+    """
+    pending = plan.pending
+    if (
+        pending is not None
+        and output.is_file()
+        and not _covers_all(pending, duration_s)
+    ):
+        return apply_range_revise(
+            source,
+            output,
+            pending,
+            output,
+            engine=engine,
+            ffmpeg_bin=ffmpeg_bin,
+            duration_s=duration_s,
+        )
+    return render_shots(
+        source,
+        output,
+        plan.spans,
+        engine=engine,
+        ffmpeg_bin=ffmpeg_bin,
+        duration_s=duration_s,
+    )
+
+
+def shot_timeline(
+    spans: tuple[UpscaleSpan, ...], duration_s: float
+) -> list[UpscaleSpan]:
+    """``spans`` in time order, checked to cover the clip once at one scale."""
+    ordered = sorted(spans, key=lambda span: span.start_s)
+    if not ordered:
+        raise UpscaleError("the plan has no shots")
+    if len({span.scale for span in ordered}) > 1:
+        raise UpscaleError("every shot in one output must use the same scale")
+    cursor = 0.0
+    for span in ordered:
+        if abs(span.start_s - cursor) > 0.05:
+            raise UpscaleError(
+                f"shots must cover the clip without gaps or overlaps "
+                f"(one starts at {span.start_s:.2f}s, expected {cursor:.2f}s)"
+            )
+        cursor = span.end_s
+    if cursor < duration_s - 0.05:
+        raise UpscaleError(f"the last shot ends at {cursor:.2f}s, before the end")
+    return ordered
+
+
+def render_shots(
+    source: Path,
+    output: Path,
+    spans: tuple[UpscaleSpan, ...],
+    *,
+    engine: UpscaleEngine,
+    ffmpeg_bin: str = "ffmpeg",
+    duration_s: float,
+) -> Path:
+    """Restore each shot with its own look and join them into ``output``.
+
+    Shot edges snap to source frames, so the parts hold every source frame
+    exactly once. Each part goes through the delivery encode, which starts it
+    on a keyframe, and the parts are joined by stream copy.
+    """
+    ordered = shot_timeline(spans, duration_s)
+    work = output.parent / "shot_work"
+    work.mkdir(parents=True, exist_ok=True)
+    if len(ordered) == 1:
+        return _upscale_full(
+            source, output, ordered[0], work, engine=engine, ffmpeg_bin=ffmpeg_bin
+        )
+    ffprobe_bin = _ffprobe_for(ffmpeg_bin)
+    want, rate = video_stream_facts(source, ffprobe_bin=ffprobe_bin)
+    fps = float(Fraction(rate))
+    edges = [0, *(round(span.start_s * fps) for span in ordered[1:]), want]
+    parts: list[Path] = []
+    for index, span in enumerate(ordered):
+        first, stop = edges[index], edges[index + 1]
+        if stop <= first:
+            continue
+        # Half a frame early on both ends, so float rounding of the frame
+        # times cannot move a frame into the neighbouring shot. The clip then
+        # restarts at zero, or the encoder pads the half-frame gap with a copy.
+        clip = trim_source(
+            source,
+            work / f"shot_{index}.mp4",
+            max(0.0, (first - 0.5) / fps),
+            (stop - 0.5) / fps,
+            ffmpeg_bin=ffmpeg_bin,
+            video_filter="setpts=PTS-STARTPTS",
+        )
+        raw = engine.upscale(
+            UpscaleRequest(
+                clip,
+                work / f"shot_{index}_up.mp4",
+                scale=span.scale,
+                strength=span.strength,
+                look=span.look,
+            )
+        )
+        parts.append(
+            encode_delivery(
+                raw,
+                work / f"shot_{index}_delivery.mp4",
+                ffmpeg_bin=ffmpeg_bin,
+                blend_with=clip,
+                strength=span.strength,
+                look=span.look,
+            )
+        )
+    silent = work / "shots.mp4"
+    _concat(parts, silent, ffmpeg_bin=ffmpeg_bin)
+    have, _rate = video_stream_facts(silent, ffprobe_bin=ffprobe_bin)
+    if have != want:
+        raise UpscaleError(
+            f"the joined shots have {have} frames instead of {want}; "
             "the previous output is left unchanged"
         )
     silent.replace(output)

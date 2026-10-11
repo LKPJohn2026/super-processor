@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -28,9 +28,10 @@ from .upscale import (
     UpscaleError,
     UpscalePlan,
     UpscaleSpan,
-    apply_range_revise,
     default_span,
     load_upscale_plan,
+    look_at,
+    render_plan,
     replace_overlapping,
     save_upscale_plan,
 )
@@ -509,6 +510,8 @@ class WizardController:
                 job_dir=job_dir,
             )
             patch = UpscaleSpan.from_dict(raw)
+            # A note retunes scale and strength; the shot keeps its look.
+            patch = replace(patch, look=look_at(plan, patch.start_s))
             updated = replace_overlapping(plan, patch, duration)
             save_upscale_plan(job_dir, updated)
             state.error = None
@@ -543,12 +546,10 @@ class WizardController:
             if plan is None:
                 plan = UpscalePlan(spans=(default_span(duration),))
                 save_upscale_plan(job_dir, plan)
-            span = plan.pending or plan.spans[-1]
-            apply_range_revise(
+            render_plan(
                 source,
                 output,
-                span,
-                output,
+                plan,
                 engine=self.upscale_engine(),
                 ffmpeg_bin=self.ffmpeg_bin,
                 duration_s=duration,
