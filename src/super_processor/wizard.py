@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import json
 import threading
+import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -138,39 +140,66 @@ def job_state_path(job_dir: Path) -> Path:
     return job_dir / WIZARD_STATE_FILE
 
 
-def load_session_state(jobs_dir: Path) -> WizardState:
-    path = session_state_path(jobs_dir)
-    if not path.is_file():
-        return WizardState()
-    data = json.loads(path.read_text(encoding="utf-8"))
+# On Windows, replacing a file that another thread has open (a page refresh
+# reading the state while the render worker saves it) fails with
+# PermissionError, and so does opening it mid-replace. Both clear within
+# milliseconds, so state reads and writes retry briefly instead of failing the
+# request.
+_STATE_RETRIES = 20
+_STATE_RETRY_S = 0.025
+
+
+def _read_state_file(path: Path, what: str) -> WizardState | None:
+    for attempt in range(_STATE_RETRIES):
+        try:
+            if not path.is_file():
+                return None
+            text = path.read_text(encoding="utf-8")
+            break
+        except PermissionError:
+            if attempt == _STATE_RETRIES - 1:
+                raise
+            time.sleep(_STATE_RETRY_S)
+    data = json.loads(text)
     if not isinstance(data, dict):
-        raise WizardError("corrupt wizard session")
+        raise WizardError(f"corrupt {what}")
     return WizardState.from_dict(data)
+
+
+def _write_state_file(path: Path, state: WizardState) -> None:
+    payload = json.dumps(state.to_dict(), indent=2) + "\n"
+    # One temp file per write, so two threads saving at once never share it.
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    try:
+        for attempt in range(_STATE_RETRIES):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError:
+                if attempt == _STATE_RETRIES - 1:
+                    raise
+                time.sleep(_STATE_RETRY_S)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def load_session_state(jobs_dir: Path) -> WizardState:
+    state = _read_state_file(session_state_path(jobs_dir), "wizard session")
+    return state if state is not None else WizardState()
 
 
 def save_session_state(jobs_dir: Path, state: WizardState) -> None:
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    path = session_state_path(jobs_dir)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state.to_dict(), indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    _write_state_file(session_state_path(jobs_dir), state)
 
 
 def load_job_wizard_state(job_dir: Path) -> WizardState | None:
-    path = job_state_path(job_dir)
-    if not path.is_file():
-        return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise WizardError("corrupt wizard_state.json")
-    return WizardState.from_dict(data)
+    return _read_state_file(job_state_path(job_dir), "wizard_state.json")
 
 
 def save_job_wizard_state(job_dir: Path, state: WizardState) -> None:
-    path = job_state_path(job_dir)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state.to_dict(), indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    _write_state_file(job_state_path(job_dir), state)
 
 
 def _active_knobs(job_dir: Path) -> tuple[int | None, float | None]:

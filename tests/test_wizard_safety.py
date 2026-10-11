@@ -208,3 +208,61 @@ def test_worker_error_with_output_stays_on_result(tmp_path: Path) -> None:
     assert state.step is WizardStep.RESULT
     assert state.job_id == "job00001"
     assert state.error == "gpu fell over"
+
+
+def test_state_files_retry_windows_sharing_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page read racing the worker's save must not fail the request."""
+    monkeypatch.setattr("super_processor.wizard._STATE_RETRY_S", 0)
+    save_session_state(tmp_path, WizardState(step=WizardStep.PICK_FILE))
+
+    real_replace = Path.replace
+    real_read = Path.read_text
+    calls = {"replace": 0, "read": 0}
+
+    def flaky_replace(self: Path, target: Path) -> Path:
+        calls["replace"] += 1
+        if calls["replace"] < 3:
+            raise PermissionError(13, "file is open in another thread")
+        return real_replace(self, target)
+
+    def flaky_read(self: Path, *args: object, **kwargs: object) -> str:
+        calls["read"] += 1
+        if calls["read"] < 3:
+            raise PermissionError(13, "file is being replaced")
+        return real_read(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    save_session_state(tmp_path, WizardState(step=WizardStep.DONE))
+    monkeypatch.setattr(Path, "read_text", flaky_read)
+    controller = WizardController(tmp_path)
+    assert controller.current_state().step is WizardStep.DONE
+    assert calls == {"replace": 3, "read": 3}
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_concurrent_state_saves_do_not_collide(tmp_path: Path) -> None:
+    errors: list[BaseException] = []
+
+    def hammer(step: WizardStep) -> None:
+        try:
+            for _ in range(200):
+                save_session_state(tmp_path, WizardState(step=step))
+        except BaseException as exc:  # noqa: BLE001 - collected for the assert
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=hammer, args=(step,))
+        for step in (WizardStep.RENDERING, WizardStep.RESULT)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert WizardController(tmp_path).current_state().step in {
+        WizardStep.RENDERING,
+        WizardStep.RESULT,
+    }
+    assert list(tmp_path.glob("*.tmp")) == []
