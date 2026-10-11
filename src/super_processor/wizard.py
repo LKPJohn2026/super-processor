@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
+import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -137,39 +140,66 @@ def job_state_path(job_dir: Path) -> Path:
     return job_dir / WIZARD_STATE_FILE
 
 
-def load_session_state(jobs_dir: Path) -> WizardState:
-    path = session_state_path(jobs_dir)
-    if not path.is_file():
-        return WizardState()
-    data = json.loads(path.read_text(encoding="utf-8"))
+# On Windows, replacing a file that another thread has open (a page refresh
+# reading the state while the render worker saves it) fails with
+# PermissionError, and so does opening it mid-replace. Both clear within
+# milliseconds, so state reads and writes retry briefly instead of failing the
+# request.
+_STATE_RETRIES = 20
+_STATE_RETRY_S = 0.025
+
+
+def _read_state_file(path: Path, what: str) -> WizardState | None:
+    for attempt in range(_STATE_RETRIES):
+        try:
+            if not path.is_file():
+                return None
+            text = path.read_text(encoding="utf-8")
+            break
+        except PermissionError:
+            if attempt == _STATE_RETRIES - 1:
+                raise
+            time.sleep(_STATE_RETRY_S)
+    data = json.loads(text)
     if not isinstance(data, dict):
-        raise WizardError("corrupt wizard session")
+        raise WizardError(f"corrupt {what}")
     return WizardState.from_dict(data)
+
+
+def _write_state_file(path: Path, state: WizardState) -> None:
+    payload = json.dumps(state.to_dict(), indent=2) + "\n"
+    # One temp file per write, so two threads saving at once never share it.
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    try:
+        for attempt in range(_STATE_RETRIES):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError:
+                if attempt == _STATE_RETRIES - 1:
+                    raise
+                time.sleep(_STATE_RETRY_S)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def load_session_state(jobs_dir: Path) -> WizardState:
+    state = _read_state_file(session_state_path(jobs_dir), "wizard session")
+    return state if state is not None else WizardState()
 
 
 def save_session_state(jobs_dir: Path, state: WizardState) -> None:
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    path = session_state_path(jobs_dir)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state.to_dict(), indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    _write_state_file(session_state_path(jobs_dir), state)
 
 
 def load_job_wizard_state(job_dir: Path) -> WizardState | None:
-    path = job_state_path(job_dir)
-    if not path.is_file():
-        return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise WizardError("corrupt wizard_state.json")
-    return WizardState.from_dict(data)
+    return _read_state_file(job_state_path(job_dir), "wizard_state.json")
 
 
 def save_job_wizard_state(job_dir: Path, state: WizardState) -> None:
-    path = job_state_path(job_dir)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state.to_dict(), indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    _write_state_file(job_state_path(job_dir), state)
 
 
 def _active_knobs(job_dir: Path) -> tuple[int | None, float | None]:
@@ -267,7 +297,8 @@ class WizardController:
             state = self._state()
             state.error = str(exc) or type(exc).__name__
             if state.step is WizardStep.RENDERING:
-                state.step = WizardStep.RESULT
+                self._render_failed(state, str(exc) or type(exc).__name__)
+                return
             self._save(state)
 
     def _save(self, state: WizardState) -> None:
@@ -374,10 +405,46 @@ class WizardController:
         if path == "/pick":
             self._pick_file(state, fields.get("path", [""])[0])
             return
+        if path == "/new":
+            self.start_new_job()
+            return
         if path == "/result":
             self._result_post(state, fields)
             return
         raise WizardError(f"unknown action {path}")
+
+    def start_new_job(self) -> None:
+        """Leave the current job as it is on disk and go back to picking a file.
+
+        Setup is skipped when a Gemini key is already available.
+        """
+        step = WizardStep.PICK_FILE if resolve_gemini_api_key() else WizardStep.SETUP
+        self._save(WizardState(step=step))
+
+    def _render_failed(self, state: WizardState, detail: str) -> None:
+        """A render failed. Keep a previous result if there is one.
+
+        When a revise fails, the earlier ``output.mp4`` is still good, so the
+        user stays on the result screen with the error. When the first upscale
+        fails there is nothing to show; the job is marked failed and the user
+        goes back to the pick screen to fix the cause or choose another file.
+        """
+        assert state.job_id
+        job_id = state.job_id
+        job_dir = self.store.job_dir(job_id)
+        if (job_dir / "output.mp4").is_file():
+            state.error = detail
+            state.step = WizardStep.RESULT
+            self._save(state)
+            return
+        with contextlib.suppress(JobError):
+            self.store.transition(job_id, JobState.FAILED)
+        message = f"The upscale failed, so there is no result yet: {detail}"
+        save_job_wizard_state(
+            job_dir,
+            WizardState(step=WizardStep.PICK_FILE, job_id=job_id, error=message),
+        )
+        self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
 
     def _pick_file(self, state: WizardState, raw_path: str) -> None:
         source = Path(raw_path.strip()).expanduser()
@@ -491,6 +558,6 @@ class WizardController:
             state.error = None
             state.step = WizardStep.RESULT
         except (UpscaleError, ProbeError, OSError, ValueError) as exc:
-            state.error = str(exc)
-            state.step = WizardStep.RESULT
+            self._render_failed(state, str(exc))
+            return
         self._save(state)

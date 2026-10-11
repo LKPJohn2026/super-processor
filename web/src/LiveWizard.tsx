@@ -213,9 +213,16 @@ function WizardStepView({
             aria-label="Upscaled result"
           />
         ) : null}
-        <p className="muted">
-          Start another job with <code>super-processor review</code>.
-        </p>
+        <div className="actions">
+          <button
+            type="button"
+            className="secondary"
+            disabled={busy}
+            onClick={() => void onSend("new", {})}
+          >
+            Start a new video
+          </button>
+        </div>
       </>
     );
   }
@@ -428,6 +435,16 @@ function ResultStep({
           </button>
         </div>
       </form>
+      <div className="actions">
+        <button
+          type="button"
+          className="secondary"
+          disabled={busy}
+          onClick={() => void onSend("new", {})}
+        >
+          Start a new video
+        </button>
+      </div>
     </>
   );
 }

@@ -103,6 +103,7 @@ frame count is refused and the previous `output.mp4` is kept.
 | Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, or a note that retunes a time range |
 | Done | `GET /` (state `done`) | Confirmation |
+| New video | `POST /new` (`/api/new`) | From Done or Result: back to pick (or setup without a key); the old job stays on disk |
 
 ## State machine
 
@@ -113,7 +114,10 @@ intro → llm_choice ┬─ gemini → setup → pick_file → rendering → res
 ```
 
 Persisted in the job directory as `wizard_state.json` (step, job id, last
-error) and `gemini_chat.json`. A state saved on a step of the removed split /
+error) and `gemini_chat.json`. If the first upscale fails, the job is marked
+failed and the wizard returns to `pick_file` with the error; a failed revise
+stays on `result` with the previous output. "Start a new video" on Done or
+Result goes back to `pick_file`. A state saved on a step of the removed split /
 enhance flow (`analyzing`, `overview`, `choose_split`, `enhance`) loads as
 `pick_file` with a message asking for the file again.
 

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The wizard no longer traps the user after Done. Done and Result have a
+  "Start a new video" button (`POST /new`, `/api/new`) that keeps the old job
+  on disk and returns to the pick screen, or to setup when no Gemini key is
+  available. Before, `super-processor review` reopened the same Done page.
+- A first upscale that fails (no CUDA, missing FlashVSR weights, a bad file)
+  marks the job failed and returns to the pick screen with the error, instead
+  of showing a Result page with no video. A failed range revise still keeps
+  the previous `output.mp4` on the Result screen.
+
 ### Removed
 
 - The wizard's Gemini split / FFmpeg enhance flow: the analyze, overview,
