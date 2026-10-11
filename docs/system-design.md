@@ -33,12 +33,12 @@ Super Processor targets a different market:
 | Dimension | Generative video tools | Super Processor |
 |---|---|---|
 | Source | Synthesized frames | Existing footage |
-| Typical duration | Short clips | Long-form files up to roughly two hours |
-| AI role | Pixel generator | Diagnoser and constrained planner |
-| Processing | Usually hosted | Local FFmpeg execution |
-| Main risk | Invented content and temporal drift | Over-processing or poor encode choices |
-| Recovery | Regenerate | Adjust a visible recipe and re-preview |
-| Trust model | Inspect final pixels | Validate plan, preview, approve, and reproduce |
+| Typical duration | Short clips | Files up to 30 minutes at 1080p |
+| AI role | Pixel generator | Restoration upscaler plus a bounded revise planner |
+| Processing | Usually hosted | Local FlashVSR and FFmpeg |
+| Main risk | Invented content and temporal drift | Invented fine texture (bounded by strength) and flicker |
+| Recovery | Regenerate | Re-run a time range at a lower strength |
+| Trust model | Inspect final pixels | Same frames and timing as the source; each revise is stored as JSON |
 
 The closest alternatives are manual FFmpeg scripts, conventional nonlinear
 editors, and black-box enhancement applications. Super Processor aims to
@@ -241,5 +241,6 @@ Deferred:
 - multi-track nonlinear editing.
 
 Super Processor's market position follows directly from these choices: use AI
-to make deterministic video tools easier and safer, while refusing to invent
-the content being processed.
+to restore footage the camera already captured, never new scenes or frames,
+and give the user a direct control over how much fine detail the restorer
+adds.

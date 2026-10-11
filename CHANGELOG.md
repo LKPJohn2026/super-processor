@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marks the job failed and returns to the pick screen with the error, instead
   of showing a Result page with no video. A failed range revise still keeps
   the previous `output.mp4` on the Result screen.
+- Intro copy, the static shell tour, and the system design no longer claim
+  "no invented frames, faces, or scenes" or that FFmpeg applies the repairs.
+  They now say FlashVSR adds fine detail, strength sets how much, and every
+  frame and its timing are kept.
 
 ### Removed
 

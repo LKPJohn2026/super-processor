@@ -4,7 +4,7 @@ const TOUR = [
   {
     id: "intro",
     title: "Introduction",
-    body: "Super Processor enhances footage you already shot. It does not generate new frames, faces, or scenes.",
+    body: "Super Processor enhances footage you already shot. FlashVSR adds fine detail as it upscales, and strength sets how much (0 is a plain upscale). It keeps every frame and its timing and does not generate new scenes.",
   },
   {
     id: "llm",
