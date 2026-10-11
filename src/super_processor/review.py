@@ -380,6 +380,7 @@ _API_POSTS = {
     "/api/local-llm": "/local-llm",
     "/api/setup": "/setup",
     "/api/pick": "/pick",
+    "/api/new": "/new",
     "/api/result": "/result",
 }
 

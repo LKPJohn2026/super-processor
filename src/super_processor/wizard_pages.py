@@ -415,16 +415,21 @@ placeholder="e.g. reduce artificial detail from 00:30 to 00:40"></textarea>
 </label>
 <button type="submit">Revise this range</button>
 </form>
+{_NEW_JOB_FORM}
 """
     return _page("Result", body, phase="result")
 
 
+_NEW_JOB_FORM = """<form method="post" action="/new">
+<button type="submit" class="secondary">Start a new video</button>
+</form>"""
+
+
 def render_done() -> str:
-    body = """
+    body = f"""
 <h1>Done</h1>
 <p class="lede">Your enhanced file is ready in the job directory as
 <code>output.mp4</code>.</p>
-<p class="muted">You can close this tab or start another job with
-<code>super-processor review</code>.</p>
+{_NEW_JOB_FORM}
 """
     return _page("Done", body, phase="result")

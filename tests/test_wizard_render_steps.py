@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
+import pytest
+
+from super_processor.jobs import JobState
 from super_processor.review import WizardServer
+from super_processor.upscale import UpscaleError
 from super_processor.wizard import (
     WizardController,
     WizardState,
@@ -99,5 +105,93 @@ def test_wizard_server_serves_output_only(tmp_path: Path) -> None:
                 exc.close()
             else:
                 raise AssertionError(f"{retired} should be gone")
+    finally:
+        server.stop()
+
+
+class _BrokenEngine:
+    def upscale(self, request: object) -> Path:
+        raise UpscaleError("FlashVSR needs an NVIDIA GPU with CUDA")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
+    clip = tmp_path / "real.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:size=160x90:rate=10:duration=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(clip),
+        ],
+        check=True,
+    )
+    controller = WizardController(tmp_path / "jobs", upscale_engine=_BrokenEngine())
+    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
+    controller.handle_post("/pick", {"path": [str(clip)]})
+    job_id = controller.current_state().job_id
+    assert job_id is not None
+    controller.run_render()
+    state = controller.current_state()
+    assert state.step is WizardStep.PICK_FILE
+    assert state.job_id is None
+    assert state.error is not None
+    assert "no result yet" in state.error and "CUDA" in state.error
+    assert controller.store.load(job_id).state is JobState.FAILED
+    page = controller.render()
+    assert "Pick" in page and "CUDA" in page
+    # Picking again starts a fresh job.
+    controller.handle_post("/pick", {"path": [str(clip)]})
+    assert controller.current_state().job_id not in {None, job_id}
+
+
+def test_start_new_job_from_done_and_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, job_id, job_dir = _seed_job(tmp_path)
+    (job_dir / "output.mp4").write_bytes(b"result")
+    for step in (WizardStep.DONE, WizardStep.RESULT):
+        state = WizardState(step=step, job_id=job_id)
+        save_job_wizard_state(job_dir, state)
+        save_session_state(tmp_path, state)
+        assert 'action="/new"' in controller.render()
+        monkeypatch.setattr(
+            "super_processor.wizard.resolve_gemini_api_key", lambda: "key"
+        )
+        controller.handle_post("/new", {})
+        fresh = controller.current_state()
+        assert fresh.step is WizardStep.PICK_FILE
+        assert fresh.job_id is None
+        assert (job_dir / "output.mp4").read_bytes() == b"result"
+    monkeypatch.setattr("super_processor.wizard.resolve_gemini_api_key", lambda: None)
+    controller.handle_post("/new", {})
+    assert controller.current_state().step is WizardStep.SETUP
+
+
+def test_start_new_job_over_the_api(tmp_path: Path) -> None:
+    controller, job_id, job_dir = _seed_job(tmp_path)
+    save_session_state(tmp_path, WizardState(step=WizardStep.DONE, job_id=job_id))
+    server = WizardServer(tmp_path, controller=controller)
+    base = server.start()
+    try:
+        request = Request(
+            base + "/api/new",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request) as response:
+            view = json.loads(response.read().decode())
+        assert view["step"] in {"pick_file", "setup"}
+        assert view["job_id"] is None
     finally:
         server.stop()

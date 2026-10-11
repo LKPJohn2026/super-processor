@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from collections.abc import Callable
@@ -267,7 +268,8 @@ class WizardController:
             state = self._state()
             state.error = str(exc) or type(exc).__name__
             if state.step is WizardStep.RENDERING:
-                state.step = WizardStep.RESULT
+                self._render_failed(state, str(exc) or type(exc).__name__)
+                return
             self._save(state)
 
     def _save(self, state: WizardState) -> None:
@@ -374,10 +376,46 @@ class WizardController:
         if path == "/pick":
             self._pick_file(state, fields.get("path", [""])[0])
             return
+        if path == "/new":
+            self.start_new_job()
+            return
         if path == "/result":
             self._result_post(state, fields)
             return
         raise WizardError(f"unknown action {path}")
+
+    def start_new_job(self) -> None:
+        """Leave the current job as it is on disk and go back to picking a file.
+
+        Setup is skipped when a Gemini key is already available.
+        """
+        step = WizardStep.PICK_FILE if resolve_gemini_api_key() else WizardStep.SETUP
+        self._save(WizardState(step=step))
+
+    def _render_failed(self, state: WizardState, detail: str) -> None:
+        """A render failed. Keep a previous result if there is one.
+
+        When a revise fails, the earlier ``output.mp4`` is still good, so the
+        user stays on the result screen with the error. When the first upscale
+        fails there is nothing to show; the job is marked failed and the user
+        goes back to the pick screen to fix the cause or choose another file.
+        """
+        assert state.job_id
+        job_id = state.job_id
+        job_dir = self.store.job_dir(job_id)
+        if (job_dir / "output.mp4").is_file():
+            state.error = detail
+            state.step = WizardStep.RESULT
+            self._save(state)
+            return
+        with contextlib.suppress(JobError):
+            self.store.transition(job_id, JobState.FAILED)
+        message = f"The upscale failed, so there is no result yet: {detail}"
+        save_job_wizard_state(
+            job_dir,
+            WizardState(step=WizardStep.PICK_FILE, job_id=job_id, error=message),
+        )
+        self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
 
     def _pick_file(self, state: WizardState, raw_path: str) -> None:
         source = Path(raw_path.strip()).expanduser()
@@ -491,6 +529,6 @@ class WizardController:
             state.error = None
             state.step = WizardStep.RESULT
         except (UpscaleError, ProbeError, OSError, ValueError) as exc:
-            state.error = str(exc)
-            state.step = WizardStep.RESULT
+            self._render_failed(state, str(exc))
+            return
         self._save(state)

@@ -174,20 +174,37 @@ def test_one_render_at_a_time(tmp_path: Path) -> None:
     assert controller.start_render() is False
 
 
-def test_worker_error_lands_on_the_result_step(tmp_path: Path) -> None:
+def _boom() -> None:
+    raise RuntimeError("gpu fell over")
+
+
+def test_worker_error_without_output_goes_back_to_pick(tmp_path: Path) -> None:
     controller = WizardController(tmp_path)
     (tmp_path / "job00001").mkdir()
     save_session_state(
         tmp_path, WizardState(step=WizardStep.RENDERING, job_id="job00001")
     )
+    controller._run_render = _boom  # type: ignore[method-assign]
+    assert controller.start_render() is True
+    assert controller.wait_idle(timeout=5)
+    state = controller.current_state()
+    assert state.step is WizardStep.PICK_FILE
+    assert state.job_id is None
+    assert state.error is not None and "gpu fell over" in state.error
+    assert not controller.busy()
 
-    def _boom() -> None:
-        raise RuntimeError("gpu fell over")
 
+def test_worker_error_with_output_stays_on_result(tmp_path: Path) -> None:
+    controller = WizardController(tmp_path)
+    (tmp_path / "job00001").mkdir()
+    (tmp_path / "job00001" / "output.mp4").write_bytes(b"earlier result")
+    save_session_state(
+        tmp_path, WizardState(step=WizardStep.RENDERING, job_id="job00001")
+    )
     controller._run_render = _boom  # type: ignore[method-assign]
     assert controller.start_render() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
     assert state.step is WizardStep.RESULT
+    assert state.job_id == "job00001"
     assert state.error == "gpu fell over"
-    assert not controller.busy()
