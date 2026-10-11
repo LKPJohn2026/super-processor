@@ -424,7 +424,12 @@ def _join_with_neighbour(
 
 
 def extract_still(
-    source: Path, at_s: float, dest: Path, *, ffmpeg_bin: str = "ffmpeg"
+    source: Path,
+    at_s: float,
+    dest: Path,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    width: int = STILL_WIDTH,
 ) -> Path:
     """Save one frame near ``at_s`` as a small JPEG."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -442,7 +447,7 @@ def extract_still(
             "-frames:v",
             "1",
             "-vf",
-            f"scale={STILL_WIDTH}:-2",
+            f"scale={width}:-2",
             "-q:v",
             "4",
             str(dest),

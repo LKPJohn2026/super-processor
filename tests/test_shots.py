@@ -263,6 +263,19 @@ class _Labels:
             for i in range(len(kwargs["shots"]))
         ]
 
+    def propose_looks(self, **kwargs: Any) -> dict[str, Any]:
+        # The same settings for every shot.
+        return {
+            "scale": 2,
+            "shots": [
+                {"index": shot["index"], "strength": 0.5, "look": {}, "reason": "ok"}
+                for shot in kwargs["shots"]
+            ],
+        }
+
+    def check_previews(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return [{"index": shot["index"], "ok": True} for shot in kwargs["shots"]]
+
 
 class _CountingEngine(FakeUpscaleEngine):
     def __init__(self) -> None:
@@ -313,7 +326,13 @@ def test_wizard_review_actions_then_render(tmp_path: Path) -> None:
         assert state.step is WizardStep.SHOTS
         assert state.error
     controller.handle_post("/shots", {"action": ["approve"]})
+    assert controller.current_state().step is WizardStep.PLANNING
+    controller.run_plan()
+    assert controller.current_state().step is WizardStep.LOOKS
+    assert engine.calls == 3  # one preview per shot
+    controller.handle_post("/looks", {"action": ["approve"]})
     assert controller.current_state().step is WizardStep.RENDERING
+    engine.calls = 0
     plan = load_upscale_plan(job_dir)
     assert plan is not None
     assert [(s.start_s, s.end_s) for s in plan.spans] == [

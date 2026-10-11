@@ -4,7 +4,8 @@ Super Processor is a local-first video processor. A localhost wizard finds
 and measures the shots in footage you already shot, has Gemini label them for
 you to approve, runs a local FlashVSR restoration upscale, then lets you revise
 a time range with a plain-language note. Gemini only labels shots from fixed
-lists and turns a note into a bounded range, scale, and strength; FFmpeg
+lists, picks bounded per-shot settings, checks previews, and turns a note
+into a bounded range, scale, and strength; FFmpeg
 detects, measures, trims, splices, encodes, and copies audio. No model writes
 shell commands. The CLI keeps the older
 FFmpeg-filter grade paths for automation.
@@ -54,8 +55,10 @@ operation inspectable.
 The wizard picture path is a local GPU restoration upscale (FlashVSR). FFmpeg
 probes, trims a cited time range, splices that range back, and copies audio.
 Before the first render, FFmpeg splits the clip into shots and measures each
-one, Gemini labels them, and the editor approves the list (see
-`docs/ui-wizard.md`, Shots). Gemini only turns a result note into `start_s`,
+one, Gemini labels them, and the editor approves the list. Gemini then
+proposes each shot's settings, short previews render, Gemini checks them for
+restoration mistakes, and the editor approves the settings or sends one shot
+back with a note (see `docs/ui-wizard.md`, Shots and Looks). Gemini only turns a result note into `start_s`,
 `end_s`, `scale` (2 or 4), and `strength` (0–1). Re-runs read the original source for that range so detail
 does not stack.
 

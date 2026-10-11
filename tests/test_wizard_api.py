@@ -191,6 +191,28 @@ def test_json_api_drives_upscale_flow(
         _status, approved, _origin = _json_request(
             base, "POST", "/api/shots", {"action": "approve"}
         )
+        assert approved["step"] == "planning"
+        _json_request(base, "GET", "/api/plan?run=1")
+        assert controller.wait_idle(timeout=60)
+        _status, looks, _origin = _json_request(base, "GET", "/api/state")
+        assert looks["step"] == "looks"
+        shot = looks["looks"]["shots"][0]
+        assert looks["looks"]["scale"] == 2
+        # This transport cannot plan either, so the measurements set the look.
+        assert "could not propose" in looks["looks"]["error"]
+        assert shot["check"]["ok"] is None
+        with urlopen(base + shot["after_url"]) as response:
+            assert response.headers.get_content_type() == "video/mp4"
+        with urlopen(base + shot["before_url"]) as response:
+            assert response.headers.get_content_type() == "video/mp4"
+        for bad in ("/previews/work/shot_000_in.mp4", "/previews/p.mp4"):
+            with pytest.raises(HTTPError) as missing:
+                urlopen(base + bad)
+            assert missing.value.code == 404
+            missing.value.close()
+        _status, approved, _origin = _json_request(
+            base, "POST", "/api/looks", {"action": "approve"}
+        )
         assert approved["step"] == "rendering"
         _status, started, _origin = _json_request(base, "GET", "/api/render?run=1")
         assert started["step"] == "rendering"

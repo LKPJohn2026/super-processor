@@ -14,7 +14,7 @@ import pytest
 from super_processor.gemini import GeminiError
 from super_processor.jobs import JobState
 from super_processor.review import WizardServer
-from super_processor.upscale import UpscaleError
+from super_processor.upscale import FakeUpscaleEngine, UpscaleError
 from super_processor.wizard import (
     WizardController,
     WizardState,
@@ -45,6 +45,8 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
         (WizardStep.PICK_FILE, "Pick"),
         (WizardStep.FINDING_SHOTS, "Finding the shots"),
         (WizardStep.SHOTS, "Approve shots"),
+        (WizardStep.PLANNING, "Planning each shot"),
+        (WizardStep.LOOKS, "Approve all and render"),
         (WizardStep.RENDERING, "Upscaling"),
         (WizardStep.RESULT, "Result"),
         (WizardStep.DONE, "Done"),
@@ -117,12 +119,20 @@ class _BrokenEngine:
         raise UpscaleError("FlashVSR needs an NVIDIA GPU with CUDA")
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-class _NoLabels:
+class _NoGemini:
+    """Every Gemini call fails, so each loop falls back to the measurements."""
+
     def label_shots(self, **_kwargs: object) -> list[dict[str, object]]:
         raise GeminiError("no key in tests")
 
+    def propose_looks(self, **_kwargs: object) -> dict[str, object]:
+        raise GeminiError("no key in tests")
 
+    def check_previews(self, **_kwargs: object) -> list[dict[str, object]]:
+        raise GeminiError("no key in tests")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
     clip = tmp_path / "real.mp4"
     subprocess.run(
@@ -145,7 +155,7 @@ def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
     )
     controller = WizardController(
         tmp_path / "jobs",
-        gemini=_NoLabels(),  # type: ignore[arg-type]
+        gemini=_NoGemini(),  # type: ignore[arg-type]
         upscale_engine=_BrokenEngine(),
     )
     save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
@@ -156,6 +166,22 @@ def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
     controller.run_scan()
     assert controller.current_state().step is WizardStep.SHOTS
     controller.handle_post("/shots", {"action": ["approve"]})
+    assert controller.current_state().step is WizardStep.PLANNING
+    # Without a GPU the previews fail, and the editor is back on the shots.
+    controller.run_plan()
+    state = controller.current_state()
+    assert state.step is WizardStep.SHOTS
+    assert state.error is not None and "previews failed" in state.error
+    assert "CUDA" in controller.render()
+    # With previews working, approve the looks; then the full render fails.
+    controller._upscale = FakeUpscaleEngine()
+    controller.handle_post("/shots", {"action": ["approve"]})
+    controller.run_plan()
+    assert controller.current_state().step is WizardStep.LOOKS
+    assert "could not propose" in controller.render()
+    controller.handle_post("/looks", {"action": ["approve"]})
+    assert controller.current_state().step is WizardStep.RENDERING
+    controller._upscale = _BrokenEngine()
     controller.run_render()
     state = controller.current_state()
     assert state.step is WizardStep.PICK_FILE

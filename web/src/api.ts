@@ -6,6 +6,8 @@ export type WizardStep =
   | "pick_file"
   | "finding_shots"
   | "shots"
+  | "planning"
+  | "looks"
   | "rendering"
   | "result"
   | "done";
@@ -17,6 +19,38 @@ export type Shot = {
   issues: string[];
   contains: string[];
   still: string;
+};
+
+export type ShotLook = Record<
+  "deblock" | "denoise" | "contrast" | "brightness" | "saturation" | "gamma" | "grain",
+  number
+>;
+
+export type ShotCheck = {
+  ok: boolean | null;
+  problems: string[];
+  note: string;
+  adjusted?: boolean;
+};
+
+export type LookShot = {
+  index: number;
+  start_s: number;
+  end_s: number;
+  label: string;
+  contains: string[];
+  strength: number;
+  look: ShotLook;
+  reason: string;
+  check: ShotCheck;
+  before_url: string | null;
+  after_url: string | null;
+};
+
+export type Looks = {
+  scale: number | null;
+  error: string | null;
+  shots: LookShot[];
 };
 
 export type WizardView = {
@@ -31,6 +65,7 @@ export type WizardView = {
   strength: number | null;
   shots?: Shot[] | null;
   label_error?: string | null;
+  looks?: Looks | null;
 };
 
 const STEPS: readonly string[] = [
@@ -41,6 +76,8 @@ const STEPS: readonly string[] = [
   "pick_file",
   "finding_shots",
   "shots",
+  "planning",
+  "looks",
   "rendering",
   "result",
   "done",
@@ -123,7 +160,7 @@ function sleep(ms: number): Promise<void> {
 
 async function runUntilDone(
   origin: string,
-  route: "render" | "scan",
+  route: "render" | "scan" | "plan",
   step: WizardView["step"],
 ): Promise<WizardView> {
   // The server starts the long pass on a worker thread and answers at once.
@@ -146,7 +183,7 @@ async function runUntilDone(
 
 function once(
   origin: string,
-  route: "render" | "scan",
+  route: "render" | "scan" | "plan",
   step: WizardView["step"],
 ): Promise<WizardView> {
   const running = inFlight.get(route);
@@ -164,6 +201,10 @@ export function runRender(origin: string): Promise<WizardView> {
 
 export function runScan(origin: string): Promise<WizardView> {
   return once(origin, "scan", "finding_shots");
+}
+
+export function runPlan(origin: string): Promise<WizardView> {
+  return once(origin, "plan", "planning");
 }
 
 export function outputSrc(origin: string, outputUrl: string | null): string | null {

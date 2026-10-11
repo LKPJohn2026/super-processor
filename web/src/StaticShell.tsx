@@ -27,6 +27,11 @@ const TOUR = [
     body: "FFmpeg finds where each shot starts and measures how blocky, noisy, soft, dark, or flat it is. Gemini labels each shot from one still. You merge or split shots, then approve the list.",
   },
   {
+    id: "looks",
+    title: "Looks",
+    body: "Gemini picks clean-up, strength, and finishing for each shot. Each shot gets a short before/after preview, which Gemini checks for wrong faces, hands, text, and fake texture. Approve them all, or tell it what to change in one shot.",
+  },
+  {
     id: "upscale",
     title: "Upscaling",
     body: "FlashVSR restores and upscales on the local GPU. FFmpeg only trims, splices, and copies audio. A long clip is processed in overlapping pieces so it can fit in GPU memory.",

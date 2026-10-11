@@ -5,7 +5,7 @@ from __future__ import annotations
 from html import escape
 
 # Phase keys for the step rail (setup → result).
-_PHASE_ORDER = ("setup", "file", "shots", "upscale", "result")
+_PHASE_ORDER = ("setup", "file", "shots", "looks", "upscale", "result")
 
 
 def _step_rail(active: str | None) -> str:
@@ -13,6 +13,7 @@ def _step_rail(active: str | None) -> str:
         "setup": "Setup",
         "file": "File",
         "shots": "Shots",
+        "looks": "Looks",
         "upscale": "Upscale",
         "result": "Result",
     }
@@ -248,6 +249,15 @@ img, video {{
 .shot form {{ display: inline; }}
 .shot input[type=text] {{ width: 6rem; margin: 0 0.3rem 0 0; }}
 .tags {{ margin: 0.2rem 0; font-size: 0.9rem; }}
+.pair {{
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}}
+.pair figure {{ margin: 0; }}
+.pair video {{ margin: 0.2rem 0 0; width: 100%; }}
+.pair figcaption {{ font-size: 0.8rem; color: var(--muted); }}
+.check-ok {{ color: var(--leaf); }}
 .seg-progress {{
   font-size: 0.85rem;
   letter-spacing: 0.06em;
@@ -258,6 +268,7 @@ img, video {{
 @media (max-width: 520px) {{
   .shell {{ padding: 0.85rem 0.75rem 2.5rem; }}
   .shot {{ grid-template-columns: 1fr; }}
+  .pair {{ grid-template-columns: 1fr; }}
   .panel {{ padding: 1.35rem 1rem 1.6rem; }}
 }}
 </style>
@@ -468,6 +479,130 @@ approve the list.</p>
 </form>
 """
     return _page("Shots", body, phase="shots")
+
+
+def render_planning() -> str:
+    body = """
+<h1>Planning each shot</h1>
+<p class="lede">Gemini is choosing clean-up, strength, and finishing for each
+shot. Each shot then gets a short before/after preview on the local GPU, and
+Gemini checks the previews for faces, hands, text, and texture that went
+wrong.</p>
+<p class="muted">Previews are a few seconds per shot. The page will
+refresh.</p>
+<meta http-equiv="refresh" content="3;url=/looks?run=1">
+"""
+    return _page("Planning", body, phase="looks")
+
+
+def settings_summary(strength: float, look: dict[str, float]) -> str:
+    """``strength 0.45 · deblock 0.30 · contrast 1.05``: only changed values."""
+    neutral = {
+        "deblock": 0.0,
+        "denoise": 0.0,
+        "contrast": 1.0,
+        "brightness": 0.0,
+        "saturation": 1.0,
+        "gamma": 1.0,
+        "grain": 0.0,
+    }
+    parts = [f"strength {strength:.2f}"]
+    for name, rest in neutral.items():
+        value = float(look.get(name, rest))
+        if abs(value - rest) > 1e-6:
+            parts.append(f"{name} {value:.2f}")
+    return " · ".join(parts)
+
+
+def check_summary(check: dict[str, object]) -> str:
+    ok = check.get("ok")
+    note = str(check.get("note") or "").strip()
+    if note and note[-1] not in ".!?":
+        note += "."
+    if ok is None:
+        return "Not checked."
+    if ok:
+        return "Check passed." + (f" {note}" if note else "")
+    problems = ", ".join(
+        str(item).replace("_", " ") for item in _items(check, "problems")
+    )
+    text = "Check found: " + (problems or "a problem") + "."
+    text += f" {note}" if note else ""
+    if check.get("adjusted"):
+        text += " Settings were adjusted and the preview redone."
+    return text
+
+
+def render_looks(view: dict[str, object], *, error: str | None = None) -> str:
+    err = f'<p class="error">{escape(error)}</p>' if error else ""
+    warn = view.get("error")
+    warning = f'<p class="muted">{escape(str(warn))}</p>' if warn else ""
+    scale = view.get("scale")
+    cards: list[str] = []
+    for shot in _items(view, "shots"):
+        if not isinstance(shot, dict):
+            continue
+        index = int(shot.get("index", 0))
+        start = float(shot.get("start_s", 0))
+        end = float(shot.get("end_s", 0))
+        label = escape(str(shot.get("label") or "Unlabelled shot"))
+        raw_look = shot.get("look")
+        look = raw_look if isinstance(raw_look, dict) else {}
+        summary = settings_summary(float(shot.get("strength", 0.5)), look)
+        raw_check = shot.get("check")
+        check = raw_check if isinstance(raw_check, dict) else {}
+        videos = ""
+        if shot.get("after_url"):
+            before = str(shot.get("before_url"))
+            after = str(shot.get("after_url"))
+            videos = f"""<div class="pair">
+<figure><figcaption>Before</figcaption>
+<video controls muted loop preload="metadata" src="{escape(before)}"
+poster="{escape(_poster(before))}"></video></figure>
+<figure><figcaption>After</figcaption>
+<video controls muted loop preload="metadata" src="{escape(after)}"
+poster="{escape(_poster(after))}"></video></figure>
+</div>"""
+        cards.append(
+            f"""<div class="card">
+<h2>{index + 1}. {format_time(start)}–{format_time(end)} · {label}</h2>
+{videos}
+<p class="tags"><strong>{escape(summary)}</strong></p>
+<p class="tags">{escape(str(shot.get("reason") or ""))}</p>
+<p class="tags muted">{escape(check_summary(check))}</p>
+<form method="post" action="/looks">
+<input type="hidden" name="action" value="redo">
+<input type="hidden" name="index" value="{index}">
+<label>Not right? Tell me what to change in this shot
+<input type="text" name="note" placeholder="e.g. skin looks waxy, keep it softer">
+</label>
+<button type="submit" class="secondary">Redo this shot</button>
+</form>
+</div>"""
+        )
+    scale_line = (
+        f'<p class="muted">The whole video is upscaled {scale}×.</p>' if scale else ""
+    )
+    body = f"""
+<h1>Looks</h1>
+<p class="lede">Each shot has its own settings and a short before/after
+preview. Approve them all to render the whole video, or tell me what to change
+in one shot.</p>
+{scale_line}
+{err}
+{warning}
+{"".join(cards)}
+<form method="post" action="/looks">
+<input type="hidden" name="action" value="approve">
+<button type="submit" class="full">Approve all and render</button>
+</form>
+"""
+    return _page("Looks", body, phase="looks")
+
+
+def _poster(video_url: str) -> str:
+    """Each preview has a still of the same name, saved for the check."""
+    return video_url.removesuffix(".mp4") + ".jpg"
 
 
 def _items(shot: dict[str, object], key: str) -> list[object]:
