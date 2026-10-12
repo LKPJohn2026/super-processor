@@ -1,10 +1,16 @@
 """Gemini structured-output client for the localhost wizard.
 
-Uses the Generative Language REST API with ``responseMimeType`` /
-``responseSchema`` so replies stay parseable. The wizard asks Gemini to label
-the shots FFmpeg found (from one still each plus the measurements), and to
-turn a result note into a time range, scale, and strength for the FlashVSR
-upscale. Transport is injectable for tests.
+Uses the legacy Generative Language ``models.generateContent`` REST API
+(``v1beta``), not the Interactions API. That API is stateless: every call
+names its model in the URL and must resend ``systemInstruction``,
+``generationConfig``, and the full ``contents`` history. There is no
+``previous_interaction_id``. Switching models repeats that same body against
+the next model. ``responseMimeType`` / ``responseSchema`` keep replies
+parseable.
+
+The wizard asks Gemini to label the shots FFmpeg found, plan and check
+per-shot looks, and turn a result note into a time range, scale, and
+strength. Transport is injectable for tests.
 """
 
 from __future__ import annotations
@@ -467,6 +473,29 @@ def append_chat_turn(job_dir: Path, turn: ChatTurn) -> list[ChatTurn]:
     return turns
 
 
+def contents_from_chat(turns: list[ChatTurn]) -> list[dict[str, Any]]:
+    """Turn stored chat into ``generateContent`` ``contents``.
+
+    Roles alternate ``user`` and ``model``. Consecutive same-role turns are
+    joined so a replay stays valid. Stills are not replayed; they belong on
+    the new user turn. Thought signatures are not stored: these calls are
+    structured JSON, not function calls, and the legacy API only requires
+    signatures when a later turn continues a tool call.
+    """
+    contents: list[dict[str, Any]] = []
+    for turn in turns:
+        role = "model" if turn.role == "model" else "user"
+        text = turn.text.strip()
+        if not text:
+            continue
+        if contents and contents[-1]["role"] == role:
+            previous = contents[-1]["parts"][0]["text"]
+            contents[-1]["parts"][0]["text"] = f"{previous}\n{text}"
+            continue
+        contents.append({"role": role, "parts": [{"text": text}]})
+    return contents
+
+
 def _extract_text(response: dict[str, Any]) -> str:
     try:
         candidates = response["candidates"]
@@ -689,7 +718,12 @@ class GeminiClient:
         return list(ordered)
 
     def _generate_with_failover(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Try candidate models, retrying transient 503s before moving on."""
+        """Try candidate models, retrying transient 503s before moving on.
+
+        Each attempt is a new ``generateContent`` call. The model name is only
+        in the URL. ``body`` already holds the system instruction, schema, and
+        the full conversation, so a fallback model sees the same context.
+        """
         errors: list[str] = []
         for model in self.candidate_models():
             last_exc: GeminiError | None = None
@@ -763,10 +797,13 @@ class GeminiClient:
         contents: list[dict[str, Any]],
         schema: dict[str, Any],
         system: str,
+        prior: list[ChatTurn] | None = None,
     ) -> dict[str, Any]:
+        # systemInstruction is request-scoped on generateContent. Resend it
+        # with the replayed history; do not put it in contents.
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
-            "contents": contents,
+            "contents": [*contents_from_chat(prior or []), *contents],
             "generationConfig": {
                 "temperature": 0.2,
                 "responseMimeType": "application/json",
@@ -817,6 +854,7 @@ class GeminiClient:
                 "You label shots for a video restoration tool. You never "
                 "suggest commands or settings. Return JSON matching the schema."
             ),
+            prior=load_chat(job_dir) if job_dir is not None else None,
         )
         labels = reply.get("shots")
         if not isinstance(labels, list):
@@ -885,6 +923,7 @@ class GeminiClient:
                 "You choose bounded numbers for a fixed video pipeline. You "
                 "never write commands. Return JSON matching the schema."
             ),
+            prior=load_chat(job_dir) if job_dir is not None else None,
         )
         if not isinstance(reply.get("shots"), list):
             raise GeminiError("Gemini returned no shot recipes")
@@ -928,6 +967,7 @@ class GeminiClient:
                 "You locate faces, hands, and text in video stills. Return "
                 "JSON matching the schema."
             ),
+            prior=load_chat(job_dir) if job_dir is not None else None,
         )
         found = reply.get("shots")
         if not isinstance(found, list):
@@ -977,6 +1017,7 @@ class GeminiClient:
                 "You check restoration previews for visible mistakes. Return "
                 "JSON matching the schema."
             ),
+            prior=load_chat(job_dir) if job_dir is not None else None,
         )
         verdicts = reply.get("shots")
         if not isinstance(verdicts, list):
@@ -1022,6 +1063,7 @@ class GeminiClient:
                 "You only retune restoration upscale parameters. "
                 "Return JSON matching the schema."
             ),
+            prior=load_chat(job_dir) if job_dir is not None else None,
         )
         if job_dir is not None:
             append_chat_turn(job_dir, ChatTurn(role="user", text=prompt))

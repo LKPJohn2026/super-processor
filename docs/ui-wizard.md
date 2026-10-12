@@ -270,6 +270,12 @@ A scale change re-renders the whole clip (see Range revise above).
 
 ## Multi-turn chat
 
+Calls use `models.generateContent`, not the Interactions API. The server
+does not keep the thread. Each request resends `systemInstruction`,
+`generationConfig`, and every stored turn as `contents` (`user` then
+`model`). A model switch repeats that same body against the next model
+name in the URL.
+
 `gemini_chat.json` stores ordered turns:
 
 ```json

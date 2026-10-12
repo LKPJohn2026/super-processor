@@ -14,6 +14,7 @@ from super_processor.gemini import (
     GeminiError,
     ModelInfo,
     append_chat_turn,
+    contents_from_chat,
     load_chat,
     model_accepts_text_or_video,
     model_has_usable_rpm,
@@ -34,6 +35,20 @@ def test_chat_round_trip(tmp_path: Path) -> None:
     assert loaded[1].structured == {"ok": True}
     append_chat_turn(tmp_path, ChatTurn(role="user", text="more"))
     assert len(load_chat(tmp_path)) == 3
+
+
+def test_contents_from_chat_alternates_roles() -> None:
+    contents = contents_from_chat(
+        [
+            ChatTurn(role="user", text="first"),
+            ChatTurn(role="user", text="still first"),
+            ChatTurn(role="model", text='{"ok": true}'),
+            ChatTurn(role="user", text="  "),
+        ]
+    )
+    assert [item["role"] for item in contents] == ["user", "model"]
+    assert contents[0]["parts"][0]["text"] == "first\nstill first"
+    assert contents[1]["parts"][0]["text"] == '{"ok": true}'
 
 
 class _FakeTransport:
@@ -307,6 +322,44 @@ def _revise(client: GeminiClient, job_dir: Path) -> dict[str, Any]:
         duration_s=20.0,
         job_dir=job_dir,
     )
+
+
+def test_revise_resends_history_to_each_model(tmp_path: Path) -> None:
+    save_chat(
+        tmp_path,
+        [
+            ChatTurn(role="user", text="label the opening shot"),
+            ChatTurn(role="model", text='{"shots": []}'),
+        ],
+    )
+    bodies: list[dict[str, Any]] = []
+    transport = _FailoverTransport(_UPSCALE_REPLY, fail_models={"gemini-gone"})
+
+    def generate(
+        *,
+        model: str,
+        api_key: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        bodies.append({"model": model, **body})
+        return _FailoverTransport.generate(
+            transport, model=model, api_key=api_key, body=body
+        )
+
+    transport.generate = generate  # type: ignore[method-assign]
+    client = GeminiClient(api_key="k", model="gemini-gone", transport=transport)
+    _revise(client, tmp_path)
+    assert len(bodies) >= 2
+    for body in bodies:
+        roles = [item["role"] for item in body["contents"]]
+        assert roles[:2] == ["user", "model"]
+        assert roles[-1] == "user"
+        assert body["contents"][0]["parts"][0]["text"] == "label the opening shot"
+        assert "less artificial detail" in body["contents"][-1]["parts"][0]["text"]
+        assert "systemInstruction" in body
+        assert "previous_interaction_id" not in body
+        assert "generationConfig" in body
+    assert bodies[0]["model"] != bodies[-1]["model"]
 
 
 def test_client_retries_transient_503(

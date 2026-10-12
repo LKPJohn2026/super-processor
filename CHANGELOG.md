@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Gemini stays on the legacy `generateContent` API. Each call resends the
+  stored chat as `contents`, and a model switch repeats that full request
+  against the next model. The Interactions API is not used.
+
 - The strength blend now takes shapes, colour, and layout from the plain
   upscale of the source and only fine detail (below a 1.5 source-pixel
   Gaussian) from FlashVSR. FlashVSR can sharpen what is there but can no
