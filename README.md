@@ -5,17 +5,22 @@
 Local-first AI video restoration: FlashVSR upscaling, with a strength
 control for how much new detail it adds.
 
-Super Processor enhances existing footage. A localhost wizard runs a local
-FlashVSR restoration upscale, then lets you revise a time range with a note;
-Gemini structured output only turns that note into a range, scale, and
-strength. FFmpeg trims, splices, and encodes from engineering-owned argument
-lists. Models never write shell commands.
+Super Processor enhances existing footage. A localhost wizard splits the video
+into shots and measures what is wrong with each, has Gemini propose bounded
+settings per shot with short before/after previews, runs a local FlashVSR
+restoration upscale, then lets you revise a time range with a note. Gemini
+structured output only labels, picks numbers inside fixed bounds, and checks
+previews. FFmpeg detects, measures, trims, splices, and encodes from
+engineering-owned argument lists. Models never write shell commands.
 
 ## Requirements
 
 - Python 3.10 or newer and a C compiler (Cython extension)
-- FFmpeg with `libx265` (and optionally `libvmaf` for offline regression)
+- FFmpeg 6 or newer with `libx265` (and optionally `libvmaf` for offline
+  regression). The shot step uses `scdet`, `blockdetect`, and `blurdetect`.
 - A Gemini API key from [Google AI Studio](https://aistudio.google.com/) for the wizard
+- For the upscale itself: an NVIDIA GPU with CUDA, PyTorch, and a FlashVSR
+  v1.1 checkout with its weights (see [GPU setup](#gpu-setup))
 
 ## Quick start
 
@@ -30,8 +35,80 @@ super-processor review
 ```
 
 The wizard walks through Gemini setup, file pick (up to 1080p and 30 minutes),
-a FlashVSR upscale on an NVIDIA GPU, and a result screen where a note re-runs
-one time range.
+shot review, per-shot looks with before/after previews, a FlashVSR upscale on
+an NVIDIA GPU, and a result screen where a note re-runs one time range.
+
+Without a GPU, the wizard works up to the Shots screen (shot detection,
+measurements, and Gemini labels). The Looks previews and the upscale need
+FlashVSR on CUDA.
+
+## GPU setup
+
+Install the GPU extra:
+
+```bash
+python -m pip install -e ".[dev,gpu]"
+```
+
+Clone FlashVSR where the wizard looks for it (`.dogfood/models/FlashVSR`
+under the folder you run from, or set `FLASHVSR_HOME` to another checkout;
+`SUPER_PROCESSOR_MODELS` moves the whole models folder):
+
+```bash
+git clone https://github.com/OpenImagingLab/FlashVSR .dogfood/models/FlashVSR
+```
+
+Download the `JunhaoZhuang/FlashVSR-v1.1` weights into
+`.dogfood/models/FlashVSR/examples/WanVSR/FlashVSR-v1.1/`. The wizard needs
+these three files there:
+
+- `diffusion_pytorch_model_streaming_dmd.safetensors`
+- `LQ_proj_in.ckpt`
+- `TCDecoder.ckpt`
+
+Install FlashVSR's own dependencies as its README describes. Then check each
+piece:
+
+```bash
+python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+python -c "from super_processor.upscale import resolve_flashvsr_weights as r; print(r())"
+ffmpeg -hide_banner -filters | grep -E ' (scdet|blockdetect|blurdetect) '
+```
+
+The first should print `CUDA: True`, the second the weights folder (it raises
+with the missing file names otherwise), and the third three filter lines.
+
+## Testing on your own footage
+
+```bash
+export GEMINI_API_KEY=your_key
+mkdir -p .dogfood/jobs
+super-processor --jobs-dir .dogfood/jobs review
+```
+
+Open the printed URL and go pick → shots → looks → upscale → result. Short
+clips (30–60 seconds) with one clear problem each are the most useful: blocky
+web video, noisy low light, old SD footage, a face close-up, and a shot with
+a sign or text. On each screen, note where the tool was wrong:
+
+- **Shots**: cuts in the wrong place, or problem hints that do not match the
+  picture (`shots.json` holds the numbers behind them).
+- **Looks**: waxy skin, changed faces, garbled text, or crawling texture in a
+  preview; face and text boxes in the wrong place; a shimmer number that does
+  not match what you see (`shot_plan.json`).
+- **Result**: seam warnings with no visible seam, or visible seams with no
+  warning (`render_report.json`).
+
+Each job folder under `.dogfood/jobs/` keeps those files, the previews, and
+`gemini_chat.json`. The thresholds they report against are first guesses from
+synthetic clips and are meant to be tuned from real footage:
+
+| What | Where | Value |
+|---|---|---|
+| Problem hints | `shots.py` | blocky ≥ 18, soft ≥ 6, noisy ≥ 2, dark < 0.25, bright > 0.75, flat < 0.35 |
+| Shimmer | `stability.py` `SHIMMER_LIMIT` | 1.6 |
+| Seams | `stability.py` `SEAM_LIMIT` | 2.5 |
+| Protected regions | `regions.py` `REGION_STRENGTH` | faces and hands 0.3, text 0.15 |
 
 Legacy single-grade and segment CLI commands remain available:
 
