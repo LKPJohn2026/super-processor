@@ -846,7 +846,7 @@ class GeminiClient:
         parts: list[dict[str, Any]] = [{"text": intro}]
         for index, (shot, still) in enumerate(zip(shots, stills, strict=True)):
             parts.append({"text": f"Shot {index}: {json.dumps(shot)}"})
-            parts.append(_jpeg_part(still))
+            parts.append(_jpeg_part(still, under=job_dir))
         reply = self._generate(
             contents=[{"role": "user", "parts": parts}],
             schema=_SHOT_LABELS_SCHEMA,
@@ -915,7 +915,7 @@ class GeminiClient:
         parts: list[dict[str, Any]] = [{"text": intro}]
         for shot, still in zip(shots, stills, strict=True):
             parts.append({"text": f"Shot: {json.dumps(shot)}"})
-            parts.append(_jpeg_part(still))
+            parts.append(_jpeg_part(still, under=job_dir))
         reply = self._generate(
             contents=[{"role": "user", "parts": parts}],
             schema=_PROPOSE_SCHEMA,
@@ -959,7 +959,7 @@ class GeminiClient:
         parts: list[dict[str, Any]] = [{"text": intro}]
         for shot, frames in zip(shots, stills, strict=True):
             parts.append({"text": f"Shot: {json.dumps(shot)}"})
-            parts.extend(_jpeg_part(frame) for frame in frames)
+            parts.extend(_jpeg_part(frame, under=job_dir) for frame in frames)
         reply = self._generate(
             contents=[{"role": "user", "parts": parts}],
             schema=_REGIONS_SCHEMA,
@@ -1007,9 +1007,9 @@ class GeminiClient:
         parts: list[dict[str, Any]] = [{"text": intro}]
         for shot, (before, after) in zip(shots, pairs, strict=True):
             parts.append({"text": f"Shot: {json.dumps(shot)}. BEFORE:"})
-            parts.append(_jpeg_part(before))
+            parts.append(_jpeg_part(before, under=job_dir))
             parts.append({"text": "AFTER:"})
-            parts.append(_jpeg_part(after))
+            parts.append(_jpeg_part(after, under=job_dir))
         reply = self._generate(
             contents=[{"role": "user", "parts": parts}],
             schema=_CHECK_SCHEMA,
@@ -1074,9 +1074,15 @@ class GeminiClient:
         return data
 
 
-def _jpeg_part(path: Path) -> dict[str, Any]:
+def _jpeg_part(path: Path, *, under: Path | None = None) -> dict[str, Any]:
+    """Encode a still. When ``under`` is set, the file must sit inside that tree."""
+    resolved = path.expanduser().resolve()
+    if under is not None:
+        root = under.expanduser().resolve()
+        if resolved != root and root not in resolved.parents:
+            raise GeminiError(f"still is outside the job: {path.name}")
     try:
-        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        data = base64.b64encode(resolved.read_bytes()).decode("ascii")
     except OSError as exc:
         raise GeminiError(f"could not read {path.name}: {exc}") from exc
     return {"inlineData": {"mimeType": "image/jpeg", "data": data}}

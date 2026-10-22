@@ -80,6 +80,10 @@ def test_wizard_setup_and_pick_flow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr("super_processor.wizard.resolve_gemini_api_key", lambda: None)
+    monkeypatch.setattr(
+        "super_processor.wizard.store_gemini_api_key", lambda _key: None
+    )
     controller = WizardController(tmp_path)
     assert controller.current_state().step is WizardStep.INTRO
     controller.handle_post("/intro", {})

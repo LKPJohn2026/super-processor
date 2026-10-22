@@ -56,17 +56,21 @@ def parse_byte_range(header: str | None, size: int) -> tuple[int, int] | None:
 
 
 ALLOWED_ORIGINS_ENV = "SUPER_PROCESSOR_ALLOWED_ORIGINS"
-# The Vite dev and preview servers, and the published React shell, may drive a
-# local wizard. Add others (comma separated) with SUPER_PROCESSOR_ALLOWED_ORIGINS.
+# Local Vite / preview shells may drive the wizard. Pages and any other site
+# must be listed in SUPER_PROCESSOR_ALLOWED_ORIGINS (comma-separated http(s)
+# origins). A published static shell without that env cannot CSRF a running
+# wizard.
 DEFAULT_ALLOWED_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:4173",
     "http://127.0.0.1:4173",
-    "https://lkpjohn2026.github.io",
 )
 _LOCAL_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 _TRUSTED_FETCH_SITES = frozenset({"same-origin", "none"})
+_REJECTED_ORIGIN_TOKENS = frozenset({"*", "null"})
+# Wizard POSTs only carry a key, a path, or a short note.
+MAX_BODY_BYTES = 256 * 1024
 
 
 def _hostname(host_header: str) -> str:
@@ -83,6 +87,23 @@ def _server_port(server: object) -> int:
     return 0
 
 
+def _origin_allowed(item: str) -> bool:
+    """True for a concrete http(s) origin; rejects ``*``, ``null``, and junk."""
+    value = item.strip().rstrip("/")
+    if not value or value.lower() in _REJECTED_ORIGIN_TOKENS:
+        return False
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if not parsed.netloc or parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.path not in {"", "/"}:
+        return False
+    if parsed.query or parsed.fragment:
+        return False
+    return True
+
+
 def allowed_origins(port: int) -> frozenset[str]:
     """Origins that may call the wizard: itself, the React shell, and env extras."""
     own = {
@@ -93,7 +114,7 @@ def allowed_origins(port: int) -> frozenset[str]:
     extra = {
         item.strip().rstrip("/")
         for item in os.environ.get(ALLOWED_ORIGINS_ENV, "").split(",")
-        if item.strip()
+        if _origin_allowed(item)
     }
     return frozenset({*DEFAULT_ALLOWED_ORIGINS, *own, *extra})
 
@@ -112,7 +133,9 @@ def request_rejection(
     clients send neither header and are local already.
     """
     host = headers.get("Host")
-    if host is not None and _hostname(host) not in _LOCAL_HOSTNAMES:
+    if host is None or not str(host).strip():
+        return "missing Host header"
+    if _hostname(host) not in _LOCAL_HOSTNAMES:
         return "unexpected Host header"
     origin = headers.get("Origin")
     if origin is not None and origin.rstrip("/") not in allowed_origins(port):
@@ -297,6 +320,9 @@ def _legacy_handler(
                 self.end_headers()
                 return
             length = int(self.headers.get("Content-Length", "0") or "0")
+            if length < 0 or length > MAX_BODY_BYTES:
+                self._reject("body too large", status=413)
+                return
             fields = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
             try:
                 if path == "/accept":
@@ -543,6 +569,8 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
 
         def _read_fields(self) -> dict[str, list[str]]:
             length = int(self.headers.get("Content-Length", "0") or "0")
+            if length < 0 or length > MAX_BODY_BYTES:
+                raise WizardError("body too large")
             raw = self.rfile.read(length)
             return form_fields_from_body(raw, self.headers.get("Content-Type", ""))
 
@@ -575,10 +603,11 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             try:
                 fields = self._read_fields()
             except WizardError as exc:
+                status = 413 if str(exc) == "body too large" else 400
                 if path.startswith("/api/"):
-                    self._json({"error": str(exc)}, status=400)
+                    self._json({"error": str(exc)}, status=status)
                     return
-                self._reject(str(exc))
+                self._reject(str(exc), status=status)
                 return
             action = _API_POSTS.get(path, path)
             try:

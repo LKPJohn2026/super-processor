@@ -45,12 +45,21 @@ def test_request_rejection_rules(monkeypatch: pytest.MonkeyPatch) -> None:
         request_rejection(_headers(Host="[::1]:9000"), port=9000, state_changing=True)
         is None
     )
+    assert request_rejection(_headers(), port=9000, state_changing=False) == (
+        "missing Host header"
+    )
     rebinding = _headers(Host="evil.example:9000")
     assert request_rejection(rebinding, port=9000, state_changing=False) == (
         "unexpected Host header"
     )
     foreign = _headers(Host="127.0.0.1:9000", Origin="https://evil.example")
     assert request_rejection(foreign, port=9000, state_changing=False) == (
+        "origin not allowed"
+    )
+    pages = _headers(
+        Host="127.0.0.1:9000", Origin="https://lkpjohn2026.github.io"
+    )
+    assert request_rejection(pages, port=9000, state_changing=True) == (
         "origin not allowed"
     )
     own = _headers(Host="127.0.0.1:9000", Origin="http://127.0.0.1:9000")
@@ -64,9 +73,30 @@ def test_request_rejection_rules(monkeypatch: pytest.MonkeyPatch) -> None:
     assert request_rejection(image_tag, port=9000, state_changing=False) is None
     refresh = _headers(Host="127.0.0.1:9000", Sec_Fetch_Site="same-origin")
     assert request_rejection(refresh, port=9000, state_changing=True) is None
-    monkeypatch.setenv(ALLOWED_ORIGINS_ENV, "https://shell.example/, ")
+    monkeypatch.setenv(
+        ALLOWED_ORIGINS_ENV,
+        "https://shell.example/, *, null, https://lkpjohn2026.github.io",
+    )
     extra = _headers(Host="127.0.0.1:9000", Origin="https://shell.example")
     assert request_rejection(extra, port=9000, state_changing=True) is None
+    assert (
+        request_rejection(
+            _headers(Host="127.0.0.1:9000", Origin="https://lkpjohn2026.github.io"),
+            port=9000,
+            state_changing=True,
+        )
+        is None
+    )
+    assert request_rejection(
+        _headers(Host="127.0.0.1:9000", Origin="null"),
+        port=9000,
+        state_changing=True,
+    ) == ("origin not allowed")
+    assert request_rejection(
+        _headers(Host="127.0.0.1:9000", Origin="*"),
+        port=9000,
+        state_changing=True,
+    ) == ("origin not allowed")
 
 
 def _request(

@@ -12,6 +12,7 @@ import pytest
 from super_processor.upscale import (
     FakeUpscaleEngine,
     FlashVsrEngine,
+    _release_gpu,
     UpscaleError,
     UpscalePlan,
     UpscaleRequest,
@@ -65,7 +66,18 @@ def test_replace_overlapping_keeps_scale_and_range() -> None:
     assert clamped.end_s == 12
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_release_gpu_moves_the_pipeline_to_cpu() -> None:
+    moved: list[str] = []
+
+    class _Pipe:
+        def to(self, device: str) -> _Pipe:
+            moved.append(device)
+            return self
+
+    _release_gpu(_Pipe())
+    assert moved == ["cpu"]
+
+
 def test_flashvsr_runner_writes_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

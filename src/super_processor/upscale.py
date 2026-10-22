@@ -459,6 +459,10 @@ class FlashVsrEngine:
             except Exception as exc:
                 raise UpscaleError(f"FlashVSR failed: {exc}") from exc
             finally:
+                _release_gpu(pipe)
+                module = None
+                pipe = None
+                _release_gpu()
                 _unload_flashvsr(previous, path_added)
         missing = [r.output.name for r in ready if not r.output.is_file()]
         if missing:
@@ -508,6 +512,9 @@ def _load_flashvsr(home: Path, infer: Path) -> tuple[Any, Any, str, list[str]]:
     previous = os.getcwd()
     path_added = [entry for entry in (str(wan), str(home)) if entry not in sys.path]
     sys.path[:0] = path_added
+    # Lets a later 2GB block reuse the reserved cache instead of failing
+    # while several gigabytes sit fragmented. Must be set before CUDA starts.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.chdir(wan)
     try:
         loader.loader.exec_module(module)
@@ -526,6 +533,35 @@ def _unload_flashvsr(previous: str, path_added: list[str]) -> None:
     for entry in path_added:
         with contextlib.suppress(ValueError):
             sys.path.remove(entry)
+
+
+def _release_gpu(pipe: Any | None = None) -> None:
+    """Move one pipeline off the GPU and return its cache to the driver.
+
+    Deleting the name inside this function does not drop the caller's
+    reference, so the caller sets its own variables to None and calls this
+    again. The weights are a reference cycle with the VRAM wrappers, and
+    PyTorch will not collect that cycle while it is trying to allocate.
+    """
+    import gc
+
+    mover = getattr(pipe, "to", None)
+    if mover is not None:
+        with contextlib.suppress(Exception):
+            mover("cpu")
+    del pipe
+    sys.modules.pop("flashvsr_infer_tiny", None)
+    gc.collect()
+    torch_mod = sys.modules.get("torch")
+    cuda = getattr(torch_mod, "cuda", None) if torch_mod is not None else None
+    if cuda is None or not getattr(cuda, "is_available", lambda: False)():
+        return
+    empty = getattr(cuda, "empty_cache", None)
+    if empty is not None:
+        empty()
+    ipc = getattr(cuda, "ipc_collect", None)
+    if ipc is not None:
+        ipc()
 
 
 def _infer_loaded(
@@ -683,6 +719,10 @@ def _run_flashvsr(request: UpscaleRequest, *, home: Path, infer: Path) -> Path:
     except Exception as exc:
         raise UpscaleError(f"FlashVSR failed: {exc}") from exc
     finally:
+        _release_gpu(pipe)
+        module = None
+        pipe = None
+        _release_gpu()
         _unload_flashvsr(previous, path_added)
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
@@ -738,6 +778,10 @@ def _run_flashvsr_chunked(
     except Exception as exc:
         raise UpscaleError(f"FlashVSR failed: {exc}") from exc
     finally:
+        _release_gpu(pipe)
+        module = None
+        pipe = None
+        _release_gpu()
         _unload_flashvsr(previous, path_added)
     # Join, blend, and encode once into the delivery settings, so the caller
     # does not encode this picture a second time.

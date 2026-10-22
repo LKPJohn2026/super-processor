@@ -52,7 +52,13 @@ def _clip(path: Path, seconds: int = 12) -> Path:
     return path
 
 
-def test_pick_missing_file(tmp_path: Path) -> None:
+def test_pick_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("super_processor.wizard.resolve_gemini_api_key", lambda: None)
+    monkeypatch.setattr(
+        "super_processor.wizard.store_gemini_api_key", lambda _key: None
+    )
     controller = WizardController(tmp_path)
     controller.handle_post("/intro", {})
     controller.handle_post("/llm", {"choice": ["gemini"]})

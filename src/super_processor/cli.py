@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -520,6 +521,9 @@ def _plans_from_assignments(
 
 def run_review_command(arguments: argparse.Namespace) -> int:
     """Serve the Gemini wizard or a job review page until interrupted."""
+    # Before the first CUDA allocation, so a later preview can reuse the
+    # cache the previous pipeline left reserved.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     store = _store_from_args(arguments)
     job_id = getattr(arguments, "job_id", None)
     if job_id:
