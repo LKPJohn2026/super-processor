@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The wizard now runs the segment loop: pick → segments → one preview per
+  segment → ready → upscale → result. Gemini proposes segments from a local
+  still grid; the editor approves them or sends a note. Each segment is then
+  planned, previewed, and checked on its own, and approved or redone with a
+  note before the next. A ready screen lists every segment's settings before
+  the full render. `SUPER_PROCESSOR_SEGMENT_LOOP` is gone.
+- Both the HTML pages and the React shell show the new steps, with a progress
+  bar on the busy ones. The step rail reads Setup · File · Segments ·
+  Previews · Upscale · Result.
+- Gemini's segments say what each contains (faces, hands, text,
+  fine_pattern), so those segments are boxed and held down as shots were.
+
+### Removed
+
+- The shot flow's wizard steps (`finding_shots`, `shots`, `planning`,
+  `looks`), their routes (`/api/scan`, `/api/shots`, `/api/plan`,
+  `/api/looks`), and shot merge and split in the wizard. A job saved on one of
+  those steps goes back to the pick step with a message.
+
 ## [3.1.0] - 2026-10-23
 
 ### Added
