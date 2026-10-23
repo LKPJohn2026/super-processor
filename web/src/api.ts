@@ -78,6 +78,7 @@ export type WizardView = {
   looks?: Looks | null;
   seams?: { time_s: number; score: number }[];
   seam_error?: string | null;
+  token?: string;
 };
 
 const STEPS: readonly string[] = [
@@ -111,6 +112,17 @@ export function configuredOrigin(): string {
   return "";
 }
 
+// This run's token from the last state the wizard sent. Posts and ?run=1
+// requests must carry it; the wizard refuses them otherwise.
+let wizardToken = "";
+
+function remember(view: WizardView): WizardView {
+  if (typeof view.token === "string" && view.token) {
+    wizardToken = view.token;
+  }
+  return view;
+}
+
 function isWizardView(value: unknown): value is WizardView {
   if (!value || typeof value !== "object") return false;
   const step = (value as { step?: unknown }).step;
@@ -129,7 +141,7 @@ async function readView(response: Response): Promise<WizardView> {
   if (!isWizardView(data)) {
     throw new Error("The server did not return a wizard state.");
   }
-  return data;
+  return remember(data);
 }
 
 export async function loadState(origin: string): Promise<WizardView | null> {
@@ -140,7 +152,7 @@ export async function loadState(origin: string): Promise<WizardView | null> {
     });
     if (!response.ok) return null;
     const data: unknown = await response.json();
-    return isWizardView(data) ? data : null;
+    return isWizardView(data) ? remember(data) : null;
   } catch {
     return null;
   }
@@ -156,6 +168,7 @@ export async function postAction(
     headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
+      "X-Wizard-Token": wizardToken,
     },
     body: JSON.stringify(fields),
   });
@@ -179,7 +192,7 @@ async function runUntilDone(
   // Poll the state until the wizard leaves that step.
   let view = await readView(
     await fetch(`${origin}/api/${route}?run=1`, {
-      headers: { Accept: "application/json" },
+      headers: { Accept: "application/json", "X-Wizard-Token": wizardToken },
     }),
   );
   while (view.step === step) {

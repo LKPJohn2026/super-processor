@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import re
+import secrets
 import struct
 import threading
 from email.message import Message
@@ -71,6 +73,50 @@ _TRUSTED_FETCH_SITES = frozenset({"same-origin", "none"})
 _REJECTED_ORIGIN_TOKENS = frozenset({"*", "null"})
 # Wizard POSTs only carry a key, a path, or a short note.
 MAX_BODY_BYTES = 256 * 1024
+# Every state-changing wizard request carries this run's token, as this
+# header or a ``token`` field. Pages the wizard serves embed it; another site
+# cannot read them, so it cannot forge the request even without Origin.
+TOKEN_HEADER = "X-Wizard-Token"
+_POST_FORM = re.compile(r'<form\b[^>]*\bmethod="post"[^>]*>', re.IGNORECASE)
+
+
+class BodyError(WizardError):
+    """A request body the wizard will not read."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def content_length(headers: Message) -> int:
+    """The declared body size, refusing junk, negatives, and big bodies."""
+    raw = (headers.get("Content-Length") or "0").strip() or "0"
+    try:
+        length = int(raw)
+    except ValueError:
+        raise BodyError("bad Content-Length", 400) from None
+    if length < 0:
+        raise BodyError("bad Content-Length", 400)
+    if length > MAX_BODY_BYTES:
+        raise BodyError("body too large", 413)
+    return length
+
+
+def new_wizard_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def with_wizard_token(page: str, token: str) -> str:
+    """Put ``token`` in every POST form and every ``?run=1`` link of a page."""
+    hidden = f'<input type="hidden" name="token" value="{token}">'
+    page = _POST_FORM.sub(lambda match: match.group(0) + hidden, page)
+    return page.replace("?run=1", f"?run=1&amp;token={token}")
+
+
+def token_matches(supplied: str | None, token: str) -> bool:
+    return bool(supplied) and hmac.compare_digest(
+        str(supplied).encode(), token.encode()
+    )
 
 
 def _hostname(host_header: str) -> str:
@@ -99,9 +145,7 @@ def _origin_allowed(item: str) -> bool:
         return False
     if parsed.path not in {"", "/"}:
         return False
-    if parsed.query or parsed.fragment:
-        return False
-    return True
+    return not (parsed.query or parsed.fragment)
 
 
 def allowed_origins(port: int) -> frozenset[str]:
@@ -319,9 +363,10 @@ def _legacy_handler(
                 self.send_response(404)
                 self.end_headers()
                 return
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            if length < 0 or length > MAX_BODY_BYTES:
-                self._reject("body too large", status=413)
+            try:
+                length = content_length(self.headers)
+            except BodyError as exc:
+                self._reject(str(exc), status=exc.status)
                 return
             fields = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
             try:
@@ -443,7 +488,9 @@ def form_fields_from_body(raw: bytes, content_type: str) -> dict[str, list[str]]
     return parse_qs(raw.decode("utf-8", errors="replace"))
 
 
-def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler]:
+def _wizard_handler(
+    controller: WizardController, token: str
+) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
             return
@@ -454,9 +501,12 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             self.end_headers()
 
         def _html(self, page: str, status: int = 200) -> None:
-            body = page.encode()
+            body = with_wizard_token(page, token).encode()
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            # Pages hold the token; another site must not frame and click them.
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -567,10 +617,22 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                 return
             self._send_file(media[0], media[1], head=True)
 
+        def _view(self) -> dict[str, object]:
+            # Only the wizard's own pages and allowed origins can read this.
+            return {**controller.api_view(), "token": token}
+
+        def _token_refused(self, path: str, supplied: str | None) -> bool:
+            if token_matches(self.headers.get(TOKEN_HEADER) or supplied, token):
+                return False
+            reason = "missing or wrong wizard token; reload the page"
+            if path.startswith("/api/"):
+                self._json({"error": reason}, status=403)
+            else:
+                self._reject(reason, status=403)
+            return True
+
         def _read_fields(self) -> dict[str, list[str]]:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            if length < 0 or length > MAX_BODY_BYTES:
-                raise WizardError("body too large")
+            length = content_length(self.headers)
             raw = self.rfile.read(length)
             return form_fields_from_body(raw, self.headers.get("Content-Type", ""))
 
@@ -592,7 +654,9 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+            self.send_header(
+                "Access-Control-Allow-Headers", f"Content-Type, Accept, {TOKEN_HEADER}"
+            )
             self.send_header("Access-Control-Max-Age", "600")
             self.end_headers()
 
@@ -603,11 +667,13 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             try:
                 fields = self._read_fields()
             except WizardError as exc:
-                status = 413 if str(exc) == "body too large" else 400
+                status = exc.status if isinstance(exc, BodyError) else 400
                 if path.startswith("/api/"):
                     self._json({"error": str(exc)}, status=status)
                     return
                 self._reject(str(exc), status=status)
+                return
+            if self._token_refused(path, fields.pop("token", [""])[0]):
                 return
             action = _API_POSTS.get(path, path)
             try:
@@ -619,7 +685,7 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                 self._reject(str(exc))
                 return
             if path.startswith("/api/"):
-                self._json(controller.api_view())
+                self._json(self._view())
                 return
             self._redirect("/")
 
@@ -630,16 +696,18 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
             runs = query.get("run", [""])[0] == "1"
             if self._refused(path, state_changing=runs):
                 return
+            if runs and self._token_refused(path, query.get("token", [""])[0]):
+                return
             try:
                 if path == "/api/state":
-                    self._json(controller.api_view())
+                    self._json(self._view())
                     return
                 # Long passes run on the controller's worker thread. These
                 # GETs start one when none is running and return at once;
                 # callers poll /api/state (or the page refreshes).
                 if path == "/api/render" and runs:
                     controller.start_render()
-                    self._json(controller.api_view())
+                    self._json(self._view())
                     return
                 if path == "/render" and runs:
                     controller.start_render()
@@ -647,7 +715,7 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                     return
                 if path == "/api/scan" and runs:
                     controller.start_scan()
-                    self._json(controller.api_view())
+                    self._json(self._view())
                     return
                 if path == "/shots" and runs:
                     controller.start_scan()
@@ -655,7 +723,7 @@ def _wizard_handler(controller: WizardController) -> type[BaseHTTPRequestHandler
                     return
                 if path == "/api/plan" and runs:
                     controller.start_plan()
-                    self._json(controller.api_view())
+                    self._json(self._view())
                     return
                 if path == "/looks" and runs:
                     controller.start_plan()
@@ -689,10 +757,15 @@ class ReviewServer:
         port: int = 0,
     ) -> None:
         self.job_dir = job_dir
+        # Set when this job reopens in the wizard; the split page has none.
+        self.token: str | None = None
         wizard_state = load_job_wizard_state(job_dir)
         if wizard_state is not None and wizard_state.step is not WizardStep.INTRO:
             controller = WizardController(jobs_dir or job_dir.parent)
-            handler: type[BaseHTTPRequestHandler] = _wizard_handler(controller)
+            self.token = new_wizard_token()
+            handler: type[BaseHTTPRequestHandler] = _wizard_handler(
+                controller, self.token
+            )
         else:
             handler = _legacy_handler(job_dir, jobs_dir=jobs_dir, job_id=job_id)
         self._httpd = ThreadingHTTPServer((host, port), handler)
@@ -730,11 +803,13 @@ class WizardServer:
         host: str = "127.0.0.1",
         port: int = 0,
         controller: WizardController | None = None,
+        token: str | None = None,
     ) -> None:
         self.controller = controller or WizardController(jobs_dir)
+        self.token = token or new_wizard_token()
         self._httpd = ThreadingHTTPServer(
             (host, port),
-            _wizard_handler(self.controller),
+            _wizard_handler(self.controller, self.token),
         )
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
 

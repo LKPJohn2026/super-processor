@@ -23,6 +23,8 @@ from super_processor.wizard import (
     save_session_state,
 )
 
+TOKEN = "test-token"
+
 
 class _FakeTransport:
     def __init__(self, payload: dict[str, Any]) -> None:
@@ -60,6 +62,8 @@ def test_run_review_starts_wizard(
         def __init__(self, *args: object, **kwargs: object) -> None:
             self.started = False
 
+        token = "t"
+
         def start(self) -> str:
             self.started = True
             return "http://127.0.0.1:9"
@@ -86,6 +90,8 @@ def test_run_review_with_job_id(
     class _Immediate:
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass
+
+        token = None
 
         def start(self) -> str:
             return "http://127.0.0.1:9"
@@ -132,16 +138,16 @@ def test_render_get_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         save_session_state(tmp_path, state)
 
     monkeypatch.setattr(controller, "run_render", _noop_render)
-    server = WizardServer(tmp_path, controller=controller)
+    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
         with pytest.raises(HTTPError) as retired:
-            urlopen(base + "/analyze?run=1")
+            urlopen(base + f"/analyze?run=1&token={TOKEN}")
         assert retired.value.code == 404
         retired.value.close()
         state = WizardState(step=WizardStep.RENDERING)
         save_session_state(tmp_path, state)
-        with urlopen(base + "/render?run=1") as response:
+        with urlopen(base + f"/render?run=1&token={TOKEN}") as response:
             response.read()
         assert controller.wait_idle(timeout=10)
         with urlopen(base + "/") as response:

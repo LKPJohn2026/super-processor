@@ -26,6 +26,8 @@ from super_processor.wizard import (
     session_state_path,
 )
 
+TOKEN = "test-token"
+
 
 def _seed_job(tmp_path: Path) -> tuple[WizardController, str, Path]:
     source = tmp_path / "clip.mp4"
@@ -97,7 +99,7 @@ def test_wizard_server_serves_output_only(tmp_path: Path) -> None:
     state = WizardState(step=WizardStep.RESULT, job_id=job_id)
     save_job_wizard_state(job_dir, state)
     save_session_state(tmp_path, state)
-    server = WizardServer(tmp_path, controller=controller)
+    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
         with urlopen(base + "/output.mp4") as response:
@@ -222,13 +224,13 @@ def test_start_new_job_from_done_and_result(
 def test_start_new_job_over_the_api(tmp_path: Path) -> None:
     controller, job_id, job_dir = _seed_job(tmp_path)
     save_session_state(tmp_path, WizardState(step=WizardStep.DONE, job_id=job_id))
-    server = WizardServer(tmp_path, controller=controller)
+    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
         request = Request(
             base + "/api/new",
             data=b"{}",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Wizard-Token": TOKEN},
             method="POST",
         )
         with urlopen(request) as response:
