@@ -134,7 +134,7 @@ frame count is refused and the previous `output.mp4` is kept.
 | Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one |
 | Ready to render | `POST /ready` (`/api/ready`) | `action=render` starts the full render from every approved segment |
 | Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
-| Result | `GET/POST /result` | Play output; happy, or a note that retunes a time range |
+| Result | `GET/POST /result` | Play output; happy, a note that retunes a time range, or a note with `restart=1` that starts over from the segments |
 | Done | `GET /` (state `done`) | Confirmation |
 | New video | `POST /new` (`/api/new`) | From Done or Result: back to pick (or setup without a key); the old job stays on disk |
 
@@ -155,7 +155,10 @@ intro → llm_choice ┬─ gemini → setup → pick_file → sampling → prop
 ```
 
 `segment_index` in `wizard_state.json` is the segment being analyzed or
-previewed. Sampling and proposing run in one worker; a note on the segments
+previewed. A result note sent with `restart=1` ("Start over from the
+segments") goes back to `sampling`: the segments, plans, previews, output, and
+their work folders are deleted, `gemini_chat.json` is kept, and the note is
+added to it, so every later Gemini call sees what the editor did not like. Sampling and proposing run in one worker; a note on the segments
 goes back to `proposing` with the stills already saved.
 
 Persisted in the job directory as `wizard_state.json` (step, job id, last

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Full restart from the result screen. A note sent with "Start over from the
+  segments" (`restart=1` on `POST /api/result`) clears the job's segments,
+  plans, previews, output, and work folders, keeps `gemini_chat.json` with
+  the note added, and goes back to sampling. Gemini then proposes segments
+  and settings again with the whole earlier exchange in view. A note without
+  `restart=1` still retunes one time range.
+
 ## [3.2.0] - 2026-10-23
 
 ### Changed
