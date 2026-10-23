@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `docs/system-design.md` describes the segment loop: local still sampling,
+  repaired Gemini segments, one preview per segment with a seeded window,
+  optional pass-through spans, the full restart that keeps the chat, the
+  shared `segments.json` name, and the job files and steps that go with
+  them.
+
 ## [3.3.0] - 2026-10-23
 
 ### Added
