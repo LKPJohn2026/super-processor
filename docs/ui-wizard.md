@@ -83,15 +83,16 @@ from 2s to 5s" lowers strength for that range only.
 
 ### Protected regions
 
-Before the first proposal, every shot whose contents include faces, hands,
-or text gets three stills (10%, 50%, 90% through it), and Gemini boxes them
+Before the first segment is planned, every segment whose contents include
+faces, hands, or text gets three stills (10%, 50%, 90% through it), and Gemini boxes them
 so one box covers the thing's whole path. Boxes are padded by 3% of the
 frame. Inside a box, the FlashVSR share is held to 0.3 for faces and hands
 and 0.15 for text (or the shot's strength, if lower), and it rises back to
 the shot's strength over a 3% feather outside the box, so there is no seam.
-The Looks screen draws the boxes over both previews. A shot that contains
-faces, hands, or text but got no boxes (Gemini failed or found none) is held
-to 0.6 as a whole instead. Boxes are per shot, not tracked frame by frame.
+The segment preview draws the boxes over both previews. A segment that
+contains faces, hands, or text but got no boxes (Gemini failed or found none)
+is held to 0.6 as a whole instead. Boxes are per segment, not tracked frame by
+frame.
 
 ## Input limits
 
@@ -127,10 +128,11 @@ frame count is refused and the previous `output.mp4` is kept.
 | Local LLM stub | `GET/POST /local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
 | Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key |
 | Pick file | `GET/POST /pick` | Local video path (up to 1080p and 30 minutes) |
-| Finding shots | `GET /shots?run=1` (`/api/scan?run=1`) | FFmpeg finds the cuts and measures each shot; Gemini labels each shot from one still |
-| Shots | `POST /shots` (`/api/shots`) | Review the shot list: merge with next, split at a time, approve |
-| Planning | `GET /looks?run=1` (`/api/plan?run=1`) | Gemini proposes each shot's settings; short previews render; Gemini checks them |
-| Looks | `POST /looks` (`/api/looks`) | Before/after preview per shot: approve all, or a note that redoes one shot |
+| Finding segments | `GET /segment?run=1` (`/api/segment?run=1`) | States `sampling` then `proposing`: FFmpeg saves the still grid; Gemini proposes segments |
+| Segments | `POST /segments` (`/api/segments`) | `action=approve`, or `action=note` with `note` to propose again |
+| Analyzing | `GET /analyze?run=1` (`/api/analyze?run=1`) | The current segment only: Gemini proposes its settings, a short preview renders, Gemini checks it |
+| Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one |
+| Ready to render | `POST /ready` (`/api/ready`) | `action=render` starts the full render from every approved segment |
 | Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, or a note that retunes a time range |
 | Done | `GET /` (state `done`) | Confirmation |
@@ -139,27 +141,51 @@ frame count is refused and the previous `output.mp4` is kept.
 ## State machine
 
 ```text
-intro → llm_choice ┬─ gemini → setup → pick_file → finding_shots → shots → planning ⇄ looks → rendering → result ─┬─ happy → done
-                   └─ local  → local_llm_stub → setup ─┘                                             ▲            │
-                                                                                                     └── note ────┘
+intro → llm_choice ┬─ gemini → setup → pick_file → sampling → proposing → segments ─┐
+                   └─ local  → local_llm_stub → setup ─┘          ▲             │      │
+                                                                  └── note ─────┘      │ approve
+                                                                                       ▼
+          ┌──────────────── note (redo this segment) ──────────────┐            analyzing
+          ▼                                                         │                │
+      analyzing ──→ preview_segment ── approve, more segments ──→ analyzing          │
+                         │                                                           │
+                         └── approve, last segment → ready_to_render → rendering → result ─┬─ happy → done
+                                                                          ▲                 │
+                                                                          └──── note ───────┘
 ```
 
-`planning ⇄ looks`: a note on one shot in Looks sends only that shot back
-through planning.
+`segment_index` in `wizard_state.json` is the segment being analyzed or
+previewed. Sampling and proposing run in one worker; a note on the segments
+goes back to `proposing` with the stills already saved.
 
 Persisted in the job directory as `wizard_state.json` (step, job id, last
-error) and `gemini_chat.json`. If finding the shots fails (FFmpeg cannot read
-the file), the job is marked failed and the wizard returns to `pick_file`. If
-only Gemini labelling fails, the shots keep the hints from the measurements and
-the shots screen says why. If the previews fail (usually no GPU), the wizard
-goes back to `shots` with the error. If Gemini cannot plan or check, the
-recipes come from the measurements, the check is skipped, and the looks screen
-says so. If the first upscale fails, the job is marked
-failed and the wizard returns to `pick_file` with the error; a failed revise
-stays on `result` with the previous output. "Start a new video" on Done or
-Result goes back to `pick_file`. A state saved on a step of the removed split /
-enhance flow (`analyzing`, `overview`, `choose_split`, `enhance`) loads as
-`pick_file` with a message asking for the file again.
+error, segment index, and the running worker's progress) and
+`gemini_chat.json`. If sampling or proposing fails (FFmpeg cannot read the
+file), the job is marked failed and the wizard returns to `pick_file`. If
+Gemini cannot propose segments, the whole video is one segment and the
+segments screen says why. If a segment's preview fails (usually no GPU), the
+wizard goes back to `segments` with the error; approving again resumes at the
+same segment. If Gemini cannot plan or check a segment, its recipe comes from
+the measurements, the check is skipped, and the preview says so. If the first
+upscale fails, the job is marked failed and the wizard returns to
+`pick_file` with the error; a failed revise stays on `result` with the
+previous output. "Start a new video" on Done or Result goes back to
+`pick_file`.
+
+A state saved on a step of an older flow loads as `pick_file` with a message
+asking for the file again: the shot flow (`finding_shots`, `shots`,
+`planning`, `looks`) and the split / enhance flow (`overview`,
+`choose_split`, `enhance`, and `analyzing` in a state file older than
+schema 3).
+
+### Progress
+
+While a worker runs, `/api/state` returns `progress`:
+`{"phase": "analyzing", "pct": 50, "message": "Rendering previews on the GPU"}`.
+The percentages are fixed milestones of each worker (stills saved, Gemini
+asked, previews rendered, previews checked), not a measured fraction of the
+work. Both shells show them as a progress bar; `progress` is `null` when
+nothing runs.
 
 ## LLM choice (sketch paths)
 
@@ -168,13 +194,26 @@ enhance flow (`analyzing`, `overview`, `choose_split`, `enhance`) loads as
   only action is “Use Gemini instead”, which continues to Gemini setup.
   No local inference is wired in this release.
 
-## Shots (loop 1)
+## Segments (loop 1)
 
-FFmpeg finds the cuts with `scdet` on a 320-pixel-wide copy. Shots shorter
-than 1 s join a neighbour, and at most 40 shots are kept (the shortest merge
-first). Each shot is then measured in its own short pass at 2 frames a second,
-so filters that average over everything they have seen (`blockdetect`) do not
-mix shots. Measurements are medians:
+No video leaves the machine. FFmpeg saves a 480-pixel-wide still about every
+second into `segment_stills/t_<ms>.jpg`, always the first frame and one
+0.1 s before the end, and never more than 120: a longer clip keeps the even
+spacing and gets fewer stills a second. Gemini sees every still with its time
+and proposes segments where the photographic context changes (place, light,
+camera, subject distance, image quality), each with a label and what it
+contains from `faces`, `hands`, `text`, `fine_pattern`.
+
+The reply is repaired to cover the clip exactly once: spans are clipped to
+the clip and sorted; a gap is split down the middle; on an overlap the later
+segment starts where it said; a span inside another adds no cut; and a cut
+less than 0.5 s from the previous one (or from the end) is dropped, its
+contents joining the segment around it. A note ("cut where we walk outside")
+sends the segments back to Gemini with the note and the earlier exchange.
+
+Approving measures each segment in its own short pass at 2 frames a second,
+as the shot flow did, so filters that average over everything they have seen
+(`blockdetect`) do not mix segments. Measurements are medians:
 
 | Metric | From | Hint when |
 |---|---|---|
@@ -184,33 +223,32 @@ mix shots. Measurements are medians:
 | `brightness` | `signalstats` YAVG / 255 | < 0.25 → `dark`, > 0.75 → `overexposed` |
 | `contrast` | `signalstats` (YHIGH − YLOW) / 255 | < 0.35 → `flat` |
 
-The thresholds are rough and only seed the list. Gemini sees one still per shot
-next to the numbers and returns a short label, the problems from a fixed list
-(`blocky`, `noisy`, `soft`, `dark`, `overexposed`, `flat`, `color_cast`,
-`shaky`), and what the shot contains from another (`faces`, `hands`, `text`,
-`fine_pattern`). Names outside the lists are dropped. Merging two shots keeps
-the first label and joins both lists; splitting measures both halves again.
-Approving writes one upscale span per shot. Neighbouring spans with the same
-settings render as one FlashVSR pass.
+The hints go to Gemini with each segment's still when it is planned.
 
-## Looks (loop 2)
+## Segment previews (loop 2)
 
-Each approved shot gets a recipe: a FlashVSR `strength` and a look (the
-bounded clean-up and finishing settings in `look.py`). The whole video shares
-one scale; Gemini picks it on the first pass, and 4× is only offered when the
-source's long edge is 960 pixels or less. Faces, hands, and text are boxed
-and held down inside the boxes (see Protected regions); a shot that contains
-them without boxes is capped at 0.6 as a whole.
+Segments are planned one at a time, in order. Each gets a recipe: a FlashVSR
+`strength`, a look (the bounded clean-up and finishing settings in
+`look.py`), and `use_upscale`. Gemini sets `use_upscale: false` where
+FlashVSR would only harm (footage already clean and sharp, or fine texture it
+would invent over); that segment is then resized with lanczos and keeps its
+look. The whole video shares one scale; Gemini picks it on the first segment,
+and 4× is only offered when the source's long edge is 960 pixels or less.
+Faces, hands, and text are boxed and held down inside the boxes (see Protected
+regions); a segment that contains them without boxes is capped at 0.6 as a
+whole.
 
-Then every shot gets a preview: up to 3 s from its middle, rendered with its
-recipe (FlashVSR loads once for all of them), plus the same seconds of the
-source. Gemini compares a still from each before/after pair for
-`identity_change`, `bad_anatomy`, `garbled_text`, `waxy_skin`,
-`oversharpened`, `halos`, `fake_texture`, `color_shift`, `too_soft`, and
-`flicker`. A shot that fails comes back with corrected settings and its
-preview is redone once (no second check). The Looks screen shows both
-previews, the settings that differ from neutral, Gemini's reason, the check
-result, and the measured shimmer.
+The preview is up to 3 s of the segment, rendered with its recipe, plus the
+same seconds of the source. The window starts at a random point inside the
+segment, seeded by job, segment, and preview count, and is kept when the
+segment is redone, so a note is judged on the same seconds; tick "Preview a
+different part" (`resample=1`) to pick a new one. Gemini compares a still from
+the before/after pair for `identity_change`, `bad_anatomy`, `garbled_text`,
+`waxy_skin`, `oversharpened`, `halos`, `fake_texture`, `color_shift`,
+`too_soft`, and `flicker`. A segment that fails comes back with corrected
+settings and its preview is redone once (no second check). The preview screen
+shows both clips, the settings that differ from neutral, Gemini's reason, the
+check result, and the measured shimmer.
 
 ### Shimmer
 
@@ -228,7 +266,7 @@ Gemini also sees the number. A clip with almost no fine detail is not judged.
 ### Seams
 
 FlashVSR starts again at every chunk (every 7.5 s inside a long part), at
-every boundary between shots with different settings, and at the edges of a
+every boundary between segments with different settings, and at the edges of a
 revised range. After each render, a 1 s window around each of those times is
 read from the output and the source at 320 pixels wide. The largest
 frame-to-frame jump in the output's window, relative to its median, is
@@ -238,11 +276,12 @@ lists them with a ready-made note ("smooth 0:15 to 0:17"); that revise
 re-renders the range in one pass, and the next render checks its new edges.
 The check never fails a render; if it cannot run, the Result screen says so.
 
-A note on one shot ("skin looks waxy") marks only that shot stale: Gemini
-re-plans it with the note and its current settings, it gets a new preview and
-check, and the others are left alone. Preview files carry a revision number
-(`shot_002_r3_after.mp4`), so a browser never shows an older one. Approving
-writes one upscale span per shot with its scale, strength, and look.
+A note on a segment ("skin looks waxy") sends that segment back: Gemini
+re-plans it with the note and its current settings, and it gets a new preview
+and check. Preview files carry a revision number (`shot_002_r3_after.mp4`), so
+a browser never shows an older one. When the last segment is approved, the
+ready screen lists every segment's settings; rendering writes one upscale span
+per segment with its scale, strength, look, and `use_upscale`.
 
 Without Gemini, recipes come from the measurements: deblock for `blocky`,
 denoise for `noisy`, a lift for `dark`, contrast for `flat`, and slightly
@@ -250,16 +289,16 @@ lower strength where there was damage to clean.
 
 ## Gemini schema
 
-The shot labels:
+The segments:
 
 ```json
-{"shots": [{"index": 0, "label": "night street, neon sign", "issues": ["noisy", "dark"], "contains": ["text"]}]}
+{"segments": [{"start_s": 0, "end_s": 14.5, "label": "night street, neon sign", "contains": ["text"]}]}
 ```
 
-A recipe per shot (and, on the first pass, the scale):
+A recipe for the current segment (and, on the first segment, the scale):
 
 ```json
-{"scale": 2, "shots": [{"index": 0, "strength": 0.4, "look": {"deblock": 0.3, "denoise": 0.2, "contrast": 1.05, "brightness": 0, "saturation": 1, "gamma": 1, "grain": 0}, "reason": "Blocky street at night; clean before upscaling."}]}
+{"scale": 2, "shots": [{"index": 0, "strength": 0.4, "use_upscale": true, "look": {"deblock": 0.3, "denoise": 0.2, "contrast": 1.05, "brightness": 0, "saturation": 1, "gamma": 1, "grain": 0}, "reason": "Blocky street at night; clean before upscaling."}]}
 ```
 
 A preview check, with corrected settings for a failed shot:
@@ -305,12 +344,14 @@ name in the URL.
 |---|---|
 | `manifest.json` | Job id, source, state |
 | `wizard_state.json` | Wizard step, job id, last error |
-| `gemini_chat.json` | Result-note history |
-| `shots.json` | Shot ranges, measurements, labels, and still names |
-| `shot_stills/` | One JPEG per shot, served at `/shot_stills/<name>.jpg` |
-| `shot_plan.json` | Per-shot recipe, reason, check result, preview revision, pending editor note |
+| `gemini_chat.json` | Every Gemini exchange of the job, replayed on each call |
+| `segment_stills/` | The still grid, `t_<ms>.jpg` |
+| `segments.json` | Proposed segments (schema 2, `kind: "wizard"`), whether they are approved, and the editor's last note |
+| `shots.json` | Approved segments as the planner's shots: ranges, measurements, contents, boxes, still names |
+| `shot_stills/` | One JPEG per segment, served at `/shot_stills/<name>.jpg` |
+| `shot_plan.json` | Per-segment recipe, `use_upscale`, preview window, reason, check result, preview revision, pending editor note |
 | `previews/` | `shot_NNN_rN_before/after.mp4` and check stills, served at `/previews/<name>` |
-| `upscale_plan.json` | Spans (one per approved shot) with scale, strength, and look, plus the pending revise |
+| `upscale_plan.json` | Spans (one per approved segment) with scale, strength, look, and `use_upscale`, plus the pending revise |
 | `output.mp4` | Current result |
 | `render_report.json` | Seam check of the latest render: times checked and seams found |
 | `output.mp4.delivery.json` | Encode settings marker for keyframe splices |
@@ -319,16 +360,17 @@ name in the URL.
 ## UI presentation
 
 Server-rendered HTML in `wizard_pages.py` remains the live localhost wizard.
-Shared shell includes a step rail (Setup · File · Upscale · Result),
+Shared shell includes a step rail (Setup · File · Segments · Previews ·
+Upscale · Result),
 brand mark, and wait estimates. Intro is a single composition with Super
 Processor as the hero. The LLM choice screen uses lettered options matching the
 product sketch.
 
 `web/` is a separate React shell. GitHub Pages serves it as a static preview
 of the same steps. When a local wizard is reachable (`/api/state`, a Vite
-proxy, or `?api=http://127.0.0.1:<port>`), that shell drives introduction,
-Gemini setup, file pick, GPU upscale, and the result. Pages itself cannot run
-the GPU.
+proxy, or `?api=http://127.0.0.1:<port>`), that shell drives every step,
+from introduction through the segments and their previews to the result, and
+shows worker progress. Pages itself cannot run the GPU.
 
 ## CI coverage
 

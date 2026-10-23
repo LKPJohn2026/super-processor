@@ -5,12 +5,13 @@
 Local-first AI video restoration: FlashVSR upscaling, with a strength
 control for how much new detail it adds.
 
-Super Processor enhances existing footage. A localhost wizard splits the video
-into shots and measures what is wrong with each, has Gemini propose bounded
-settings per shot with short before/after previews, runs a local FlashVSR
-restoration upscale, then lets you revise a time range with a note. Gemini
-structured output only labels, picks numbers inside fixed bounds, and checks
-previews. FFmpeg detects, measures, trims, splices, and encodes from
+Super Processor enhances existing footage. A localhost wizard has Gemini split
+the video into segments from a grid of local stills, then plans each segment
+in turn with bounded settings and a short before/after preview you approve or
+send back with a note. It runs a local FlashVSR restoration upscale (or a
+plain resize where FlashVSR would only harm), then lets you revise a time
+range with a note. Gemini structured output only labels, picks numbers inside
+fixed bounds, and checks previews. FFmpeg detects, measures, trims, splices, and encodes from
 engineering-owned argument lists. Models never write shell commands.
 
 ## Requirements
@@ -35,12 +36,13 @@ super-processor review
 ```
 
 The wizard walks through Gemini setup, file pick (up to 1080p and 30 minutes),
-shot review, per-shot looks with before/after previews, a FlashVSR upscale on
-an NVIDIA GPU, and a result screen where a note re-runs one time range.
+segment review, a before/after preview of each segment in turn, a FlashVSR
+upscale on an NVIDIA GPU, and a result screen where a note re-runs one time
+range.
 
-Without a GPU, the wizard works up to the Shots screen (shot detection,
-measurements, and Gemini labels). The Looks previews and the upscale need
-FlashVSR on CUDA.
+Without a GPU, the wizard works up to the Segments screen (the still grid and
+Gemini's segments). The segment previews and the upscale need FlashVSR on
+CUDA.
 
 ## GPU setup
 
@@ -86,14 +88,14 @@ mkdir -p .dogfood/jobs
 super-processor --jobs-dir .dogfood/jobs review
 ```
 
-Open the printed URL and go pick → shots → looks → upscale → result. Short
+Open the printed URL and go pick → segments → previews → upscale → result. Short
 clips (30–60 seconds) with one clear problem each are the most useful: blocky
 web video, noisy low light, old SD footage, a face close-up, and a shot with
 a sign or text. On each screen, note where the tool was wrong:
 
-- **Shots**: cuts in the wrong place, or problem hints that do not match the
-  picture (`shots.json` holds the numbers behind them).
-- **Looks**: waxy skin, changed faces, garbled text, or crawling texture in a
+- **Segments**: cuts in the wrong place, or contents (faces, hands, text)
+  missed (`segments.json`; `shots.json` holds the measurements).
+- **Previews**: waxy skin, changed faces, garbled text, or crawling texture in a
   preview; face and text boxes in the wrong place; a shimmer number that does
   not match what you see (`shot_plan.json`).
 - **Result**: seam warnings with no visible seam, or visible seams with no
