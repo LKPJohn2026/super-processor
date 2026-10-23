@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Wizard steps for the segment loop (`sampling`, `proposing`, `segments`,
+  `analyzing`, `preview_segment`, `ready_to_render`) and a `segment_index`
+  in the wizard state. Nothing leads to them yet; the page shell shows a
+  placeholder on them.
+- Worker progress. The scan, planning, and render workers record
+  `{phase, pct, message}` in the wizard state as they go, and `/api/state`
+  returns it as `progress` while a worker runs.
+
+### Changed
+
+- The wizard state file is schema 3. Schema 2 files load unchanged; a file
+  older than schema 3 on the removed flow's `analyzing` step still goes back
+  to the pick step.
+
 ## [2.8.0] - 2026-10-23
 
 ### Added
