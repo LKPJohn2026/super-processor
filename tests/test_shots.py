@@ -377,3 +377,35 @@ def test_render_shots_keeps_different_settings_apart(tmp_path: Path) -> None:
     )
     render_shots(clip, tmp_path / "out.mp4", spans, engine=engine, duration_s=7.0)
     assert engine.calls == 2
+
+
+@needs_ffmpeg
+def test_scan_reports_progress_while_busy(tmp_path: Path) -> None:
+    clip = _cuts_clip(tmp_path / "cuts.mp4")
+    seen: list[Any] = []
+
+    class _Watching(_Labels):
+        def label_shots(self, **kwargs: Any) -> list[dict[str, Any]]:
+            seen.append(controller.api_view()["progress"])
+            return super().label_shots(**kwargs)
+
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Watching(),  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
+    controller.handle_post("/pick", {"path": [str(clip)]})
+    assert controller.start_scan()
+    assert controller.wait_idle(60)
+    assert seen == [
+        {
+            "phase": "finding_shots",
+            "pct": 60,
+            "message": "Gemini is labelling the shots",
+        }
+    ]
+    state = controller.current_state()
+    assert state.step is WizardStep.SHOTS
+    assert state.progress is None
+    assert controller.api_view()["progress"] is None

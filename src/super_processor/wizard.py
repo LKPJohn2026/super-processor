@@ -433,6 +433,7 @@ class WizardController:
     def _run_worker(self, target: Callable[[], None]) -> None:
         try:
             target()
+            self._clear_progress()
         except Exception as exc:  # noqa: BLE001 - surfaced on the page
             state = self._state()
             state.error = str(exc) or type(exc).__name__
@@ -445,6 +446,21 @@ class WizardController:
             if state.step is WizardStep.PLANNING:
                 self._plan_failed(state, str(exc) or type(exc).__name__)
                 return
+            self._save(state)
+
+    def _progress(self, state: WizardState, phase: str, pct: int, message: str) -> None:
+        """Record how far the running worker is, for ``/api/state``."""
+        state.progress = {
+            "phase": phase,
+            "pct": max(0, min(100, int(pct))),
+            "message": message,
+        }
+        self._save(state)
+
+    def _clear_progress(self) -> None:
+        state = self._state()
+        if state.progress is not None:
+            state.progress = None
             self._save(state)
 
     def _save(self, state: WizardState) -> None:
@@ -537,6 +553,9 @@ class WizardController:
             "step": state.step.value,
             "busy": self.busy(),
             "error": state.error,
+            # A worker that died mid-run leaves its last progress behind.
+            "progress": state.progress if self.busy() else None,
+            "segment_index": state.segment_index,
             "job_id": state.job_id,
             "has_gemini_key": resolve_gemini_api_key() is not None,
             "output_ready": output_ready,
@@ -686,12 +705,14 @@ class WizardController:
         assert state.job_id
         job_dir = self.store.job_dir(state.job_id)
         source = Path(self.store.load(state.job_id).source_path)
+        self._progress(state, "finding_shots", 5, "Finding and measuring shots")
         try:
             duration = float(probe_file(source).duration_s or 0.0)
             shots = find_shots(source, job_dir, duration, ffmpeg_bin=self.ffmpeg_bin)
         except (ShotError, ProbeError, OSError) as exc:
             self._scan_failed(state, str(exc))
             return
+        self._progress(state, "finding_shots", 60, "Gemini is labelling the shots")
         try:
             labels = self.gemini().label_shots(
                 shots=[
@@ -805,7 +826,9 @@ class WizardController:
         first = not any(recipe.reason for recipe in plan.recipes)
         scales = tuple(sorted({2, plan.scale})) if first else (plan.scale,)
         if first:
+            self._progress(state, "planning", 10, "Boxing faces, hands, and text")
             shots = self._locate(shots, source, job_dir, warnings)
+        self._progress(state, "planning", 30, "Gemini is proposing settings")
         try:
             reply = self.gemini().propose_looks(
                 shots=shots_payload(shots, plan, indexes),
@@ -822,6 +845,7 @@ class WizardController:
             warnings.append(f"Gemini could not propose settings ({exc})")
             plan.scale = min(scales)
             plan = _fallback_plan(plan, shots, indexes)
+        self._progress(state, "planning", 50, "Rendering previews on the GPU")
         try:
             plan = render_previews(
                 source,
@@ -833,6 +857,7 @@ class WizardController:
                 ffmpeg_bin=self.ffmpeg_bin,
             )
             plan = measure_shimmer(job_dir, plan, indexes, ffmpeg_bin=self.ffmpeg_bin)
+            self._progress(state, "planning", 80, "Checking the previews")
             plan = self._check(
                 plan,
                 shots,
@@ -1097,6 +1122,7 @@ class WizardController:
         assert state.job_id
         source = Path(self.store.load(state.job_id).source_path)
         output = job_dir / "output.mp4"
+        self._progress(state, "rendering", 5, "Upscaling on the GPU")
         try:
             facts = probe_file(source)
             duration = float(facts.duration_s or 0.0)
@@ -1117,6 +1143,7 @@ class WizardController:
             candidates = seam_candidates(plan, duration)
             plan = UpscalePlan(spans=plan.spans, pending=None)
             save_upscale_plan(job_dir, plan)
+            self._progress(state, "rendering", 90, "Checking for seams")
             self._check_seams(job_dir, output, source, candidates)
             state.error = None
             state.step = WizardStep.RESULT
