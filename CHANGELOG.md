@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Segment loop groundwork. `segment_loop.py` samples a still grid from the
+  source (about one a second, at most 120, always the first and last frame)
+  into `segment_stills/t_{ms}.jpg` inside the job folder, and keeps the
+  wizard's segment list in `segments.json` (schema 2, `kind: "wizard"`). The
+  older segment review refuses to read or overwrite that file, and the
+  wizard refuses the older review's. The wizard does not use the loop yet.
 - Shimmer check. Each preview's fine-detail layer is measured for how much
   it changes frame to frame relative to how much there is, against the
   source. A preview whose texture is over 1.6x less stable than the source's
