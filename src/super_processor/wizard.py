@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import threading
 import time
 import uuid
@@ -23,6 +24,18 @@ from .jobs import JobError, JobState, JobStore
 from .look import LOOK_BOUNDS
 from .probe import MediaFacts, ProbeError, probe_file
 from .regions import MAX_REGIONS, REGION_STRENGTH
+from .segment_loop import (
+    LoopSegment,
+    SegmentList,
+    SegmentLoopError,
+    extract_segment_stills,
+    load_segment_list,
+    load_segment_stills,
+    repair_coverage,
+    sample_times,
+    save_segment_list,
+    shots_from_segments,
+)
 from .segments import MAX_DURATION_S
 from .shot_plan import (
     CHECK_PROBLEMS,
@@ -42,6 +55,8 @@ from .shot_plan import (
     locate_targets,
     measure_shimmer,
     new_plan,
+    plan_path,
+    random_preview_start,
     render_previews,
     request_redo,
     save_plan,
@@ -57,6 +72,7 @@ from .shots import (
     load_shots,
     merge_with_next,
     save_shots,
+    shots_path,
     split_at,
 )
 from .stability import StabilityError, find_seams, seam_candidates
@@ -94,6 +110,9 @@ WIZARD_SCHEMA_VERSION = 3
 # Inputs are limited to 1080p (either orientation) and 30 minutes. FlashVSR
 # at 2x already makes 4K from 1080p; larger inputs exceed what one GPU pass
 # and the job directory are sized for.
+# Set to 1 to send a picked file through the segment loop instead of the
+# shot flow. The loop has no page of its own yet; the JSON API drives it.
+SEGMENT_LOOP_ENV = "SUPER_PROCESSOR_SEGMENT_LOOP"
 MAX_INPUT_LONG_EDGE = 1920
 MAX_INPUT_SHORT_EDGE = 1080
 
@@ -139,6 +158,7 @@ _RETIRED_MESSAGE = (
 )
 
 
+_SEGMENTING_STEPS = frozenset({WizardStep.SAMPLING, WizardStep.PROPOSING})
 _LOOP_TITLES = {
     WizardStep.SAMPLING: "Sampling stills",
     WizardStep.PROPOSING: "Proposing segments",
@@ -188,6 +208,10 @@ class WizardState:
             segment_index=index if isinstance(index, int) and index >= 0 else 0,
             progress=progress if isinstance(progress, dict) else None,
         )
+
+
+def segment_loop_enabled() -> bool:
+    return os.environ.get(SEGMENT_LOOP_ENV, "") == "1"
 
 
 def input_limit_error(facts: MediaFacts) -> str | None:
@@ -404,6 +428,14 @@ class WizardController:
         """Run :meth:`run_plan` on a worker thread. False if not started."""
         return self._start_worker(WizardStep.PLANNING, self.run_plan)
 
+    def start_segmenting(self) -> bool:
+        """Run :meth:`run_segmenting` on a worker thread. False if not started."""
+        return self._start_worker(_SEGMENTING_STEPS, self.run_segmenting)
+
+    def start_analyze(self) -> bool:
+        """Run :meth:`run_analyze` on a worker thread. False if not started."""
+        return self._start_worker(WizardStep.ANALYZING, self.run_analyze)
+
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Block until the worker finishes. True when nothing is running."""
         with self._worker_guard:
@@ -412,18 +444,22 @@ class WizardController:
             worker.join(timeout)
         return not self.busy()
 
-    def _start_worker(self, step: WizardStep, target: Callable[[], None]) -> bool:
+    def _start_worker(
+        self, step: WizardStep | frozenset[WizardStep], target: Callable[[], None]
+    ) -> bool:
+        steps = step if isinstance(step, frozenset) else frozenset({step})
         with self._worker_guard:
             if self._worker is not None and self._worker.is_alive():
                 return False
             if self.busy():
                 return False
-            if self._state().step is not step:
+            current = self._state().step
+            if current not in steps:
                 return False
             worker = threading.Thread(
                 target=self._run_worker,
                 args=(target,),
-                name=f"wizard-{step.value}",
+                name=f"wizard-{current.value}",
                 daemon=True,
             )
             self._worker = worker
@@ -445,6 +481,12 @@ class WizardController:
                 return
             if state.step is WizardStep.PLANNING:
                 self._plan_failed(state, str(exc) or type(exc).__name__)
+                return
+            if state.step in _SEGMENTING_STEPS:
+                self._segmenting_failed(state, str(exc) or type(exc).__name__)
+                return
+            if state.step is WizardStep.ANALYZING:
+                self._analyze_failed(state, str(exc) or type(exc).__name__)
                 return
             self._save(state)
 
@@ -547,8 +589,19 @@ class WizardController:
                 shots = [shot.to_dict() for shot in found.shots]
                 label_error = found.label_error
         looks: dict[str, Any] | None = None
-        if state.job_id and state.step is WizardStep.LOOKS:
+        if state.job_id and state.step in {
+            WizardStep.LOOKS,
+            WizardStep.READY_TO_RENDER,
+        }:
             looks = self._looks_view(self.store.job_dir(state.job_id))
+        segments: dict[str, Any] | None = None
+        if state.job_id and state.step is WizardStep.SEGMENTS:
+            segments = self._segments_view(self.store.job_dir(state.job_id))
+        segment_preview: dict[str, Any] | None = None
+        if state.job_id and state.step is WizardStep.PREVIEW_SEGMENT:
+            segment_preview = self._segment_preview_view(
+                self.store.job_dir(state.job_id), state.segment_index
+            )
         return {
             "step": state.step.value,
             "busy": self.busy(),
@@ -565,6 +618,8 @@ class WizardController:
             "shots": shots,
             "label_error": label_error,
             "looks": looks,
+            "segments": segments,
+            "segment_preview": segment_preview,
             "seams": seams,
             "seam_error": seam_error,
         }
@@ -621,6 +676,15 @@ class WizardController:
             return
         if path == "/looks":
             self._looks_post(state, fields)
+            return
+        if path == "/segments":
+            self._segments_post(state, fields)
+            return
+        if path == "/preview":
+            self._preview_post(state, fields)
+            return
+        if path == "/ready":
+            self._ready_post(state, fields)
             return
         if path == "/result":
             self._result_post(state, fields)
@@ -683,7 +747,9 @@ class WizardController:
             self._save(state)
             return
         state.job_id = manifest.job_id
-        state.step = WizardStep.FINDING_SHOTS
+        state.step = (
+            WizardStep.SAMPLING if segment_loop_enabled() else WizardStep.FINDING_SHOTS
+        )
         self._save(state)
 
     def run_scan(self) -> None:
@@ -821,14 +887,40 @@ class WizardController:
             state.step = WizardStep.LOOKS
             self._save(state)
             return
+        self._work_on(
+            state,
+            job_dir,
+            source,
+            shots,
+            plan,
+            indexes,
+            phase="planning",
+            done=WizardStep.LOOKS,
+            failed=self._plan_failed,
+        )
+
+    def _work_on(
+        self,
+        state: WizardState,
+        job_dir: Path,
+        source: Path,
+        shots: ShotList,
+        plan: ShotPlan,
+        indexes: list[int],
+        *,
+        phase: str,
+        done: WizardStep,
+        failed: Callable[[WizardState, str], None],
+    ) -> None:
+        """Propose, preview, and check ``indexes``; then go to ``done``."""
         warnings: list[str] = []
         # The scale is chosen once, on the first pass; every shot shares it.
         first = not any(recipe.reason for recipe in plan.recipes)
         scales = tuple(sorted({2, plan.scale})) if first else (plan.scale,)
         if first:
-            self._progress(state, "planning", 10, "Boxing faces, hands, and text")
+            self._progress(state, phase, 10, "Boxing faces, hands, and text")
             shots = self._locate(shots, source, job_dir, warnings)
-        self._progress(state, "planning", 30, "Gemini is proposing settings")
+        self._progress(state, phase, 30, "Gemini is proposing settings")
         try:
             reply = self.gemini().propose_looks(
                 shots=shots_payload(shots, plan, indexes),
@@ -845,7 +937,7 @@ class WizardController:
             warnings.append(f"Gemini could not propose settings ({exc})")
             plan.scale = min(scales)
             plan = _fallback_plan(plan, shots, indexes)
-        self._progress(state, "planning", 50, "Rendering previews on the GPU")
+        self._progress(state, phase, 50, "Rendering previews on the GPU")
         try:
             plan = render_previews(
                 source,
@@ -857,7 +949,7 @@ class WizardController:
                 ffmpeg_bin=self.ffmpeg_bin,
             )
             plan = measure_shimmer(job_dir, plan, indexes, ffmpeg_bin=self.ffmpeg_bin)
-            self._progress(state, "planning", 80, "Checking the previews")
+            self._progress(state, phase, 80, "Checking the previews")
             plan = self._check(
                 plan,
                 shots,
@@ -868,14 +960,14 @@ class WizardController:
                 ask_gemini=not warnings,
             )
         except (UpscaleError, ShotError, OSError) as exc:
-            self._plan_failed(state, str(exc))
+            failed(state, str(exc))
             return
         plan = finish(plan, indexes)
         if warnings:
             plan.error = "; ".join(warnings) + "."
         save_plan(job_dir, plan)
         state.error = None
-        state.step = WizardStep.LOOKS
+        state.step = done
         self._save(state)
 
     def _locate(
@@ -1050,6 +1142,274 @@ class WizardController:
             else:
                 raise ValueError(f"unknown action {action!r}")
         except (ShotPlanError, ValueError) as exc:
+            state.error = str(exc)
+        self._save(state)
+
+    # Segment loop -----------------------------------------------------------
+
+    def run_segmenting(self) -> None:
+        if not self._work_lock.acquire(blocking=False):
+            return
+        try:
+            state = self._state()
+            if state.job_id and state.step is WizardStep.SAMPLING:
+                self._sample(state)
+            state = self._state()
+            if state.job_id and state.step is WizardStep.PROPOSING:
+                self._propose_segments(state)
+        finally:
+            self._work_lock.release()
+
+    def _sample(self, state: WizardState) -> None:
+        """Save the still grid Gemini cuts the video from."""
+        assert state.job_id
+        job_dir = self.store.job_dir(state.job_id)
+        source = Path(self.store.load(state.job_id).source_path)
+        self._progress(state, "sampling", 5, "Saving stills from the video")
+        try:
+            duration = float(probe_file(source).duration_s or 0.0)
+            extract_segment_stills(
+                source, job_dir, sample_times(duration), ffmpeg_bin=self.ffmpeg_bin
+            )
+        except (SegmentLoopError, ProbeError, ValueError, OSError) as exc:
+            self._segmenting_failed(state, str(exc))
+            return
+        state.step = WizardStep.PROPOSING
+        self._save(state)
+
+    def _propose_segments(self, state: WizardState) -> None:
+        """Ask Gemini for segments; one whole-video segment if it cannot."""
+        assert state.job_id
+        job_dir = self.store.job_dir(state.job_id)
+        source = Path(self.store.load(state.job_id).source_path)
+        try:
+            duration = float(probe_file(source).duration_s or 0.0)
+            earlier = load_segment_list(job_dir)
+        except (SegmentLoopError, ProbeError, OSError) as exc:
+            self._segmenting_failed(state, str(exc))
+            return
+        stills = load_segment_stills(job_dir)
+        if not stills:
+            self._segmenting_failed(state, "the stills are missing")
+            return
+        self._progress(state, "proposing", 50, "Gemini is proposing segments")
+        error: str | None = None
+        try:
+            raw = self.gemini().propose_segments(
+                stills=[job_dir / still.path for still in stills],
+                times=[still.t_s for still in stills],
+                duration_s=duration,
+                note=earlier.note if earlier else "",
+                job_dir=job_dir,
+            )
+            segments = repair_coverage(raw, duration)
+        except (GeminiError, SegmentLoopError) as exc:
+            error = (
+                f"Gemini could not propose segments ({exc}); the whole video is one."
+            )
+            segments = [LoopSegment(0.0, duration, label="whole video")]
+        save_segment_list(job_dir, SegmentList(segments=segments, error=error))
+        state.error = None
+        state.step = WizardStep.SEGMENTS
+        self._save(state)
+
+    def _segmenting_failed(self, state: WizardState, detail: str) -> None:
+        """Sampling or proposing failed; mark the job failed and go back to pick."""
+        assert state.job_id
+        job_id = state.job_id
+        with contextlib.suppress(JobError):
+            self.store.transition(job_id, JobState.FAILED)
+        message = f"Finding the segments failed: {detail}"
+        save_job_wizard_state(
+            self.store.job_dir(job_id),
+            WizardState(step=WizardStep.PICK_FILE, job_id=job_id, error=message),
+        )
+        self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
+
+    def _segments_view(self, job_dir: Path) -> dict[str, Any]:
+        try:
+            found = load_segment_list(job_dir)
+        except SegmentLoopError as exc:
+            return {"segments": [], "error": str(exc), "note": ""}
+        if found is None:
+            return {"segments": [], "error": None, "note": ""}
+        return {
+            "segments": [segment.to_dict() for segment in found.segments],
+            "error": found.error,
+            "note": found.note,
+        }
+
+    def _segments_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
+        """Approve the segments, or send them back to Gemini with a note."""
+        if state.step is not WizardStep.SEGMENTS or not state.job_id:
+            raise WizardError("there are no segments to change")
+        job_dir = self.store.job_dir(state.job_id)
+        try:
+            found = load_segment_list(job_dir)
+        except SegmentLoopError as exc:
+            raise WizardError(str(exc)) from exc
+        if found is None:
+            raise WizardError("the segments are missing; pick the file again")
+        action = fields.get("action", [""])[0]
+        if action == "approve":
+            if not found.approved:
+                # New segments: plan them from the start.
+                found.approved = True
+                save_segment_list(job_dir, found)
+                shots_path(job_dir).unlink(missing_ok=True)
+                plan_path(job_dir).unlink(missing_ok=True)
+                state.segment_index = 0
+            state.step = WizardStep.ANALYZING
+        elif action == "note":
+            text = " ".join(fields.get("note", [""])[0].split())
+            if not text:
+                state.error = "say what to change about the segments"
+            else:
+                found.note = text[:500]
+                found.approved = False
+                save_segment_list(job_dir, found)
+                state.step = WizardStep.PROPOSING
+        else:
+            state.error = f"unknown action {action!r}"
+        self._save(state)
+
+    def run_analyze(self) -> None:
+        if not self._work_lock.acquire(blocking=False):
+            return
+        try:
+            state = self._state()
+            if state.step is WizardStep.ANALYZING and state.job_id:
+                self._analyze(state)
+        finally:
+            self._work_lock.release()
+
+    def _analyze(self, state: WizardState) -> None:
+        """Plan, preview, and check the current segment only."""
+        assert state.job_id
+        job_dir = self.store.job_dir(state.job_id)
+        source = Path(self.store.load(state.job_id).source_path)
+        try:
+            found = load_segment_list(job_dir)
+        except SegmentLoopError:
+            found = None
+        if found is None or not found.approved:
+            message = "this job has no approved segments; pick the file again"
+            self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
+            return
+        shots = load_shots(job_dir)
+        plan = load_plan(job_dir)
+        if shots is None or plan is None:
+            self._progress(state, "analyzing", 5, "Measuring the segments")
+            try:
+                shots = shots_from_segments(
+                    source, job_dir, found.segments, ffmpeg_bin=self.ffmpeg_bin
+                )
+                video = probe_file(source).primary_video()
+            except (SegmentLoopError, ProbeError) as exc:
+                self._analyze_failed(state, str(exc))
+                return
+            save_shots(job_dir, shots)
+            scales = allowed_scales(
+                (video.width or 0) if video else 0,
+                (video.height or 0) if video else 0,
+            )
+            plan = new_plan(shots, max(scales))
+            save_plan(job_dir, plan)
+        index = state.segment_index
+        if index >= len(plan.recipes):
+            state.step = WizardStep.READY_TO_RENDER
+            self._save(state)
+            return
+        recipe = plan.recipes[index]
+        if recipe.preview_start is None:
+            seed = f"{state.job_id}:{index}:{recipe.rev}"
+            plan.recipes[index] = replace(
+                recipe, preview_start=random_preview_start(shots.shots[index], seed)
+            )
+        if not recipe.stale and recipe.rev:
+            state.step = WizardStep.PREVIEW_SEGMENT
+            self._save(state)
+            return
+        self._work_on(
+            state,
+            job_dir,
+            source,
+            shots,
+            plan,
+            [index],
+            phase="analyzing",
+            done=WizardStep.PREVIEW_SEGMENT,
+            failed=self._analyze_failed,
+        )
+
+    def _analyze_failed(self, state: WizardState, detail: str) -> None:
+        """A segment preview failed; go back to the segments to try again."""
+        state.error = f"The segment preview failed: {detail}"
+        state.step = WizardStep.SEGMENTS
+        self._save(state)
+
+    def _segment_preview_view(self, job_dir: Path, index: int) -> dict[str, Any]:
+        looks = self._looks_view(job_dir)
+        items = looks["shots"]
+        return {
+            "index": index,
+            "count": len(items),
+            "scale": looks["scale"],
+            "error": looks["error"],
+            "shot": items[index] if 0 <= index < len(items) else None,
+        }
+
+    def _preview_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
+        """Approve this segment's preview, or redo it with a note."""
+        if state.step is not WizardStep.PREVIEW_SEGMENT or not state.job_id:
+            raise WizardError("there is no segment preview to change")
+        job_dir = self.store.job_dir(state.job_id)
+        plan = load_plan(job_dir)
+        if plan is None:
+            raise WizardError("the segment settings are missing; pick the file again")
+        action = fields.get("action", [""])[0]
+        try:
+            if action == "approve":
+                state.segment_index += 1
+                state.step = (
+                    WizardStep.READY_TO_RENDER
+                    if state.segment_index >= len(plan.recipes)
+                    else WizardStep.ANALYZING
+                )
+            elif action == "redo":
+                save_plan(
+                    job_dir,
+                    request_redo(
+                        plan,
+                        state.segment_index,
+                        fields.get("note", [""])[0],
+                        resample=fields.get("resample", [""])[0] == "1",
+                    ),
+                )
+                state.step = WizardStep.ANALYZING
+            else:
+                raise ValueError(f"unknown action {action!r}")
+        except (ShotPlanError, ValueError) as exc:
+            state.error = str(exc)
+        self._save(state)
+
+    def _ready_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
+        """Start the full render from every approved segment."""
+        if state.step is not WizardStep.READY_TO_RENDER or not state.job_id:
+            raise WizardError("the segments are not all approved yet")
+        job_dir = self.store.job_dir(state.job_id)
+        shots = load_shots(job_dir)
+        plan = load_plan(job_dir)
+        if shots is None or plan is None:
+            raise WizardError("the segment settings are missing; pick the file again")
+        if fields.get("action", [""])[0] != "render":
+            state.error = "send action=render to start the full render"
+            self._save(state)
+            return
+        try:
+            save_upscale_plan(job_dir, plan.to_upscale_plan(shots))
+            state.step = WizardStep.RENDERING
+        except ShotPlanError as exc:
             state.error = str(exc)
         self._save(state)
 
