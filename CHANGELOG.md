@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-10-23
+
 ### Added
 
 - Full restart from the result screen. A note sent with "Start over from the
