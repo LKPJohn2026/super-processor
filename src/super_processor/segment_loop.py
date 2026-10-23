@@ -9,6 +9,11 @@ their times; the editor approves them before anything is planned.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from pathlib import Path
+
+from .segments import STILLS_DIR_NAME
+from .shots import ShotError, extract_still
 
 MAX_STILLS = 120
 STILLS_PER_S = 1.0
@@ -37,3 +42,51 @@ def sample_times(
     count = min(cap, math.ceil(last * per_s) + 1)
     times = [round(last * i / (count - 1), 3) for i in range(count)]
     return sorted(set(times))
+
+
+class SegmentLoopError(RuntimeError):
+    """Raised when the segment loop cannot sample or keep its segments."""
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentStill:
+    """One sampled still: its source time and its path inside the job."""
+
+    t_s: float
+    path: str
+
+
+def still_name(t_s: float) -> str:
+    """File name for a still at ``t_s``; the time is in the name, in ms."""
+    return f"t_{round(t_s * 1000):08d}.jpg"
+
+
+def extract_segment_stills(
+    source: Path,
+    job_dir: Path,
+    times: list[float],
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+) -> list[SegmentStill]:
+    """Save one still per time under ``job_dir`` and return them in order.
+
+    Stills from an earlier sampling are removed first. Stills from the older
+    segment review (``seg_NN.ppm``) share the folder and are left alone.
+    """
+    folder = job_dir / STILLS_DIR_NAME
+    if folder.is_symlink():
+        raise SegmentLoopError(f"refusing {STILLS_DIR_NAME}: it is a symbolic link")
+    folder.mkdir(parents=True, exist_ok=True)
+    if not folder.resolve().is_relative_to(job_dir.resolve()):
+        raise SegmentLoopError(f"{STILLS_DIR_NAME} is outside the job folder")
+    for old in folder.glob("t_*.jpg"):
+        old.unlink()
+    stills: list[SegmentStill] = []
+    for t_s in times:
+        relative = f"{STILLS_DIR_NAME}/{still_name(t_s)}"
+        try:
+            extract_still(source, t_s, job_dir / relative, ffmpeg_bin=ffmpeg_bin)
+        except ShotError as exc:
+            raise SegmentLoopError(f"could not sample the video: {exc}") from exc
+        stills.append(SegmentStill(t_s=t_s, path=relative))
+    return stills
