@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The segment loop runs in the wizard when `SUPER_PROCESSOR_SEGMENT_LOOP=1`
+  is set. After the pick, one worker samples the stills and asks Gemini for
+  segments (`GET /api/segment?run=1`). `POST /api/segments` approves them or
+  sends them back with a `note`. Each segment is then planned, previewed,
+  and checked on its own (`GET /api/analyze?run=1`); `POST /api/preview`
+  approves it and moves to the next, or redoes it with a `note`
+  (`resample=1` picks a new preview window). When every segment is
+  approved, `POST /api/ready` with `action=render` starts the full render.
+  `/api/state` returns `segments`, `segment_preview`, and `segment_index`.
+  The page shell does not show these steps yet.
+- Each segment's preview is a random window of up to 3s inside it, seeded
+  by job, segment, and preview count, and kept across redos.
+
 ## [2.9.0] - 2026-10-23
 
 ### Added
