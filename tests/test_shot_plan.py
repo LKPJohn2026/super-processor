@@ -7,6 +7,7 @@ import math
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from super_processor.shot_plan import (
     look_from_model,
     new_plan,
     preview_window,
+    random_preview_start,
     render_previews,
     request_redo,
     save_plan,
@@ -564,3 +566,30 @@ def test_proposals_carry_use_upscale() -> None:
     assert data["recipes"][0]["use_upscale"] is False
     assert ShotRecipe.from_dict(data["recipes"][0]).use_upscale is False
     assert ShotRecipe.from_dict({"strength": 0.5}).use_upscale is True
+
+
+def test_random_preview_window_is_seeded_and_inside_the_shot() -> None:
+    shot = Shot(10.0, 30.0)
+    first = random_preview_start(shot, "job:0:1")
+    assert first is not None
+    assert first == random_preview_start(shot, "job:0:1")
+    starts = {random_preview_start(shot, f"job:0:{rev}") for rev in range(8)}
+    assert len(starts) > 1
+    for start in starts:
+        assert start is not None
+        begin, end = preview_window(shot, start)
+        assert begin >= 10.0 and end <= 30.0 and end - begin == pytest.approx(3.0)
+    assert random_preview_start(Shot(0.0, 2.0), "x") is None
+    assert preview_window(shot, 29.0) == (27.0, 30.0)
+    assert preview_window(shot, 1.0) == (10.0, 13.0)
+
+
+def test_redo_can_resample_the_preview_window() -> None:
+    shots = _shots()
+    plan = new_plan(shots, 2)
+    plan.recipes[0] = replace(plan.recipes[0], preview_start=4.0)
+    kept = request_redo(plan, 0, "less sharp")
+    assert kept.recipes[0].preview_start == 4.0
+    fresh = request_redo(plan, 0, "show another part", resample=True)
+    assert fresh.recipes[0].preview_start is None
+    assert ShotRecipe.from_dict(kept.recipes[0].to_dict()).preview_start == 4.0

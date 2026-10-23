@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .segments import SEGMENTS_FILE_NAME, STILLS_DIR_NAME, WIZARD_SEGMENTS_KIND
-from .shots import ShotError, extract_still
+from .shots import Shot, ShotError, ShotList, extract_still, measure_range, shot_still
 
 MAX_STILLS = 120
 STILLS_PER_S = 1.0
@@ -60,6 +61,27 @@ class SegmentStill:
 
     t_s: float
     path: str
+
+
+_STILL_NAME = re.compile(r"t_(\d{8})\.jpg")
+
+
+def load_segment_stills(job_dir: Path) -> list[SegmentStill]:
+    """The sampled stills already in the job, in time order."""
+    folder = job_dir / STILLS_DIR_NAME
+    if folder.is_symlink() or not folder.is_dir():
+        return []
+    stills: list[SegmentStill] = []
+    for path in folder.iterdir():
+        found = _STILL_NAME.fullmatch(path.name)
+        if found and path.is_file() and not path.is_symlink():
+            stills.append(
+                SegmentStill(
+                    t_s=int(found.group(1)) / 1000,
+                    path=f"{STILLS_DIR_NAME}/{path.name}",
+                )
+            )
+    return sorted(stills, key=lambda still: still.t_s)
 
 
 def still_name(t_s: float) -> str:
@@ -146,6 +168,8 @@ class SegmentList:
     segments: list[LoopSegment] = field(default_factory=list)
     approved: bool = False
     error: str | None = None
+    # The editor's reason for sending the last proposal back.
+    note: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -153,6 +177,7 @@ class SegmentList:
             "kind": SEGMENT_LIST_KIND,
             "approved": self.approved,
             "error": self.error,
+            "note": self.note,
             "segments": [segment.to_dict() for segment in self.segments],
         }
 
@@ -171,6 +196,7 @@ class SegmentList:
             segments=[LoopSegment.from_dict(item) for item in raw],
             approved=bool(data.get("approved", False)),
             error=error if isinstance(error, str) else None,
+            note=str(data.get("note", "")),
         )
 
 
@@ -256,3 +282,38 @@ def repair_coverage(raw: list[dict[str, Any]], duration_s: float) -> list[LoopSe
         LoopSegment(round(start, 3), round(end, 3), label=label)
         for start, end, label in zip(edges[:-1], edges[1:], labels, strict=True)
     ]
+
+
+def shots_from_segments(
+    source: Path,
+    job_dir: Path,
+    segments: list[LoopSegment],
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+) -> ShotList:
+    """Measure and still each approved segment, as the shot planner expects.
+
+    The planner works on shots; in the segment loop each segment is one.
+    """
+    shots: list[Shot] = []
+    for segment in segments:
+        try:
+            metrics = measure_range(
+                source, segment.start_s, segment.end_s, ffmpeg_bin=ffmpeg_bin
+            )
+            still = shot_still(
+                source, job_dir, segment.start_s, segment.end_s, ffmpeg_bin=ffmpeg_bin
+            )
+        except ShotError as exc:
+            raise SegmentLoopError(f"could not measure a segment: {exc}") from exc
+        shots.append(
+            Shot(
+                start_s=segment.start_s,
+                end_s=segment.end_s,
+                metrics=metrics,
+                label=segment.label,
+                issues=metrics.hints(),
+                still=still,
+            )
+        )
+    return ShotList(shots=shots)

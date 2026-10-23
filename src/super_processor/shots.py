@@ -463,7 +463,7 @@ def extract_still(
     return dest
 
 
-def _still_for(
+def shot_still(
     source: Path, job_dir: Path, start_s: float, end_s: float, *, ffmpeg_bin: str
 ) -> str:
     name = f"{STILLS_DIR}/{int(round(start_s * 1000)):09d}.jpg"
@@ -489,7 +489,7 @@ def find_shots(
                 end_s=end,
                 metrics=metrics,
                 issues=metrics.hints(),
-                still=_still_for(source, job_dir, start, end, ffmpeg_bin=ffmpeg_bin),
+                still=shot_still(source, job_dir, start, end, ffmpeg_bin=ffmpeg_bin),
             )
         )
     return ShotList(shots=shots)
@@ -542,7 +542,7 @@ def split_at(
                 label=shot.label,
                 issues=shot.issues,
                 contains=shot.contains,
-                still=_still_for(source, job_dir, start, end, ffmpeg_bin=ffmpeg_bin),
+                still=shot_still(source, job_dir, start, end, ffmpeg_bin=ffmpeg_bin),
             )
         )
     rest = [*shots.shots[:index], *halves, *shots.shots[index + 1 :]]

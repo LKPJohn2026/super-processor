@@ -18,6 +18,7 @@ capped at :data:`PROTECTED_STRENGTH` as a whole instead.
 from __future__ import annotations
 
 import json
+import random
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -116,11 +117,15 @@ class ShotRecipe:
     # False: Gemini judged FlashVSR detail a risk here; the shot is only
     # resized to the output scale, with its look applied.
     use_upscale: bool = True
+    # Segment loop: where the preview window starts, picked once at random
+    # so a redo shows the same seconds. ``None`` previews the middle.
+    preview_start: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "strength": self.strength,
             "use_upscale": self.use_upscale,
+            "preview_start": self.preview_start,
             "look": self.look.to_dict(),
             "reason": self.reason,
             "check": self.check.to_dict(),
@@ -144,6 +149,7 @@ class ShotRecipe:
             note=str(data.get("note", "")),
             shimmer=_optional_number(data.get("shimmer")),
             use_upscale=data.get("use_upscale") is not False,
+            preview_start=_optional_number(data.get("preview_start")),
         )
 
 
@@ -470,12 +476,31 @@ def load_plan(job_dir: Path) -> ShotPlan | None:
     return ShotPlan.from_dict(data)
 
 
-def preview_window(shot: Shot) -> tuple[float, float]:
-    """At most :data:`PREVIEW_S` seconds from the middle of the shot."""
+def preview_window(shot: Shot, start: float | None = None) -> tuple[float, float]:
+    """At most :data:`PREVIEW_S` seconds of the shot.
+
+    From ``start`` when given (kept inside the shot), else from the middle.
+    """
     if shot.duration_s <= PREVIEW_S:
         return shot.start_s, shot.end_s
-    middle = (shot.start_s + shot.end_s) / 2
-    return middle - PREVIEW_S / 2, middle + PREVIEW_S / 2
+    if start is None:
+        middle = (shot.start_s + shot.end_s) / 2
+        return middle - PREVIEW_S / 2, middle + PREVIEW_S / 2
+    begin = min(max(start, shot.start_s), shot.end_s - PREVIEW_S)
+    return begin, begin + PREVIEW_S
+
+
+def random_preview_start(shot: Shot, seed: str) -> float | None:
+    """A random preview start inside ``shot``, the same for the same ``seed``.
+
+    ``None`` when the whole shot fits in one preview.
+    """
+    room = shot.duration_s - PREVIEW_S
+    if room <= 0:
+        return None
+    # A str seed is hashed with SHA-512, so it does not change between runs
+    # the way hash() does.
+    return round(shot.start_s + random.Random(seed).uniform(0.0, room), 3)
 
 
 def preview_name(index: int, rev: int, side: str, ext: str = "mp4") -> str:
@@ -506,7 +531,7 @@ def render_previews(
     for index in indexes:
         recipe = replace(recipes[index], rev=recipes[index].rev + 1)
         recipes[index] = recipe
-        start, end = preview_window(shots.shots[index])
+        start, end = preview_window(shots.shots[index], recipe.preview_start)
         clip = trim_source(
             source,
             work / f"shot_{index:03d}_in.mp4",
@@ -543,7 +568,7 @@ def render_previews(
         )
         encode_delivery(clips[index], before, ffmpeg_bin=ffmpeg_bin)
         for side, video in (("before", before), ("after", after)):
-            middle = _middle_s(shots.shots[index])
+            middle = _middle_s(shots.shots[index], recipe.preview_start)
             extract_still(
                 video,
                 middle,
@@ -554,8 +579,8 @@ def render_previews(
     return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
 
 
-def _middle_s(shot: Shot) -> float:
-    start, end = preview_window(shot)
+def _middle_s(shot: Shot, start_s: float | None = None) -> float:
+    start, end = preview_window(shot, start_s)
     return (end - start) / 2
 
 
@@ -647,8 +672,13 @@ def finish(plan: ShotPlan, indexes: list[int]) -> ShotPlan:
     return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
 
 
-def request_redo(plan: ShotPlan, index: int, note: str) -> ShotPlan:
-    """Send one shot round again with the editor's note."""
+def request_redo(
+    plan: ShotPlan, index: int, note: str, *, resample: bool = False
+) -> ShotPlan:
+    """Send one shot round again with the editor's note.
+
+    ``resample`` drops the preview window, so the next one is picked anew.
+    """
     if not 0 <= index < len(plan.recipes):
         raise ShotPlanError("no such shot")
     text = " ".join(note.split())
@@ -656,6 +686,8 @@ def request_redo(plan: ShotPlan, index: int, note: str) -> ShotPlan:
         raise ShotPlanError("say what to change about this shot")
     recipes = list(plan.recipes)
     recipes[index] = replace(recipes[index], stale=True, note=text[:500])
+    if resample:
+        recipes[index] = replace(recipes[index], preview_start=None)
     return ShotPlan(scale=plan.scale, recipes=recipes, error=None)
 
 

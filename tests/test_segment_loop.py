@@ -18,11 +18,14 @@ from super_processor.segment_loop import (
     LoopSegment,
     SegmentList,
     SegmentLoopError,
+    SegmentStill,
     extract_segment_stills,
     load_segment_list,
+    load_segment_stills,
     repair_coverage,
     sample_times,
     save_segment_list,
+    shots_from_segments,
     still_name,
 )
 from super_processor.segments import (
@@ -341,3 +344,45 @@ def test_repair_coverage_boundary_rules() -> None:
         10.0,
     )
     assert [(s.start_s, s.label) for s in sliver] == [(0.0, "a"), (6.0, "b")]
+
+
+def test_segment_list_keeps_the_editor_note(tmp_path: Path) -> None:
+    saved = _two_segments()
+    saved.note = "split where we go outside"
+    save_segment_list(tmp_path, saved)
+    loaded = load_segment_list(tmp_path)
+    assert loaded is not None and loaded.note == "split where we go outside"
+
+
+def test_load_segment_stills_reads_times_from_names(tmp_path: Path) -> None:
+    assert load_segment_stills(tmp_path) == []
+    folder = tmp_path / STILLS_DIR_NAME
+    folder.mkdir()
+    for name in ("t_00002500.jpg", "t_00000000.jpg", "seg_00.ppm", "t_x.jpg"):
+        (folder / name).write_bytes(b"x")
+    (folder / "t_00009000.jpg").symlink_to(folder / "t_00000000.jpg")
+    assert load_segment_stills(tmp_path) == [
+        SegmentStill(0.0, f"{STILLS_DIR_NAME}/t_00000000.jpg"),
+        SegmentStill(2.5, f"{STILLS_DIR_NAME}/t_00002500.jpg"),
+    ]
+
+
+@needs_ffmpeg
+def test_shots_from_segments_measures_each_segment(tmp_path: Path) -> None:
+    source = _clip(tmp_path / "in.mp4", seconds=4)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    segments = [
+        LoopSegment(0.0, 1.5, label="first"),
+        LoopSegment(1.5, 4.0, label="second"),
+    ]
+    shots = shots_from_segments(source, job_dir, segments)
+    assert [(s.start_s, s.end_s, s.label) for s in shots.shots] == [
+        (0.0, 1.5, "first"),
+        (1.5, 4.0, "second"),
+    ]
+    assert all((job_dir / s.still).is_file() for s in shots.shots)
+    with pytest.raises(SegmentLoopError, match="measure a segment"):
+        shots_from_segments(
+            source, job_dir, segments, ffmpeg_bin=str(tmp_path / "no-ffmpeg")
+        )
