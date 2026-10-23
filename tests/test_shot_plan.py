@@ -544,3 +544,23 @@ def test_flashvsr_batches_previews_with_one_load(
     long = _clip(tmp_path / "long.mp4", seconds=10)
     with pytest.raises(UpscaleError, match="at most"):
         engine.upscale_many([UpscaleRequest(long, tmp_path / "out" / "long.mp4")])
+
+
+def test_proposals_carry_use_upscale() -> None:
+    shots = _shots()
+    plan = new_plan(shots, 2)
+    merged = apply_proposals(
+        plan,
+        shots,
+        [
+            {"index": 0, "strength": 0.4, "look": {}, "use_upscale": False},
+            {"index": 1, "strength": 0.4, "look": {}, "use_upscale": "no"},
+            {"index": 2, "strength": 0.4, "look": {}},
+        ],
+        [0, 1, 2],
+    )
+    assert [r.use_upscale for r in merged.recipes] == [False, True, True]
+    data = merged.to_dict()
+    assert data["recipes"][0]["use_upscale"] is False
+    assert ShotRecipe.from_dict(data["recipes"][0]).use_upscale is False
+    assert ShotRecipe.from_dict({"strength": 0.5}).use_upscale is True

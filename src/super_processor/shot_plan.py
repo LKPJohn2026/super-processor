@@ -113,10 +113,14 @@ class ShotRecipe:
     note: str = ""
     # Measured on the latest preview: see :func:`.stability.shimmer_index`.
     shimmer: float | None = None
+    # False: Gemini judged FlashVSR detail a risk here; the shot is only
+    # resized to the output scale, with its look applied.
+    use_upscale: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "strength": self.strength,
+            "use_upscale": self.use_upscale,
             "look": self.look.to_dict(),
             "reason": self.reason,
             "check": self.check.to_dict(),
@@ -139,6 +143,7 @@ class ShotRecipe:
             stale=bool(data.get("stale", True)),
             note=str(data.get("note", "")),
             shimmer=_optional_number(data.get("shimmer")),
+            use_upscale=data.get("use_upscale") is not False,
         )
 
 
@@ -370,6 +375,7 @@ def apply_proposals(
             strength=cap_strength(strength, shot),
             look=look_from_model(item.get("look")),
             reason=" ".join(str(item.get("reason", "")).split())[:240],
+            use_upscale=item.get("use_upscale") is not False,
         )
     error = plan.error
     if missing:

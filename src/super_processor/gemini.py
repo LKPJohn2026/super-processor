@@ -580,6 +580,7 @@ _PROPOSE_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "index": {"type": "integer"},
                     "strength": {"type": "number"},
+                    "use_upscale": {"type": "boolean"},
                     "look": _LOOK_SCHEMA,
                     "reason": {"type": "string"},
                 },
@@ -926,6 +927,10 @@ class GeminiClient:
             "down inside them automatically, so its strength can suit the "
             "rest of the frame; a shot that contains faces, hands, or text "
             f"without boxes is capped at strength {protected_strength:g}. "
+            "Set use_upscale to false for a shot that FlashVSR would only "
+            "harm (already clean and sharp, or fine texture it would invent "
+            "over); it is then resized with a plain upscale and keeps its "
+            "look. "
             f"Pick one scale for the whole video from {list(scales)}. If a "
             "shot has an editor_note, follow it; current shows its settings "
             "now. Return a short reason per shot in plain words."
