@@ -373,10 +373,11 @@ def test_shots_from_segments_measures_each_segment(tmp_path: Path) -> None:
     job_dir = tmp_path / "job"
     job_dir.mkdir()
     segments = [
-        LoopSegment(0.0, 1.5, label="first"),
+        LoopSegment(0.0, 1.5, label="first", contains=("faces",)),
         LoopSegment(1.5, 4.0, label="second"),
     ]
     shots = shots_from_segments(source, job_dir, segments)
+    assert [s.contains for s in shots.shots] == [("faces",), ()]
     assert [(s.start_s, s.end_s, s.label) for s in shots.shots] == [
         (0.0, 1.5, "first"),
         (1.5, 4.0, "second"),
@@ -386,3 +387,25 @@ def test_shots_from_segments_measures_each_segment(tmp_path: Path) -> None:
         shots_from_segments(
             source, job_dir, segments, ffmpeg_bin=str(tmp_path / "no-ffmpeg")
         )
+
+
+def test_repair_coverage_keeps_known_contents() -> None:
+    segments = repair_coverage(
+        [
+            {"start_s": 0, "end_s": 0.2, "label": "x", "contains": ["text"]},
+            {
+                "start_s": 0.2,
+                "end_s": 5,
+                "label": "a",
+                "contains": ["Faces", "faces", "robots"],
+            },
+            {"start_s": 5, "end_s": 10, "label": "b", "contains": "hands"},
+        ],
+        10.0,
+    )
+    assert [(s.label, s.contains) for s in segments] == [
+        ("a", ("text", "faces")),
+        ("b", ()),
+    ]
+    saved = SegmentList(segments=segments)
+    assert SegmentList.from_dict(saved.to_dict()) == saved

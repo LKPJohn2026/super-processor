@@ -522,6 +522,7 @@ def test_propose_segments_sends_stills_with_times(tmp_path: Path) -> None:
         stills=_segment_stills(tmp_path, 3),
         times=[0.0, 1.0, 2.0],
         duration_s=3.0,
+        contains=("faces", "text"),
         job_dir=tmp_path,
     )
     assert out == reply["segments"]
@@ -530,6 +531,9 @@ def test_propose_segments_sends_stills_with_times(tmp_path: Path) -> None:
     assert [p["text"] for p in parts[1::2]] == ["t=0.000s", "t=1.000s", "t=2.000s"]
     assert all("inlineData" in p for p in parts[2::2])
     assert "did not accept" not in parts[0]["text"]
+    assert "faces, text" in parts[0]["text"]
+    schema = transport.last_body["generationConfig"]["responseSchema"]
+    assert "contains" in schema["properties"]["segments"]["items"]["required"]
     turns = load_chat(tmp_path)
     assert [turn.role for turn in turns] == ["user", "model"]
 

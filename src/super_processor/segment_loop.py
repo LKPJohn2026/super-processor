@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import Any
 
 from .segments import SEGMENTS_FILE_NAME, STILLS_DIR_NAME, WIZARD_SEGMENTS_KIND
-from .shots import Shot, ShotError, ShotList, extract_still, measure_range, shot_still
+from .shots import (
+    CONTENTS,
+    Shot,
+    ShotError,
+    ShotList,
+    extract_still,
+    measure_range,
+    shot_still,
+)
 
 MAX_STILLS = 120
 STILLS_PER_S = 1.0
@@ -128,6 +136,8 @@ class LoopSegment:
     end_s: float
     label: str = ""
     note: str = ""
+    # Where restoration mistakes would be obvious (see :data:`.shots.CONTENTS`).
+    contains: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         start, end = float(self.start_s), float(self.end_s)
@@ -144,6 +154,7 @@ class LoopSegment:
             "end_s": self.end_s,
             "label": self.label,
             "note": self.note,
+            "contains": list(self.contains),
         }
 
     @classmethod
@@ -156,6 +167,7 @@ class LoopSegment:
                 end_s=float(data["end_s"]),
                 label=str(data.get("label", "")),
                 note=str(data.get("note", "")),
+                contains=_contents(data.get("contains")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise SegmentLoopError("a segment is missing start_s or end_s") from exc
@@ -227,11 +239,20 @@ def load_segment_list(job_dir: Path) -> SegmentList | None:
 MIN_LOOP_SEGMENT_S = 0.5
 
 
-def _proposed_spans(
-    raw: list[dict[str, Any]], duration_s: float
-) -> list[tuple[float, float, str]]:
+def _contents(raw: Any) -> tuple[str, ...]:
+    """Known content names from a model reply, in order, without repeats."""
+    if not isinstance(raw, list):
+        return ()
+    names = [str(item).strip().lower() for item in raw]
+    return tuple(dict.fromkeys(name for name in names if name in CONTENTS))
+
+
+_Span = tuple[float, float, str, tuple[str, ...]]
+
+
+def _proposed_spans(raw: list[dict[str, Any]], duration_s: float) -> list[_Span]:
     """Gemini's spans clamped to the clip, in start order; broken ones dropped."""
-    spans: list[tuple[float, float, str]] = []
+    spans: list[_Span] = []
     for item in raw:
         try:
             start = min(max(float(item["start_s"]), 0.0), duration_s)
@@ -241,7 +262,7 @@ def _proposed_spans(
         if not (math.isfinite(start) and math.isfinite(end)) or end <= start:
             continue
         label = " ".join(str(item.get("label", "")).split())[:80]
-        spans.append((start, end, label))
+        spans.append((start, end, label, _contents(item.get("contains"))))
     return sorted(spans)
 
 
@@ -263,9 +284,9 @@ def repair_coverage(raw: list[dict[str, Any]], duration_s: float) -> list[LoopSe
     # would leave a sliver, so it is dropped and the newer span's label
     # takes over the segment it would have started.
     cuts: list[float] = []
-    labels: list[str] = [spans[0][2]]
+    labels: list[tuple[str, tuple[str, ...]]] = [(spans[0][2], spans[0][3])]
     reach = spans[0][1]
-    for start, end, label in spans[1:]:
+    for start, end, label, contains in spans[1:]:
         if end <= reach:
             continue
         cut = (reach + start) / 2 if start > reach else start
@@ -273,14 +294,18 @@ def repair_coverage(raw: list[dict[str, Any]], duration_s: float) -> list[LoopSe
         if cut > duration_s - MIN_LOOP_SEGMENT_S:
             break
         if cut - (cuts[-1] if cuts else 0.0) < MIN_LOOP_SEGMENT_S:
-            labels[-1] = label
+            # Keep what the sliver contained, so its faces stay protected.
+            merged = tuple(dict.fromkeys((*labels[-1][1], *contains)))
+            labels[-1] = (label, merged)
             continue
         cuts.append(cut)
-        labels.append(label)
+        labels.append((label, contains))
     edges = [0.0, *cuts, duration_s]
     return [
-        LoopSegment(round(start, 3), round(end, 3), label=label)
-        for start, end, label in zip(edges[:-1], edges[1:], labels, strict=True)
+        LoopSegment(round(start, 3), round(end, 3), label=label, contains=contains)
+        for start, end, (label, contains) in zip(
+            edges[:-1], edges[1:], labels, strict=True
+        )
     ]
 
 
@@ -313,6 +338,7 @@ def shots_from_segments(
                 metrics=metrics,
                 label=segment.label,
                 issues=metrics.hints(),
+                contains=segment.contains,
                 still=still,
             )
         )

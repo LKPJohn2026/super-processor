@@ -601,8 +601,9 @@ _SEGMENTS_SCHEMA: dict[str, Any] = {
                     "start_s": {"type": "number"},
                     "end_s": {"type": "number"},
                     "label": {"type": "string"},
+                    "contains": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["start_s", "end_s", "label"],
+                "required": ["start_s", "end_s", "label", "contains"],
             },
         },
     },
@@ -959,6 +960,7 @@ class GeminiClient:
         stills: list[Path],
         times: list[float],
         duration_s: float,
+        contains: tuple[str, ...] = (),
         note: str = "",
         job_dir: Path | None = None,
     ) -> list[dict[str, Any]]:
@@ -967,8 +969,8 @@ class GeminiClient:
         A segment is a stretch where the picture asks for the same
         restoration. ``note`` is the editor's reason for rejecting the last
         proposal; the replayed chat shows Gemini what it proposed then.
-        Returns ``[{start_s, end_s, label}]``; the caller repairs gaps and
-        overlaps.
+        Returns ``[{start_s, end_s, label, contains}]``; the caller repairs
+        gaps and overlaps and drops any name outside ``contains``.
         """
         if not stills or len(stills) != len(times):
             raise GeminiError("propose_segments needs one time per still")
@@ -981,7 +983,9 @@ class GeminiClient:
             "different settings. Do not cut a stretch that looks the same. "
             "The segments run in order from 0 to the end with no gaps or "
             "overlaps. Give each a label of at most eight words saying what "
-            "is in it and how it is lit."
+            "is in it and how it is lit, and what it contains from this list "
+            "only, where restoration mistakes would be obvious: "
+            f"{', '.join(contains)}."
         )
         text = " ".join(note.split())
         if text:

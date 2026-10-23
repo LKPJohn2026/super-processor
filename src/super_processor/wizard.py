@@ -1199,6 +1199,7 @@ class WizardController:
                 stills=[job_dir / still.path for still in stills],
                 times=[still.t_s for still in stills],
                 duration_s=duration,
+                contains=CONTENTS,
                 note=earlier.note if earlier else "",
                 job_dir=job_dir,
             )
