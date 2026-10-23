@@ -589,6 +589,24 @@ _PROPOSE_SCHEMA: dict[str, Any] = {
     },
     "required": ["scale", "shots"],
 }
+_SEGMENTS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start_s": {"type": "number"},
+                    "end_s": {"type": "number"},
+                    "label": {"type": "string"},
+                },
+                "required": ["start_s", "end_s", "label"],
+            },
+        },
+    },
+    "required": ["segments"],
+}
 _REGIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -929,6 +947,62 @@ class GeminiClient:
             raise GeminiError("Gemini returned no shot recipes")
         self._log(job_dir, intro + f" ({len(shots)} shots)", reply)
         return reply
+
+    def propose_segments(
+        self,
+        *,
+        stills: list[Path],
+        times: list[float],
+        duration_s: float,
+        note: str = "",
+        job_dir: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Cut the video into segments from a grid of stills and their times.
+
+        A segment is a stretch where the picture asks for the same
+        restoration. ``note`` is the editor's reason for rejecting the last
+        proposal; the replayed chat shows Gemini what it proposed then.
+        Returns ``[{start_s, end_s, label}]``; the caller repairs gaps and
+        overlaps.
+        """
+        if not stills or len(stills) != len(times):
+            raise GeminiError("propose_segments needs one time per still")
+        intro = (
+            "These stills are sampled from one video an editor wants "
+            "restored and upscaled, each with its time in seconds. The video "
+            f"is {duration_s:.2f}s long. Cut it into segments where the "
+            "photographic context changes: location, light, camera, subject "
+            "distance, or image quality, anywhere the restoration would need "
+            "different settings. Do not cut a stretch that looks the same. "
+            "The segments run in order from 0 to the end with no gaps or "
+            "overlaps. Give each a label of at most eight words saying what "
+            "is in it and how it is lit."
+        )
+        text = " ".join(note.split())
+        if text:
+            intro += (
+                " The editor did not accept your last segments and wrote: "
+                f"{text[:500]!r}. Follow that note."
+            )
+        parts: list[dict[str, Any]] = [{"text": intro}]
+        for t_s, still in zip(times, stills, strict=True):
+            parts.append({"text": f"t={t_s:.3f}s"})
+            parts.append(_jpeg_part(still, under=job_dir))
+        reply = self._generate(
+            contents=[{"role": "user", "parts": parts}],
+            schema=_SEGMENTS_SCHEMA,
+            system=(
+                "You split videos into segments for a restoration tool. You "
+                "never suggest commands or settings. Return JSON matching the "
+                "schema."
+            ),
+            prior=load_chat(job_dir) if job_dir is not None else None,
+        )
+        segments = reply.get("segments")
+        if not isinstance(segments, list) or not segments:
+            raise GeminiError("Gemini returned no segments")
+        self._log(job_dir, intro + f" ({len(stills)} stills)", reply)
+        return [item for item in segments if isinstance(item, dict)]
 
     def locate_regions(
         self,

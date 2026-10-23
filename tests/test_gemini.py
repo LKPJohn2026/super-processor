@@ -501,3 +501,79 @@ def test_candidate_models_honors_env_list(
     assert names[0] == "gemini-3.8-flash"
     assert "gemini-2.5-flash" in names
     assert "gemini-2.5-pro" in names
+
+
+def _segment_stills(job_dir: Path, count: int) -> list[Path]:
+    folder = job_dir / "segment_stills"
+    folder.mkdir(parents=True, exist_ok=True)
+    stills = []
+    for index in range(count):
+        path = folder / f"t_{index * 1000:08d}.jpg"
+        path.write_bytes(b"\xff\xd8jpeg")
+        stills.append(path)
+    return stills
+
+
+def test_propose_segments_sends_stills_with_times(tmp_path: Path) -> None:
+    reply = {"segments": [{"start_s": 0.0, "end_s": 3.0, "label": "kitchen"}]}
+    transport = _FakeTransport(reply)
+    client = GeminiClient(api_key="k", transport=transport)
+    out = client.propose_segments(
+        stills=_segment_stills(tmp_path, 3),
+        times=[0.0, 1.0, 2.0],
+        duration_s=3.0,
+        job_dir=tmp_path,
+    )
+    assert out == reply["segments"]
+    assert transport.last_body is not None
+    parts = transport.last_body["contents"][-1]["parts"]
+    assert [p["text"] for p in parts[1::2]] == ["t=0.000s", "t=1.000s", "t=2.000s"]
+    assert all("inlineData" in p for p in parts[2::2])
+    assert "did not accept" not in parts[0]["text"]
+    turns = load_chat(tmp_path)
+    assert [turn.role for turn in turns] == ["user", "model"]
+
+
+def test_propose_segments_note_replays_the_last_proposal(tmp_path: Path) -> None:
+    first = {"segments": [{"start_s": 0.0, "end_s": 3.0, "label": "one take"}]}
+    transport = _FakeTransport(first)
+    client = GeminiClient(api_key="k", transport=transport)
+    stills = _segment_stills(tmp_path, 2)
+    client.propose_segments(
+        stills=stills, times=[0.0, 2.0], duration_s=3.0, job_dir=tmp_path
+    )
+    transport.payload = {
+        "segments": [
+            {"start_s": 0.0, "end_s": 1.5, "label": "indoor"},
+            {"start_s": 1.5, "end_s": 3.0, "label": "outdoor"},
+        ]
+    }
+    client.propose_segments(
+        stills=stills,
+        times=[0.0, 2.0],
+        duration_s=3.0,
+        note="split   where we walk outside",
+        job_dir=tmp_path,
+    )
+    assert transport.last_body is not None
+    contents = transport.last_body["contents"]
+    assert [item["role"] for item in contents] == ["user", "model", "user"]
+    assert "one take" in contents[1]["parts"][0]["text"]
+    assert "'split where we walk outside'" in contents[2]["parts"][0]["text"]
+
+
+def test_propose_segments_refuses_bad_input_and_replies(tmp_path: Path) -> None:
+    client = GeminiClient(api_key="k", transport=_FakeTransport({"segments": []}))
+    stills = _segment_stills(tmp_path, 1)
+    with pytest.raises(GeminiError, match="one time per still"):
+        client.propose_segments(stills=stills, times=[], duration_s=1.0)
+    with pytest.raises(GeminiError, match="no segments"):
+        client.propose_segments(
+            stills=stills, times=[0.0], duration_s=1.0, job_dir=tmp_path
+        )
+    outside = tmp_path.parent / "elsewhere.jpg"
+    outside.write_bytes(b"\xff\xd8")
+    with pytest.raises(GeminiError, match="outside the job"):
+        client.propose_segments(
+            stills=[outside], times=[0.0], duration_s=1.0, job_dir=tmp_path
+        )
