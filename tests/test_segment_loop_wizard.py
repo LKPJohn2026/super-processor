@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
+from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pytest
 
+from super_processor.review import WizardServer
 from super_processor.shot_plan import load_plan
 from super_processor.upscale import FakeUpscaleEngine, UpscaleRequest
 from super_processor.wizard import (
@@ -20,6 +24,8 @@ from super_processor.wizard import (
     save_job_wizard_state,
     save_session_state,
 )
+
+TOKEN = "test-token"
 
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg required"
@@ -193,3 +199,61 @@ def test_pick_uses_shot_flow_without_the_switch(
     controller = WizardController(tmp_path / "jobs")
     assert controller.start_segmenting() is False
     assert controller.start_analyze() is False
+
+
+def _call(
+    base: str, method: str, path: str, payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    parsed = urlparse(base)
+    connection = HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port)
+    body = b"" if payload is None else json.dumps(payload).encode()
+    headers = {"Accept": "application/json", "X-Wizard-Token": TOKEN}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    connection.request(method, path, body=body, headers=headers)
+    response = connection.getresponse()
+    raw = response.read()
+    assert response.status == 200, raw
+    loaded = json.loads(raw.decode())
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+@needs_ffmpeg
+def test_segment_loop_over_the_json_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(SEGMENT_LOOP_ENV, "1")
+    clip = _clip(tmp_path / "in.mp4")
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Gemini(),  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
+    server = WizardServer(controller.jobs_dir, token=TOKEN, controller=controller)
+    base = server.start()
+    try:
+        assert _call(base, "POST", "/api/pick", {"path": str(clip)})["step"] == (
+            "sampling"
+        )
+        _call(base, "GET", "/api/segment?run=1")
+        assert controller.wait_idle(120)
+        view = _call(base, "GET", "/api/state")
+        assert view["step"] == "segments" and len(view["segments"]["segments"]) == 2
+        assert view["progress"] is None
+        _call(base, "POST", "/api/segments", {"action": "approve"})
+        for _ in range(2):
+            _call(base, "GET", "/api/analyze?run=1")
+            assert controller.wait_idle(120)
+            view = _call(base, "GET", "/api/state")
+            assert view["step"] == "preview_segment"
+            assert view["segment_preview"]["shot"]["before_url"]
+            _call(base, "POST", "/api/preview", {"action": "approve"})
+        view = _call(base, "GET", "/api/state")
+        assert view["step"] == "ready_to_render"
+        assert _call(base, "POST", "/api/ready", {"action": "render"})["step"] == (
+            "rendering"
+        )
+    finally:
+        server.stop()

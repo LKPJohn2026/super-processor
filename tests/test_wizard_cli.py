@@ -142,7 +142,7 @@ def test_render_get_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     base = server.start()
     try:
         with pytest.raises(HTTPError) as retired:
-            urlopen(base + f"/analyze?run=1&token={TOKEN}")
+            urlopen(base + f"/enhance?run=1&token={TOKEN}")
         assert retired.value.code == 404
         retired.value.close()
         state = WizardState(step=WizardStep.RENDERING)
