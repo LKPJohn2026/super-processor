@@ -16,6 +16,7 @@ strength. Transport is injectable for tests.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import time
@@ -113,6 +114,19 @@ class ModelInfo:
             "rpm_used": self.rpm_used,
             "rpm_remaining": self.rpm_remaining,
         }
+
+
+def _grouped(errors: list[str]) -> str:
+    """``model: reason`` lines with the models that share a reason joined."""
+    if not errors:
+        return "no candidates"
+    by_reason: dict[str, list[str]] = {}
+    for line in errors:
+        model, _, reason = line.partition(": ")
+        by_reason.setdefault(reason, []).append(model)
+    return "; ".join(
+        f"{', '.join(models)}: {reason}" for reason, models in by_reason.items()
+    )
 
 
 def _strip_models_prefix(name: str) -> str:
@@ -299,6 +313,54 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> tuple[int, str]:
     return status, detail
 
 
+def _retry_text(seconds: float) -> str:
+    if seconds >= 3600:
+        return f"about {round(seconds / 3600)} h"
+    if seconds >= 60:
+        return f"about {round(seconds / 60)} min"
+    return f"{round(seconds)} s"
+
+
+def summarize_gemini_error(status: int, detail: str) -> str:
+    """One readable line for an error body from the Gemini API.
+
+    The API answers with a JSON object several kilobytes long (help links,
+    quota metrics, retry hints). The wizard shows this text to the editor,
+    so keep what they can act on: what went wrong and when to try again.
+    Words the failover looks for (``quota``, ``no longer available``) stay.
+    """
+    try:
+        error = json.loads(detail).get("error") or {}
+    except (json.JSONDecodeError, AttributeError):
+        error = {}
+    message = " ".join(str(error.get("message") or detail).split())
+    reason = str(error.get("status") or "")
+    retry: str | None = None
+    daily = False
+    for item in error.get("details") or []:
+        if not isinstance(item, dict):
+            continue
+        delay = str(item.get("retryDelay") or "")
+        if delay.endswith("s"):
+            with contextlib.suppress(ValueError):
+                retry = _retry_text(float(delay[:-1]))
+        for violation in item.get("violations") or []:
+            if isinstance(violation, dict) and "PerDay" in str(
+                violation.get("quotaId", "")
+            ):
+                daily = True
+        if item.get("reason") == "API_KEY_INVALID":
+            return "the API key was rejected; replace it on the setup screen"
+    if status == 429 or reason == "RESOURCE_EXHAUSTED":
+        kind = "daily quota" if daily else "quota"
+        text = f"{kind} used up"
+        return f"{text}; try again in {retry}" if retry else text
+    if status == 404 and "no longer available" in message:
+        return "this model is no longer available"
+    first = message.split(". ")[0].rstrip(".")
+    return first[:160] + ("…" if len(first) > 160 else "")
+
+
 class UrllibGeminiTransport:
     """Default transport using ``urllib``."""
 
@@ -326,7 +388,7 @@ class UrllibGeminiTransport:
         except urllib.error.HTTPError as exc:
             status, detail = _http_error_detail(exc)
             raise GeminiError(
-                f"Gemini HTTP {status}: {detail}",
+                f"Gemini HTTP {status}: {summarize_gemini_error(status, detail)}",
                 status=status,
             ) from None
         except (
@@ -356,7 +418,7 @@ class UrllibGeminiTransport:
             except urllib.error.HTTPError as exc:
                 status, detail = _http_error_detail(exc)
                 raise GeminiError(
-                    f"Gemini HTTP {status}: {detail}",
+                    f"Gemini HTTP {status}: {summarize_gemini_error(status, detail)}",
                     status=status,
                 ) from None
             except (
@@ -771,8 +833,7 @@ class GeminiClient:
                 return response
             if last_exc is not None and not _is_retryable_error(last_exc):
                 raise last_exc
-        detail = "; ".join(errors) if errors else "no candidates"
-        raise GeminiError(f"All candidate Gemini models failed: {detail}")
+        raise GeminiError(f"All candidate Gemini models failed: {_grouped(errors)}")
 
     def pick_working_model(self) -> str:
         """Probe candidates until one accepts a tiny structured generate call."""

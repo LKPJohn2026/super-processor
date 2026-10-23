@@ -21,6 +21,7 @@ from super_processor.gemini import (
     parse_model_info,
     save_chat,
     select_candidate_models,
+    summarize_gemini_error,
 )
 
 
@@ -581,3 +582,103 @@ def test_propose_segments_refuses_bad_input_and_replies(tmp_path: Path) -> None:
         client.propose_segments(
             stills=[outside], times=[0.0], duration_s=1.0, job_dir=tmp_path
         )
+
+
+_QUOTA_BODY = {
+    "error": {
+        "code": 429,
+        "message": "You exceeded your current quota, please check your plan. "
+        "For more information, head to: https://ai.google.dev/rate-limits.",
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [
+            {"@type": "type.googleapis.com/google.rpc.Help", "links": []},
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [
+                    {"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}
+                ],
+            },
+            {
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": "57511s",
+            },
+        ],
+    }
+}
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (429, _QUOTA_BODY, "daily quota used up; try again in about 16 h"),
+        (
+            429,
+            {
+                "error": {
+                    "status": "RESOURCE_EXHAUSTED",
+                    "details": [{"retryDelay": "90s"}],
+                }
+            },
+            "quota used up; try again in about 2 min",
+        ),
+        (
+            429,
+            {"error": {"code": 429, "details": [{"retryDelay": "xs"}, "junk"]}},
+            "quota used up",
+        ),
+        (
+            400,
+            {
+                "error": {
+                    "message": "API key not valid. Please pass a valid API key.",
+                    "details": [{"reason": "API_KEY_INVALID"}],
+                }
+            },
+            "the API key was rejected; replace it on the setup screen",
+        ),
+        (
+            404,
+            {"error": {"message": "Model x is no longer available to new users."}},
+            "this model is no longer available",
+        ),
+        (500, {"error": {"message": "Internal error. Retry later."}}, "Internal error"),
+        (503, "Service Unavailable", "Service Unavailable"),
+        (400, {"error": {"message": "x" * 300}}, "x" * 160 + "…"),
+    ],
+)
+def test_gemini_errors_are_one_readable_line(
+    status: int, body: object, expected: str
+) -> None:
+    detail = body if isinstance(body, str) else json.dumps(body)
+    assert summarize_gemini_error(status, detail) == expected
+
+
+def test_failover_groups_models_that_failed_the_same_way(tmp_path: Path) -> None:
+    transport = _FailoverTransport({}, fail_models={"gemini-gone", "gemini-3.8-flash"})
+    transport.list_models = lambda *, api_key: [  # type: ignore[method-assign]
+        {
+            "name": f"models/{name}",
+            "description": "multimodal image video",
+            "supportedGenerationMethods": ["generateContent"],
+            "rateLimits": {"rpm": "0/10"},
+        }
+        for name in ("gemini-gone", "gemini-3.8-flash")
+    ]
+    original = transport.generate
+
+    def same_reason(
+        *, model: str, api_key: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            return original(model=model, api_key=api_key, body=body)
+        except GeminiError as exc:
+            raise GeminiError("Gemini HTTP 404: retired", status=404) from exc
+
+    transport.generate = same_reason  # type: ignore[method-assign]
+    client = GeminiClient(api_key="k", model="gemini-gone", transport=transport)
+    with pytest.raises(GeminiError) as failed:
+        _revise(client, tmp_path)
+    assert str(failed.value) == (
+        "All candidate Gemini models failed: "
+        "gemini-gone, gemini-3.8-flash: Gemini HTTP 404: retired"
+    )
