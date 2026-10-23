@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Gemini errors read as one line. The API's error body (several kilobytes of
+  JSON with help links and quota metrics) becomes what went wrong and when to
+  try again: "daily quota used up; try again in about 16 h", "the API key was
+  rejected; replace it on the setup screen", "this model is no longer
+  available". When several models fail the same way, the failover names them
+  together once.
+- The Segments screen shows a timeline bar with one block per segment, as
+  wide as its share of the video, and each segment with the sampled still
+  nearest its middle, its time range and length, and what it contains as
+  tags. The approve button says how many segments it approves.
+- When Gemini could not split the video, the Segments screen says so instead
+  of "Gemini split the video", and the reason sits in a notice box; the
+  segment preview shows its warnings the same way.
+- The pick screen describes the segment loop instead of a whole-file pass.
+- The React shell matches all of the above.
+
+### Added
+
+- `GET /segment_stills/t_<ms>.jpg` serves the still grid to the Segments
+  screen; other names and symbolic links are refused.
+
 ## [3.3.2] - 2026-10-23
 
 ### Changed
