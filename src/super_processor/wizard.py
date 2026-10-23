@@ -1047,11 +1047,16 @@ class WizardController:
             return {"segments": [], "error": str(exc), "note": ""}
         if found is None:
             return {"segments": [], "error": None, "note": ""}
-        return {
-            "segments": [segment.to_dict() for segment in found.segments],
-            "error": found.error,
-            "note": found.note,
-        }
+        stills = load_segment_stills(job_dir)
+        items: list[dict[str, Any]] = []
+        for segment in found.segments:
+            item = segment.to_dict()
+            # The sampled still nearest the middle stands for the segment.
+            middle = (segment.start_s + segment.end_s) / 2
+            nearest = min(stills, key=lambda s: abs(s.t_s - middle), default=None)
+            item["still_url"] = f"/{nearest.path}" if nearest else None
+            items.append(item)
+        return {"segments": items, "error": found.error, "note": found.note}
 
     def _segments_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
         """Approve the segments, or send them back to Gemini with a note."""

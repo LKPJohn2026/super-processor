@@ -47,7 +47,7 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
         (WizardStep.PICK_FILE, "Pick"),
         (WizardStep.SAMPLING, "Finding the segments"),
         (WizardStep.PROPOSING, "Finding the segments"),
-        (WizardStep.SEGMENTS, "Approve segments"),
+        (WizardStep.SEGMENTS, "<h1>Segments</h1>"),
         (WizardStep.ANALYZING, "Segment 1 of"),
         (WizardStep.PREVIEW_SEGMENT, "Segment preview"),
         (WizardStep.READY_TO_RENDER, "Render the whole video"),

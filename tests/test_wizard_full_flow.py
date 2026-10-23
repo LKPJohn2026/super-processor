@@ -180,7 +180,8 @@ def test_wizard_website_full_flow_intro_to_done(
         assert controller.wait_idle(timeout=60)
         found = _get(base)
         assert "<h1>Segments</h1>" in found
-        assert "0:00–0:12 · flat gray card" in found
+        assert "1. flat gray card" in found and "0:00–0:12" in found
+        assert "Approve 1 segment<" in found
         assert "made_up" not in found
 
         analyzing = _post(base, "/segments", {"action": "approve"})

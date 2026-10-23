@@ -450,6 +450,8 @@ def _legacy_handler(
 
 # Shot stills are named by their start time in milliseconds.
 _STILL_URL = re.compile(r"/shot_stills/(\d{9}\.jpg)")
+# The segment loop's still grid (see :func:`.segment_loop.still_name`).
+_GRID_URL = re.compile(r"/segment_stills/(t_\d{8}\.jpg)")
 
 _API_POSTS = {
     "/api/intro": "/intro",
@@ -597,6 +599,11 @@ def _wizard_handler(
             if still is not None:
                 image = job_dir / STILLS_DIR / still.group(1)
                 return (image, "image/jpeg") if image.is_file() else None
+            grid = _GRID_URL.fullmatch(path)
+            if grid is not None:
+                image = job_dir / STILLS_DIR_NAME / grid.group(1)
+                usable = image.is_file() and not image.is_symlink()
+                return (image, "image/jpeg") if usable else None
             if path.startswith("/previews/"):
                 name = path.removeprefix("/previews/")
                 match = PREVIEW_NAME.fullmatch(name)

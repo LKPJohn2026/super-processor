@@ -155,6 +155,41 @@ p, li {{ line-height: 1.55; }}
 .lede {{ font-size: 1.05rem; max-width: 34rem; }}
 .muted {{ color: var(--muted); font-size: 0.95rem; }}
 .error {{ color: var(--err); }}
+form + form {{ margin-top: 1.25rem; }}
+.notice {{
+  border-left: 3px solid #c58b2c;
+  background: rgba(197, 139, 44, 0.1);
+  padding: 0.55rem 0.8rem;
+  margin: 0.8rem 0;
+  font-size: 0.95rem;
+}}
+.timeline {{
+  display: flex;
+  height: 1.6rem;
+  margin: 1rem 0 0.4rem;
+  border-radius: 4px;
+  overflow: hidden;
+}}
+.timeline span {{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.2rem;
+  font-size: 0.75rem;
+  color: #fff;
+  background: var(--leaf);
+  border-right: 2px solid var(--paper);
+}}
+.timeline span:nth-child(even) {{ background: var(--leaf-hot); }}
+.timeline span:last-child {{ border-right: 0; }}
+.chip {{
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  margin: 0 0.25rem 0.2rem 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.8rem;
+}}
 .steps {{
   display: flex;
   flex-wrap: wrap;
@@ -396,8 +431,9 @@ def render_pick(*, error: str | None = None) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
     body = f"""
 <h1>Pick a video file</h1>
-<p class="lede">Choose a short clip. A local GPU model restores and upscales it.
-The first pass usually covers the whole file.</p>
+<p class="lede">Choose a video on this computer. Gemini splits it into
+segments, you approve a short before/after preview of each, and then the whole
+video is restored and upscaled on your GPU.</p>
 <p class="muted">Up to 1080p and 30 minutes.</p>
 {err}
 <form method="post" action="/pick">
@@ -562,37 +598,88 @@ def render_analyzing(index: int, count: int, progress: object = None) -> str:
     )
 
 
+def _notice(text: object) -> str:
+    return f'<p class="notice" role="status">{escape(str(text))}</p>' if text else ""
+
+
+def _timeline(segments: list[dict[str, object]]) -> str:
+    """One block per segment, as wide as its share of the video."""
+    total = sum(
+        float(str(s.get("end_s", 0))) - float(str(s.get("start_s", 0)))
+        for s in segments
+    )
+    if total <= 0:
+        return ""
+    blocks = []
+    for index, segment in enumerate(segments):
+        start = float(str(segment.get("start_s", 0)))
+        end = float(str(segment.get("end_s", 0)))
+        share = (end - start) / total * 100
+        blocks.append(
+            f'<span style="width:{share:.2f}%" '
+            f'title="{index + 1}. {format_time(start)}–{format_time(end)}">'
+            f"{index + 1}</span>"
+        )
+    return (
+        '<div class="timeline" role="img" aria-label="'
+        f'{len(segments)} segments across the video">' + "".join(blocks) + "</div>"
+    )
+
+
 def render_segments(view: dict[str, object], *, error: str | None = None) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
     warn = view.get("error")
-    warning = f'<p class="muted">{escape(str(warn))}</p>' if warn else ""
+    segments = [s for s in _items(view, "segments") if isinstance(s, dict)]
     rows: list[str] = []
-    for index, raw in enumerate(_items(view, "segments")):
-        if not isinstance(raw, dict):
-            continue
+    for index, raw in enumerate(segments):
         start = float(str(raw.get("start_s", 0)))
         end = float(str(raw.get("end_s", 0)))
         label = escape(str(raw.get("label") or "Unlabelled segment"))
-        contains = ", ".join(
-            str(item).replace("_", " ") for item in _items(raw, "contains")
+        chips = "".join(
+            f'<span class="chip">{escape(str(item).replace("_", " "))}</span>'
+            for item in _items(raw, "contains")
+        )
+        still = raw.get("still_url")
+        image = (
+            f'<img src="{escape(str(still))}" alt="Still from segment {index + 1}">'
+            if still
+            else ""
         )
         rows.append(
-            f"""<div class="card">
-<h2>{index + 1}. {format_time(start)}–{format_time(end)} · {label}</h2>
-<p class="tags muted">Contains: {escape(contains) or "nothing flagged"}</p>
+            f"""<div class="card shot">
+{image}
+<div>
+<h2>{index + 1}. {label}</h2>
+<p class="tags muted">{format_time(start)}–{format_time(end)} ·
+{end - start:.1f} s</p>
+<p class="tags">{chips or '<span class="muted">Nothing to protect</span>'}</p>
+</div>
 </div>"""
         )
+    if warn:
+        lede = (
+            "Gemini could not split the video, so it is one segment for now. "
+            "Approve it to go on, or ask Gemini to try again."
+        )
+    else:
+        lede = (
+            "Gemini split the video where the picture needs different settings. "
+            "Approve the segments, or say where the cuts should go and Gemini "
+            "will try again."
+        )
+    count = len(segments)
+    noun = "segment" if count == 1 else "segments"
     body = f"""
 <h1>Segments</h1>
-<p class="lede">Gemini split the video where the picture needs different
-settings. Approve the segments, or say where the cuts should go and Gemini
-will try again.</p>
+<p class="lede">{lede}</p>
 {err}
-{warning}
+{_notice(warn)}
+{_timeline(segments)}
+<p class="muted">{count} {noun}</p>
 {"".join(rows)}
 <form method="post" action="/segments">
 <input type="hidden" name="action" value="approve">
-<button type="submit" class="full">Approve segments</button>
+<button type="submit" class="full">Approve {count} {noun}</button>
 </form>
 <form method="post" action="/segments">
 <input type="hidden" name="action" value="note">
@@ -607,8 +694,7 @@ will try again.</p>
 
 def render_preview_segment(view: dict[str, object], *, error: str | None = None) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
-    warn = view.get("error")
-    warning = f'<p class="muted">{escape(str(warn))}</p>' if warn else ""
+    warning = _notice(view.get("error"))
     index = int(str(view.get("index", 0)))
     count = int(str(view.get("count", 0)))
     shot = view.get("shot")

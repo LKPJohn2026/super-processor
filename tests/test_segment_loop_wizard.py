@@ -121,7 +121,9 @@ def test_segment_loop_end_to_end(
         (3.5, "second"),
     ]
     page = controller.render()
-    assert "0:00–0:03.5 · first" in page and "Propose again" in page
+    assert "1. first" in page and "0:00–0:03.5" in page
+    assert '<div class="timeline"' in page and "Approve 2 segments" in page
+    assert 'src="/segment_stills/t_' in page
 
     controller.handle_post("/segments", {"action": ["note"], "note": [" "]})
     assert controller.current_state().error is not None
@@ -250,6 +252,18 @@ def test_segment_loop_over_the_json_api(
         assert controller.wait_idle(120)
         view = _call(base, "GET", "/api/state")
         assert view["step"] == "segments" and len(view["segments"]["segments"]) == 2
+        still = view["segments"]["segments"][0]["still_url"]
+        connection = HTTPConnection("127.0.0.1", urlparse(base).port)
+        connection.request("GET", still)
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "image/jpeg"
+        response.read()
+        for bad in ("/segment_stills/../segments.json", "/segment_stills/t_1.jpg"):
+            connection.request("GET", bad)
+            refused = connection.getresponse()
+            refused.read()
+            assert refused.status == 404
         assert view["progress"] is None
         _call(base, "POST", "/api/segments", {"action": "approve"})
         for _ in range(2):
@@ -388,3 +402,19 @@ def test_render_worker_shows_frames_done(tmp_path: Path) -> None:
         }
     ]
     assert controller.current_state().progress is None
+
+
+def test_segments_page_says_when_gemini_could_not_split() -> None:
+    from super_processor.wizard_pages import render_segments
+
+    page = render_segments(
+        {
+            "segments": [{"start_s": 0, "end_s": 52.2, "label": "whole video"}],
+            "error": "Gemini could not propose segments (daily quota used up)",
+        }
+    )
+    assert "could not split the video, so it is one segment" in page
+    assert '<p class="notice" role="status">Gemini could not propose' in page
+    assert "Approve 1 segment<" in page and "Nothing to protect" in page
+    empty = render_segments({"segments": [], "error": None})
+    assert '<div class="timeline"' not in empty
