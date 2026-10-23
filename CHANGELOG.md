@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-10-23
+
 ### Changed
 
 - Gemini errors read as one line. The API's error body (several kilobytes of
