@@ -22,14 +22,14 @@ const TOUR = [
     body: "Give the absolute path of a video on the computer running the wizard. A local GPU model restores and upscales it. You set scale and strength.",
   },
   {
-    id: "shots",
-    title: "Shots",
-    body: "FFmpeg finds where each shot starts and measures how blocky, noisy, soft, dark, or flat it is. Gemini labels each shot from one still. You merge or split shots, then approve the list.",
+    id: "segments",
+    title: "Segments",
+    body: "FFmpeg saves a small still about every second, on your machine. Gemini looks at them and splits the video where the light, place, or picture quality changes. You approve the segments, or say where the cuts should go.",
   },
   {
-    id: "looks",
-    title: "Looks",
-    body: "Gemini picks clean-up, strength, and finishing for each shot. Each shot gets a short before/after preview, which Gemini checks for wrong faces, hands, text, and fake texture. Approve them all, or tell it what to change in one shot.",
+    id: "previews",
+    title: "Previews",
+    body: "One segment at a time, Gemini picks clean-up, strength, and finishing, or leaves FlashVSR out where it would only harm. A few seconds of the segment are previewed before and after, and Gemini checks for wrong faces, hands, text, and fake texture. Approve it, or say what to change.",
   },
   {
     id: "upscale",

@@ -1,27 +1,37 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
   outputSrc,
   postAction,
-  runPlan,
+  runAnalyze,
   runRender,
-  runScan,
+  runSegmenting,
   type LookShot,
   type Looks,
+  type Progress,
   type Region,
-  type Shot,
+  type Runner,
+  type SegmentList,
+  type SegmentPreview,
   type WizardView,
 } from "./api";
 
-const RAIL = ["Setup", "File", "Shots", "Looks", "Upscale", "Result"] as const;
+const RAIL = ["Setup", "File", "Segments", "Previews", "Upscale", "Result"] as const;
+
+const RUNNERS: Partial<Record<WizardView["step"], Runner>> = {
+  sampling: runSegmenting,
+  proposing: runSegmenting,
+  analyzing: runAnalyze,
+  rendering: runRender,
+};
 
 function railIndex(step: WizardView["step"]): number {
   if (step === "intro" || step === "llm_choice" || step === "local_llm_stub" || step === "setup") {
     return 0;
   }
   if (step === "pick_file") return 1;
-  if (step === "finding_shots" || step === "shots") return 2;
-  if (step === "planning" || step === "looks") return 3;
-  if (step === "rendering") return 4;
+  if (step === "sampling" || step === "proposing" || step === "segments") return 2;
+  if (step === "analyzing" || step === "preview_segment") return 3;
+  if (step === "ready_to_render" || step === "rendering") return 4;
   return 5;
 }
 
@@ -50,12 +60,15 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   }
 
   useEffect(() => {
-    const runners = { rendering: runRender, finding_shots: runScan, planning: runPlan };
-    if (!(view.step in runners)) return;
+    const run = RUNNERS[view.step];
+    if (!run) return;
     let cancelled = false;
     setLocalError(null);
-    const run = runners[view.step as keyof typeof runners];
-    run(origin)
+    // Each poll while the worker runs carries its progress.
+    const progress = (next: WizardView) => {
+      if (!cancelled) onView(next);
+    };
+    run(origin, progress)
       .then((next) => {
         if (!cancelled) onView(next);
       })
@@ -192,26 +205,24 @@ function WizardStepView({
     return <PickStep busy={busy} message={message} onSend={onSend} />;
   }
 
-  if (view.step === "finding_shots") {
+  if (view.step === "sampling" || view.step === "proposing") {
     return (
-      <>
-        <h1>Finding the shots</h1>
-        <p className="lede" role="status">
-          FFmpeg is finding where each shot starts and measuring how blocky,
-          noisy, soft, dark, or flat it is. Gemini then labels each shot from
-          one still.
-        </p>
-        {message ? <Alert text={message} /> : null}
-      </>
+      <Busy
+        title="Finding the segments"
+        progress={view.progress ?? null}
+        message={message}
+      >
+        FFmpeg saves a small still about every second, on this computer.
+        Gemini looks at them and splits the video where the light, place, or
+        picture quality changes.
+      </Busy>
     );
   }
 
-  if (view.step === "shots") {
+  if (view.step === "segments") {
     return (
-      <ShotsStep
-        origin={origin}
-        shots={view.shots ?? []}
-        labelError={view.label_error ?? null}
+      <SegmentsStep
+        list={view.segments ?? { segments: [], error: null, note: "" }}
         busy={busy}
         message={message}
         onSend={onSend}
@@ -219,25 +230,38 @@ function WizardStepView({
     );
   }
 
-  if (view.step === "planning") {
+  if (view.step === "analyzing") {
+    const count = view.segments?.segments.length;
     return (
-      <>
-        <h1>Planning each shot</h1>
-        <p className="lede" role="status">
-          Gemini is choosing clean-up, strength, and finishing for each shot.
-          Each shot then gets a short before/after preview on the local GPU,
-          and Gemini checks the previews for faces, hands, text, and texture
-          that went wrong.
-        </p>
-        {message ? <Alert text={message} /> : null}
-      </>
+      <Busy
+        title={`Segment ${(view.segment_index ?? 0) + 1}${count ? ` of ${count}` : ""}`}
+        progress={view.progress ?? null}
+        message={message}
+      >
+        Gemini is choosing clean-up, strength, and finishing for this segment.
+        A few seconds of it are previewed on the local GPU, and Gemini checks
+        the preview for faces, hands, text, and texture that went wrong.
+      </Busy>
     );
   }
 
-  if (view.step === "looks") {
+  if (view.step === "preview_segment") {
     return (
-      <LooksStep
+      <PreviewStep
         origin={origin}
+        preview={
+          view.segment_preview ?? { index: 0, count: 0, scale: null, error: null, shot: null }
+        }
+        busy={busy}
+        message={message}
+        onSend={onSend}
+      />
+    );
+  }
+
+  if (view.step === "ready_to_render") {
+    return (
+      <ReadyStep
         looks={view.looks ?? { scale: null, error: null, shots: [] }}
         busy={busy}
         message={message}
@@ -248,14 +272,10 @@ function WizardStepView({
 
   if (view.step === "rendering") {
     return (
-      <>
-        <h1>Upscaling</h1>
-        <p className="lede" role="status">
-          Restoring and upscaling on the local GPU. FFmpeg only trims, splices,
-          and copies audio. This can take several minutes.
-        </p>
-        {message ? <Alert text={message} /> : null}
-      </>
+      <Busy title="Upscaling" progress={view.progress ?? null} message={message}>
+        Restoring and upscaling on the local GPU. FFmpeg only trims, splices,
+        and copies audio. This can take several minutes.
+      </Busy>
     );
   }
 
@@ -297,8 +317,39 @@ function WizardStepView({
       <p>
         This step ({view.step}) is served by the Python wizard page. Open the
         URL printed by <code>super-processor review</code> to finish it. This
-        shell drives introduction, Gemini setup, file pick, upscale, and result.
+        shell drives every step from introduction to result.
       </p>
+      {message ? <Alert text={message} /> : null}
+    </>
+  );
+}
+
+function Busy({
+  title,
+  progress,
+  message,
+  children,
+}: {
+  title: string;
+  progress: Progress | null;
+  message: string | null;
+  children: ReactNode;
+}) {
+  const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
+  return (
+    <>
+      <h1>{title}</h1>
+      <p className="lede" role="status">
+        {children}
+      </p>
+      {pct !== null ? (
+        <p className="progress">
+          <progress max={100} value={pct} aria-label={`${title}: ${pct}%`}>
+            {pct}%
+          </progress>{" "}
+          {pct}% · {progress?.message}
+        </p>
+      ) : null}
       {message ? <Alert text={message} /> : null}
     </>
   );
@@ -422,7 +473,7 @@ function PickStep({
         </label>
         <div className="actions">
           <button type="submit" disabled={busy}>
-            Find the shots
+            Find the segments
           </button>
         </div>
       </form>
@@ -528,80 +579,43 @@ function words(items: string[]): string {
   return items.map((item) => item.replace(/_/g, " ")).join(", ");
 }
 
-function ShotsStep({
-  origin,
-  shots,
-  labelError,
+function SegmentsStep({
+  list,
   busy,
   message,
   onSend,
 }: {
-  origin: string;
-  shots: Shot[];
-  labelError: string | null;
+  list: SegmentList;
   busy: boolean;
   message: string | null;
   onSend: (action: string, fields: Record<string, string>) => Promise<void>;
 }) {
-  const [splitAt, setSplitAt] = useState<Record<number, string>>({});
+  const [note, setNote] = useState("");
 
-  function split(event: FormEvent, index: number) {
+  function propose(event: FormEvent) {
     event.preventDefault();
-    void onSend("shots", { action: "split", index: String(index), at: splitAt[index] ?? "" });
+    void onSend("segments", { action: "note", note });
   }
 
   return (
     <>
-      <h1>Shots</h1>
+      <h1>Segments</h1>
       <p className="lede">
-        These are the shots found and what looks wrong in each. Merge shots
-        that belong together or split one that changes partway, then approve
-        the list.
+        Gemini split the video where the picture needs different settings.
+        Approve the segments, or say where the cuts should go and Gemini will
+        try again.
       </p>
       {message ? <Alert text={message} /> : null}
-      {labelError ? <p className="muted">{labelError}</p> : null}
+      {list.error ? <p className="muted">{list.error}</p> : null}
       <ol className="shots">
-        {shots.map((shot, index) => (
-          <li key={`${shot.start_s}-${shot.end_s}`} className="shot">
-            {shot.still ? (
-              <img
-                src={outputSrc(origin, `/${shot.still}`) ?? undefined}
-                alt={`Still from shot ${index + 1}`}
-              />
-            ) : null}
+        {list.segments.map((segment, index) => (
+          <li key={`${segment.start_s}-${segment.end_s}`} className="shot">
             <div>
               <h2>
-                {index + 1}. {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
-                {shot.label || "Unlabelled shot"}
+                {index + 1}. {formatTime(segment.start_s)}–{formatTime(segment.end_s)} ·{" "}
+                {segment.label || "Unlabelled segment"}
               </h2>
-              <p>Problems: {words(shot.issues) || "none found"}</p>
-              <p className="muted">Contains: {words(shot.contains) || "nothing flagged"}</p>
-              <form className="actions" onSubmit={(event) => split(event, index)}>
-                {index < shots.length - 1 ? (
-                  <button
-                    type="button"
-                    className="secondary"
-                    disabled={busy}
-                    onClick={() =>
-                      void onSend("shots", { action: "merge", index: String(index) })
-                    }
-                  >
-                    Merge with next
-                  </button>
-                ) : null}
-                <input
-                  type="text"
-                  aria-label={`Split shot ${index + 1} at`}
-                  placeholder={formatTime((shot.start_s + shot.end_s) / 2)}
-                  value={splitAt[index] ?? ""}
-                  onChange={(event) =>
-                    setSplitAt({ ...splitAt, [index]: event.target.value })
-                  }
-                />
-                <button type="submit" className="secondary" disabled={busy}>
-                  Split here
-                </button>
-              </form>
+              <p className="muted">Contains: {words(segment.contains) || "nothing flagged"}</p>
             </div>
           </li>
         ))}
@@ -610,11 +624,28 @@ function ShotsStep({
         <button
           type="button"
           disabled={busy}
-          onClick={() => void onSend("shots", { action: "approve" })}
+          onClick={() => void onSend("segments", { action: "approve" })}
         >
-          Approve shots and upscale
+          Approve segments
         </button>
       </div>
+      <form onSubmit={propose}>
+        <label htmlFor="segments-note">
+          Not right? Say what to change
+          <input
+            id="segments-note"
+            type="text"
+            value={note}
+            placeholder="e.g. cut where we walk outside"
+            onChange={(event) => setNote(event.target.value)}
+          />
+        </label>
+        <div className="actions">
+          <button type="submit" className="secondary" disabled={busy}>
+            Propose again
+          </button>
+        </div>
+      </form>
     </>
   );
 }
@@ -710,116 +741,179 @@ function checkSummary(check: LookShot["check"]): string {
   return text;
 }
 
-function LooksStep({
+function LookCard({ origin, shot }: { origin: string; shot: LookShot }) {
+  const summary = settingsSummary(shot.strength, shot.look);
+  return (
+    <>
+      <h2>
+        {shot.index + 1}. {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
+        {shot.label || "Unlabelled segment"}
+      </h2>
+      {shot.after_url ? (
+        <div className="pair">
+          <figure>
+            <figcaption>Before</figcaption>
+            <div className="frame">
+              <video
+                controls
+                muted
+                loop
+                preload="metadata"
+                src={outputSrc(origin, shot.before_url) ?? undefined}
+                poster={outputSrc(origin, poster(shot.before_url)) ?? undefined}
+                aria-label={`Segment ${shot.index + 1} before`}
+              />
+              <Boxes regions={shot.regions ?? []} />
+            </div>
+          </figure>
+          <figure>
+            <figcaption>After</figcaption>
+            <div className="frame">
+              <video
+                controls
+                muted
+                loop
+                preload="metadata"
+                src={outputSrc(origin, shot.after_url) ?? undefined}
+                poster={outputSrc(origin, poster(shot.after_url)) ?? undefined}
+                aria-label={`Segment ${shot.index + 1} after`}
+              />
+              <Boxes regions={shot.regions ?? []} />
+            </div>
+          </figure>
+        </div>
+      ) : null}
+      <p>
+        <strong>
+          {shot.use_upscale === false ? `No FlashVSR: resized only. ${summary}` : summary}
+        </strong>
+      </p>
+      <Protected regions={shot.regions ?? []} contains={shot.contains} />
+      <p>{shot.reason}</p>
+      <p className="muted">
+        {checkSummary(shot.check)}
+        {typeof shot.shimmer === "number"
+          ? ` Texture stability: ${shot.shimmer.toFixed(1)}× as jumpy as the source.`
+          : ""}
+      </p>
+    </>
+  );
+}
+
+function PreviewStep({
   origin,
-  looks,
+  preview,
   busy,
   message,
   onSend,
 }: {
   origin: string;
+  preview: SegmentPreview;
+  busy: boolean;
+  message: string | null;
+  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+}) {
+  const [note, setNote] = useState("");
+  const [resample, setResample] = useState(false);
+  const last = preview.index + 1 >= preview.count;
+
+  function redo(event: FormEvent) {
+    event.preventDefault();
+    void onSend("preview", { action: "redo", note, resample: resample ? "1" : "" });
+  }
+
+  return (
+    <>
+      <h1>
+        Segment {preview.index + 1} of {preview.count}
+      </h1>
+      <p className="lede">
+        A few seconds of this segment, before and after. Approve it, or tell me
+        what to change.
+      </p>
+      {preview.scale ? (
+        <p className="muted">The whole video is upscaled {preview.scale}×.</p>
+      ) : null}
+      {message ? <Alert text={message} /> : null}
+      {preview.error ? <p className="muted">{preview.error}</p> : null}
+      {preview.shot ? <LookCard origin={origin} shot={preview.shot} /> : null}
+      <div className="actions">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void onSend("preview", { action: "approve" })}
+        >
+          {last ? "Approve and finish" : "Approve and go to the next segment"}
+        </button>
+      </div>
+      <form onSubmit={redo}>
+        <label htmlFor="preview-note">
+          Not right? Tell me what to change in this segment
+          <input
+            id="preview-note"
+            type="text"
+            value={note}
+            placeholder="e.g. skin looks waxy, keep it softer"
+            onChange={(event) => setNote(event.target.value)}
+          />
+        </label>
+        <label htmlFor="preview-resample" className="inline">
+          <input
+            id="preview-resample"
+            type="checkbox"
+            checked={resample}
+            onChange={(event) => setResample(event.target.checked)}
+          />
+          Preview a different part
+        </label>
+        <div className="actions">
+          <button type="submit" className="secondary" disabled={busy}>
+            Redo this segment
+          </button>
+        </div>
+      </form>
+    </>
+  );
+}
+
+function ReadyStep({
+  looks,
+  busy,
+  message,
+  onSend,
+}: {
   looks: Looks;
   busy: boolean;
   message: string | null;
   onSend: (action: string, fields: Record<string, string>) => Promise<void>;
 }) {
-  const [notes, setNotes] = useState<Record<number, string>>({});
-
-  function redo(event: FormEvent, index: number) {
-    event.preventDefault();
-    void onSend("looks", { action: "redo", index: String(index), note: notes[index] ?? "" });
-  }
-
   return (
     <>
-      <h1>Looks</h1>
+      <h1>Ready to render</h1>
       <p className="lede">
-        Each shot has its own settings and a short before/after preview.
-        Approve them all to render the whole video, or tell me what to change
-        in one shot.
+        Every segment is approved. The whole video is now restored and upscaled
+        with these settings.
       </p>
-      {looks.scale ? <p className="muted">The whole video is upscaled {looks.scale}×.</p> : null}
       {message ? <Alert text={message} /> : null}
-      {looks.error ? <p className="muted">{looks.error}</p> : null}
-      <ol className="shots">
-        {looks.shots.map((shot) => (
-          <li key={shot.index} className="look">
-            <h2>
-              {shot.index + 1}. {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
-              {shot.label || "Unlabelled shot"}
-            </h2>
-            {shot.after_url ? (
-              <div className="pair">
-                <figure>
-                  <figcaption>Before</figcaption>
-                  <div className="frame">
-                    <video
-                      controls
-                      muted
-                      loop
-                      preload="metadata"
-                      src={outputSrc(origin, shot.before_url) ?? undefined}
-                      poster={outputSrc(origin, poster(shot.before_url)) ?? undefined}
-                      aria-label={`Shot ${shot.index + 1} before`}
-                    />
-                    <Boxes regions={shot.regions ?? []} />
-                  </div>
-                </figure>
-                <figure>
-                  <figcaption>After</figcaption>
-                  <div className="frame">
-                    <video
-                      controls
-                      muted
-                      loop
-                      preload="metadata"
-                      src={outputSrc(origin, shot.after_url) ?? undefined}
-                      poster={outputSrc(origin, poster(shot.after_url)) ?? undefined}
-                      aria-label={`Shot ${shot.index + 1} after`}
-                    />
-                    <Boxes regions={shot.regions ?? []} />
-                  </div>
-                </figure>
-              </div>
-            ) : null}
-            <p>
-              <strong>{settingsSummary(shot.strength, shot.look)}</strong>
-            </p>
-            <Protected regions={shot.regions ?? []} contains={shot.contains} />
-            <p>{shot.reason}</p>
-            <p className="muted">
-              {checkSummary(shot.check)}
-              {typeof shot.shimmer === "number"
-                ? ` Texture stability: ${shot.shimmer.toFixed(1)}× as jumpy as the source.`
-                : ""}
-            </p>
-            <form onSubmit={(event) => redo(event, shot.index)}>
-              <label htmlFor={`note-${shot.index}`}>
-                Not right? Tell me what to change in this shot
-                <input
-                  id={`note-${shot.index}`}
-                  type="text"
-                  value={notes[shot.index] ?? ""}
-                  placeholder="e.g. skin looks waxy, keep it softer"
-                  onChange={(event) => setNotes({ ...notes, [shot.index]: event.target.value })}
-                />
-              </label>
-              <div className="actions">
-                <button type="submit" className="secondary" disabled={busy}>
-                  Redo this shot
-                </button>
-              </div>
-            </form>
-          </li>
-        ))}
-      </ol>
+      <ul className="summary">
+        {looks.shots.map((shot) => {
+          const summary = settingsSummary(shot.strength, shot.look);
+          return (
+            <li key={shot.index}>
+              {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
+              {shot.label || "Unlabelled segment"}:{" "}
+              {shot.use_upscale === false ? `No FlashVSR: resized only. ${summary}` : summary}
+            </li>
+          );
+        })}
+      </ul>
       <div className="actions">
         <button
           type="button"
           disabled={busy}
-          onClick={() => void onSend("looks", { action: "approve" })}
+          onClick={() => void onSend("ready", { action: "render" })}
         >
-          Approve all and render
+          Render the whole video
         </button>
       </div>
     </>

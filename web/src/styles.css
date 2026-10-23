@@ -322,6 +322,30 @@ video {
   outline-offset: 2px;
 }
 
+.progress {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--muted);
+}
+
+.progress progress {
+  flex: 1;
+  height: 0.6rem;
+  accent-color: var(--leaf);
+}
+
+label.inline {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.summary {
+  padding-left: 1.1rem;
+  line-height: 1.6;
+}
+
 @media (max-width: 520px) {
   .shell {
     padding: 0.85rem 0.7rem 2rem;

@@ -4,21 +4,34 @@ export type WizardStep =
   | "local_llm_stub"
   | "setup"
   | "pick_file"
-  | "finding_shots"
-  | "shots"
-  | "planning"
-  | "looks"
+  | "sampling"
+  | "proposing"
+  | "segments"
+  | "analyzing"
+  | "preview_segment"
+  | "ready_to_render"
   | "rendering"
   | "result"
   | "done";
 
-export type Shot = {
+export type Segment = {
   start_s: number;
   end_s: number;
   label: string;
-  issues: string[];
+  note: string;
   contains: string[];
-  still: string;
+};
+
+export type SegmentList = {
+  segments: Segment[];
+  error: string | null;
+  note: string;
+};
+
+export type Progress = {
+  phase: string;
+  pct: number;
+  message: string;
 };
 
 export type ShotLook = Record<
@@ -49,6 +62,7 @@ export type LookShot = {
   contains: string[];
   regions?: Region[];
   strength: number;
+  use_upscale?: boolean;
   look: ShotLook;
   reason: string;
   check: ShotCheck;
@@ -63,6 +77,14 @@ export type Looks = {
   shots: LookShot[];
 };
 
+export type SegmentPreview = {
+  index: number;
+  count: number;
+  scale: number | null;
+  error: string | null;
+  shot: LookShot | null;
+};
+
 export type WizardView = {
   step: WizardStep;
   busy?: boolean;
@@ -73,8 +95,10 @@ export type WizardView = {
   output_url: string | null;
   scale: number | null;
   strength: number | null;
-  shots?: Shot[] | null;
-  label_error?: string | null;
+  progress?: Progress | null;
+  segment_index?: number;
+  segments?: SegmentList | null;
+  segment_preview?: SegmentPreview | null;
   looks?: Looks | null;
   seams?: { time_s: number; score: number }[];
   seam_error?: string | null;
@@ -87,10 +111,12 @@ const STEPS: readonly string[] = [
   "local_llm_stub",
   "setup",
   "pick_file",
-  "finding_shots",
-  "shots",
-  "planning",
-  "looks",
+  "sampling",
+  "proposing",
+  "segments",
+  "analyzing",
+  "preview_segment",
+  "ready_to_render",
   "rendering",
   "result",
   "done",
@@ -183,19 +209,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type Route = "render" | "segment" | "analyze";
+
 async function runUntilDone(
   origin: string,
-  route: "render" | "scan" | "plan",
-  step: WizardView["step"],
+  route: Route,
+  steps: readonly WizardView["step"][],
+  onProgress: (view: WizardView) => void,
 ): Promise<WizardView> {
   // The server starts the long pass on a worker thread and answers at once.
-  // Poll the state until the wizard leaves that step.
+  // Poll the state, reporting progress, until the wizard leaves those steps.
+  // Sampling goes on to proposing in the same worker, so both count.
   let view = await readView(
     await fetch(`${origin}/api/${route}?run=1`, {
       headers: { Accept: "application/json", "X-Wizard-Token": wizardToken },
     }),
   );
-  while (view.step === step) {
+  while (steps.includes(view.step)) {
+    onProgress(view);
     await sleep(POLL_MS);
     view = await readView(
       await fetch(`${origin}/api/state`, {
@@ -208,29 +239,32 @@ async function runUntilDone(
 
 function once(
   origin: string,
-  route: "render" | "scan" | "plan",
-  step: WizardView["step"],
+  route: Route,
+  steps: readonly WizardView["step"][],
+  onProgress: (view: WizardView) => void,
 ): Promise<WizardView> {
   const running = inFlight.get(route);
   if (running) return running;
-  const next = runUntilDone(origin, route, step).finally(() => {
+  const next = runUntilDone(origin, route, steps, onProgress).finally(() => {
     inFlight.delete(route);
   });
   inFlight.set(route, next);
   return next;
 }
 
-export function runRender(origin: string): Promise<WizardView> {
-  return once(origin, "render", "rendering");
-}
+export type Runner = (
+  origin: string,
+  onProgress: (view: WizardView) => void,
+) => Promise<WizardView>;
 
-export function runScan(origin: string): Promise<WizardView> {
-  return once(origin, "scan", "finding_shots");
-}
+export const runRender: Runner = (origin, onProgress) =>
+  once(origin, "render", ["rendering"], onProgress);
 
-export function runPlan(origin: string): Promise<WizardView> {
-  return once(origin, "plan", "planning");
-}
+export const runSegmenting: Runner = (origin, onProgress) =>
+  once(origin, "segment", ["sampling", "proposing"], onProgress);
+
+export const runAnalyze: Runner = (origin, onProgress) =>
+  once(origin, "analyze", ["analyzing"], onProgress);
 
 export function outputSrc(origin: string, outputUrl: string | null): string | null {
   if (!outputUrl) return null;
