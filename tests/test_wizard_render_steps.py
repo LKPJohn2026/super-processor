@@ -49,6 +49,12 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
         (WizardStep.SHOTS, "Approve shots"),
         (WizardStep.PLANNING, "Planning each shot"),
         (WizardStep.LOOKS, "Approve all and render"),
+        (WizardStep.SAMPLING, "Sampling stills"),
+        (WizardStep.PROPOSING, "Proposing segments"),
+        (WizardStep.SEGMENTS, "Review segments"),
+        (WizardStep.ANALYZING, "Analyzing segment"),
+        (WizardStep.PREVIEW_SEGMENT, "Segment preview"),
+        (WizardStep.READY_TO_RENDER, "Ready to render"),
         (WizardStep.RENDERING, "Upscaling"),
         (WizardStep.RESULT, "Result"),
         (WizardStep.DONE, "Done"),
@@ -84,11 +90,35 @@ def test_retired_steps_go_back_to_pick(tmp_path: Path) -> None:
     loaded = load_job_wizard_state(job_dir)
     assert loaded is not None
     assert loaded.to_dict() == {
-        "schema_version": 2,
+        "schema_version": 3,
         "step": "pick_file",
         "job_id": None,
         "error": loaded.error,
+        "segment_index": 0,
+        "progress": None,
     }
+
+
+def test_segment_loop_state_round_trips(tmp_path: Path) -> None:
+    controller, job_id, job_dir = _seed_job(tmp_path)
+    state = WizardState(
+        step=WizardStep.ANALYZING,
+        job_id=job_id,
+        segment_index=2,
+        progress={"phase": "analyzing", "pct": 40, "message": "proposing"},
+    )
+    save_job_wizard_state(job_dir, state)
+    save_session_state(tmp_path, state)
+    assert controller.current_state() == state
+    raw = {
+        "schema_version": 3,
+        "step": "segments",
+        "segment_index": -1,
+        "progress": "junk",
+    }
+    loaded = WizardState.from_dict(raw)
+    assert loaded.step is WizardStep.SEGMENTS
+    assert (loaded.segment_index, loaded.progress) == (0, None)
 
 
 def test_wizard_server_serves_output_only(tmp_path: Path) -> None:

@@ -418,6 +418,17 @@ one still.</p>
     return _page("Finding shots", body, phase="shots")
 
 
+def render_segment_loop_pending(title: str) -> str:
+    """A segment-loop step this page shell cannot show yet."""
+    body = f"""
+<h1>{escape(title)}</h1>
+<p class="lede">This job is in the segment loop, which only the API drives
+for now. Start a new job to use the shot flow here.</p>
+<form method="post" action="/new"><button type="submit">Start a new job</button></form>
+"""
+    return _page(title, body, phase="shots")
+
+
 def format_time(seconds: float) -> str:
     """``75.5`` as ``1:15.5``; whole seconds drop the fraction."""
     minutes, rest = divmod(round(max(0.0, seconds), 1), 60.0)

@@ -84,12 +84,13 @@ from .wizard_pages import (
     render_planning,
     render_rendering,
     render_result,
+    render_segment_loop_pending,
     render_setup,
     render_shots,
 )
 
 WIZARD_STATE_FILE = "wizard_state.json"
-WIZARD_SCHEMA_VERSION = 2
+WIZARD_SCHEMA_VERSION = 3
 # Inputs are limited to 1080p (either orientation) and 30 minutes. FlashVSR
 # at 2x already makes 4K from 1080p; larger inputs exceed what one GPU pass
 # and the job directory are sized for.
@@ -113,17 +114,39 @@ class WizardStep(str, Enum):
     SHOTS = "shots"
     PLANNING = "planning"
     LOOKS = "looks"
+    # Segment loop: sample stills, Gemini proposes segments, the editor
+    # approves them, then each segment is analyzed and previewed in turn.
+    SAMPLING = "sampling"
+    PROPOSING = "proposing"
+    SEGMENTS = "segments"
+    ANALYZING = "analyzing"
+    PREVIEW_SEGMENT = "preview_segment"
+    READY_TO_RENDER = "ready_to_render"
     RENDERING = "rendering"
     RESULT = "result"
     DONE = "done"
 
 
 # Steps of the removed Gemini split / FFmpeg enhance flow. A state file saved
-# on one of them is sent back to the pick step.
-_RETIRED_STEPS = frozenset({"analyzing", "overview", "choose_split", "enhance"})
+# on one of them is sent back to the pick step. That flow also had an
+# "analyzing" step; the segment loop reuses the name from schema 3 on, so
+# only an older file on it is retired.
+_RETIRED_STEPS = frozenset({"overview", "choose_split", "enhance"})
+_REUSED_STEPS = frozenset({"analyzing"})
+_REUSED_SINCE = 3
 _RETIRED_MESSAGE = (
     "this job used the removed split and enhance flow; pick the file again"
 )
+
+
+_LOOP_TITLES = {
+    WizardStep.SAMPLING: "Sampling stills",
+    WizardStep.PROPOSING: "Proposing segments",
+    WizardStep.SEGMENTS: "Review segments",
+    WizardStep.ANALYZING: "Analyzing segment",
+    WizardStep.PREVIEW_SEGMENT: "Segment preview",
+    WizardStep.READY_TO_RENDER: "Ready to render",
+}
 
 
 @dataclass(slots=True)
@@ -133,6 +156,10 @@ class WizardState:
     step: WizardStep = WizardStep.INTRO
     job_id: str | None = None
     error: str | None = None
+    # Segment loop: the segment being analyzed or previewed.
+    segment_index: int = 0
+    # While a worker runs: {"phase", "pct" (0 to 100), "message"}.
+    progress: dict[str, Any] | None = None
     schema_version: int = WIZARD_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -141,17 +168,25 @@ class WizardState:
             "step": self.step.value,
             "job_id": self.job_id,
             "error": self.error,
+            "segment_index": self.segment_index,
+            "progress": self.progress,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WizardState:
         raw_step = str(data.get("step", WizardStep.INTRO.value))
-        if raw_step in _RETIRED_STEPS:
+        version = data.get("schema_version")
+        old = not isinstance(version, int) or version < _REUSED_SINCE
+        if raw_step in _RETIRED_STEPS or (old and raw_step in _REUSED_STEPS):
             return cls(step=WizardStep.PICK_FILE, error=_RETIRED_MESSAGE)
+        index = data.get("segment_index", 0)
+        progress = data.get("progress")
         return cls(
             step=WizardStep(raw_step),
             job_id=data.get("job_id"),
             error=data.get("error"),
+            segment_index=index if isinstance(index, int) and index >= 0 else 0,
+            progress=progress if isinstance(progress, dict) else None,
         )
 
 
@@ -449,6 +484,8 @@ class WizardController:
                 self._looks_view(self.store.job_dir(state.job_id)),
                 error=state.error,
             )
+        if state.step in _LOOP_TITLES:
+            return render_segment_loop_pending(_LOOP_TITLES[state.step])
         if state.step is WizardStep.RENDERING:
             return render_rendering()
         if state.step is WizardStep.RESULT:
