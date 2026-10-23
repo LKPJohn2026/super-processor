@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Gemini proposes the segment loop's segments from the still grid and its
+  times (`GeminiClient.propose_segments`). A re-proposal carries the
+  editor's note, and the saved chat is replayed so Gemini sees what it
+  proposed before. `repair_coverage` turns any reply into segments that
+  cover the clip once: gaps are split down the middle, an overlap is cut
+  where the later segment starts, and slivers under 0.5s are folded in.
+- Gemini can set `use_upscale: false` on a shot's look so it skips FlashVSR.
+  The setting is kept in `shot_plan.json`; rendering follows it from a
+  later release.
+
 ## [2.7.1] - 2026-10-23
 
 ### Fixed
