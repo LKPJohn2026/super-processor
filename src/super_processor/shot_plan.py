@@ -34,6 +34,7 @@ from .upscale import (
     UpscaleRequest,
     UpscaleSpan,
     encode_delivery,
+    restore_clip,
     trim_source,
     upscale_all,
 )
@@ -198,6 +199,7 @@ class ShotPlan:
                     strength=recipe.strength,
                     look=recipe.look,
                     regions=shot.regions,
+                    use_upscale=recipe.use_upscale,
                 )
                 for shot, recipe in zip(shots.shots, self.recipes, strict=True)
             )
@@ -528,6 +530,8 @@ def render_previews(
     recipes = list(plan.recipes)
     clips: dict[int, Path] = {}
     requests: list[UpscaleRequest] = []
+    # Shots that skip FlashVSR are only resized; see :func:`restore_clip`.
+    plain: dict[int, Path] = {}
     for index in indexes:
         recipe = replace(recipes[index], rev=recipes[index].rev + 1)
         recipes[index] = recipe
@@ -541,18 +545,25 @@ def render_previews(
             video_filter="setpts=PTS-STARTPTS",
         )
         clips[index] = clip
-        requests.append(
-            UpscaleRequest(
-                clip,
-                work / f"shot_{index:03d}_up.mp4",
-                scale=plan.scale,
-                strength=recipe.strength,
-                look=recipe.look,
-                regions=shots.shots[index].regions,
-            )
+        request = UpscaleRequest(
+            clip,
+            work / f"shot_{index:03d}_up.mp4",
+            scale=plan.scale,
+            strength=recipe.strength,
+            look=recipe.look,
+            regions=shots.shots[index].regions,
         )
-    raws = upscale_all(engine, requests)
-    for index, raw in zip(indexes, raws, strict=True):
+        if recipe.use_upscale:
+            requests.append(request)
+        else:
+            plain[index] = restore_clip(
+                engine, request, use_upscale=False, ffmpeg_bin=ffmpeg_bin
+            )[0]
+    upscaled = [index for index in indexes if index not in plain]
+    raws = dict(zip(upscaled, upscale_all(engine, requests), strict=True))
+    raws.update(plain)
+    for index in indexes:
+        raw = raws[index]
         recipe = recipes[index]
         _remove_old_previews(folder, index)
         after = folder / preview_name(index, recipe.rev, "after")
@@ -562,7 +573,7 @@ def render_previews(
             after,
             ffmpeg_bin=ffmpeg_bin,
             blend_with=clips[index],
-            strength=recipe.strength,
+            strength=recipe.strength if recipe.use_upscale else 0.0,
             look=recipe.look,
             regions=shots.shots[index].regions,
         )

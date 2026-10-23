@@ -77,6 +77,8 @@ class UpscaleSpan:
     source: str = "original"
     look: ShotLook = field(default_factory=ShotLook)
     regions: tuple[Region, ...] = ()
+    # False: skip FlashVSR and only resize this span (see :func:`restore_clip`).
+    use_upscale: bool = True
 
     def __post_init__(self) -> None:
         scale = _require_scale(self.scale)
@@ -101,6 +103,7 @@ class UpscaleSpan:
             "source": self.source,
             "look": self.look.to_dict(),
             "regions": [region.to_dict() for region in self.regions],
+            "use_upscale": self.use_upscale,
         }
 
     @classmethod
@@ -120,6 +123,7 @@ class UpscaleSpan:
                 source=str(data.get("source", "original")),
                 look=look,
                 regions=regions_from_dicts(data.get("regions")),
+                use_upscale=data.get("use_upscale") is not False,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise UpscaleError("upscale span is missing start_s or end_s") from exc
@@ -391,6 +395,53 @@ def _flashvsr_ready() -> tuple[Path, Path]:
         )
     resolve_flashvsr_weights(home)
     return home, infer
+
+
+def plain_upscale(request: UpscaleRequest, *, ffmpeg_bin: str = "ffmpeg") -> Path:
+    """Resize ``request.source`` by its scale with lanczos, without FlashVSR."""
+    request.output.parent.mkdir(parents=True, exist_ok=True)
+    _run_ffmpeg(
+        [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(request.source),
+            "-vf",
+            f"scale=iw*{request.scale}:ih*{request.scale}:flags=lanczos",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            str(request.output),
+        ]
+    )
+    if not request.output.is_file():
+        raise UpscaleError("the plain upscale produced no output")
+    return request.output
+
+
+def restore_clip(
+    engine: UpscaleEngine,
+    request: UpscaleRequest,
+    *,
+    use_upscale: bool,
+    ffmpeg_bin: str = "ffmpeg",
+) -> tuple[Path, float]:
+    """The restored clip and the strength to blend it at.
+
+    Without FlashVSR the clip is only resized. Blended at strength 0 the
+    delivery encode keeps just its lanczos base with the look applied, so a
+    pass-through span matches its neighbours' size and frame timing.
+    """
+    if use_upscale:
+        return engine.upscale(request), request.strength
+    return plain_upscale(request, ffmpeg_bin=ffmpeg_bin), 0.0
 
 
 def upscale_all(engine: UpscaleEngine, requests: list[UpscaleRequest]) -> list[Path]:
@@ -1184,7 +1235,8 @@ def _upscale_full(
     engine: UpscaleEngine,
     ffmpeg_bin: str,
 ) -> Path:
-    raw = engine.upscale(
+    raw, strength = restore_clip(
+        engine,
         UpscaleRequest(
             source,
             work / "full_up.mp4",
@@ -1192,14 +1244,16 @@ def _upscale_full(
             strength=span.strength,
             look=span.look,
             regions=span.regions,
-        )
+        ),
+        use_upscale=span.use_upscale,
+        ffmpeg_bin=ffmpeg_bin,
     )
     encode_delivery(
         raw,
         output,
         ffmpeg_bin=ffmpeg_bin,
         blend_with=source,
-        strength=span.strength,
+        strength=strength,
         look=span.look,
         regions=span.regions,
     )
@@ -1245,7 +1299,8 @@ def apply_range_revise(
         duration_s if end is None else end,
         ffmpeg_bin=ffmpeg_bin,
     )
-    raw = engine.upscale(
+    raw, strength = restore_clip(
+        engine,
         UpscaleRequest(
             clip,
             work / "range_up.mp4",
@@ -1253,14 +1308,16 @@ def apply_range_revise(
             strength=span.strength,
             look=span.look,
             regions=span.regions,
-        )
+        ),
+        use_upscale=span.use_upscale,
+        ffmpeg_bin=ffmpeg_bin,
     )
     middle = encode_delivery(
         raw,
         work / "range_delivery.mp4",
         ffmpeg_bin=ffmpeg_bin,
         blend_with=clip,
-        strength=span.strength,
+        strength=strength,
         look=span.look,
         regions=span.regions,
     )
@@ -1370,7 +1427,8 @@ def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
             last.strength,
             last.look,
             last.regions,
-        ) == (span.scale, span.strength, span.look, span.regions):
+            last.use_upscale,
+        ) == (span.scale, span.strength, span.look, span.regions, span.use_upscale):
             out[-1] = replace(last, end_s=span.end_s)
         else:
             out.append(span)
@@ -1421,7 +1479,8 @@ def render_shots(
             ffmpeg_bin=ffmpeg_bin,
             video_filter="setpts=PTS-STARTPTS",
         )
-        raw = engine.upscale(
+        raw, strength = restore_clip(
+            engine,
             UpscaleRequest(
                 clip,
                 work / f"shot_{index}_up.mp4",
@@ -1429,7 +1488,9 @@ def render_shots(
                 strength=span.strength,
                 look=span.look,
                 regions=span.regions,
-            )
+            ),
+            use_upscale=span.use_upscale,
+            ffmpeg_bin=ffmpeg_bin,
         )
         parts.append(
             encode_delivery(
@@ -1437,7 +1498,7 @@ def render_shots(
                 work / f"shot_{index}_delivery.mp4",
                 ffmpeg_bin=ffmpeg_bin,
                 blend_with=clip,
-                strength=span.strength,
+                strength=strength,
                 look=span.look,
                 regions=span.regions,
             )
