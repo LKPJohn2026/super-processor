@@ -596,6 +596,23 @@ def write_gray_still(path: Path, gray: bytes) -> None:
     path.write_bytes(header + gray[:pixels])
 
 
+# The wizard's segment loop keeps its own list in the same file, marked with
+# this kind. The two lists have different shapes, so neither reads the other.
+WIZARD_SEGMENTS_KIND = "wizard"
+_WIZARD_OWNED = (
+    "segments.json in this job belongs to the wizard's segment loop; "
+    "run the segment review on another job"
+)
+
+
+def _wizard_owned(path: Path) -> bool:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and data.get("kind") == WIZARD_SEGMENTS_KIND
+
+
 def segments_path(job_dir: Path) -> Path:
     """Return the on-disk segment list for a job."""
     return job_dir / SEGMENTS_FILE_NAME
@@ -604,6 +621,8 @@ def segments_path(job_dir: Path) -> Path:
 def write_segments(job_dir: Path, segments: list[TimelineSegment]) -> Path:
     """Atomically write the proposed segment list."""
     path = segments_path(job_dir)
+    if path.is_file() and _wizard_owned(path):
+        raise SegmentError(_WIZARD_OWNED)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": SEGMENTS_SCHEMA_VERSION,
@@ -624,6 +643,8 @@ def load_segments(job_dir: Path) -> list[TimelineSegment]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise SegmentError("segments root must be an object")
+    if data.get("kind") == WIZARD_SEGMENTS_KIND:
+        raise SegmentError(_WIZARD_OWNED)
     raw_rows = data.get("segments")
     if not isinstance(raw_rows, list):
         raise SegmentError("segments list is missing")

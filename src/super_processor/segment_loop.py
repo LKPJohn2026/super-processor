@@ -8,11 +8,13 @@ their times; the editor approves them before anything is planned.
 
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from .segments import STILLS_DIR_NAME
+from .segments import SEGMENTS_FILE_NAME, STILLS_DIR_NAME, WIZARD_SEGMENTS_KIND
 from .shots import ShotError, extract_still
 
 MAX_STILLS = 120
@@ -20,6 +22,10 @@ STILLS_PER_S = 1.0
 # Seeking to the exact duration finds no frame; the last still is taken this
 # far before the end.
 END_MARGIN_S = 0.1
+# segments.json is shared with the older segment review, which writes
+# schema 1 without a kind. Each side refuses the other's file.
+SEGMENT_LIST_SCHEMA_VERSION = 2
+SEGMENT_LIST_KIND = WIZARD_SEGMENTS_KIND
 
 
 def sample_times(
@@ -90,3 +96,101 @@ def extract_segment_stills(
             raise SegmentLoopError(f"could not sample the video: {exc}") from exc
         stills.append(SegmentStill(t_s=t_s, path=relative))
     return stills
+
+
+@dataclass(frozen=True, slots=True)
+class LoopSegment:
+    """One span of the video that is planned and previewed on its own."""
+
+    start_s: float
+    end_s: float
+    label: str = ""
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        start, end = float(self.start_s), float(self.end_s)
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise SegmentLoopError("segment times must be finite")
+        if start < 0 or end <= start:
+            raise SegmentLoopError("segment end must be after its start")
+        object.__setattr__(self, "start_s", start)
+        object.__setattr__(self, "end_s", end)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start_s": self.start_s,
+            "end_s": self.end_s,
+            "label": self.label,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> LoopSegment:
+        if not isinstance(data, dict):
+            raise SegmentLoopError("each segment must be an object")
+        try:
+            return cls(
+                start_s=float(data["start_s"]),
+                end_s=float(data["end_s"]),
+                label=str(data.get("label", "")),
+                note=str(data.get("note", "")),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SegmentLoopError("a segment is missing start_s or end_s") from exc
+
+
+@dataclass(slots=True)
+class SegmentList:
+    """The proposed segments, and whether the editor approved them."""
+
+    segments: list[LoopSegment] = field(default_factory=list)
+    approved: bool = False
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": SEGMENT_LIST_SCHEMA_VERSION,
+            "kind": SEGMENT_LIST_KIND,
+            "approved": self.approved,
+            "error": self.error,
+            "segments": [segment.to_dict() for segment in self.segments],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> SegmentList:
+        if not isinstance(data, dict) or data.get("kind") != SEGMENT_LIST_KIND:
+            raise SegmentLoopError(
+                f"{SEGMENTS_FILE_NAME} belongs to the older segment review; "
+                "pick the file again in the wizard"
+            )
+        raw = data.get("segments")
+        if not isinstance(raw, list):
+            raise SegmentLoopError("the segment list is missing")
+        error = data.get("error")
+        return cls(
+            segments=[LoopSegment.from_dict(item) for item in raw],
+            approved=bool(data.get("approved", False)),
+            error=error if isinstance(error, str) else None,
+        )
+
+
+def save_segment_list(job_dir: Path, segments: SegmentList) -> Path:
+    """Write ``segments.json`` atomically."""
+    path = job_dir / SEGMENTS_FILE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(segments.to_dict(), indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_segment_list(job_dir: Path) -> SegmentList | None:
+    """Read ``segments.json``, or ``None`` when there is none yet."""
+    path = job_dir / SEGMENTS_FILE_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SegmentLoopError(f"cannot read {SEGMENTS_FILE_NAME}: {exc}") from exc
+    return SegmentList.from_dict(data)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import shutil
 import subprocess
@@ -12,12 +13,23 @@ import pytest
 from super_processor.segment_loop import (
     END_MARGIN_S,
     MAX_STILLS,
+    LoopSegment,
+    SegmentList,
     SegmentLoopError,
     extract_segment_stills,
+    load_segment_list,
     sample_times,
+    save_segment_list,
     still_name,
 )
-from super_processor.segments import STILLS_DIR_NAME
+from super_processor.segments import (
+    SEGMENTS_FILE_NAME,
+    STILLS_DIR_NAME,
+    SegmentError,
+    TimelineSegment,
+    load_segments,
+    write_segments,
+)
 
 
 def test_sample_times_one_a_second_with_both_ends() -> None:
@@ -145,3 +157,86 @@ def test_extract_segment_stills_reports_ffmpeg_failure(tmp_path: Path) -> None:
             [0.0],
             ffmpeg_bin=str(tmp_path / "no-ffmpeg"),
         )
+
+
+def _two_segments() -> SegmentList:
+    return SegmentList(
+        segments=[
+            LoopSegment(0.0, 4.0, label="kitchen, window light"),
+            LoopSegment(4.0, 9.5, label="street at night", note="keep grain"),
+        ]
+    )
+
+
+def test_segment_list_round_trips(tmp_path: Path) -> None:
+    assert load_segment_list(tmp_path) is None
+    saved = _two_segments()
+    saved.approved = True
+    path = save_segment_list(tmp_path, saved)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 2
+    assert data["kind"] == "wizard"
+    loaded = load_segment_list(tmp_path)
+    assert loaded == saved
+
+
+@pytest.mark.parametrize(
+    ("start", "end"), [(-1.0, 2.0), (3.0, 3.0), (4.0, 2.0), (0.0, math.inf)]
+)
+def test_loop_segment_refuses_bad_times(start: float, end: float) -> None:
+    with pytest.raises(SegmentLoopError):
+        LoopSegment(start, end)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"kind": "wizard", "segments": "nope"},
+        {"kind": "wizard", "segments": ["nope"]},
+        {"kind": "wizard", "segments": [{"start_s": 1.0}]},
+    ],
+)
+def test_segment_list_refuses_malformed_files(tmp_path: Path, raw: object) -> None:
+    (tmp_path / SEGMENTS_FILE_NAME).write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(SegmentLoopError):
+        load_segment_list(tmp_path)
+
+
+def test_segment_list_refuses_unreadable_json(tmp_path: Path) -> None:
+    (tmp_path / SEGMENTS_FILE_NAME).write_text("{", encoding="utf-8")
+    with pytest.raises(SegmentLoopError, match="cannot read"):
+        load_segment_list(tmp_path)
+
+
+def test_wizard_refuses_the_older_review_file(tmp_path: Path) -> None:
+    write_segments(
+        tmp_path,
+        [
+            TimelineSegment(
+                index=0,
+                start_s=0.0,
+                end_s=6.0,
+                context="indoor",
+                problem="noisy",
+                keyframe_s=3.0,
+                look_group=0,
+            )
+        ],
+    )
+    with pytest.raises(SegmentLoopError, match="older segment review"):
+        load_segment_list(tmp_path)
+
+
+def test_older_review_refuses_the_wizard_file(tmp_path: Path) -> None:
+    save_segment_list(tmp_path, _two_segments())
+    with pytest.raises(SegmentError, match="segment loop"):
+        load_segments(tmp_path)
+    with pytest.raises(SegmentError, match="segment loop"):
+        write_segments(tmp_path, [])
+    assert load_segment_list(tmp_path) == _two_segments()
+
+
+def test_older_review_overwrites_unreadable_file(tmp_path: Path) -> None:
+    (tmp_path / SEGMENTS_FILE_NAME).write_text("{", encoding="utf-8")
+    write_segments(tmp_path, [])
+    assert load_segments(tmp_path) == []
