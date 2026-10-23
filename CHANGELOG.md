@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.1] - 2026-10-23
+
+### Fixed
+
+- The FlashVSR runner test skips when `ffmpeg` is missing from `PATH`, so
+  the release wheel tests pass. The 2.7.0 release built no wheels and was
+  not published; 2.7.1 ships its changes.
+
 ## [2.7.0] - 2026-10-23
 
 ### Security
