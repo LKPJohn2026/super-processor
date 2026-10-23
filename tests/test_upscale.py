@@ -78,6 +78,7 @@ def test_release_gpu_moves_the_pipeline_to_cpu() -> None:
     assert moved == ["cpu"]
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_flashvsr_runner_writes_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
