@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Spans and previews marked `use_upscale: false` skip FlashVSR. The clip is
+  resized with lanczos and goes through the same delivery encode at strength
+  0, so it keeps its look, matches its neighbours' size, and the joined
+  output still holds every source frame once. Full renders, range revises,
+  and previews all follow it, and `upscale_plan.json` spans carry the flag.
+
 ## [3.0.0] - 2026-10-23
 
 ### Added
