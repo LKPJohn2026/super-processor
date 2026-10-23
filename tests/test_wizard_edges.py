@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from super_processor.wizard import (
     WizardController,
     WizardStep,
@@ -52,9 +54,7 @@ def _clip(path: Path, seconds: int = 12) -> Path:
     return path
 
 
-def test_pick_missing_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_pick_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("super_processor.wizard.resolve_gemini_api_key", lambda: None)
     monkeypatch.setattr(
         "super_processor.wizard.store_gemini_api_key", lambda _key: None

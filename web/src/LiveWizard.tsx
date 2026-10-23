@@ -327,11 +327,7 @@ function SetupStep({
 
   function submit(event: FormEvent) {
     event.preventDefault();
-    const fields: Record<string, string> = { api_key: apiKey };
-    if (hasKey) {
-      fields.replace = "1";
-    }
-    void onSend("setup", fields);
+    void onSend("setup", { api_key: apiKey });
   }
 
   return (

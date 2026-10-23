@@ -36,11 +36,22 @@ the job directory. CI also runs `@pytest.mark.gemini_live` against
 ## Local-only server
 
 The wizard answers only requests whose `Host` is `127.0.0.1`, `localhost`, or
-`[::1]`. A request carrying an `Origin` must come from the wizard itself, the
-Vite dev or preview server (`:5173`, `:4173`), or the published React shell.
-Add origins, comma separated, with `SUPER_PROCESSOR_ALLOWED_ORIGINS`. A
-cross-site GET that would start work (for example an image tag pointing at
-`/render?run=1`) is refused.
+`[::1]`. A request carrying an `Origin` must come from the wizard itself or the
+Vite dev or preview server (`:5173`, `:4173`). The published React shell on
+GitHub Pages is not allowed by default; to drive a local wizard from it, start
+the wizard with
+`SUPER_PROCESSOR_ALLOWED_ORIGINS=https://lkpjohn2026.github.io`. Add other
+origins the same way, comma separated; `*`, `null`, and anything that is not a
+plain `http(s)` origin are ignored. A cross-site GET that would start work (for
+example an image tag pointing at `/render?run=1`) is refused.
+
+Each run also makes a random token and prints it after the URL. Every POST and
+every `?run=1` request must carry it, as an `X-Wizard-Token` header or a
+`token` field. The wizard puts it in its own forms and links, and `/api/state`
+returns it as `token`, which only the wizard's pages and allowed origins can
+read. So a page on another site cannot drive the wizard even in a browser that
+sends no `Origin` header. Scripts send the printed token. Bodies over 256 KiB
+get 413, and a bad `Content-Length` gets 400.
 
 Upscale runs on a single worker thread. `GET /render?run=1` and
 `GET /api/render?run=1` start a pass when none is running and return at once.

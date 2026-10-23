@@ -375,7 +375,6 @@ rel="noreferrer">Google AI Studio</a></li>
 <input name="api_key" type="password" autocomplete="off"
 placeholder="AIza…">
 </label>
-{('<input type="hidden" name="replace" value="1">' if has_key else "")}
 <button type="submit">Save and continue</button>
 </form>
 """

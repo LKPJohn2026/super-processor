@@ -56,9 +56,7 @@ def test_request_rejection_rules(monkeypatch: pytest.MonkeyPatch) -> None:
     assert request_rejection(foreign, port=9000, state_changing=False) == (
         "origin not allowed"
     )
-    pages = _headers(
-        Host="127.0.0.1:9000", Origin="https://lkpjohn2026.github.io"
-    )
+    pages = _headers(Host="127.0.0.1:9000", Origin="https://lkpjohn2026.github.io")
     assert request_rejection(pages, port=9000, state_changing=True) == (
         "origin not allowed"
     )
@@ -162,7 +160,11 @@ def test_server_refuses_other_sites(tmp_path: Path) -> None:
         assert status == 200
         assert allow == "http://localhost:5173"
         status, _body, _allow = _request(
-            base, "POST", "/intro", headers={"Origin": base}, body=b"x=1"
+            base,
+            "POST",
+            "/intro",
+            headers={"Origin": base, "X-Wizard-Token": server.token},
+            body=b"x=1",
         )
         assert status == 303
         assert controller.current_state().step is WizardStep.LLM_CHOICE

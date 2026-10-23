@@ -17,6 +17,8 @@ from super_processor.wizard_pages import (
     render_setup,
 )
 
+TOKEN = "test-token"
+
 
 def test_render_helpers_smoke() -> None:
     assert "local LLM" in render_llm_choice()
@@ -43,12 +45,12 @@ def test_step_rail_has_no_split_or_enhance() -> None:
 
 
 def test_wizard_server_post_intro(tmp_path: Path) -> None:
-    server = WizardServer(tmp_path)
+    server = WizardServer(tmp_path, token=TOKEN)
     base = server.start()
     try:
         req = Request(
             base + "/intro",
-            data=urlencode({}).encode(),
+            data=urlencode({"token": TOKEN}).encode(),
             method="POST",
         )
         with urlopen(req) as response:

@@ -17,6 +17,8 @@ from super_processor.review import WizardServer
 from super_processor.upscale import FakeUpscaleEngine
 from super_processor.wizard import WizardController, WizardStep
 
+TOKEN = "test-token"
+
 
 class _FakeTransport:
     def __init__(self, payloads: list[dict[str, Any]]) -> None:
@@ -64,7 +66,7 @@ def _tiny_clip(path: Path, seconds: int = 12) -> Path:
 
 
 def _get(base: str, path: str = "/") -> str:
-    with urlopen(base + path) as response:
+    with urlopen(Request(base + path, headers={"X-Wizard-Token": TOKEN})) as response:
         return str(response.read().decode())
 
 
@@ -72,6 +74,7 @@ def _post(base: str, path: str, fields: dict[str, str]) -> str:
     req = Request(
         base + path,
         data=urlencode(fields).encode(),
+        headers={"X-Wizard-Token": TOKEN},
         method="POST",
     )
     with urlopen(req) as response:
@@ -152,7 +155,7 @@ def test_wizard_website_full_flow_intro_to_done(
         gemini=gemini,
         upscale_engine=FakeUpscaleEngine(),
     )
-    server = WizardServer(tmp_path, controller=controller)
+    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
         intro = _get(base)
@@ -245,7 +248,7 @@ def test_wizard_website_local_llm_stub_then_gemini_path(
     """LLM B route shows deferred stub UI, then returns to Gemini setup."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     controller = WizardController(tmp_path)
-    server = WizardServer(tmp_path, controller=controller)
+    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
         _post(base, "/intro", {})

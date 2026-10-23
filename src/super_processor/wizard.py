@@ -544,14 +544,6 @@ class WizardController:
                 self._save(state)
                 return
             key = fields.get("api_key", [""])[0]
-            # A page that can POST here could otherwise silently swap the key.
-            if resolve_gemini_api_key() and fields.get("replace", [""])[0] != "1":
-                state.error = (
-                    "a Gemini API key is already saved; send replace=1 to overwrite it"
-                )
-                state.step = WizardStep.SETUP
-                self._save(state)
-                return
             try:
                 store_gemini_api_key(key)
             except GeminiError as exc:
@@ -614,11 +606,6 @@ class WizardController:
 
     def _pick_file(self, state: WizardState, raw_path: str) -> None:
         source = Path(raw_path.strip()).expanduser()
-        if source.is_symlink():
-            state.error = "refusing a symbolic link; pick the real video file"
-            state.step = WizardStep.PICK_FILE
-            self._save(state)
-            return
         if not source.is_file():
             state.error = f"file not found: {source}"
             state.step = WizardStep.PICK_FILE

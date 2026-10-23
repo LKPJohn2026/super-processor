@@ -537,6 +537,9 @@ def run_review_command(arguments: argparse.Namespace) -> int:
         store.ensure_root()
         server = WizardServer(store.root)
     print(server.start(), flush=True)
+    if server.token:
+        # For scripts: send it as X-Wizard-Token on posts and ?run=1 requests.
+        print(f"wizard token: {server.token}", flush=True)
     try:
         server.wait()
     except KeyboardInterrupt:

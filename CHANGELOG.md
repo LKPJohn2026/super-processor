@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The wizard makes a random token each run and prints it after the URL.
+  Every POST and `?run=1` request must carry it (`X-Wizard-Token` header or
+  `token` field); the wizard's own pages and `/api/state` hand it out, and
+  pages refuse to be framed. Another site can no longer drive the wizard in a
+  browser that omits `Origin`. This replaces the `replace=1` key guard, which
+  any page able to post could also send.
+- A junk or negative `Content-Length` now gets 400 instead of dropping the
+  connection.
+
+### Changed
+
+- Picking a video through a symbolic link works again; the link is followed.
+- Docs: the GitHub Pages shell needs
+  `SUPER_PROCESSOR_ALLOWED_ORIGINS=https://lkpjohn2026.github.io` to drive a
+  local wizard.
+
 ### Added
 
 - Shimmer check. Each preview's fine-detail layer is measured for how much

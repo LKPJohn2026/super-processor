@@ -19,6 +19,8 @@ from super_processor.review import WizardServer, form_fields_from_body
 from super_processor.upscale import FakeUpscaleEngine
 from super_processor.wizard import WizardController, WizardError, WizardStep
 
+TOKEN = "test-token"
+
 
 def test_json_body_parser_rejects_non_objects() -> None:
     assert form_fields_from_body(b"", "application/json") == {}
@@ -51,7 +53,7 @@ def _json_request(
 ) -> tuple[int, dict[str, Any], str | None]:
     connection = _connection(base)
     body = b"" if payload is None else json.dumps(payload).encode()
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "X-Wizard-Token": TOKEN}
     if payload is not None:
         headers["Content-Type"] = "application/json"
         headers["Content-Length"] = str(len(body))
@@ -70,7 +72,7 @@ def _json_request(
 
 
 def test_api_state_and_cors_before_a_job(tmp_path: Path) -> None:
-    server = WizardServer(tmp_path)
+    server = WizardServer(tmp_path, token=TOKEN)
     base = server.start()
     try:
         status, payload, allow = _json_request(
@@ -154,7 +156,7 @@ def test_json_api_drives_upscale_flow(
         ),
         upscale_engine=FakeUpscaleEngine(),
     )
-    server = WizardServer(tmp_path, controller=controller)
+    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
         status, intro, _origin = _json_request(base, "POST", "/api/intro", {})
@@ -267,10 +269,12 @@ class _RangeTransport:
 
 
 def test_html_post_still_redirects(tmp_path: Path) -> None:
-    server = WizardServer(tmp_path)
+    server = WizardServer(tmp_path, token=TOKEN)
     base = server.start()
     try:
-        request = Request(base + "/intro", data=b"", method="POST")
+        request = Request(
+            base + "/intro", data=b"", headers={"X-Wizard-Token": TOKEN}, method="POST"
+        )
         with urlopen(request) as response:
             html = response.read().decode()
         assert "What type of LLM" in html

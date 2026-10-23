@@ -12,11 +12,11 @@ import pytest
 from super_processor.upscale import (
     FakeUpscaleEngine,
     FlashVsrEngine,
-    _release_gpu,
     UpscaleError,
     UpscalePlan,
     UpscaleRequest,
     UpscaleSpan,
+    _release_gpu,
     apply_range_revise,
     clamp_span,
     default_span,
