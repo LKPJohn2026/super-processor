@@ -481,6 +481,29 @@ class WizardController:
         }
         self._save(state)
 
+    def _render_progress(self, state: WizardState) -> Callable[[float], None]:
+        """Show the share of frames rendered as 5% to 90% of the render step.
+
+        The state is saved only when the whole percentage changes, so a long
+        render does not rewrite it for every chunk.
+        """
+        shown = [-1]
+
+        def report(done: float) -> None:
+            frames = round(min(max(done, 0.0), 1.0) * 100)
+            pct = 5 + round(frames * 0.85)
+            if pct == shown[0]:
+                return
+            shown[0] = pct
+            self._progress(
+                state,
+                "rendering",
+                pct,
+                f"Upscaling on the GPU: {frames}% of the frames",
+            )
+
+        return report
+
     def _clear_progress(self) -> None:
         state = self._state()
         if state.progress is not None:
@@ -1312,6 +1335,7 @@ class WizardController:
                 engine=self.upscale_engine(),
                 ffmpeg_bin=self.ffmpeg_bin,
                 duration_s=duration,
+                on_progress=self._render_progress(state),
             )
             # Candidates include the pending revise's edges, so read them
             # before the pending span is cleared.

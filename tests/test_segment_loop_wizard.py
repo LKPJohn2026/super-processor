@@ -358,3 +358,33 @@ def test_restart_leaves_symlinked_folders_alone(tmp_path: Path) -> None:
     assert not (job_dir / "previews").exists()
     assert (outside / "keep.mp4").is_file()
     assert (job_dir / "gemini_chat.json").is_file()
+
+
+@needs_ffmpeg
+def test_render_worker_shows_frames_done(tmp_path: Path) -> None:
+    seen: list[Any] = []
+
+    class _Watching(FakeUpscaleEngine):
+        def upscale(self, request: UpscaleRequest) -> Path:
+            if request.on_progress is not None:
+                request.on_progress(0.5)
+                seen.append(controller.api_view()["progress"])
+            return super().upscale(request)
+
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Gemini(),  # type: ignore[arg-type]
+        upscale_engine=_Watching(),
+    )
+    to_ready(controller, _clip(tmp_path / "in.mp4"))
+    controller.handle_post("/ready", {"action": ["render"]})
+    assert _run(controller, "start_render").step is WizardStep.RESULT
+    # Both segments share settings, so they render as one part.
+    assert seen == [
+        {
+            "phase": "rendering",
+            "pct": 47,
+            "message": "Upscaling on the GPU: 50% of the frames",
+        }
+    ]
+    assert controller.current_state().progress is None

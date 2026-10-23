@@ -702,3 +702,23 @@ def test_splice_refuses_to_change_the_frame_count(tmp_path: Path) -> None:
             duration_s=6,
         )
     assert _frame_hashes(output) == before
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_chunked_flashvsr_reports_each_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _script = _flashvsr_tree(tmp_path, _FAKE_INFER)
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+    source = tmp_path / "in.mp4"
+    _tiny(source, seconds=12)
+    seen: list[float] = []
+    FlashVsrEngine().upscale(
+        UpscaleRequest(
+            source, tmp_path / "out" / "clip.mp4", scale=2, on_progress=seen.append
+        )
+    )
+    count = len(planned_chunks(12.0, scale=2, strength=0.5))
+    assert count > 1
+    assert seen == pytest.approx([(i + 1) / count for i in range(count)])

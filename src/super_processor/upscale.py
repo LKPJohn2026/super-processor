@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
@@ -60,6 +61,23 @@ _WEIGHT_FILES = (
     "LQ_proj_in.ckpt",
     "TCDecoder.ckpt",
 )
+
+
+ProgressFn = Callable[[float], None]
+
+
+def _part_of(
+    on_progress: ProgressFn | None, start: float, share: float
+) -> ProgressFn | None:
+    """Map a part's own 0-1 progress onto ``start`` to ``start + share``."""
+    if on_progress is None:
+        return None
+    report = on_progress
+
+    def part(done: float) -> None:
+        report(start + share * min(max(done, 0.0), 1.0))
+
+    return part
 
 
 class UpscaleError(RuntimeError):
@@ -171,6 +189,9 @@ class UpscaleRequest:
     strength: float = 0.5
     look: ShotLook = field(default_factory=ShotLook)
     regions: tuple[Region, ...] = ()
+    # Called with the share of this clip done (0 to 1) as an engine works
+    # through it; FlashVSR reports once per chunk.
+    on_progress: ProgressFn | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scale", _require_scale(self.scale))
@@ -824,6 +845,8 @@ def _run_flashvsr_chunked(
             skip = 0.0 if index == 0 else CHUNK_OVERLAP_S
             trim_source(raw, kept, skip, raw_duration)
             pieces.append(kept)
+            if request.on_progress is not None:
+                request.on_progress((index + 1) / len(chunks))
     except UpscaleError:
         raise
     except Exception as exc:
@@ -1234,6 +1257,7 @@ def _upscale_full(
     *,
     engine: UpscaleEngine,
     ffmpeg_bin: str,
+    on_progress: ProgressFn | None = None,
 ) -> Path:
     raw, strength = restore_clip(
         engine,
@@ -1244,6 +1268,7 @@ def _upscale_full(
             strength=span.strength,
             look=span.look,
             regions=span.regions,
+            on_progress=on_progress,
         ),
         use_upscale=span.use_upscale,
         ffmpeg_bin=ffmpeg_bin,
@@ -1270,6 +1295,7 @@ def apply_range_revise(
     engine: UpscaleEngine,
     ffmpeg_bin: str = "ffmpeg",
     duration_s: float,
+    on_progress: ProgressFn | None = None,
 ) -> Path:
     """Re-upscale ``span`` from the original source and splice it into ``current``.
 
@@ -1282,7 +1308,13 @@ def apply_range_revise(
     work.mkdir(parents=True, exist_ok=True)
     if _covers_all(span, duration_s) or not current.is_file():
         return _upscale_full(
-            source, output, span, work, engine=engine, ffmpeg_bin=ffmpeg_bin
+            source,
+            output,
+            span,
+            work,
+            engine=engine,
+            ffmpeg_bin=ffmpeg_bin,
+            on_progress=on_progress,
         )
     if not is_delivery(current):
         current = encode_delivery(current, work / "current.mp4", ffmpeg_bin=ffmpeg_bin)
@@ -1290,7 +1322,13 @@ def apply_range_revise(
     start, end = snap_to_keyframes(keys, span.start_s, span.end_s, duration_s)
     if start == 0.0 and end is None:
         return _upscale_full(
-            source, output, span, work, engine=engine, ffmpeg_bin=ffmpeg_bin
+            source,
+            output,
+            span,
+            work,
+            engine=engine,
+            ffmpeg_bin=ffmpeg_bin,
+            on_progress=on_progress,
         )
     clip = trim_source(
         source,
@@ -1308,6 +1346,7 @@ def apply_range_revise(
             strength=span.strength,
             look=span.look,
             regions=span.regions,
+            on_progress=on_progress,
         ),
         use_upscale=span.use_upscale,
         ffmpeg_bin=ffmpeg_bin,
@@ -1363,8 +1402,11 @@ def render_plan(
     engine: UpscaleEngine,
     ffmpeg_bin: str = "ffmpeg",
     duration_s: float,
+    on_progress: ProgressFn | None = None,
 ) -> Path:
     """Render what ``plan`` asks for into ``output``.
+
+    ``on_progress`` gets the share of the work done, 0 to 1, by source frames.
 
     A pending range on an existing output is spliced in by
     :func:`apply_range_revise`. Anything else (the first render, a pending
@@ -1384,6 +1426,7 @@ def render_plan(
             engine=engine,
             ffmpeg_bin=ffmpeg_bin,
             duration_s=duration_s,
+            on_progress=on_progress,
         )
     return render_shots(
         source,
@@ -1392,6 +1435,7 @@ def render_plan(
         engine=engine,
         ffmpeg_bin=ffmpeg_bin,
         duration_s=duration_s,
+        on_progress=on_progress,
     )
 
 
@@ -1443,6 +1487,7 @@ def render_shots(
     engine: UpscaleEngine,
     ffmpeg_bin: str = "ffmpeg",
     duration_s: float,
+    on_progress: ProgressFn | None = None,
 ) -> Path:
     """Restore each shot with its own look and join them into ``output``.
 
@@ -1457,7 +1502,13 @@ def render_shots(
     work.mkdir(parents=True, exist_ok=True)
     if len(ordered) == 1:
         return _upscale_full(
-            source, output, ordered[0], work, engine=engine, ffmpeg_bin=ffmpeg_bin
+            source,
+            output,
+            ordered[0],
+            work,
+            engine=engine,
+            ffmpeg_bin=ffmpeg_bin,
+            on_progress=on_progress,
         )
     ffprobe_bin = _ffprobe_for(ffmpeg_bin)
     want, rate = video_stream_facts(source, ffprobe_bin=ffprobe_bin)
@@ -1468,6 +1519,8 @@ def render_shots(
         first, stop = edges[index], edges[index + 1]
         if stop <= first:
             continue
+        # Each part's share of the work is its share of the source frames.
+        part = _part_of(on_progress, first / want, (stop - first) / want)
         # Half a frame early on both ends, so float rounding of the frame
         # times cannot move a frame into the neighbouring shot. The clip then
         # restarts at zero, or the encoder pads the half-frame gap with a copy.
@@ -1488,6 +1541,7 @@ def render_shots(
                 strength=span.strength,
                 look=span.look,
                 regions=span.regions,
+                on_progress=part,
             ),
             use_upscale=span.use_upscale,
             ffmpeg_bin=ffmpeg_bin,
@@ -1503,6 +1557,8 @@ def render_shots(
                 regions=span.regions,
             )
         )
+        if part is not None:
+            part(1.0)
     silent = work / "shots.mp4"
     _concat(parts, silent, ffmpeg_bin=ffmpeg_bin)
     have, _rate = video_stream_facts(silent, ffprobe_bin=ffprobe_bin)

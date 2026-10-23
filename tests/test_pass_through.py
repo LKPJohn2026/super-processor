@@ -204,3 +204,42 @@ def test_previews_skip_the_engine_for_pass_through_shots(tmp_path: Path) -> None
     for index in (0, 1):
         after = job_dir / "previews" / f"shot_{index:03d}_r1_after.mp4"
         assert _streams(after)["video"] == (320, 180)
+
+
+class _HalfwayEngine(FakeUpscaleEngine):
+    """Reports half of each clip done before finishing it."""
+
+    def upscale(self, request: UpscaleRequest) -> Path:
+        if request.on_progress is not None:
+            request.on_progress(0.5)
+        return super().upscale(request)
+
+
+@needs_ffmpeg
+def test_render_reports_progress_by_source_frames(tmp_path: Path) -> None:
+    source = _clip(tmp_path / "in.mp4")
+    seen: list[float] = []
+    render_shots(
+        source,
+        tmp_path / "out" / "output.mp4",
+        (
+            UpscaleSpan(0, 3, strength=0.5),
+            UpscaleSpan(3, 4.5, strength=0.5, use_upscale=False),
+            UpscaleSpan(4.5, 6, strength=0.2),
+        ),
+        engine=_HalfwayEngine(),
+        duration_s=6,
+        on_progress=seen.append,
+    )
+    # Part one: halfway, then done; the pass-through part only reports done.
+    assert seen == pytest.approx([0.25, 0.5, 0.75, 0.875, 1.0])
+    single: list[float] = []
+    render_shots(
+        source,
+        tmp_path / "one" / "output.mp4",
+        (UpscaleSpan(0, 6, strength=0.5),),
+        engine=_HalfwayEngine(),
+        duration_s=6,
+        on_progress=single.append,
+    )
+    assert single == [0.5]
