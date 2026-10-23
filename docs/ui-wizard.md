@@ -185,9 +185,12 @@ schema 3).
 
 While a worker runs, `/api/state` returns `progress`:
 `{"phase": "analyzing", "pct": 50, "message": "Rendering previews on the GPU"}`.
-The percentages are fixed milestones of each worker (stills saved, Gemini
-asked, previews rendered, previews checked), not a measured fraction of the
-work. Both shells show them as a progress bar; `progress` is `null` when
+While sampling and analyzing, the percentage marks fixed milestones (stills
+saved, Gemini asked, previews rendered, previews checked). During the full
+render it follows the work: each part counts for its share of the source
+frames, FlashVSR reports after every chunk of about 8 s, and the bar runs from
+5% to 90% with "Upscaling on the GPU: N% of the frames"; the seam check is the
+last 10%. Both shells show them as a progress bar; `progress` is `null` when
 nothing runs.
 
 ## LLM choice (sketch paths)

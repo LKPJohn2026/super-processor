@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The render's progress follows the work instead of jumping between fixed
+  steps. Each part counts for its share of the source frames, FlashVSR
+  reports after every chunk of about 8 s, and the bar reads "Upscaling on
+  the GPU: N% of the frames". `render_plan`, `render_shots`, and
+  `apply_range_revise` take an `on_progress` callback, and `UpscaleRequest`
+  carries one to the engine.
+
 ## [3.3.1] - 2026-10-23
 
 ### Changed
