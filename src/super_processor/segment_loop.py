@@ -194,3 +194,65 @@ def load_segment_list(job_dir: Path) -> SegmentList | None:
     except (OSError, json.JSONDecodeError) as exc:
         raise SegmentLoopError(f"cannot read {SEGMENTS_FILE_NAME}: {exc}") from exc
     return SegmentList.from_dict(data)
+
+
+# Gemini's boundaries come from stills about a second apart, so a sliver
+# shorter than this is a rounding artefact, not a segment of its own.
+MIN_LOOP_SEGMENT_S = 0.5
+
+
+def _proposed_spans(
+    raw: list[dict[str, Any]], duration_s: float
+) -> list[tuple[float, float, str]]:
+    """Gemini's spans clamped to the clip, in start order; broken ones dropped."""
+    spans: list[tuple[float, float, str]] = []
+    for item in raw:
+        try:
+            start = min(max(float(item["start_s"]), 0.0), duration_s)
+            end = min(max(float(item["end_s"]), 0.0), duration_s)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(start) and math.isfinite(end)) or end <= start:
+            continue
+        label = " ".join(str(item.get("label", "")).split())[:80]
+        spans.append((start, end, label))
+    return sorted(spans)
+
+
+def repair_coverage(raw: list[dict[str, Any]], duration_s: float) -> list[LoopSegment]:
+    """Turn Gemini's proposal into segments covering 0 to the end exactly once.
+
+    Each segment starts where the one before it ends; the first starts at 0
+    and the last ends at ``duration_s``. Nothing is shorter than
+    :data:`MIN_LOOP_SEGMENT_S` unless the whole clip is.
+    """
+    if not math.isfinite(duration_s) or duration_s <= 0:
+        raise SegmentLoopError("the video has no duration to segment")
+    spans = _proposed_spans(raw, duration_s)
+    if not spans:
+        return [LoopSegment(0.0, duration_s, label="whole video")]
+    # A gap is split down the middle; on an overlap the later span's start
+    # wins, since Gemini saw the change somewhere inside it. A span wholly
+    # inside an earlier one adds no cut. A cut too close to the last one
+    # would leave a sliver, so it is dropped and the newer span's label
+    # takes over the segment it would have started.
+    cuts: list[float] = []
+    labels: list[str] = [spans[0][2]]
+    reach = spans[0][1]
+    for start, end, label in spans[1:]:
+        if end <= reach:
+            continue
+        cut = (reach + start) / 2 if start > reach else start
+        reach = end
+        if cut > duration_s - MIN_LOOP_SEGMENT_S:
+            break
+        if cut - (cuts[-1] if cuts else 0.0) < MIN_LOOP_SEGMENT_S:
+            labels[-1] = label
+            continue
+        cuts.append(cut)
+        labels.append(label)
+    edges = [0.0, *cuts, duration_s]
+    return [
+        LoopSegment(round(start, 3), round(end, 3), label=label)
+        for start, end, label in zip(edges[:-1], edges[1:], labels, strict=True)
+    ]

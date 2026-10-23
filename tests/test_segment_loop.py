@@ -7,17 +7,20 @@ import math
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from super_processor.segment_loop import (
     END_MARGIN_S,
     MAX_STILLS,
+    MIN_LOOP_SEGMENT_S,
     LoopSegment,
     SegmentList,
     SegmentLoopError,
     extract_segment_stills,
     load_segment_list,
+    repair_coverage,
     sample_times,
     save_segment_list,
     still_name,
@@ -240,3 +243,101 @@ def test_older_review_overwrites_unreadable_file(tmp_path: Path) -> None:
     (tmp_path / SEGMENTS_FILE_NAME).write_text("{", encoding="utf-8")
     write_segments(tmp_path, [])
     assert load_segments(tmp_path) == []
+
+
+def _assert_covers(segments: list[LoopSegment], duration: float) -> None:
+    assert segments[0].start_s == 0.0
+    assert segments[-1].end_s == pytest.approx(duration)
+    for before, after in zip(segments, segments[1:], strict=False):
+        assert after.start_s == before.end_s
+    if len(segments) > 1:
+        assert min(s.end_s - s.start_s for s in segments) >= MIN_LOOP_SEGMENT_S
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Clean proposal.
+        [
+            {"start_s": 0, "end_s": 4, "label": "a"},
+            {"start_s": 4, "end_s": 10, "label": "b"},
+        ],
+        # Gap between segments, and the ends not reached.
+        [
+            {"start_s": 0.4, "end_s": 3, "label": "a"},
+            {"start_s": 5, "end_s": 9.2, "label": "b"},
+        ],
+        # Overlap, out of order.
+        [
+            {"start_s": 3, "end_s": 10, "label": "b"},
+            {"start_s": 0, "end_s": 5, "label": "a"},
+        ],
+        # One span inside another.
+        [
+            {"start_s": 0, "end_s": 10, "label": "a"},
+            {"start_s": 2, "end_s": 3, "label": "b"},
+        ],
+        # Slivers and spans past the end.
+        [
+            {"start_s": 0, "end_s": 0.2, "label": "x"},
+            {"start_s": 0.2, "end_s": 6, "label": "a"},
+            {"start_s": 6, "end_s": 6.1, "label": "y"},
+            {"start_s": 6.1, "end_s": 40, "label": "b"},
+        ],
+    ],
+)
+def test_repair_coverage_covers_the_clip_once(raw: list[dict[str, Any]]) -> None:
+    segments = repair_coverage(raw, 10.0)
+    _assert_covers(segments, 10.0)
+    assert {s.label for s in segments} <= {"a", "b", "x", "y"}
+
+
+def test_repair_coverage_keeps_a_clean_proposal() -> None:
+    raw = [
+        {"start_s": 0, "end_s": 4, "label": "kitchen"},
+        {"start_s": 4, "end_s": 10, "label": "street"},
+    ]
+    assert repair_coverage(raw, 10.0) == [
+        LoopSegment(0.0, 4.0, label="kitchen"),
+        LoopSegment(4.0, 10.0, label="street"),
+    ]
+
+
+def test_repair_coverage_falls_back_to_one_segment() -> None:
+    broken: list[dict[str, Any]] = [
+        {"start_s": "x", "end_s": 2},
+        {"start_s": 5, "end_s": 5},
+        {"end_s": 3},
+        {"start_s": math.nan, "end_s": 3},
+    ]
+    assert repair_coverage(broken, 8.0) == [LoopSegment(0.0, 8.0, label="whole video")]
+    with pytest.raises(SegmentLoopError):
+        repair_coverage([], 0.0)
+
+
+def test_repair_coverage_boundary_rules() -> None:
+    gap = repair_coverage(
+        [
+            {"start_s": 0, "end_s": 3, "label": "a"},
+            {"start_s": 5, "end_s": 10, "label": "b"},
+        ],
+        10.0,
+    )
+    assert [s.start_s for s in gap] == [0.0, 4.0]
+    overlap = repair_coverage(
+        [
+            {"start_s": 0, "end_s": 5, "label": "a"},
+            {"start_s": 3, "end_s": 10, "label": "b"},
+        ],
+        10.0,
+    )
+    assert [s.start_s for s in overlap] == [0.0, 3.0]
+    sliver = repair_coverage(
+        [
+            {"start_s": 0, "end_s": 0.2, "label": "x"},
+            {"start_s": 0.2, "end_s": 6, "label": "a"},
+            {"start_s": 6, "end_s": 9.8, "label": "b"},
+        ],
+        10.0,
+    )
+    assert [(s.start_s, s.label) for s in sliver] == [(0.0, "a"), (6.0, "b")]
