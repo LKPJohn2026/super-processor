@@ -1,12 +1,13 @@
 # Super Processor — System Design
 
-Super Processor is a local-first video processor. A localhost wizard finds
-and measures the shots in footage you already shot, has Gemini label them for
-you to approve, runs a local FlashVSR restoration upscale, then lets you revise
-a time range with a plain-language note. Gemini only labels shots from fixed
-lists, picks bounded per-shot settings, checks previews, and turns a note
-into a bounded range, scale, and strength; FFmpeg
-detects, measures, trims, splices, encodes, and copies audio. No model writes
+Super Processor is a local-first video processor. A localhost wizard has
+Gemini cut footage you already shot into segments from a grid of local
+stills, plans and previews each segment in turn for you to approve, runs a
+local FlashVSR restoration upscale, then lets you revise a time range or
+start over with a plain-language note. Gemini only proposes segments, picks
+bounded per-segment settings, checks previews, and turns a note into a
+bounded range, scale, and strength; FFmpeg samples, measures, trims, splices,
+encodes, and copies audio. No model writes
 shell commands. The CLI keeps the older
 FFmpeg-filter grade paths for automation.
 
@@ -54,16 +55,14 @@ operation inspectable.
 
 The wizard picture path is a local GPU restoration upscale (FlashVSR). FFmpeg
 probes, trims a cited time range, splices that range back, and copies audio.
-Before the first render, FFmpeg splits the clip into shots and measures each
-one, Gemini labels them, and the editor approves the list. Gemini then
-proposes each shot's settings, short previews render, Gemini checks them for
-restoration mistakes, and the editor approves the settings or sends one shot
-back with a note (see `docs/ui-wizard.md`, Shots and Looks). Gemini only turns a result note into `start_s`,
-`end_s`, `scale` (2 or 4), and `strength` (0–1). Re-runs read the original source for that range so detail
+Before the first render, the segment loop (below) cuts the clip into
+segments and gets each one's settings approved on a short preview. Gemini
+turns a result note into `start_s`, `end_s`, `scale` (2 or 4), and
+`strength` (0–1). Re-runs read the original source for that range so detail
 does not stack.
 
-Each span in the plan is a shot with its own look (`look.py`): bounded FFmpeg
-settings that always run in the same order.
+Each span in the plan is a segment with its own look (`look.py`): bounded
+FFmpeg settings that always run in the same order.
 
 | Stage | Settings | Why |
 |---|---|---|
@@ -73,13 +72,52 @@ settings that always run in the same order.
 
 Filter text is built from the numbers in code; model output never reaches
 FFmpeg as text. None of these filters changes the frame count, and a
-multi-shot render checks the joined result against the source's frame count.
+multi-segment render checks the joined result against the source's frame
+count.
+
+A span can skip the restore stage (`use_upscale: false`). It is resized with
+lanczos to the same scale and goes through the same delivery encode at
+strength 0, so it keeps its look and lines up with its neighbours frame for
+frame. Gemini sets it where FlashVSR would only harm.
 
 Text-to-video, inpainting, and face reenactment stay out. A lower strength
 asks the restorer for less invented texture. The job stores
-`upscale_plan.json` with ordered spans so a later chunked runner can cover
-clips up to about 30 minutes (about 8s pieces with a short overlap). The
-prototype runs one span, then one range revise.
+`upscale_plan.json` with ordered spans, one per segment; FlashVSR runs long
+spans in about 8 s pieces with a short overlap, so clips up to 30 minutes
+fit in GPU memory.
+
+### Segment loop
+
+The wizard works one segment at a time instead of planning every shot at
+once. The steps are `sampling → proposing → segments → (analyzing ⇄
+preview_segment) per segment → ready_to_render → rendering → result`.
+
+- **Dense local sampling.** FFmpeg saves a still about every second (at most
+  120, evenly spaced, first and last frame included) inside the job folder.
+  Gemini proposes segment boundaries from those stills and their times; no
+  video file is uploaded. FFmpeg's `scdet` is not used for this flow: a cut
+  is not the same as a change in what the restoration needs.
+- **Repair in code.** Gemini's segments are clipped, sorted, and made to
+  cover the clip exactly once, with no segment under 0.5 s.
+- **Feedback on cuts.** The editor approves the segments or sends a note;
+  Gemini proposes again with the note and the earlier exchange.
+- **One segment at a time.** Each segment is measured, its faces, hands, and
+  text boxed, its settings proposed, and a random window of up to 3 s inside
+  it previewed and checked. The window is seeded by job, segment, and preview
+  count, and is kept when the segment is redone, so a note is judged on the
+  same seconds. The editor approves it, moving to the next segment, or sends
+  a note that redoes only that segment. The scale is chosen on the first
+  segment and shared by all.
+- **Full render** builds `upscale_plan.json` from the approved recipes and
+  renders it as before, with pass-through spans where `use_upscale` is false.
+
+### Full restart keeps the chat
+
+On the result screen a note can retune one time range (below) or start over.
+Starting over deletes the segments, plans, previews, output, and their work
+folders, keeps `gemini_chat.json` with the note added, and goes back to
+sampling. Every Gemini call resends the stored chat, so the new segments and
+settings are proposed with what the editor disliked in view.
 
 ### Localhost wizard before a desktop shell
 
@@ -96,8 +134,10 @@ FFprobe, frame sampling, previews, and final FFmpeg encodes run on the user's
 machine. Expected inputs can be large (roughly 4–10 GB and 90–120 minutes);
 cloud upload of the full source is avoided.
 
-Gemini receives only sampled frames the user has consented to send through the
-wizard. It never receives the full source file by default.
+Gemini receives only sampled stills the user has consented to send through the
+wizard: the segment grid (480 pixels wide, at most 120), one still per
+segment, the stills it boxes faces in, and a still from each preview pair. It
+never receives a video file.
 
 ### Gemini-only planning for the wizard
 
@@ -113,9 +153,11 @@ structured-ops contract.
 
 Gemini emits parseable JSON through
 [structured outputs](https://ai.google.dev/gemini-api/docs/structured-output).
-The wizard has one schema: a result note becomes `start_s`, `end_s`, `scale`
-(2 or 4), and `strength` (0–1). Values are validated and clamped to the file
-before anything runs. The model has no shell tool, and FFmpeg argument lists
+Each wizard call has its own schema: segments (times, label, contents), a
+recipe per segment (strength, `use_upscale`, look, and once the scale),
+protection boxes, a preview check, and a result note's range (`start_s`,
+`end_s`, `scale` 2 or 4, `strength` 0–1). Values are validated, clamped, and
+unknown names dropped before anything runs. The model has no shell tool, and FFmpeg argument lists
 are built by engineering-owned code.
 
 ### Result note and range revise
@@ -139,7 +181,14 @@ An earlier wizard had Gemini propose timeline split layouts and per-segment
 FFmpeg filter options with short previews, then concatenated the graded
 segments. Once the picture path became a FlashVSR upscale, that flow was no
 longer reachable from the wizard, and it has been removed. The CLI `segment`
-and `plans` commands still provide a classical split and grade.
+and `plans` commands still provide a classical split and grade. Their
+`segments.json` shares the file name with the wizard's segment list; each
+refuses to read or overwrite the other's (the wizard's carries
+`kind: "wizard"`), so a job used by both reports which flow owns it.
+
+The shot flow that came between (FFmpeg `scdet` cuts, one Gemini labelling
+pass, then every shot planned at once on a Looks screen) was replaced by the
+segment loop in 3.2.0.
 
 ### Focused operations (CLI grade path)
 
@@ -174,16 +223,28 @@ integrity, and user acceptance.
 Pick file (localhost wizard) ──► FFprobe ──► 1080p / 30 min check
    │
    ▼
-FlashVSR restore + upscale (8 s chunks, frame count conformed)
+still grid (~1/s, ≤ 120) ──► Gemini: segments ──► editor: approve or note
+   │
+   ▼  for each segment
+measure + box faces/text ──► Gemini: recipe ──► 3 s preview (FlashVSR or resize)
+   │                                              │
+   │                         Gemini check ◄───────┘
+   ▼
+editor: approve (next segment) or note (redo this one)
    │
    ▼
-lanczos blend at strength ──► delivery encode (IDR every 1 s)
+FlashVSR restore + upscale per span (8 s chunks, frame count conformed),
+pass-through spans resized
    │
    ▼
-result player ──► happy, or a note
-                      │
-                      ▼
-          Gemini: note → range, scale, strength
+lanczos blend at strength ──► delivery encode (IDR every 1 s) ──► join + audio
+   │
+   ▼
+result player ──► happy, a range note, or start over
+                      │                       │
+                      ▼                       ▼
+          Gemini: note → range,       clear plans, keep chat,
+          scale, strength             back to the still grid
                       │
                       ▼
           re-restore range from source ──► keyframe splice ──► result
@@ -198,22 +259,30 @@ than interpolated shell strings.
 Each job has an on-disk directory containing:
 
 - source identity and FFprobe facts;
-- `wizard_state.json` (step, job id, last error);
-- `gemini_chat.json` history of result notes;
-- `upscale_plan.json` spans with scale and strength;
+- `wizard_state.json` (step, job id, last error, segment index, worker
+  progress);
+- `gemini_chat.json`, every Gemini exchange of the job, kept across a full
+  restart;
+- `segment_stills/` and `segments.json` (the proposal, its approval, and the
+  editor's note);
+- `shots.json` and `shot_plan.json` (each segment's measurements, boxes,
+  recipe, preview window, and check), with `previews/`;
+- `upscale_plan.json` spans with scale, strength, look, and `use_upscale`;
 - `output.mp4` and its `output.mp4.delivery.json` encode marker;
 - work folders for chunks and range splices.
 
 Wizard steps:
 
 ```text
-intro → llm_choice → setup → pick_file → rendering → result ─┬─ happy → done
-                                             ▲               │
-                                             └──── note ─────┘
+intro → llm_choice → setup → pick_file → sampling → proposing → segments
+  → analyzing ⇄ preview_segment (per segment) → ready_to_render → rendering
+  → result ─┬─ happy → done
+            ├─ range note → rendering
+            └─ restart note → sampling
 ```
 
-A state file saved on a step of the removed split/enhance flow sends the user
-back to the pick step. Cancellation terminates the FFmpeg process group; final
+A state file saved on a step of the removed shot flow or split/enhance flow
+sends the user back to the pick step. Cancellation terminates the FFmpeg process group; final
 output is written atomically.
 
 ## CLI direction
