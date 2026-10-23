@@ -458,8 +458,6 @@ _API_POSTS = {
     "/api/setup": "/setup",
     "/api/pick": "/pick",
     "/api/new": "/new",
-    "/api/shots": "/shots",
-    "/api/looks": "/looks",
     "/api/segments": "/segments",
     "/api/preview": "/preview",
     "/api/ready": "/ready",
@@ -714,22 +712,6 @@ def _wizard_handler(
                     return
                 if path == "/render" and runs:
                     controller.start_render()
-                    self._redirect("/")
-                    return
-                if path == "/api/scan" and runs:
-                    controller.start_scan()
-                    self._json(self._view())
-                    return
-                if path == "/shots" and runs:
-                    controller.start_scan()
-                    self._redirect("/")
-                    return
-                if path == "/api/plan" and runs:
-                    controller.start_plan()
-                    self._json(self._view())
-                    return
-                if path == "/looks" and runs:
-                    controller.start_plan()
                     self._redirect("/")
                     return
                 if path == "/api/segment" and runs:

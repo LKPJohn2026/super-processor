@@ -1,10 +1,9 @@
-"""Localhost wizard: setup → pick → shots → looks → FlashVSR upscale → result."""
+"""Localhost wizard: setup → pick → segments → previews → render → result."""
 
 from __future__ import annotations
 
 import contextlib
 import json
-import os
 import threading
 import time
 import uuid
@@ -64,16 +63,11 @@ from .shot_plan import (
 )
 from .shots import (
     CONTENTS,
-    ISSUES,
     ShotError,
     ShotList,
-    apply_labels,
-    find_shots,
     load_shots,
-    merge_with_next,
     save_shots,
     shots_path,
-    split_at,
 )
 from .stability import StabilityError, find_seams, seam_candidates
 from .upscale import (
@@ -92,13 +86,10 @@ from .upscale import (
 from .wizard_pages import (
     render_analyzing,
     render_done,
-    render_finding_shots,
     render_intro,
     render_llm_choice,
     render_local_llm_stub,
-    render_looks,
     render_pick,
-    render_planning,
     render_preview_segment,
     render_ready,
     render_rendering,
@@ -106,7 +97,6 @@ from .wizard_pages import (
     render_sampling,
     render_segments,
     render_setup,
-    render_shots,
 )
 
 WIZARD_STATE_FILE = "wizard_state.json"
@@ -114,9 +104,6 @@ WIZARD_SCHEMA_VERSION = 3
 # Inputs are limited to 1080p (either orientation) and 30 minutes. FlashVSR
 # at 2x already makes 4K from 1080p; larger inputs exceed what one GPU pass
 # and the job directory are sized for.
-# Set to 1 to send a picked file through the segment loop instead of the
-# shot flow. The loop has no page of its own yet; the JSON API drives it.
-SEGMENT_LOOP_ENV = "SUPER_PROCESSOR_SEGMENT_LOOP"
 MAX_INPUT_LONG_EDGE = 1920
 MAX_INPUT_SHORT_EDGE = 1080
 
@@ -133,10 +120,6 @@ class WizardStep(str, Enum):
     LOCAL_LLM_STUB = "local_llm_stub"
     SETUP = "setup"
     PICK_FILE = "pick_file"
-    FINDING_SHOTS = "finding_shots"
-    SHOTS = "shots"
-    PLANNING = "planning"
-    LOOKS = "looks"
     # Segment loop: sample stills, Gemini proposes segments, the editor
     # approves them, then each segment is analyzed and previewed in turn.
     SAMPLING = "sampling"
@@ -157,6 +140,11 @@ class WizardStep(str, Enum):
 _RETIRED_STEPS = frozenset({"overview", "choose_split", "enhance"})
 _REUSED_STEPS = frozenset({"analyzing"})
 _REUSED_SINCE = 3
+# The shot flow the segment loop replaced in 3.2.
+_SHOT_FLOW_STEPS = frozenset({"finding_shots", "shots", "planning", "looks"})
+_SHOT_FLOW_MESSAGE = (
+    "this job used the shot flow, which the segment loop replaced; pick the file again"
+)
 _RETIRED_MESSAGE = (
     "this job used the removed split and enhance flow; pick the file again"
 )
@@ -195,6 +183,8 @@ class WizardState:
         old = not isinstance(version, int) or version < _REUSED_SINCE
         if raw_step in _RETIRED_STEPS or (old and raw_step in _REUSED_STEPS):
             return cls(step=WizardStep.PICK_FILE, error=_RETIRED_MESSAGE)
+        if raw_step in _SHOT_FLOW_STEPS:
+            return cls(step=WizardStep.PICK_FILE, error=_SHOT_FLOW_MESSAGE)
         index = data.get("segment_index", 0)
         progress = data.get("progress")
         return cls(
@@ -204,10 +194,6 @@ class WizardState:
             segment_index=index if isinstance(index, int) and index >= 0 else 0,
             progress=progress if isinstance(progress, dict) else None,
         )
-
-
-def segment_loop_enabled() -> bool:
-    return os.environ.get(SEGMENT_LOOP_ENV, "") == "1"
 
 
 def input_limit_error(facts: MediaFacts) -> str | None:
@@ -338,22 +324,6 @@ def load_render_report(job_dir: Path) -> dict[str, Any]:
     return {"seams": seams, "error": str(error) if error else None}
 
 
-def parse_time(raw: str) -> float:
-    """Seconds from ``"75"``, ``"1:15"``, or ``"0:01:15.5"``."""
-    text = raw.strip()
-    if not text:
-        raise ValueError("give a time to split at, like 1:15")
-    total = 0.0
-    try:
-        for part in text.split(":"):
-            total = total * 60 + float(part)
-    except ValueError as exc:
-        raise ValueError(f"could not read the time {text!r}") from exc
-    if total < 0 or text.count(":") > 2:
-        raise ValueError(f"could not read the time {text!r}")
-    return total
-
-
 def _active_knobs(job_dir: Path) -> tuple[int | None, float | None]:
     plan = load_upscale_plan(job_dir)
     if plan is None or not plan.spans:
@@ -416,14 +386,6 @@ class WizardController:
         """Run :meth:`run_render` on a worker thread. False if not started."""
         return self._start_worker(WizardStep.RENDERING, self.run_render)
 
-    def start_scan(self) -> bool:
-        """Run :meth:`run_scan` on a worker thread. False if not started."""
-        return self._start_worker(WizardStep.FINDING_SHOTS, self.run_scan)
-
-    def start_plan(self) -> bool:
-        """Run :meth:`run_plan` on a worker thread. False if not started."""
-        return self._start_worker(WizardStep.PLANNING, self.run_plan)
-
     def start_segmenting(self) -> bool:
         """Run :meth:`run_segmenting` on a worker thread. False if not started."""
         return self._start_worker(_SEGMENTING_STEPS, self.run_segmenting)
@@ -472,12 +434,6 @@ class WizardController:
             if state.step is WizardStep.RENDERING:
                 self._render_failed(state, str(exc) or type(exc).__name__)
                 return
-            if state.step is WizardStep.FINDING_SHOTS:
-                self._scan_failed(state, str(exc) or type(exc).__name__)
-                return
-            if state.step is WizardStep.PLANNING:
-                self._plan_failed(state, str(exc) or type(exc).__name__)
-                return
             if state.step in _SEGMENTING_STEPS:
                 self._segmenting_failed(state, str(exc) or type(exc).__name__)
                 return
@@ -520,24 +476,6 @@ class WizardController:
             )
         if state.step is WizardStep.PICK_FILE:
             return render_pick(error=state.error)
-        if state.step is WizardStep.FINDING_SHOTS:
-            return render_finding_shots()
-        if state.step is WizardStep.SHOTS:
-            assert state.job_id
-            shots = load_shots(self.store.job_dir(state.job_id))
-            return render_shots(
-                [shot.to_dict() for shot in shots.shots] if shots else [],
-                error=state.error,
-                label_error=shots.label_error if shots else None,
-            )
-        if state.step is WizardStep.PLANNING:
-            return render_planning()
-        if state.step is WizardStep.LOOKS:
-            assert state.job_id
-            return render_looks(
-                self._looks_view(self.store.job_dir(state.job_id)),
-                error=state.error,
-            )
         if state.step in _SEGMENTING_STEPS:
             return render_sampling(state.progress)
         if state.step is WizardStep.SEGMENTS:
@@ -601,18 +539,8 @@ class WizardController:
                 scale, strength = _active_knobs(job_dir)
                 report = load_render_report(job_dir)
                 seams, seam_error = report["seams"], report["error"]
-        shots: list[dict[str, Any]] | None = None
-        label_error: str | None = None
-        if state.job_id and state.step is WizardStep.SHOTS:
-            found = load_shots(self.store.job_dir(state.job_id))
-            if found is not None:
-                shots = [shot.to_dict() for shot in found.shots]
-                label_error = found.label_error
         looks: dict[str, Any] | None = None
-        if state.job_id and state.step in {
-            WizardStep.LOOKS,
-            WizardStep.READY_TO_RENDER,
-        }:
+        if state.job_id and state.step is WizardStep.READY_TO_RENDER:
             looks = self._looks_view(self.store.job_dir(state.job_id))
         segments: dict[str, Any] | None = None
         if state.job_id and state.step is WizardStep.SEGMENTS:
@@ -635,8 +563,6 @@ class WizardController:
             "output_url": output_url,
             "scale": scale,
             "strength": strength,
-            "shots": shots,
-            "label_error": label_error,
             "looks": looks,
             "segments": segments,
             "segment_preview": segment_preview,
@@ -690,12 +616,6 @@ class WizardController:
             return
         if path == "/new":
             self.start_new_job()
-            return
-        if path == "/shots":
-            self._shots_post(state, fields)
-            return
-        if path == "/looks":
-            self._looks_post(state, fields)
             return
         if path == "/segments":
             self._segments_post(state, fields)
@@ -767,157 +687,8 @@ class WizardController:
             self._save(state)
             return
         state.job_id = manifest.job_id
-        state.step = (
-            WizardStep.SAMPLING if segment_loop_enabled() else WizardStep.FINDING_SHOTS
-        )
+        state.step = WizardStep.SAMPLING
         self._save(state)
-
-    def run_scan(self) -> None:
-        if not self._work_lock.acquire(blocking=False):
-            return
-        try:
-            state = self._state()
-            if state.step is WizardStep.FINDING_SHOTS and state.job_id:
-                self._scan(state)
-        finally:
-            self._work_lock.release()
-
-    def _scan(self, state: WizardState) -> None:
-        """Loop 1: find and measure the shots, then ask Gemini to label them.
-
-        A labelling failure is not fatal: the shots keep the hints from the
-        measurements, and the review screen says why the labels are missing.
-        """
-        assert state.job_id
-        job_dir = self.store.job_dir(state.job_id)
-        source = Path(self.store.load(state.job_id).source_path)
-        self._progress(state, "finding_shots", 5, "Finding and measuring shots")
-        try:
-            duration = float(probe_file(source).duration_s or 0.0)
-            shots = find_shots(source, job_dir, duration, ffmpeg_bin=self.ffmpeg_bin)
-        except (ShotError, ProbeError, OSError) as exc:
-            self._scan_failed(state, str(exc))
-            return
-        self._progress(state, "finding_shots", 60, "Gemini is labelling the shots")
-        try:
-            labels = self.gemini().label_shots(
-                shots=[
-                    {
-                        "start_s": round(shot.start_s, 2),
-                        "end_s": round(shot.end_s, 2),
-                        "metrics": shot.metrics.to_dict(),
-                        "hints": list(shot.issues),
-                    }
-                    for shot in shots.shots
-                ],
-                stills=[job_dir / shot.still for shot in shots.shots],
-                issues=ISSUES,
-                contains=CONTENTS,
-                job_dir=job_dir,
-            )
-            shots = apply_labels(shots, labels)
-        except GeminiError as exc:
-            shots.label_error = f"Gemini could not label the shots: {exc}"
-        save_shots(job_dir, shots)
-        state.error = None
-        state.step = WizardStep.SHOTS
-        self._save(state)
-
-    def _scan_failed(self, state: WizardState, detail: str) -> None:
-        """Finding the shots failed; mark the job failed and go back to pick."""
-        assert state.job_id
-        job_id = state.job_id
-        with contextlib.suppress(JobError):
-            self.store.transition(job_id, JobState.FAILED)
-        message = f"Finding the shots failed: {detail}"
-        save_job_wizard_state(
-            self.store.job_dir(job_id),
-            WizardState(step=WizardStep.PICK_FILE, job_id=job_id, error=message),
-        )
-        self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
-
-    def _shots_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
-        """Approve the shot list, or merge or split a shot and stay on it."""
-        if state.step is not WizardStep.SHOTS or not state.job_id:
-            raise WizardError("there is no shot list to change")
-        job_dir = self.store.job_dir(state.job_id)
-        shots = load_shots(job_dir)
-        if shots is None:
-            raise WizardError("the shot list is missing; pick the file again")
-        action = fields.get("action", [""])[0]
-        try:
-            if action == "approve":
-                source = Path(self.store.load(state.job_id).source_path)
-                video = probe_file(source).primary_video()
-                scales = allowed_scales(
-                    (video.width or 0) if video else 0,
-                    (video.height or 0) if video else 0,
-                )
-                save_plan(job_dir, new_plan(shots, max(scales)))
-                state.step = WizardStep.PLANNING
-                self._save(state)
-                return
-            index = int(fields.get("index", [""])[0])
-            if action == "merge":
-                shots = merge_with_next(shots, index)
-            elif action == "split":
-                source = Path(self.store.load(state.job_id).source_path)
-                shots = split_at(
-                    shots,
-                    index,
-                    parse_time(fields.get("at", [""])[0]),
-                    source=source,
-                    job_dir=job_dir,
-                    ffmpeg_bin=self.ffmpeg_bin,
-                )
-            else:
-                raise ValueError(f"unknown shot action {action!r}")
-            save_shots(job_dir, shots)
-        except (ShotError, ValueError, UpscaleError, ProbeError) as exc:
-            state.error = str(exc)
-        self._save(state)
-
-    def run_plan(self) -> None:
-        if not self._work_lock.acquire(blocking=False):
-            return
-        try:
-            state = self._state()
-            if state.step is WizardStep.PLANNING and state.job_id:
-                self._plan(state)
-        finally:
-            self._work_lock.release()
-
-    def _plan(self, state: WizardState) -> None:
-        """Loop 2: propose recipes, render previews, and self-check them.
-
-        Only shots marked stale are worked on: all of them the first time,
-        one after an editor note. Gemini failures fall back to recipes from
-        the measurements and skip the check; the looks screen says so.
-        """
-        assert state.job_id
-        job_dir = self.store.job_dir(state.job_id)
-        source = Path(self.store.load(state.job_id).source_path)
-        shots = load_shots(job_dir)
-        plan = load_plan(job_dir)
-        if shots is None or plan is None:
-            self._plan_failed(state, "the shot list is missing; pick the file again")
-            return
-        indexes = plan.stale_indexes()
-        if not indexes:
-            state.step = WizardStep.LOOKS
-            self._save(state)
-            return
-        self._work_on(
-            state,
-            job_dir,
-            source,
-            shots,
-            plan,
-            indexes,
-            phase="planning",
-            done=WizardStep.LOOKS,
-            failed=self._plan_failed,
-        )
 
     def _work_on(
         self,
@@ -1098,12 +869,6 @@ class WizardController:
             json.dumps(report, indent=2) + "\n", encoding="utf-8"
         )
 
-    def _plan_failed(self, state: WizardState, detail: str) -> None:
-        """Planning failed (usually the GPU); go back to the shot list."""
-        state.error = f"The previews failed: {detail}"
-        state.step = WizardStep.SHOTS
-        self._save(state)
-
     def _looks_view(self, job_dir: Path) -> dict[str, Any]:
         shots = load_shots(job_dir)
         plan = load_plan(job_dir)
@@ -1139,32 +904,6 @@ class WizardController:
                 }
             )
         return {"scale": plan.scale, "error": plan.error, "shots": items}
-
-    def _looks_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
-        """Approve every shot's settings, or send one shot back with a note."""
-        if state.step is not WizardStep.LOOKS or not state.job_id:
-            raise WizardError("there are no shot settings to change")
-        job_dir = self.store.job_dir(state.job_id)
-        shots = load_shots(job_dir)
-        plan = load_plan(job_dir)
-        if shots is None or plan is None:
-            raise WizardError("the shot settings are missing; pick the file again")
-        action = fields.get("action", [""])[0]
-        try:
-            if action == "approve":
-                save_upscale_plan(job_dir, plan.to_upscale_plan(shots))
-                state.step = WizardStep.RENDERING
-            elif action == "redo":
-                index = int(fields.get("index", [""])[0])
-                save_plan(
-                    job_dir, request_redo(plan, index, fields.get("note", [""])[0])
-                )
-                state.step = WizardStep.PLANNING
-            else:
-                raise ValueError(f"unknown action {action!r}")
-        except (ShotPlanError, ValueError) as exc:
-            state.error = str(exc)
-        self._save(state)
 
     # Segment loop -----------------------------------------------------------
 

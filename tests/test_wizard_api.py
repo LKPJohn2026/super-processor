@@ -174,46 +174,49 @@ def test_json_api_drives_upscale_flow(
         _status, waiting, _origin = _json_request(
             base, "POST", "/api/pick", {"path": str(clip)}
         )
-        assert waiting["step"] == "finding_shots"
-        _json_request(base, "GET", "/api/scan?run=1")
+        assert waiting["step"] == "sampling"
+        _json_request(base, "GET", "/api/segment?run=1")
         assert controller.wait_idle(timeout=60)
-        _status, shots, _origin = _json_request(base, "GET", "/api/state")
-        assert shots["step"] == "shots"
-        assert len(shots["shots"]) == 1
-        assert shots["shots"][0]["still"].startswith("shot_stills/")
-        # This transport only knows upscale params, so labelling fails softly.
-        assert "could not label" in shots["label_error"]
-        with urlopen(base + "/" + shots["shots"][0]["still"]) as response:
-            assert response.headers.get_content_type() == "image/jpeg"
-        for bad in ("/shot_stills/../shots.json", "/shot_stills/1.jpg"):
-            with pytest.raises(HTTPError) as missing:
-                urlopen(base + bad)
-            assert missing.value.code == 404
-            missing.value.close()
+        _status, found, _origin = _json_request(base, "GET", "/api/state")
+        assert found["step"] == "segments"
+        # This transport only knows upscale params, so the whole clip is one.
+        assert len(found["segments"]["segments"]) == 1
+        assert "could not propose segments" in found["segments"]["error"]
         _status, approved, _origin = _json_request(
-            base, "POST", "/api/shots", {"action": "approve"}
+            base, "POST", "/api/segments", {"action": "approve"}
         )
-        assert approved["step"] == "planning"
-        _json_request(base, "GET", "/api/plan?run=1")
+        assert approved["step"] == "analyzing"
+        _json_request(base, "GET", "/api/analyze?run=1")
         assert controller.wait_idle(timeout=60)
         _status, looks, _origin = _json_request(base, "GET", "/api/state")
-        assert looks["step"] == "looks"
-        shot = looks["looks"]["shots"][0]
-        assert looks["looks"]["scale"] == 2
+        assert looks["step"] == "preview_segment"
+        view = looks["segment_preview"]
+        shot = view["shot"]
+        assert (view["index"], view["count"], view["scale"]) == (0, 1, 2)
         # This transport cannot plan either, so the measurements set the look.
-        assert "could not propose" in looks["looks"]["error"]
+        assert "could not propose" in view["error"]
         assert shot["check"]["ok"] is None
         with urlopen(base + shot["after_url"]) as response:
             assert response.headers.get_content_type() == "video/mp4"
         with urlopen(base + shot["before_url"]) as response:
             assert response.headers.get_content_type() == "video/mp4"
-        for bad in ("/previews/work/shot_000_in.mp4", "/previews/p.mp4"):
+        for bad in (
+            "/previews/work/shot_000_in.mp4",
+            "/previews/p.mp4",
+            "/shot_stills/../shots.json",
+            "/shot_stills/1.jpg",
+        ):
             with pytest.raises(HTTPError) as missing:
                 urlopen(base + bad)
             assert missing.value.code == 404
             missing.value.close()
+        _status, ready, _origin = _json_request(
+            base, "POST", "/api/preview", {"action": "approve"}
+        )
+        assert ready["step"] == "ready_to_render"
+        assert len(ready["looks"]["shots"]) == 1
         _status, approved, _origin = _json_request(
-            base, "POST", "/api/looks", {"action": "approve"}
+            base, "POST", "/api/ready", {"action": "render"}
         )
         assert approved["step"] == "rendering"
         _status, started, _origin = _json_request(base, "GET", "/api/render?run=1")

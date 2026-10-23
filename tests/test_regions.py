@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from loop_driver import (
+    approve_preview,
+    approve_segments,
+    pick_and_segment,
+    preview,
+    segments,
+)
 
 from super_processor.gemini import GeminiClient, GeminiError
 from super_processor.regions import (
@@ -41,9 +48,7 @@ from super_processor.upscale import (
 )
 from super_processor.wizard import (
     WizardController,
-    WizardState,
     WizardStep,
-    save_session_state,
 )
 
 needs_ffmpeg = pytest.mark.skipif(
@@ -301,11 +306,8 @@ class _Planner:
         self.fail_locate = fail_locate
         self.proposed: list[dict[str, Any]] = []
 
-    def label_shots(self, **kwargs: Any) -> list[dict[str, Any]]:
-        return [
-            {"index": i, "label": "anchor", "issues": [], "contains": ["faces"]}
-            for i in range(len(kwargs["shots"]))
-        ]
+    def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return segments((0.0, kwargs["duration_s"], "anchor", ["faces"]))
 
     def locate_regions(self, **kwargs: Any) -> list[dict[str, Any]]:
         if self.fail_locate:
@@ -343,12 +345,8 @@ def _plan_job(tmp_path: Path, planner: _Planner) -> WizardController:
         gemini=planner,  # type: ignore[arg-type]
         upscale_engine=FakeUpscaleEngine(),
     )
-    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
-    controller.handle_post("/pick", {"path": [str(clip)]})
-    controller.run_scan()
-    controller.handle_post("/shots", {"action": ["approve"]})
-    controller.run_plan()
-    assert controller.current_state().step is WizardStep.LOOKS
+    pick_and_segment(controller, clip)
+    assert approve_segments(controller).step is WizardStep.PREVIEW_SEGMENT
     return controller
 
 
@@ -363,14 +361,15 @@ def test_wizard_boxes_faces_before_planning(tmp_path: Path) -> None:
     assert shots is not None
     assert [r.kind for r in shots.shots[0].regions] == ["faces"]
     assert planner.proposed[0]["protected_boxes"] == ["faces"]
-    view = controller.api_view()["looks"]["shots"][0]
+    view = preview(controller)["shot"]
     # Boxed, so the shot keeps the strength Gemini asked for.
     assert view["strength"] == 0.9
     assert view["regions"][0]["kind"] == "faces"
     page = controller.render()
     assert "Protected inside the boxes: faces." in page
     assert 'class="box faces"' in page
-    controller.handle_post("/looks", {"action": ["approve"]})
+    assert approve_preview(controller).step is WizardStep.READY_TO_RENDER
+    controller.handle_post("/ready", {"action": ["render"]})
     plan = load_upscale_plan(job_dir)
     assert plan is not None and plan.spans[0].regions == shots.shots[0].regions
 
@@ -378,8 +377,8 @@ def test_wizard_boxes_faces_before_planning(tmp_path: Path) -> None:
 @needs_ffmpeg
 def test_without_boxes_the_whole_shot_is_capped(tmp_path: Path) -> None:
     controller = _plan_job(tmp_path, _Planner(fail_locate=True))
-    looks = controller.api_view()["looks"]
-    assert looks["shots"][0]["strength"] == PROTECTED_STRENGTH
+    looks = preview(controller)
+    assert looks["shot"]["strength"] == PROTECTED_STRENGTH
     assert "could not box" in looks["error"]
     assert "no boxes were placed" in controller.render()
 

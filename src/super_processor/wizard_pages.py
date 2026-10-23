@@ -5,15 +5,15 @@ from __future__ import annotations
 from html import escape
 
 # Phase keys for the step rail (setup → result).
-_PHASE_ORDER = ("setup", "file", "shots", "looks", "upscale", "result")
+_PHASE_ORDER = ("setup", "file", "segments", "previews", "upscale", "result")
 
 
 def _step_rail(active: str | None) -> str:
     labels = {
         "setup": "Setup",
         "file": "File",
-        "shots": "Shots",
-        "looks": "Looks",
+        "segments": "Segments",
+        "previews": "Previews",
         "upscale": "Upscale",
         "result": "Result",
     }
@@ -410,101 +410,11 @@ The first pass usually covers the whole file.</p>
     return _page("Pick a video", body, phase="file")
 
 
-def render_finding_shots() -> str:
-    body = """
-<h1>Finding the shots</h1>
-<p class="lede">FFmpeg is finding where each shot starts and measuring how
-blocky, noisy, soft, dark, or flat it is. Gemini then labels each shot from
-one still.</p>
-<p class="muted">This reads the whole file once. The page will refresh.</p>
-<meta http-equiv="refresh" content="2;url=/shots?run=1">
-"""
-    return _page("Finding shots", body, phase="shots")
-
-
 def format_time(seconds: float) -> str:
     """``75.5`` as ``1:15.5``; whole seconds drop the fraction."""
     minutes, rest = divmod(round(max(0.0, seconds), 1), 60.0)
     text = f"{rest:04.1f}" if round(rest % 1, 1) else f"{int(round(rest)):02d}"
     return f"{int(minutes)}:{text}"
-
-
-def render_shots(
-    shots: list[dict[str, object]],
-    *,
-    error: str | None = None,
-    label_error: str | None = None,
-) -> str:
-    err = f'<p class="error">{escape(error)}</p>' if error else ""
-    warn = f'<p class="muted">{escape(label_error)}</p>' if label_error else ""
-    cards: list[str] = []
-    for index, shot in enumerate(shots):
-        start = float(str(shot.get("start_s", 0)))
-        end = float(str(shot.get("end_s", 0)))
-        label = escape(str(shot.get("label") or "Unlabelled shot"))
-        issues = ", ".join(str(i).replace("_", " ") for i in _items(shot, "issues"))
-        contains = ", ".join(str(i).replace("_", " ") for i in _items(shot, "contains"))
-        still = str(shot.get("still") or "")
-        image = (
-            f'<img src="/{escape(still)}" alt="Still from shot {index + 1}">'
-            if still
-            else ""
-        )
-        merge = (
-            f"""<form method="post" action="/shots">
-<input type="hidden" name="action" value="merge">
-<input type="hidden" name="index" value="{index}">
-<button type="submit" class="secondary">Merge with next</button>
-</form>"""
-            if index < len(shots) - 1
-            else ""
-        )
-        cards.append(
-            f"""<div class="card shot">
-{image}
-<div>
-<h2>{index + 1}. {format_time(start)}–{format_time(end)} · {label}</h2>
-<p class="tags">Problems: {escape(issues) or "none found"}</p>
-<p class="tags muted">Contains: {escape(contains) or "nothing flagged"}</p>
-{merge}
-<form method="post" action="/shots">
-<input type="hidden" name="action" value="split">
-<input type="hidden" name="index" value="{index}">
-<input type="text" name="at" placeholder="{format_time((start + end) / 2)}"
-aria-label="Split shot {index + 1} at">
-<button type="submit" class="secondary">Split here</button>
-</form>
-</div>
-</div>"""
-        )
-    body = f"""
-<h1>Shots</h1>
-<p class="lede">These are the shots found and what looks wrong in each.
-Merge shots that belong together or split one that changes partway, then
-approve the list.</p>
-{err}
-{warn}
-{"".join(cards)}
-<form method="post" action="/shots">
-<input type="hidden" name="action" value="approve">
-<button type="submit" class="full">Approve shots and upscale</button>
-</form>
-"""
-    return _page("Shots", body, phase="shots")
-
-
-def render_planning() -> str:
-    body = """
-<h1>Planning each shot</h1>
-<p class="lede">Gemini is choosing clean-up, strength, and finishing for each
-shot. Each shot then gets a short before/after preview on the local GPU, and
-Gemini checks the previews for faces, hands, text, and texture that went
-wrong.</p>
-<p class="muted">Previews are a few seconds per shot. The page will
-refresh.</p>
-<meta http-equiv="refresh" content="3;url=/looks?run=1">
-"""
-    return _page("Planning", body, phase="looks")
 
 
 def settings_summary(strength: float, look: dict[str, float]) -> str:
@@ -543,36 +453,6 @@ def check_summary(check: dict[str, object]) -> str:
     if check.get("adjusted"):
         text += " Settings were adjusted and the preview redone."
     return text
-
-
-def render_looks(view: dict[str, object], *, error: str | None = None) -> str:
-    err = f'<p class="error">{escape(error)}</p>' if error else ""
-    warn = view.get("error")
-    warning = f'<p class="muted">{escape(str(warn))}</p>' if warn else ""
-    scale = view.get("scale")
-    cards = [
-        _look_card(shot, _redo_form("/looks", int(shot.get("index", 0)), "shot"))
-        for shot in _items(view, "shots")
-        if isinstance(shot, dict)
-    ]
-    scale_line = (
-        f'<p class="muted">The whole video is upscaled {scale}×.</p>' if scale else ""
-    )
-    body = f"""
-<h1>Looks</h1>
-<p class="lede">Each shot has its own settings and a short before/after
-preview. Approve them all to render the whole video, or tell me what to change
-in one shot.</p>
-{scale_line}
-{err}
-{warning}
-{"".join(cards)}
-<form method="post" action="/looks">
-<input type="hidden" name="action" value="approve">
-<button type="submit" class="full">Approve all and render</button>
-</form>
-"""
-    return _page("Looks", body, phase="looks")
 
 
 def _redo_form(action: str, index: int, what: str, *, resample: bool = False) -> str:
@@ -665,7 +545,7 @@ def render_sampling(progress: object = None) -> str:
         "Gemini looks at them and splits the video where the light, place, or "
         "picture quality changes.",
         "/segment?run=1",
-        "shots",
+        "segments",
         progress,
     )
 
@@ -677,7 +557,7 @@ def render_analyzing(index: int, count: int, progress: object = None) -> str:
         "A few seconds of it are previewed on the local GPU, and Gemini checks "
         "the preview for faces, hands, text, and texture that went wrong.",
         "/analyze?run=1",
-        "looks",
+        "previews",
         progress,
     )
 
@@ -722,7 +602,7 @@ will try again.</p>
 <button type="submit" class="secondary">Propose again</button>
 </form>
 """
-    return _page("Segments", body, phase="shots")
+    return _page("Segments", body, phase="segments")
 
 
 def render_preview_segment(view: dict[str, object], *, error: str | None = None) -> str:
@@ -756,7 +636,7 @@ or tell me what to change.</p>
 <button type="submit" class="full">{approve}</button>
 </form>
 """
-    return _page("Segment preview", body, phase="looks")
+    return _page("Segment preview", body, phase="previews")
 
 
 def render_ready(view: dict[str, object], *, error: str | None = None) -> str:

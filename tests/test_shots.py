@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from loop_driver import segments, to_ready
 
 from super_processor.gemini import GeminiClient, GeminiError
 from super_processor.shots import (
@@ -39,7 +40,6 @@ from super_processor.wizard import (
     WizardError,
     WizardState,
     WizardStep,
-    parse_time,
     save_session_state,
 )
 from super_processor.wizard_pages import format_time
@@ -137,13 +137,7 @@ def test_merge_labels_and_storage(tmp_path: Path) -> None:
         ShotList(shots=[]).to_plan()
 
 
-def test_times_read_and_print() -> None:
-    assert parse_time("75") == 75
-    assert parse_time("1:15.5") == 75.5
-    assert parse_time("0:01:15") == 75
-    for bad in ("", "x", "1:2:3:4", "-5"):
-        with pytest.raises(ValueError):
-            parse_time(bad)
+def test_times_print() -> None:
     assert format_time(75) == "1:15"
     assert format_time(5.5) == "0:05.5"
     assert format_time(59.97) == "1:00"
@@ -257,6 +251,11 @@ def test_gemini_label_shots_sends_one_still_per_shot(tmp_path: Path) -> None:
 
 
 class _Labels:
+    def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return segments(
+            (0.0, 2.0, "shot 0", []), (2.0, 5.0, "shot 1", []), (5.0, 7.0, "shot 2", [])
+        )
+
     def label_shots(self, **kwargs: Any) -> list[dict[str, Any]]:
         return [
             {"index": i, "label": f"shot {i}", "issues": ["soft"], "contains": []}
@@ -288,7 +287,9 @@ class _CountingEngine(FakeUpscaleEngine):
 
 
 @needs_ffmpeg
-def test_wizard_review_actions_then_render(tmp_path: Path) -> None:
+def test_loop_previews_each_segment_then_renders_alike_ones_once(
+    tmp_path: Path,
+) -> None:
     clip = _cuts_clip(tmp_path / "cuts.mp4")
     engine = _CountingEngine()
     controller = WizardController(
@@ -297,57 +298,28 @@ def test_wizard_review_actions_then_render(tmp_path: Path) -> None:
         upscale_engine=engine,
     )
     save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
-    with pytest.raises(WizardError, match="no shot list"):
-        controller.handle_post("/shots", {"action": ["approve"]})
-    controller.handle_post("/pick", {"path": [str(clip)]})
-    controller.run_scan()
-    state = controller.current_state()
-    assert state.step is WizardStep.SHOTS
-    assert state.job_id
-    job_dir = controller.store.job_dir(state.job_id)
-    view = controller.api_view()
-    assert [shot["label"] for shot in view["shots"]] == ["shot 0", "shot 1", "shot 2"]
-    assert view["label_error"] is None
-    assert "shot 1" in controller.render()
-
-    controller.handle_post("/shots", {"action": ["merge"], "index": ["1"]})
-    assert len(controller.api_view()["shots"]) == 2
-    controller.handle_post("/shots", {"action": ["split"], "index": ["0"], "at": ["1"]})
-    assert len(controller.api_view()["shots"]) == 3
-    for bad in (
-        {"action": ["split"], "index": ["0"], "at": ["0:00.1"]},
-        {"action": ["split"], "index": ["0"], "at": ["soon"]},
-        {"action": ["merge"], "index": ["x"]},
-        {"action": ["merge"], "index": ["2"]},
-        {"action": ["rotate"], "index": ["0"]},
-    ):
-        controller.handle_post("/shots", bad)
-        state = controller.current_state()
-        assert state.step is WizardStep.SHOTS
-        assert state.error
-    controller.handle_post("/shots", {"action": ["approve"]})
-    assert controller.current_state().step is WizardStep.PLANNING
-    controller.run_plan()
-    assert controller.current_state().step is WizardStep.LOOKS
-    assert engine.calls == 3  # one preview per shot
-    controller.handle_post("/looks", {"action": ["approve"]})
+    with pytest.raises(WizardError, match="no segments"):
+        controller.handle_post("/segments", {"action": ["approve"]})
+    job_dir = to_ready(controller, clip)
+    assert engine.calls == 3  # one preview per segment
+    controller.handle_post("/ready", {"action": ["render"]})
     assert controller.current_state().step is WizardStep.RENDERING
     engine.calls = 0
     plan = load_upscale_plan(job_dir)
     assert plan is not None
     assert [(s.start_s, s.end_s) for s in plan.spans] == [
-        (0.0, 1.0),
-        (1.0, 2.0),
-        (2.0, 7.0),
+        (0.0, 2.0),
+        (2.0, 5.0),
+        (5.0, 7.0),
     ]
     controller.run_render()
     assert controller.current_state().step is WizardStep.RESULT
-    # Every shot has the same settings, so they render as one part.
+    # Every segment has the same settings, so they render as one part.
     assert engine.calls == 1
 
 
 @needs_ffmpeg
-def test_scan_failure_returns_to_pick(tmp_path: Path) -> None:
+def test_sampling_failure_returns_to_pick(tmp_path: Path) -> None:
     clip = tmp_path / "not_video.mp4"
     _cuts_clip(clip)
     controller = WizardController(
@@ -357,10 +329,10 @@ def test_scan_failure_returns_to_pick(tmp_path: Path) -> None:
     )
     save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
     controller.handle_post("/pick", {"path": [str(clip)]})
-    controller.run_scan()
+    controller.run_segmenting()
     state = controller.current_state()
     assert state.step is WizardStep.PICK_FILE
-    assert state.error is not None and "Finding the shots failed" in state.error
+    assert state.error is not None and "Finding the segments failed" in state.error
 
 
 @needs_ffmpeg
@@ -380,14 +352,14 @@ def test_render_shots_keeps_different_settings_apart(tmp_path: Path) -> None:
 
 
 @needs_ffmpeg
-def test_scan_reports_progress_while_busy(tmp_path: Path) -> None:
+def test_segmenting_reports_progress_while_busy(tmp_path: Path) -> None:
     clip = _cuts_clip(tmp_path / "cuts.mp4")
     seen: list[Any] = []
 
     class _Watching(_Labels):
-        def label_shots(self, **kwargs: Any) -> list[dict[str, Any]]:
+        def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
             seen.append(controller.api_view()["progress"])
-            return super().label_shots(**kwargs)
+            return super().propose_segments(**kwargs)
 
     controller = WizardController(
         tmp_path / "jobs",
@@ -396,16 +368,12 @@ def test_scan_reports_progress_while_busy(tmp_path: Path) -> None:
     )
     save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
     controller.handle_post("/pick", {"path": [str(clip)]})
-    assert controller.start_scan()
+    assert controller.start_segmenting()
     assert controller.wait_idle(60)
     assert seen == [
-        {
-            "phase": "finding_shots",
-            "pct": 60,
-            "message": "Gemini is labelling the shots",
-        }
+        {"phase": "proposing", "pct": 50, "message": "Gemini is proposing segments"}
     ]
     state = controller.current_state()
-    assert state.step is WizardStep.SHOTS
+    assert state.step is WizardStep.SEGMENTS
     assert state.progress is None
     assert controller.api_view()["progress"] is None

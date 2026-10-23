@@ -93,12 +93,12 @@ def test_wizard_website_full_flow_intro_to_done(
         transport=_FakeTransport(
             [
                 {
-                    "shots": [
+                    "segments": [
                         {
-                            "index": 0,
+                            "start_s": 0,
+                            "end_s": 12,
                             "label": "flat gray card",
-                            "issues": ["flat", "made_up"],
-                            "contains": [],
+                            "contains": ["made_up"],
                         }
                     ]
                 },
@@ -173,23 +173,22 @@ def test_wizard_website_full_flow_intro_to_done(
         pick = _post(base, "/setup", {"skip": "1"})
         assert "Pick a video file" in pick
 
-        scanning = _post(base, "/pick", {"path": str(clip)})
-        assert "Finding the shots" in scanning
-        assert controller.current_state().step is WizardStep.FINDING_SHOTS
-        _get(base, "/shots?run=1")
+        sampling = _post(base, "/pick", {"path": str(clip)})
+        assert "Finding the segments" in sampling
+        assert controller.current_state().step is WizardStep.SAMPLING
+        _get(base, "/segment?run=1")
         assert controller.wait_idle(timeout=60)
-        shots = _get(base)
-        assert "<h1>Shots</h1>" in shots
-        assert "flat gray card" in shots
-        assert "Problems: flat" in shots
-        assert "made_up" not in shots
+        found = _get(base)
+        assert "<h1>Segments</h1>" in found
+        assert "0:00–0:12 · flat gray card" in found
+        assert "made_up" not in found
 
-        planning = _post(base, "/shots", {"action": "approve"})
-        assert "Planning each shot" in planning
-        _get(base, "/looks?run=1")
+        analyzing = _post(base, "/segments", {"action": "approve"})
+        assert "<h1>Segment 1 of 1</h1>" in analyzing
+        _get(base, "/analyze?run=1")
         assert controller.wait_idle(timeout=60)
         looks = _get(base)
-        assert "<h1>Looks</h1>" in looks
+        assert "Approve and finish" in looks
         assert "strength 0.40 · deblock 0.20 · contrast 1.05" in looks
         assert "Flat card; light deblock" in looks
         assert "Check passed. Cleaner, nothing invented." in looks
@@ -198,7 +197,9 @@ def test_wizard_website_full_flow_intro_to_done(
         with urlopen(base + "/previews/shot_000_r1_after.jpg") as response:
             assert response.headers.get_content_type() == "image/jpeg"
 
-        waiting = _post(base, "/looks", {"action": "approve"})
+        ready = _post(base, "/preview", {"action": "approve"})
+        assert "<h1>Ready to render</h1>" in ready
+        waiting = _post(base, "/ready", {"action": "render"})
         assert "<h1>Upscaling</h1>" in waiting
         assert controller.current_state().step is WizardStep.RENDERING
 

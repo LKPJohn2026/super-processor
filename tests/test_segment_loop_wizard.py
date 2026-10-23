@@ -16,7 +16,6 @@ from super_processor.review import WizardServer
 from super_processor.shot_plan import load_plan
 from super_processor.upscale import FakeUpscaleEngine, UpscaleRequest
 from super_processor.wizard import (
-    SEGMENT_LOOP_ENV,
     WizardController,
     WizardError,
     WizardState,
@@ -101,7 +100,6 @@ def _run(controller: WizardController, start: str) -> WizardState:
 def test_segment_loop_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(SEGMENT_LOOP_ENV, "1")
     clip = _clip(tmp_path / "in.mp4")
     gemini = _Gemini()
     engine = _CountingEngine()
@@ -199,13 +197,17 @@ def test_analyze_without_approved_segments_goes_back_to_pick(tmp_path: Path) -> 
     assert state.error is not None and "approved segments" in state.error
 
 
-def test_pick_uses_shot_flow_without_the_switch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv(SEGMENT_LOOP_ENV, raising=False)
+def test_workers_start_only_on_their_steps(tmp_path: Path) -> None:
     controller = WizardController(tmp_path / "jobs")
     assert controller.start_segmenting() is False
     assert controller.start_analyze() is False
+
+
+def test_old_shot_flow_states_go_back_to_pick() -> None:
+    for step in ("finding_shots", "shots", "planning", "looks"):
+        state = WizardState.from_dict({"schema_version": 3, "step": step})
+        assert state.step is WizardStep.PICK_FILE
+        assert state.error is not None and "shot flow" in state.error
 
 
 def _call(
@@ -230,7 +232,6 @@ def _call(
 def test_segment_loop_over_the_json_api(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(SEGMENT_LOOP_ENV, "1")
     clip = _clip(tmp_path / "in.mp4")
     controller = WizardController(
         tmp_path / "jobs",

@@ -12,6 +12,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from loop_driver import (
+    analyze,
+    approve_preview,
+    approve_segments,
+    pick_and_segment,
+    preview,
+    segments,
+)
 
 from super_processor.gemini import GeminiClient, GeminiError
 from super_processor.look import LOOK_BOUNDS, ShotLook
@@ -48,9 +56,7 @@ from super_processor.upscale import (
 )
 from super_processor.wizard import (
     WizardController,
-    WizardState,
     WizardStep,
-    save_session_state,
 )
 from super_processor.wizard_pages import check_summary, settings_summary
 
@@ -357,18 +363,18 @@ def test_gemini_propose_and_check_requests(tmp_path: Path) -> None:
 
 
 class _Planner:
-    """Labels, then plans; fails the check on shot 1 once."""
+    """Proposes three segments, then plans; fails the check on segment 1 once."""
 
     def __init__(self) -> None:
         self.proposals: list[list[dict[str, Any]]] = []
         self.scales: list[tuple[int, ...]] = []
         self.checks = 0
+        self.failed: set[int] = set()
 
-    def label_shots(self, **kwargs: Any) -> list[dict[str, Any]]:
-        return [
-            {"index": i, "label": f"shot {i}", "issues": [], "contains": []}
-            for i in range(len(kwargs["shots"]))
-        ]
+    def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return segments(
+            (0.0, 2.0, "shot 0", []), (2.0, 4.0, "shot 1", []), (4.0, 6.0, "shot 2", [])
+        )
 
     def propose_looks(self, **kwargs: Any) -> dict[str, Any]:
         self.proposals.append(kwargs["shots"])
@@ -388,9 +394,12 @@ class _Planner:
 
     def check_previews(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.checks += 1
+        failed_before = 1 in self.failed
         out = []
         for shot in kwargs["shots"]:
-            bad = shot["index"] == 1 and self.checks == 1
+            bad = shot["index"] == 1 and not failed_before
+            if bad:
+                self.failed.add(1)
             out.append(
                 {
                     "index": shot["index"],
@@ -407,7 +416,7 @@ class _Planner:
 
 
 @needs_ffmpeg
-def test_wizard_plans_checks_and_redoes_one_shot(tmp_path: Path) -> None:
+def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
     clip = _three_shots(tmp_path / "cuts.mp4")  # 320x180: 4x is allowed
     planner = _Planner()
     controller = WizardController(
@@ -415,49 +424,45 @@ def test_wizard_plans_checks_and_redoes_one_shot(tmp_path: Path) -> None:
         gemini=planner,  # type: ignore[arg-type]
         upscale_engine=FakeUpscaleEngine(),
     )
-    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
-    controller.handle_post("/pick", {"path": [str(clip)]})
-    controller.run_scan()
-    controller.handle_post("/shots", {"action": ["approve"]})
-    assert controller.start_plan() is True
-    assert controller.wait_idle(timeout=60)
-    state = controller.current_state()
-    assert state.step is WizardStep.LOOKS, state.error
+    pick_and_segment(controller, clip)
+    state = approve_segments(controller)
+    assert state.step is WizardStep.PREVIEW_SEGMENT, state.error
+    # The scale is chosen once, on the first segment.
     assert planner.scales == [(2, 4)]
-    looks = controller.api_view()["looks"]
-    assert looks["scale"] == 4
-    assert looks["error"] is None
-    first, second, third = looks["shots"]
-    assert first["strength"] == 0.7 and first["check"]["ok"] is True
-    # The check failed shot 2: its settings changed and its preview was redone.
+    first = preview(controller)
+    assert first["scale"] == 4 and first["error"] is None
+    assert first["shot"]["strength"] == 0.7 and first["shot"]["check"]["ok"] is True
+    assert "upscaled 4×" in controller.render()
+
+    approve_preview(controller)
+    # The check failed segment 2: its settings changed and its preview was redone.
+    second = preview(controller)["shot"]
     assert second["strength"] == 0.4
     assert second["check"]["problems"] == ["fake_texture"]
     assert second["after_url"].endswith("shot_001_r2_after.mp4")
-    assert third["after_url"].endswith("shot_002_r1_after.mp4")
-    page = controller.render()
-    assert "Check found: fake texture. grain turned to worms." in page
-    assert "upscaled 4×" in page
+    assert "Check found: fake texture. grain turned to worms." in controller.render()
 
-    controller.handle_post("/looks", {"action": ["redo"], "index": ["2"], "note": [""]})
+    approve_preview(controller)
+    third = preview(controller)["shot"]
+    assert third["after_url"].endswith("shot_002_r1_after.mp4")
+    controller.handle_post("/preview", {"action": ["redo"], "note": [""]})
     assert controller.current_state().error
-    assert controller.current_state().step is WizardStep.LOOKS
+    assert controller.current_state().step is WizardStep.PREVIEW_SEGMENT
     controller.handle_post(
-        "/looks", {"action": ["redo"], "index": ["2"], "note": ["keep the sign crisp"]}
+        "/preview", {"action": ["redo"], "note": ["keep the sign crisp"]}
     )
-    assert controller.current_state().step is WizardStep.PLANNING
-    controller.run_plan()
-    assert controller.current_state().step is WizardStep.LOOKS
+    assert analyze(controller).step is WizardStep.PREVIEW_SEGMENT
     assert planner.scales[-1] == (4,)
     assert [shot["index"] for shot in planner.proposals[-1]] == [2]
     assert planner.proposals[-1][0]["editor_note"] == "keep the sign crisp"
-    after = controller.api_view()["looks"]["shots"]
-    assert after[2]["strength"] == 0.3
-    assert after[2]["after_url"].endswith("shot_002_r2_after.mp4")
-    assert after[0]["after_url"].endswith("shot_000_r1_after.mp4")
+    third = preview(controller)["shot"]
+    assert third["strength"] == 0.3
+    assert third["after_url"].endswith("shot_002_r2_after.mp4")
 
-    controller.handle_post("/looks", {"action": ["dance"]})
+    controller.handle_post("/preview", {"action": ["dance"]})
     assert "unknown action" in (controller.current_state().error or "")
-    controller.handle_post("/looks", {"action": ["approve"]})
+    assert approve_preview(controller).step is WizardStep.READY_TO_RENDER
+    controller.handle_post("/ready", {"action": ["render"]})
     assert controller.current_state().step is WizardStep.RENDERING
     state = controller.current_state()
     assert state.job_id
@@ -468,11 +473,13 @@ def test_wizard_plans_checks_and_redoes_one_shot(tmp_path: Path) -> None:
     assert plan.spans[2].look.denoise == pytest.approx(0.2)
 
 
-def test_looks_post_needs_the_looks_step(tmp_path: Path) -> None:
+def test_preview_post_needs_the_preview_step(tmp_path: Path) -> None:
     from super_processor.wizard import WizardError
 
     controller = WizardController(tmp_path)
-    with pytest.raises(WizardError, match="no shot settings"):
+    with pytest.raises(WizardError, match="no segment preview"):
+        controller.handle_post("/preview", {"action": ["approve"]})
+    with pytest.raises(WizardError, match="unknown action /looks"):
         controller.handle_post("/looks", {"action": ["approve"]})
 
 

@@ -45,10 +45,6 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
         (WizardStep.LOCAL_LLM_STUB, "Local LLM"),
         (WizardStep.SETUP, "Gemini"),
         (WizardStep.PICK_FILE, "Pick"),
-        (WizardStep.FINDING_SHOTS, "Finding the shots"),
-        (WizardStep.SHOTS, "Approve shots"),
-        (WizardStep.PLANNING, "Planning each shot"),
-        (WizardStep.LOOKS, "Approve all and render"),
         (WizardStep.SAMPLING, "Finding the segments"),
         (WizardStep.PROPOSING, "Finding the segments"),
         (WizardStep.SEGMENTS, "Approve segments"),
@@ -154,7 +150,7 @@ class _BrokenEngine:
 class _NoGemini:
     """Every Gemini call fails, so each loop falls back to the measurements."""
 
-    def label_shots(self, **_kwargs: object) -> list[dict[str, object]]:
+    def propose_segments(self, **_kwargs: object) -> list[dict[str, object]]:
         raise GeminiError("no key in tests")
 
     def propose_looks(self, **_kwargs: object) -> dict[str, object]:
@@ -194,24 +190,27 @@ def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
     controller.handle_post("/pick", {"path": [str(clip)]})
     job_id = controller.current_state().job_id
     assert job_id is not None
-    assert controller.current_state().step is WizardStep.FINDING_SHOTS
-    controller.run_scan()
-    assert controller.current_state().step is WizardStep.SHOTS
-    controller.handle_post("/shots", {"action": ["approve"]})
-    assert controller.current_state().step is WizardStep.PLANNING
-    # Without a GPU the previews fail, and the editor is back on the shots.
-    controller.run_plan()
+    assert controller.current_state().step is WizardStep.SAMPLING
+    controller.run_segmenting()
+    assert controller.current_state().step is WizardStep.SEGMENTS
+    # Gemini is down, so the whole clip is one segment.
+    assert "could not propose segments" in controller.render()
+    controller.handle_post("/segments", {"action": ["approve"]})
+    assert controller.current_state().step is WizardStep.ANALYZING
+    # Without a GPU the preview fails, and the editor is back on the segments.
+    controller.run_analyze()
     state = controller.current_state()
-    assert state.step is WizardStep.SHOTS
-    assert state.error is not None and "previews failed" in state.error
+    assert state.step is WizardStep.SEGMENTS
+    assert state.error is not None and "preview failed" in state.error
     assert "CUDA" in controller.render()
-    # With previews working, approve the looks; then the full render fails.
+    # With previews working, approve the segment; then the full render fails.
     controller._upscale = FakeUpscaleEngine()
-    controller.handle_post("/shots", {"action": ["approve"]})
-    controller.run_plan()
-    assert controller.current_state().step is WizardStep.LOOKS
+    controller.handle_post("/segments", {"action": ["approve"]})
+    controller.run_analyze()
+    assert controller.current_state().step is WizardStep.PREVIEW_SEGMENT
     assert "could not propose" in controller.render()
-    controller.handle_post("/looks", {"action": ["approve"]})
+    controller.handle_post("/preview", {"action": ["approve"]})
+    controller.handle_post("/ready", {"action": ["render"]})
     assert controller.current_state().step is WizardStep.RENDERING
     controller._upscale = _BrokenEngine()
     controller.run_render()

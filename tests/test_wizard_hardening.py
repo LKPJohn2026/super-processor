@@ -146,7 +146,7 @@ def test_pick_follows_a_symlink(
     controller.handle_post("/pick", {"path": [str(link)]})
     state = controller.current_state()
     assert state.error is None
-    assert state.step is WizardStep.FINDING_SHOTS
+    assert state.step is WizardStep.SAMPLING
 
 
 def test_bad_content_length_is_400(tmp_path: Path) -> None:
@@ -218,7 +218,7 @@ def test_state_changes_need_the_run_token(tmp_path: Path) -> None:
 def test_pages_carry_the_token_into_run_links() -> None:
     page = (
         '<meta http-equiv="refresh" content="2;url=/render?run=1">'
-        '<form method="post" action="/looks"><button>Go</button></form>'
+        '<form method="post" action="/preview"><button>Go</button></form>'
         '<form method="get" action="/"></form>'
     )
     marked = with_wizard_token(page, "abc")

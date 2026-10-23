@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from loop_driver import approve_segments, pick_and_segment, preview, segments
 
 from super_processor.look import ShotLook
 from super_processor.regions import Region
@@ -230,11 +231,8 @@ class _CrawlEngine(FakeUpscaleEngine):
 class _Gemini:
     """Labels nothing special and passes every preview."""
 
-    def label_shots(self, **kwargs: Any) -> list[dict[str, Any]]:
-        return [
-            {"index": i, "label": "street", "issues": [], "contains": []}
-            for i in range(len(kwargs["shots"]))
-        ]
+    def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return segments((0.0, kwargs["duration_s"], "street", []))
 
     def propose_looks(self, **kwargs: Any) -> dict[str, Any]:
         self.shimmer_seen: list[Any] = []
@@ -262,13 +260,9 @@ def test_planning_fails_a_crawling_preview_even_when_gemini_passes_it(
         gemini=gemini,  # type: ignore[arg-type]
         upscale_engine=_CrawlEngine(),
     )
-    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
-    controller.handle_post("/pick", {"path": [str(source)]})
-    controller.run_scan()
-    controller.handle_post("/shots", {"action": ["approve"]})
-    controller.run_plan()
-    assert controller.current_state().step is WizardStep.LOOKS
-    shot = controller.api_view()["looks"]["shots"][0]
+    pick_and_segment(controller, source)
+    assert approve_segments(controller).step is WizardStep.PREVIEW_SEGMENT
+    shot = preview(controller)["shot"]
     assert gemini.shimmer_seen and gemini.shimmer_seen[0] > SHIMMER_LIMIT
     assert shot["check"]["ok"] is False
     assert "flicker" in shot["check"]["problems"]
