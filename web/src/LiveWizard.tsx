@@ -10,6 +10,7 @@ import {
   type Progress,
   type Region,
   type Runner,
+  type Segment,
   type SegmentList,
   type SegmentPreview,
   type WizardView,
@@ -222,6 +223,7 @@ function WizardStepView({
   if (view.step === "segments") {
     return (
       <SegmentsStep
+        origin={origin}
         list={view.segments ?? { segments: [], error: null, note: "" }}
         busy={busy}
         message={message}
@@ -453,8 +455,9 @@ function PickStep({
     <>
       <h1>Pick a video file</h1>
       <p className="lede">
-        Choose a clip on this machine. A local GPU model restores and upscales
-        it. The first pass usually covers the whole file.
+        Choose a video on this computer. Gemini splits it into segments, you
+        approve a short before/after preview of each, and then the whole video
+        is restored and upscaled on your GPU.
       </p>
       <p className="muted">Up to 1080p and 30 minutes.</p>
       {message ? <Alert text={message} /> : null}
@@ -587,18 +590,49 @@ function words(items: string[]): string {
   return items.map((item) => item.replace(/_/g, " ")).join(", ");
 }
 
+function Notice({ text }: { text: string | null }) {
+  if (!text) return null;
+  return (
+    <p className="notice" role="status">
+      {text}
+    </p>
+  );
+}
+
+function Timeline({ segments }: { segments: Segment[] }) {
+  const total = segments.reduce((sum, s) => sum + (s.end_s - s.start_s), 0);
+  if (total <= 0) return null;
+  return (
+    <div className="timeline" role="img" aria-label={`${segments.length} segments across the video`}>
+      {segments.map((segment, index) => (
+        <span
+          key={`${segment.start_s}-${segment.end_s}`}
+          style={{ width: `${((segment.end_s - segment.start_s) / total) * 100}%` }}
+          title={`${index + 1}. ${formatTime(segment.start_s)}–${formatTime(segment.end_s)}`}
+        >
+          {index + 1}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function SegmentsStep({
+  origin,
   list,
   busy,
   message,
   onSend,
 }: {
+  origin: string;
   list: SegmentList;
   busy: boolean;
   message: string | null;
   onSend: (action: string, fields: Record<string, string>) => Promise<void>;
 }) {
   const [note, setNote] = useState("");
+  const count = list.segments.length;
+  const noun = count === 1 ? "segment" : "segments";
 
   function propose(event: FormEvent) {
     event.preventDefault();
@@ -609,21 +643,44 @@ function SegmentsStep({
     <>
       <h1>Segments</h1>
       <p className="lede">
-        Gemini split the video where the picture needs different settings.
-        Approve the segments, or say where the cuts should go and Gemini will
-        try again.
+        {list.error
+          ? "Gemini could not split the video, so it is one segment for now. Approve it to go on, or ask Gemini to try again."
+          : "Gemini split the video where the picture needs different settings. Approve the segments, or say where the cuts should go and Gemini will try again."}
       </p>
       {message ? <Alert text={message} /> : null}
-      {list.error ? <p className="muted">{list.error}</p> : null}
+      <Notice text={list.error} />
+      <Timeline segments={list.segments} />
+      <p className="muted">
+        {count} {noun}
+      </p>
       <ol className="shots">
         {list.segments.map((segment, index) => (
           <li key={`${segment.start_s}-${segment.end_s}`} className="shot">
+            {segment.still_url ? (
+              <img
+                src={outputSrc(origin, segment.still_url) ?? undefined}
+                alt={`Still from segment ${index + 1}`}
+              />
+            ) : null}
             <div>
               <h2>
-                {index + 1}. {formatTime(segment.start_s)}–{formatTime(segment.end_s)} ·{" "}
-                {segment.label || "Unlabelled segment"}
+                {index + 1}. {segment.label || "Unlabelled segment"}
               </h2>
-              <p className="muted">Contains: {words(segment.contains) || "nothing flagged"}</p>
+              <p className="muted">
+                {formatTime(segment.start_s)}–{formatTime(segment.end_s)} ·{" "}
+                {(segment.end_s - segment.start_s).toFixed(1)} s
+              </p>
+              <p>
+                {segment.contains.length ? (
+                  segment.contains.map((item) => (
+                    <span key={item} className="chip">
+                      {item.replace(/_/g, " ")}
+                    </span>
+                  ))
+                ) : (
+                  <span className="muted">Nothing to protect</span>
+                )}
+              </p>
             </div>
           </li>
         ))}
@@ -634,7 +691,7 @@ function SegmentsStep({
           disabled={busy}
           onClick={() => void onSend("segments", { action: "approve" })}
         >
-          Approve segments
+          Approve {count} {noun}
         </button>
       </div>
       <form onSubmit={propose}>
@@ -843,7 +900,7 @@ function PreviewStep({
         <p className="muted">The whole video is upscaled {preview.scale}×.</p>
       ) : null}
       {message ? <Alert text={message} /> : null}
-      {preview.error ? <p className="muted">{preview.error}</p> : null}
+      <Notice text={preview.error} />
       {preview.shot ? <LookCard origin={origin} shot={preview.shot} /> : null}
       <div className="actions">
         <button

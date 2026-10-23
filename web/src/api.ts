@@ -20,6 +20,7 @@ export type Segment = {
   label: string;
   note: string;
   contains: string[];
+  still_url?: string | null;
 };
 
 export type SegmentList = {
