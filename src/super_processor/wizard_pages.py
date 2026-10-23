@@ -273,6 +273,10 @@ img, video {{
   color: var(--muted);
   margin: 0 0 0.5rem;
 }}
+.progress {{ display: flex; align-items: center; gap: 0.6rem; color: var(--muted); }}
+.progress progress {{ flex: 1; height: 0.6rem; accent-color: var(--leaf); }}
+label.inline {{ display: inline-flex; gap: 0.4rem; align-items: center; }}
+.summary {{ padding-left: 1.1rem; line-height: 1.6; }}
 @media (max-width: 520px) {{
   .shell {{ padding: 0.85rem 0.75rem 2.5rem; }}
   .shot {{ grid-template-columns: 1fr; }}
@@ -418,17 +422,6 @@ one still.</p>
     return _page("Finding shots", body, phase="shots")
 
 
-def render_segment_loop_pending(title: str) -> str:
-    """A segment-loop step this page shell cannot show yet."""
-    body = f"""
-<h1>{escape(title)}</h1>
-<p class="lede">This job is in the segment loop, which only the API drives
-for now. Start a new job to use the shot flow here.</p>
-<form method="post" action="/new"><button type="submit">Start a new job</button></form>
-"""
-    return _page(title, body, phase="shots")
-
-
 def format_time(seconds: float) -> str:
     """``75.5`` as ``1:15.5``; whole seconds drop the fraction."""
     minutes, rest = divmod(round(max(0.0, seconds), 1), 60.0)
@@ -557,51 +550,11 @@ def render_looks(view: dict[str, object], *, error: str | None = None) -> str:
     warn = view.get("error")
     warning = f'<p class="muted">{escape(str(warn))}</p>' if warn else ""
     scale = view.get("scale")
-    cards: list[str] = []
-    for shot in _items(view, "shots"):
-        if not isinstance(shot, dict):
-            continue
-        index = int(shot.get("index", 0))
-        start = float(shot.get("start_s", 0))
-        end = float(shot.get("end_s", 0))
-        label = escape(str(shot.get("label") or "Unlabelled shot"))
-        raw_look = shot.get("look")
-        look = raw_look if isinstance(raw_look, dict) else {}
-        summary = settings_summary(float(shot.get("strength", 0.5)), look)
-        raw_check = shot.get("check")
-        check = raw_check if isinstance(raw_check, dict) else {}
-        shimmer = _shimmer_text(shot.get("shimmer"))
-        videos = ""
-        if shot.get("after_url"):
-            before = str(shot.get("before_url"))
-            after = str(shot.get("after_url"))
-            boxes = _boxes(_items(shot, "regions"))
-            videos = f"""<div class="pair">
-<figure><figcaption>Before</figcaption><div class="frame">
-<video controls muted loop preload="metadata" src="{escape(before)}"
-poster="{escape(_poster(before))}"></video>{boxes}</div></figure>
-<figure><figcaption>After</figcaption><div class="frame">
-<video controls muted loop preload="metadata" src="{escape(after)}"
-poster="{escape(_poster(after))}"></video>{boxes}</div></figure>
-</div>"""
-        cards.append(
-            f"""<div class="card">
-<h2>{index + 1}. {format_time(start)}–{format_time(end)} · {label}</h2>
-{videos}
-<p class="tags"><strong>{escape(summary)}</strong></p>
-{_protected_line(_items(shot, "regions"), _items(shot, "contains"))}
-<p class="tags">{escape(str(shot.get("reason") or ""))}</p>
-<p class="tags muted">{escape(check_summary(check))}{shimmer}</p>
-<form method="post" action="/looks">
-<input type="hidden" name="action" value="redo">
-<input type="hidden" name="index" value="{index}">
-<label>Not right? Tell me what to change in this shot
-<input type="text" name="note" placeholder="e.g. skin looks waxy, keep it softer">
-</label>
-<button type="submit" class="secondary">Redo this shot</button>
-</form>
-</div>"""
-        )
+    cards = [
+        _look_card(shot, _redo_form("/looks", int(shot.get("index", 0)), "shot"))
+        for shot in _items(view, "shots")
+        if isinstance(shot, dict)
+    ]
     scale_line = (
         f'<p class="muted">The whole video is upscaled {scale}×.</p>' if scale else ""
     )
@@ -620,6 +573,222 @@ in one shot.</p>
 </form>
 """
     return _page("Looks", body, phase="looks")
+
+
+def _redo_form(action: str, index: int, what: str, *, resample: bool = False) -> str:
+    again = (
+        '<label class="inline"><input type="checkbox" name="resample" value="1"> '
+        "Preview a different part</label>"
+        if resample
+        else ""
+    )
+    return f"""<form method="post" action="{action}">
+<input type="hidden" name="action" value="redo">
+<input type="hidden" name="index" value="{index}">
+<label>Not right? Tell me what to change in this {what}
+<input type="text" name="note" placeholder="e.g. skin looks waxy, keep it softer">
+</label>
+{again}
+<button type="submit" class="secondary">Redo this {what}</button>
+</form>"""
+
+
+def _look_card(shot: dict[str, object], redo: str) -> str:
+    """One shot or segment: before/after preview, settings, check, redo form."""
+    index = int(str(shot.get("index", 0)))
+    start = float(str(shot.get("start_s", 0)))
+    end = float(str(shot.get("end_s", 0)))
+    label = escape(str(shot.get("label") or "Unlabelled shot"))
+    raw_look = shot.get("look")
+    look = raw_look if isinstance(raw_look, dict) else {}
+    summary = settings_summary(float(str(shot.get("strength", 0.5))), look)
+    if shot.get("use_upscale") is False:
+        summary = "No FlashVSR: resized only. " + summary
+    raw_check = shot.get("check")
+    check = raw_check if isinstance(raw_check, dict) else {}
+    shimmer = _shimmer_text(shot.get("shimmer"))
+    videos = ""
+    if shot.get("after_url"):
+        before = str(shot.get("before_url"))
+        after = str(shot.get("after_url"))
+        boxes = _boxes(_items(shot, "regions"))
+        videos = f"""<div class="pair">
+<figure><figcaption>Before</figcaption><div class="frame">
+<video controls muted loop preload="metadata" src="{escape(before)}"
+poster="{escape(_poster(before))}"></video>{boxes}</div></figure>
+<figure><figcaption>After</figcaption><div class="frame">
+<video controls muted loop preload="metadata" src="{escape(after)}"
+poster="{escape(_poster(after))}"></video>{boxes}</div></figure>
+</div>"""
+    return f"""<div class="card">
+<h2>{index + 1}. {format_time(start)}–{format_time(end)} · {label}</h2>
+{videos}
+<p class="tags"><strong>{escape(summary)}</strong></p>
+{_protected_line(_items(shot, "regions"), _items(shot, "contains"))}
+<p class="tags">{escape(str(shot.get("reason") or ""))}</p>
+<p class="tags muted">{escape(check_summary(check))}{shimmer}</p>
+{redo}
+</div>"""
+
+
+def _progress_bar(progress: dict[str, object] | None) -> str:
+    """How far the running worker is, from the wizard state."""
+    if not progress:
+        return ""
+    try:
+        pct = max(0, min(100, int(str(progress.get("pct", 0)))))
+    except ValueError:
+        return ""
+    message = escape(str(progress.get("message") or ""))
+    return (
+        f'<p class="progress"><progress max="100" value="{pct}">{pct}%</progress> '
+        f"{pct}% · {message}</p>"
+    )
+
+
+def _busy(title: str, lede: str, run_url: str, phase: str, progress: object) -> str:
+    bar = _progress_bar(progress if isinstance(progress, dict) else None)
+    body = f"""
+<h1>{escape(title)}</h1>
+<p class="lede">{lede}</p>
+{bar}
+<p class="muted">The page will refresh.</p>
+<meta http-equiv="refresh" content="2;url={run_url}">
+"""
+    return _page(title, body, phase=phase)
+
+
+def render_sampling(progress: object = None) -> str:
+    return _busy(
+        "Finding the segments",
+        "FFmpeg saves a small still about every second, on this computer. "
+        "Gemini looks at them and splits the video where the light, place, or "
+        "picture quality changes.",
+        "/segment?run=1",
+        "shots",
+        progress,
+    )
+
+
+def render_analyzing(index: int, count: int, progress: object = None) -> str:
+    return _busy(
+        f"Segment {index + 1} of {count}",
+        "Gemini is choosing clean-up, strength, and finishing for this segment. "
+        "A few seconds of it are previewed on the local GPU, and Gemini checks "
+        "the preview for faces, hands, text, and texture that went wrong.",
+        "/analyze?run=1",
+        "looks",
+        progress,
+    )
+
+
+def render_segments(view: dict[str, object], *, error: str | None = None) -> str:
+    err = f'<p class="error">{escape(error)}</p>' if error else ""
+    warn = view.get("error")
+    warning = f'<p class="muted">{escape(str(warn))}</p>' if warn else ""
+    rows: list[str] = []
+    for index, raw in enumerate(_items(view, "segments")):
+        if not isinstance(raw, dict):
+            continue
+        start = float(str(raw.get("start_s", 0)))
+        end = float(str(raw.get("end_s", 0)))
+        label = escape(str(raw.get("label") or "Unlabelled segment"))
+        contains = ", ".join(
+            str(item).replace("_", " ") for item in _items(raw, "contains")
+        )
+        rows.append(
+            f"""<div class="card">
+<h2>{index + 1}. {format_time(start)}–{format_time(end)} · {label}</h2>
+<p class="tags muted">Contains: {escape(contains) or "nothing flagged"}</p>
+</div>"""
+        )
+    body = f"""
+<h1>Segments</h1>
+<p class="lede">Gemini split the video where the picture needs different
+settings. Approve the segments, or say where the cuts should go and Gemini
+will try again.</p>
+{err}
+{warning}
+{"".join(rows)}
+<form method="post" action="/segments">
+<input type="hidden" name="action" value="approve">
+<button type="submit" class="full">Approve segments</button>
+</form>
+<form method="post" action="/segments">
+<input type="hidden" name="action" value="note">
+<label>Not right? Say what to change
+<input type="text" name="note" placeholder="e.g. cut where we walk outside">
+</label>
+<button type="submit" class="secondary">Propose again</button>
+</form>
+"""
+    return _page("Segments", body, phase="shots")
+
+
+def render_preview_segment(view: dict[str, object], *, error: str | None = None) -> str:
+    err = f'<p class="error">{escape(error)}</p>' if error else ""
+    warn = view.get("error")
+    warning = f'<p class="muted">{escape(str(warn))}</p>' if warn else ""
+    index = int(str(view.get("index", 0)))
+    count = int(str(view.get("count", 0)))
+    shot = view.get("shot")
+    card = (
+        _look_card(shot, _redo_form("/preview", index, "segment", resample=True))
+        if isinstance(shot, dict)
+        else ""
+    )
+    scale = view.get("scale")
+    scale_line = (
+        f'<p class="muted">The whole video is upscaled {scale}×.</p>' if scale else ""
+    )
+    last = index + 1 >= count
+    approve = "Approve and finish" if last else "Approve and go to the next segment"
+    body = f"""
+<h1>Segment {index + 1} of {count}</h1>
+<p class="lede">A few seconds of this segment, before and after. Approve it,
+or tell me what to change.</p>
+{scale_line}
+{err}
+{warning}
+{card}
+<form method="post" action="/preview">
+<input type="hidden" name="action" value="approve">
+<button type="submit" class="full">{approve}</button>
+</form>
+"""
+    return _page("Segment preview", body, phase="looks")
+
+
+def render_ready(view: dict[str, object], *, error: str | None = None) -> str:
+    err = f'<p class="error">{escape(error)}</p>' if error else ""
+    rows: list[str] = []
+    for shot in _items(view, "shots"):
+        if not isinstance(shot, dict):
+            continue
+        raw_look = shot.get("look")
+        look = raw_look if isinstance(raw_look, dict) else {}
+        summary = settings_summary(float(str(shot.get("strength", 0.5))), look)
+        if shot.get("use_upscale") is False:
+            summary = "No FlashVSR: resized only. " + summary
+        start = float(str(shot.get("start_s", 0)))
+        end = float(str(shot.get("end_s", 0)))
+        label = escape(str(shot.get("label") or "Unlabelled segment"))
+        rows.append(
+            f"<li>{format_time(start)}–{format_time(end)} · {label}: "
+            f"{escape(summary)}</li>"
+        )
+    body = f"""
+<h1>Ready to render</h1>
+<p class="lede">Every segment is approved. The whole video is now restored
+and upscaled with these settings.</p>
+{err}
+<ul class="summary">{"".join(rows)}</ul>
+<form method="post" action="/ready">
+<input type="hidden" name="action" value="render">
+<button type="submit" class="full">Render the whole video</button>
+</form>
+"""
+    return _page("Ready to render", body, phase="upscale")
 
 
 def _shimmer_text(value: object) -> str:
@@ -678,16 +847,15 @@ def _items(shot: dict[str, object], key: str) -> list[object]:
     return list(value) if isinstance(value, list) else []
 
 
-def render_rendering() -> str:
-    body = """
-<h1>Upscaling</h1>
-<p class="lede">Restoring and upscaling on the local GPU. FFmpeg only trims,
-splices, and copies audio.</p>
-<p class="muted">A short clip finishes sooner than a longer one. The page
-will refresh.</p>
-<meta http-equiv="refresh" content="2;url=/render?run=1">
-"""
-    return _page("Upscaling", body, phase="upscale")
+def render_rendering(progress: object = None) -> str:
+    return _busy(
+        "Upscaling",
+        "Restoring and upscaling on the local GPU. FFmpeg only trims, splices, "
+        "and copies audio. A short clip finishes sooner than a longer one.",
+        "/render?run=1",
+        "upscale",
+        progress,
+    )
 
 
 def render_result(

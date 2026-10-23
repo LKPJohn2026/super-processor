@@ -121,6 +121,8 @@ def test_segment_loop_end_to_end(
         (0.0, "first"),
         (3.5, "second"),
     ]
+    page = controller.render()
+    assert "0:00–0:03.5 · first" in page and "Propose again" in page
 
     controller.handle_post("/segments", {"action": ["note"], "note": [" "]})
     assert controller.current_state().error is not None
@@ -137,6 +139,9 @@ def test_segment_loop_end_to_end(
     assert gemini.looks_calls == [[0]]
     preview = controller.api_view()["segment_preview"]
     assert (preview["index"], preview["count"]) == (0, 2)
+    page = controller.render()
+    assert "Segment 1 of 2" in page and "Preview a different part" in page
+    assert preview["shot"]["after_url"] in page
     assert preview["shot"]["after_url"].endswith("_r1_after.mp4")
     assert state.job_id
     job_dir = controller.store.job_dir(state.job_id)
@@ -160,6 +165,8 @@ def test_segment_loop_end_to_end(
     controller.handle_post("/preview", {"action": ["approve"]})
     assert controller.current_state().step is WizardStep.READY_TO_RENDER
     assert len(controller.api_view()["looks"]["shots"]) == 2
+    page = controller.render()
+    assert "Render the whole video" in page and "· second:" in page
 
     controller.handle_post("/ready", {"action": ["wait"]})
     assert controller.current_state().step is WizardStep.READY_TO_RENDER
@@ -257,3 +264,14 @@ def test_segment_loop_over_the_json_api(
         )
     finally:
         server.stop()
+
+
+def test_busy_pages_show_progress() -> None:
+    from super_processor.wizard_pages import render_analyzing, render_sampling
+
+    page = render_analyzing(1, 3, {"pct": 140, "message": "Checking <it>"})
+    assert "Segment 2 of 3" in page
+    assert 'value="100"' in page and "Checking &lt;it&gt;" in page
+    assert "/analyze?run=1" in page
+    assert "<progress" not in render_sampling(None)
+    assert "<progress" not in render_sampling({"pct": "x"})

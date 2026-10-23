@@ -90,6 +90,7 @@ from .upscale import (
     span_at,
 )
 from .wizard_pages import (
+    render_analyzing,
     render_done,
     render_finding_shots,
     render_intro,
@@ -98,9 +99,12 @@ from .wizard_pages import (
     render_looks,
     render_pick,
     render_planning,
+    render_preview_segment,
+    render_ready,
     render_rendering,
     render_result,
-    render_segment_loop_pending,
+    render_sampling,
+    render_segments,
     render_setup,
     render_shots,
 )
@@ -159,14 +163,6 @@ _RETIRED_MESSAGE = (
 
 
 _SEGMENTING_STEPS = frozenset({WizardStep.SAMPLING, WizardStep.PROPOSING})
-_LOOP_TITLES = {
-    WizardStep.SAMPLING: "Sampling stills",
-    WizardStep.PROPOSING: "Proposing segments",
-    WizardStep.SEGMENTS: "Review segments",
-    WizardStep.ANALYZING: "Analyzing segment",
-    WizardStep.PREVIEW_SEGMENT: "Segment preview",
-    WizardStep.READY_TO_RENDER: "Ready to render",
-}
 
 
 @dataclass(slots=True)
@@ -542,10 +538,34 @@ class WizardController:
                 self._looks_view(self.store.job_dir(state.job_id)),
                 error=state.error,
             )
-        if state.step in _LOOP_TITLES:
-            return render_segment_loop_pending(_LOOP_TITLES[state.step])
+        if state.step in _SEGMENTING_STEPS:
+            return render_sampling(state.progress)
+        if state.step is WizardStep.SEGMENTS:
+            assert state.job_id
+            return render_segments(
+                self._segments_view(self.store.job_dir(state.job_id)),
+                error=state.error,
+            )
+        if state.step is WizardStep.ANALYZING:
+            assert state.job_id
+            found = self._segments_view(self.store.job_dir(state.job_id))
+            count = len(found["segments"])
+            return render_analyzing(state.segment_index, count, state.progress)
+        if state.step is WizardStep.PREVIEW_SEGMENT:
+            assert state.job_id
+            return render_preview_segment(
+                self._segment_preview_view(
+                    self.store.job_dir(state.job_id), state.segment_index
+                ),
+                error=state.error,
+            )
+        if state.step is WizardStep.READY_TO_RENDER:
+            assert state.job_id
+            return render_ready(
+                self._looks_view(self.store.job_dir(state.job_id)), error=state.error
+            )
         if state.step is WizardStep.RENDERING:
-            return render_rendering()
+            return render_rendering(state.progress)
         if state.step is WizardStep.RESULT:
             assert state.job_id
             job_dir = self.store.job_dir(state.job_id)
@@ -1113,6 +1133,7 @@ class WizardController:
                     "reason": recipe.reason,
                     "check": recipe.check.to_dict(),
                     "shimmer": recipe.shimmer,
+                    "use_upscale": recipe.use_upscale,
                     "before_url": before if recipe.rev else None,
                     "after_url": after if recipe.rev else None,
                 }
