@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import pytest
+from loop_driver import to_ready
 
 from super_processor.review import WizardServer
 from super_processor.shot_plan import load_plan
@@ -276,3 +277,84 @@ def test_busy_pages_show_progress() -> None:
     assert "/analyze?run=1" in page
     assert "<progress" not in render_sampling(None)
     assert "<progress" not in render_sampling({"pct": "x"})
+
+
+class _Recording(_Gemini):
+    """Records the chat each segment proposal sees, as the real client would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.chats: list[list[str]] = []
+
+    def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
+        from super_processor.gemini import load_chat
+
+        self.chats.append([turn.text for turn in load_chat(kwargs["job_dir"])])
+        return super().propose_segments(**kwargs)
+
+
+@needs_ffmpeg
+def test_result_note_can_restart_from_the_segments(tmp_path: Path) -> None:
+    from super_processor.gemini import ChatTurn, append_chat_turn
+
+    clip = _clip(tmp_path / "in.mp4")
+    gemini = _Recording()
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=gemini,  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    job_dir = to_ready(controller, clip)
+    append_chat_turn(job_dir, ChatTurn(role="model", text='{"segments": []}'))
+    controller.handle_post("/ready", {"action": ["render"]})
+    controller.run_render()
+    assert controller.current_state().step is WizardStep.RESULT
+    page = controller.render()
+    assert 'name="restart" value="1"' in page
+    for name in ("segments.json", "shot_plan.json", "upscale_plan.json", "output.mp4"):
+        assert (job_dir / name).is_file()
+    chat_before = (job_dir / "gemini_chat.json").read_text(encoding="utf-8")
+
+    controller.handle_post("/result", {"note": [""], "restart": ["1"]})
+    assert controller.current_state().step is WizardStep.RESULT
+    controller.handle_post(
+        "/result", {"note": ["too  sharp, faces look fake"], "restart": ["1"]}
+    )
+    state = controller.current_state()
+    assert state.step is WizardStep.SAMPLING
+    assert (state.segment_index, state.progress, state.error) == (0, None, None)
+    for name in (
+        "segments.json",
+        "shots.json",
+        "shot_plan.json",
+        "upscale_plan.json",
+        "output.mp4",
+        "render_report.json",
+        "previews",
+        "shot_stills",
+        "shot_work",
+    ):
+        assert not (job_dir / name).exists(), name
+    chat = (job_dir / "gemini_chat.json").read_text(encoding="utf-8")
+    assert chat.startswith(chat_before.rsplit("]", 1)[0].rstrip())
+
+    assert _run(controller, "start_segmenting").step is WizardStep.SEGMENTS
+    assert len(gemini.chats) == 2
+    assert any("too sharp, faces look fake" in text for text in gemini.chats[-1])
+    assert len(gemini.chats[-1]) == len(gemini.chats[0]) + 2
+
+
+def test_restart_leaves_symlinked_folders_alone(tmp_path: Path) -> None:
+    from super_processor.wizard import restart_from_segmentation
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.mp4").write_bytes(b"x")
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "previews").symlink_to(outside, target_is_directory=True)
+    (job_dir / "gemini_chat.json").write_text("{}", encoding="utf-8")
+    restart_from_segmentation(job_dir)
+    assert not (job_dir / "previews").exists()
+    assert (outside / "keep.mp4").is_file()
+    assert (job_dir / "gemini_chat.json").is_file()

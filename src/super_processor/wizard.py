@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 import threading
 import time
 import uuid
@@ -14,8 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from .gemini import (
+    ChatTurn,
     GeminiClient,
     GeminiError,
+    append_chat_turn,
     resolve_gemini_api_key,
     store_gemini_api_key,
 )
@@ -301,6 +304,33 @@ def _fallback_plan(plan: ShotPlan, shots: ShotList, indexes: list[int]) -> ShotP
 
 
 RENDER_REPORT_FILE = "render_report.json"
+# A full restart clears these from the job folder. ``gemini_chat.json``
+# stays, so Gemini sees what the editor did not like the first time.
+_RESTART_FILES = (
+    "segments.json",
+    "shots.json",
+    "shot_plan.json",
+    "upscale_plan.json",
+    "output.mp4",
+    "output.mp4.delivery.json",
+    RENDER_REPORT_FILE,
+)
+_RESTART_DIRS = ("shot_stills", "previews", "shot_work", "range_work")
+
+
+def restart_from_segmentation(job_dir: Path) -> None:
+    """Clear the segments, plans, previews, and output of a job; keep the chat.
+
+    The still grid is sampled again on the way back through ``sampling``.
+    """
+    for name in _RESTART_FILES:
+        (job_dir / name).unlink(missing_ok=True)
+    for name in _RESTART_DIRS:
+        folder = job_dir / name
+        if folder.is_symlink():
+            folder.unlink()
+        elif folder.is_dir():
+            shutil.rmtree(folder)
 
 
 def load_render_report(job_dir: Path) -> dict[str, Any]:
@@ -1193,6 +1223,9 @@ class WizardController:
             self._save(state)
             return
         job_dir = self.store.job_dir(state.job_id)
+        if fields.get("restart", [""])[0] == "1":
+            self._restart(state, job_dir, note)
+            return
         source = Path(self.store.load(state.job_id).source_path)
         try:
             facts = probe_file(source)
@@ -1223,6 +1256,27 @@ class WizardController:
         except (UpscaleError, GeminiError, ProbeError, OSError, ValueError) as exc:
             state.error = str(exc)
             state.step = WizardStep.RESULT
+        self._save(state)
+
+    def _restart(self, state: WizardState, job_dir: Path, note: str) -> None:
+        """Start the job again from the segments, with the note in the chat."""
+        text = " ".join(note.split())[:500]
+        append_chat_turn(
+            job_dir,
+            ChatTurn(
+                role="user",
+                text=(
+                    "The editor watched the finished video, was not happy, and "
+                    f"started over from the segments. Their note: {text!r}. Do "
+                    "not repeat what they disliked."
+                ),
+            ),
+        )
+        restart_from_segmentation(job_dir)
+        state.error = None
+        state.segment_index = 0
+        state.progress = None
+        state.step = WizardStep.SAMPLING
         self._save(state)
 
     def run_render(self) -> None:

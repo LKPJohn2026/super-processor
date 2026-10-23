@@ -771,6 +771,8 @@ def render_result(
 placeholder="e.g. reduce artificial detail from 00:30 to 00:40"></textarea>
 </label>
 <button type="submit">Revise this range</button>
+<button type="submit" name="restart" value="1" class="secondary">Start over from
+the segments with this note</button>
 </form>
 {_NEW_JOB_FORM}
 """
