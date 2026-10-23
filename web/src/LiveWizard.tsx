@@ -549,6 +549,14 @@ function ResultStep({
           <button type="submit" disabled={busy}>
             Revise this range
           </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={busy}
+            onClick={() => void onSend("result", { note, restart: "1" })}
+          >
+            Start over from the segments with this note
+          </button>
         </div>
       </form>
       <div className="actions">
