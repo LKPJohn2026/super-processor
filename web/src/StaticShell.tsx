@@ -32,9 +32,9 @@ const TOUR = [
     body: "One segment at a time, Gemini picks clean-up, strength, and finishing, or leaves FlashVSR out where it would only harm. A few seconds of the segment are previewed before and after, and Gemini checks for wrong faces, hands, text, and fake texture. Approve it, or say what to change.",
   },
   {
-    id: "upscale",
-    title: "Upscaling",
-    body: "FlashVSR restores and upscales on the local GPU. FFmpeg only trims, splices, and copies audio. A long clip is processed in overlapping pieces so it can fit in GPU memory.",
+    id: "render",
+    title: "Render",
+    body: "Choose whether to upscale: 2× (or 4× for small sources) with FlashVSR on the local GPU, or keep the size and apply only the clean-up and finishing. FFmpeg only trims, splices, and copies audio. A long clip is processed in overlapping pieces so it can fit in GPU memory.",
   },
   {
     id: "result",

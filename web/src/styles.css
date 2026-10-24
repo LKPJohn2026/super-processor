@@ -322,6 +322,91 @@ video {
   outline-offset: 2px;
 }
 
+.steps li button.step-link {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-decoration: underline dotted;
+  cursor: pointer;
+}
+
+button.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--leaf);
+  text-decoration: underline;
+}
+
+.back {
+  margin-top: 1.25rem;
+}
+
+.dropzone {
+  display: block;
+  margin: 1rem 0;
+  padding: 1.6rem 1rem;
+  text-align: center;
+  border: 2px dashed var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.dropzone.over {
+  border-color: var(--leaf);
+  background: rgba(30, 51, 36, 0.06);
+}
+
+.dropzone strong {
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.dropzone input[type="file"] {
+  display: none;
+}
+
+details.fallback {
+  margin-top: 1rem;
+}
+
+details.fallback summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+fieldset.options {
+  border: 0;
+  padding: 0;
+  margin: 1rem 0;
+}
+
+fieldset.options legend {
+  font-weight: 600;
+  margin-bottom: 0.4rem;
+}
+
+label.option {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0.6rem 0.8rem;
+  margin: 0.4rem 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+label.option:has(input:checked) {
+  border-color: var(--leaf);
+  background: rgba(30, 51, 36, 0.06);
+}
+
 .notice {
   border-left: 3px solid #c58b2c;
   background: rgba(197, 139, 44, 0.1);

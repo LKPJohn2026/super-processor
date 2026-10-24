@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import {
   outputSrc,
   postAction,
@@ -12,11 +12,20 @@ import {
   type Runner,
   type Segment,
   type SegmentList,
+  type Navigation,
   type SegmentPreview,
+  uploadVideo,
   type WizardView,
 } from "./api";
 
-const RAIL = ["Setup", "File", "Segments", "Previews", "Upscale", "Result"] as const;
+const RAIL = ["Setup", "File", "Segments", "Previews", "Result"] as const;
+// Rail steps the editor can go back (or forward) to, by their index.
+const NAV_TARGETS: Record<number, keyof Navigation> = { 0: "setup", 1: "file", 2: "segments" };
+const BACK_TEXT: Record<keyof Navigation, string> = {
+  setup: "Back to Gemini setup",
+  file: "Choose another file",
+  segments: "Back to the segments",
+};
 
 const RUNNERS: Partial<Record<WizardView["step"], Runner>> = {
   sampling: runSegmenting,
@@ -31,9 +40,10 @@ function railIndex(step: WizardView["step"]): number {
   }
   if (step === "pick_file") return 1;
   if (step === "sampling" || step === "proposing" || step === "segments") return 2;
-  if (step === "analyzing" || step === "preview_segment") return 3;
-  if (step === "ready_to_render" || step === "rendering") return 4;
-  return 5;
+  if (step === "analyzing" || step === "preview_segment" || step === "ready_to_render") {
+    return 3;
+  }
+  return 4;
 }
 
 type LiveWizardProps = {
@@ -89,11 +99,25 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     <>
       <p className="brand">Super Processor</p>
       <ol className="steps" aria-label="Progress">
-        {RAIL.map((label, index) => (
-          <li key={label} className={index === active ? "active" : undefined}>
-            {label}
-          </li>
-        ))}
+        {RAIL.map((label, index) => {
+          const target = NAV_TARGETS[index];
+          const reachable = target !== undefined && view.navigation?.[target] && !busy;
+          return (
+            <li key={label} className={index === active ? "active" : undefined}>
+              {reachable ? (
+                <button
+                  type="button"
+                  className="step-link"
+                  onClick={() => void send("goto", { to: target })}
+                >
+                  {label}
+                </button>
+              ) : (
+                label
+              )}
+            </li>
+          );
+        })}
       </ol>
       <div className="panel" aria-busy={busy}>
         <WizardStepView
@@ -102,6 +126,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           busy={busy}
           message={message}
           onSend={send}
+          onView={onView}
         />
         <div className="actions">
           <button type="button" className="secondary" onClick={onDisconnect}>
@@ -119,12 +144,14 @@ function WizardStepView({
   busy,
   message,
   onSend,
+  onView,
 }: {
   origin: string;
   view: WizardView;
   busy: boolean;
   message: string | null;
   onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onView: (view: WizardView) => void;
 }) {
   if (view.step === "intro") {
     return (
@@ -203,7 +230,16 @@ function WizardStepView({
   }
 
   if (view.step === "pick_file") {
-    return <PickStep busy={busy} message={message} onSend={onSend} />;
+    return (
+      <PickStep
+        origin={origin}
+        view={view}
+        busy={busy}
+        message={message}
+        onSend={onSend}
+        onView={onView}
+      />
+    );
   }
 
   if (view.step === "sampling" || view.step === "proposing") {
@@ -228,6 +264,7 @@ function WizardStepView({
         busy={busy}
         message={message}
         onSend={onSend}
+        view={view}
       />
     );
   }
@@ -257,6 +294,7 @@ function WizardStepView({
         busy={busy}
         message={message}
         onSend={onSend}
+        view={view}
       />
     );
   }
@@ -268,6 +306,7 @@ function WizardStepView({
         busy={busy}
         message={message}
         onSend={onSend}
+        view={view}
       />
     );
   }
@@ -357,6 +396,36 @@ function Busy({
   );
 }
 
+function Back({
+  view,
+  to,
+  busy,
+  onSend,
+}: {
+  view: WizardView;
+  to: (keyof Navigation)[];
+  busy: boolean;
+  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+}) {
+  const shown = to.filter((target) => view.navigation?.[target]);
+  if (!shown.length) return null;
+  return (
+    <div className="actions back">
+      {shown.map((target) => (
+        <button
+          key={target}
+          type="button"
+          className="link"
+          disabled={busy}
+          onClick={() => void onSend("goto", { to: target })}
+        >
+          ← {BACK_TEXT[target]}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function Alert({ text }: { text: string }) {
   return (
     <p className="error" role="alert">
@@ -436,19 +505,46 @@ function SetupStep({
 }
 
 function PickStep({
+  origin,
+  view,
   busy,
   message,
   onSend,
+  onView,
 }: {
+  origin: string;
+  view: WizardView;
   busy: boolean;
   message: string | null;
   onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onView: (view: WizardView) => void;
 }) {
   const [path, setPath] = useState("");
+  const [over, setOver] = useState(false);
+  const [upload, setUpload] = useState<{ name: string; pct: number } | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   function submit(event: FormEvent) {
     event.preventDefault();
     void onSend("pick", { path });
+  }
+
+  function send(file: File | undefined) {
+    if (!file) return;
+    setUploadError(null);
+    setUpload({ name: file.name, pct: 0 });
+    uploadVideo(origin, file, (pct) => setUpload({ name: file.name, pct }))
+      .then(onView)
+      .catch((error: unknown) => {
+        setUploadError(error instanceof Error ? error.message : "The upload failed.");
+      })
+      .finally(() => setUpload(null));
+  }
+
+  function drop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    setOver(false);
+    send(event.dataTransfer.files[0]);
   }
 
   return (
@@ -456,30 +552,66 @@ function PickStep({
       <h1>Pick a video file</h1>
       <p className="lede">
         Choose a video on this computer. Gemini splits it into segments, you
-        approve a short before/after preview of each, and then the whole video
-        is restored and upscaled on your GPU.
+        approve a short before/after preview of each, and then you choose
+        whether to upscale the whole video on your GPU.
       </p>
       <p className="muted">Up to 1080p and 30 minutes.</p>
       {message ? <Alert text={message} /> : null}
-      <form onSubmit={submit}>
-        <label htmlFor="video-path">
-          Absolute path to video
-          <input
-            id="video-path"
-            name="path"
-            type="text"
-            value={path}
-            autoComplete="off"
-            onChange={(event) => setPath(event.target.value)}
-            placeholder="/home/you/clip.mp4"
-          />
-        </label>
-        <div className="actions">
-          <button type="submit" disabled={busy}>
-            Find the segments
-          </button>
-        </div>
-      </form>
+      <div className="actions">
+        <button type="button" disabled={busy || upload !== null} onClick={() => void onSend("browse", {})}>
+          Choose a file…
+        </button>
+      </div>
+      <label
+        className={over ? "dropzone over" : "dropzone"}
+        onDragEnter={(event) => {
+          event.preventDefault();
+          setOver(true);
+        }}
+        onDragOver={(event) => event.preventDefault()}
+        onDragLeave={() => setOver(false)}
+        onDrop={drop}
+      >
+        <strong>…or drop a video here</strong>
+        <span className="muted">A dropped file is copied into the jobs folder on this computer.</span>
+        <input
+          type="file"
+          accept="video/*,.mkv,.mts,.ts"
+          hidden
+          disabled={busy || upload !== null}
+          onChange={(event) => send(event.target.files?.[0])}
+        />
+        {upload ? (
+          <span className="progress" role="status">
+            <progress max={100} value={upload.pct} aria-label={`Copying ${upload.name}`} />{" "}
+            {upload.pct}% · Copying {upload.name}
+          </span>
+        ) : null}
+      </label>
+      {uploadError ? <Alert text={uploadError} /> : null}
+      <details className="fallback">
+        <summary>Type a path instead</summary>
+        <form onSubmit={submit}>
+          <label htmlFor="video-path">
+            Absolute path to video
+            <input
+              id="video-path"
+              name="path"
+              type="text"
+              value={path}
+              autoComplete="off"
+              onChange={(event) => setPath(event.target.value)}
+              placeholder="/home/you/clip.mp4"
+            />
+          </label>
+          <div className="actions">
+            <button type="submit" className="secondary" disabled={busy}>
+              Use this path
+            </button>
+          </div>
+        </form>
+      </details>
+      <Back view={view} to={["setup", "segments"]} busy={busy} onSend={onSend} />
     </>
   );
 }
@@ -623,12 +755,14 @@ function SegmentsStep({
   busy,
   message,
   onSend,
+  view,
 }: {
   origin: string;
   list: SegmentList;
   busy: boolean;
   message: string | null;
   onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  view: WizardView;
 }) {
   const [note, setNote] = useState("");
   const count = list.segments.length;
@@ -711,6 +845,7 @@ function SegmentsStep({
           </button>
         </div>
       </form>
+      <Back view={view} to={["file"]} busy={busy} onSend={onSend} />
     </>
   );
 }
@@ -871,12 +1006,14 @@ function PreviewStep({
   busy,
   message,
   onSend,
+  view,
 }: {
   origin: string;
   preview: SegmentPreview;
   busy: boolean;
   message: string | null;
   onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  view: WizardView;
 }) {
   const [note, setNote] = useState("");
   const [resample, setResample] = useState(false);
@@ -937,7 +1074,39 @@ function PreviewStep({
           </button>
         </div>
       </form>
+      {preview.shot ? (
+        <UpscaleToggle shot={preview.shot} busy={busy} onSend={onSend} />
+      ) : null}
+      <Back view={view} to={["segments"]} busy={busy} onSend={onSend} />
     </>
+  );
+}
+
+function UpscaleToggle({
+  shot,
+  busy,
+  onSend,
+}: {
+  shot: LookShot;
+  busy: boolean;
+  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+}) {
+  const on = shot.use_upscale !== false;
+  const who = typeof shot.upscale_override === "boolean" ? "You" : "Gemini";
+  return (
+    <div className="actions">
+      <p className="muted">
+        {who} chose: this segment {on ? "uses FlashVSR" : "skips FlashVSR (plain resize)"}.
+      </p>
+      <button
+        type="button"
+        className="secondary"
+        disabled={busy}
+        onClick={() => void onSend("preview", { action: "upscale", on: on ? "0" : "1" })}
+      >
+        {on ? "Skip FlashVSR for this segment" : "Use FlashVSR for this segment"}
+      </button>
+    </div>
   );
 }
 
@@ -946,18 +1115,25 @@ function ReadyStep({
   busy,
   message,
   onSend,
+  view,
 }: {
   looks: Looks;
   busy: boolean;
   message: string | null;
   onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  view: WizardView;
 }) {
+  const scales = [...(looks.scales ?? [])].sort((a, b) => b - a);
+  const [scale, setScale] = useState<number | null>(
+    looks.scale !== null && scales.includes(looks.scale) ? looks.scale : (scales[0] ?? null),
+  );
+  const [width, height] = looks.source_size ?? [0, 0];
   return (
     <>
       <h1>Ready to render</h1>
       <p className="lede">
-        Every segment is approved. The whole video is now restored and upscaled
-        with these settings.
+        Every segment is approved. Choose whether to upscale, then render the
+        whole video with these settings.
       </p>
       {message ? <Alert text={message} /> : null}
       <ul className="summary">
@@ -972,15 +1148,50 @@ function ReadyStep({
           );
         })}
       </ul>
+      {scales.length ? (
+        <fieldset className="options">
+          <legend>Upscale</legend>
+          {scales.map((option) => {
+            const size = width && height ? ` · ${width * option}×${height * option}` : "";
+            return (
+              <label key={option} className="option">
+                <input
+                  type="radio"
+                  name="scale"
+                  value={option}
+                  checked={scale === option}
+                  onChange={() => setScale(option)}
+                />
+                <span>
+                  {option === 1 ? (
+                    <>
+                      <strong>Don&apos;t upscale</strong>
+                      {size} · clean-up and finishing only, no FlashVSR
+                    </>
+                  ) : (
+                    <>
+                      <strong>Upscale {option}×</strong>
+                      {size} · FlashVSR on the GPU
+                    </>
+                  )}
+                </span>
+              </label>
+            );
+          })}
+        </fieldset>
+      ) : null}
       <div className="actions">
         <button
           type="button"
           disabled={busy}
-          onClick={() => void onSend("ready", { action: "render" })}
+          onClick={() =>
+            void onSend("ready", scale === null ? { action: "render" } : { action: "render", scale: String(scale) })
+          }
         >
           Render the whole video
         </button>
       </div>
+      <Back view={view} to={["segments"]} busy={busy} onSend={onSend} />
     </>
   );
 }

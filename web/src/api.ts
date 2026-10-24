@@ -64,6 +64,7 @@ export type LookShot = {
   regions?: Region[];
   strength: number;
   use_upscale?: boolean;
+  upscale_override?: boolean | null;
   look: ShotLook;
   reason: string;
   check: ShotCheck;
@@ -76,7 +77,12 @@ export type Looks = {
   scale: number | null;
   error: string | null;
   shots: LookShot[];
+  // On the ready screen: 1 is "do not upscale".
+  scales?: number[];
+  source_size?: [number, number];
 };
+
+export type Navigation = { setup: boolean; file: boolean; segments: boolean };
 
 export type SegmentPreview = {
   index: number;
@@ -97,6 +103,7 @@ export type WizardView = {
   scale: number | null;
   strength: number | null;
   progress?: Progress | null;
+  navigation?: Navigation;
   segment_index?: number;
   segments?: SegmentList | null;
   segment_preview?: SegmentPreview | null;
@@ -200,6 +207,44 @@ export async function postAction(
     body: JSON.stringify(fields),
   });
   return readView(response);
+}
+
+export function uploadVideo(
+  origin: string,
+  file: File,
+  onProgress: (pct: number) => void,
+): Promise<WizardView> {
+  // fetch() cannot report upload progress, so this one uses XHR. The body is
+  // the file itself; the wizard streams it to disk and picks it.
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${origin}/api/upload`);
+    xhr.setRequestHeader("X-Wizard-Token", wizardToken);
+    xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.onload = () => {
+      let data: unknown = null;
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch {
+        // fall through to the status message
+      }
+      if (xhr.status === 200 && isWizardView(data)) {
+        resolve(remember(data));
+        return;
+      }
+      const error =
+        data && typeof data === "object" && "error" in data
+          ? String((data as { error: unknown }).error)
+          : `The upload failed (${xhr.status}).`;
+      reject(new Error(error));
+    };
+    xhr.onerror = () => reject(new Error("The upload failed."));
+    xhr.send(file);
+  });
 }
 
 const inFlight = new Map<string, Promise<WizardView>>();
