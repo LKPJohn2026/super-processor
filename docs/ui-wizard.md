@@ -127,12 +127,13 @@ frame count is refused and the previous `output.mp4` is kept.
 | LLM type | `GET/POST /llm` (state `llm_choice`) | A: no local LLM → Gemini; B: have local LLM → stub |
 | Local LLM stub | `GET/POST /local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
 | Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key |
-| Pick file | `GET/POST /pick` | Local video path (up to 1080p and 30 minutes) |
+| Pick file | `POST /browse` (`/api/browse`), `POST /upload` (`/api/upload`), `POST /pick` | "Choose a file…" opens the desktop's own file dialog on the wizard's machine (zenity through the XDG portal, then kdialog; `osascript` on macOS, PowerShell on Windows) and picks the real path. A file dropped on the page is uploaded: the body is the file, `X-File-Name` its name, `X-Wizard-Token` the token; it is streamed to `<jobs>/uploads/` (video extensions only, at most 32 GiB) and removed again if the pick refuses it. Typing a path is under "Type a path instead". Up to 1080p and 30 minutes |
+| Go back | `POST /goto` (`/api/goto`) with `to=setup`, `file`, or `segments` | Setup, File, and Segments in the step rail are links when they can be reached, and each of those screens has a back link. Nothing is deleted: going back to the segments keeps the approved segments and previews, and approving them again carries on at the same segment. `/api/state` returns `navigation` |
 | Finding segments | `GET /segment?run=1` (`/api/segment?run=1`) | States `sampling` then `proposing`: FFmpeg saves the still grid; Gemini proposes segments |
 | Segments | `POST /segments` (`/api/segments`) | `action=approve`, or `action=note` with `note` to propose again |
 | Analyzing | `GET /analyze?run=1` (`/api/analyze?run=1`) | The current segment only: Gemini proposes its settings, a short preview renders, Gemini checks it |
-| Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one |
-| Ready to render | `POST /ready` (`/api/ready`) | `action=render` starts the full render from every approved segment |
+| Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one; `action=upscale` with `on=0` or `on=1` overrides Gemini's FlashVSR choice for this segment, which later proposals keep |
+| Ready to render | `POST /ready` (`/api/ready`) | Choose the upscale: `scale=2`, `4` (when the source's long edge is 960 or less), or `1` ("Don't upscale": same size, clean-up and finishing only, no FlashVSR). `action=render` starts the full render from every approved segment |
 | Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, a note that retunes a time range, or a note with `restart=1` that starts over from the segments |
 | Done | `GET /` (state `done`) | Confirmation |
@@ -367,7 +368,7 @@ name in the URL.
 
 Server-rendered HTML in `wizard_pages.py` remains the live localhost wizard.
 Shared shell includes a step rail (Setup · File · Segments · Previews ·
-Upscale · Result),
+Result; upscaling is a choice on the ready screen, not a step),
 brand mark, and wait estimates. Intro is a single composition with Super
 Processor as the hero. The LLM choice screen uses lettered options matching the
 product sketch.

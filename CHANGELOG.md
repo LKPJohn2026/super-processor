@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Go back and forth between Setup, File, and Segments. Those steps in the rail
+  are links when they can be reached, and each screen has a back link
+  (`POST /goto`). Going back keeps the job: approving the same segments again
+  carries on at the segment you were on.
+- The file step opens the desktop's own file dialog ("Choose a file…",
+  through the XDG portal on Linux) and uses the real path, or takes a video
+  dropped on the page, which is streamed into `<jobs>/uploads/` and removed
+  again if it cannot be used. Typing a path moved under "Type a path
+  instead".
+- Upscaling is a choice on the ready screen: 2×, 4× when the source is small
+  enough, or "Don't upscale" (scale 1: same size, clean-up and finishing only,
+  no FlashVSR). Each segment preview can also turn FlashVSR on or off for
+  that segment; later Gemini proposals keep the editor's choice.
+
+### Changed
+
+- The step rail drops Upscale: Setup · File · Segments · Previews · Result.
+- A file that cannot be read says so in one line, naming the file, instead of
+  showing FFprobe's output.
+
 ## [3.4.0] - 2026-10-23
 
 ### Changed
