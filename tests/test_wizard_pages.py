@@ -35,13 +35,13 @@ def test_render_helpers_smoke() -> None:
     assert "happy" in render_result(output_url="/output.mp4").lower()
 
 
-def test_step_rail_has_no_split_or_enhance() -> None:
+def test_step_rail_has_no_split_enhance_or_upscale() -> None:
     page = render_rendering()
-    for label in ("Setup", "File", "Upscale", "Result"):
+    for label in ("Setup", "File", "Segments", "Previews", "Result"):
         assert f">{label}</span>" in page
-    assert ">Split<" not in page
-    assert ">Enhance<" not in page
-    assert '<span class="step active">Upscale</span>' in page
+    for gone in (">Split<", ">Enhance<", ">Upscale<"):
+        assert gone not in page
+    assert '<span class="step active" data-phase="result">Result</span>' in page
 
 
 def test_wizard_server_post_intro(tmp_path: Path) -> None:

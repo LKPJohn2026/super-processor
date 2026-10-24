@@ -37,7 +37,8 @@ def test_span_rejects_bad_scale_and_strength() -> None:
     with pytest.raises(UpscaleError):
         UpscaleSpan(0, 1, strength=1.2)
     with pytest.raises(UpscaleError):
-        UpscaleRequest(Path("a.mp4"), Path("b.mp4"), scale=1)
+        UpscaleRequest(Path("a.mp4"), Path("b.mp4"), scale=3)
+    assert UpscaleSpan(0, 1, scale=1).scale == 1
 
 
 def test_plan_roundtrip_and_chunks(tmp_path: Path) -> None:

@@ -52,7 +52,9 @@ FRAME_SLACK = 8
 # FlashVSR. FlashVSR can sharpen what is there but cannot move, reshape, or
 # recolour it.
 STRUCTURE_SIGMA = 1.5
-_SCALES = frozenset({2, 4})
+# 1 is "do not upscale": the clip keeps its size, goes through clean-up and
+# finishing, and never reaches FlashVSR (see :func:`restore_clip`).
+_SCALES = frozenset({1, 2, 4})
 # The upstream script is imported with a chdir into its folder, which is
 # process-wide. Only one FlashVSR load or inference may run at a time.
 _FLASHVSR_LOCK = threading.Lock()
@@ -456,11 +458,12 @@ def restore_clip(
 ) -> tuple[Path, float]:
     """The restored clip and the strength to blend it at.
 
-    Without FlashVSR the clip is only resized. Blended at strength 0 the
+    Without FlashVSR (``use_upscale`` off, or scale 1) the clip is only
+    resized, or at scale 1 only re-encoded. Blended at strength 0 the
     delivery encode keeps just its lanczos base with the look applied, so a
     pass-through span matches its neighbours' size and frame timing.
     """
-    if use_upscale:
+    if use_upscale and request.scale > 1:
         return engine.upscale(request), request.strength
     return plain_upscale(request, ffmpeg_bin=ffmpeg_bin), 0.0
 
@@ -1641,9 +1644,9 @@ def _run_ffmpeg(command: list[str]) -> None:
 
 def _require_scale(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise UpscaleError("scale must be 2 or 4")
+        raise UpscaleError("scale must be 1, 2, or 4")
     if value not in _SCALES:
-        raise UpscaleError("scale must be 2 or 4")
+        raise UpscaleError("scale must be 1, 2, or 4")
     return value
 
 

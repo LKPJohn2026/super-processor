@@ -121,12 +121,16 @@ class ShotRecipe:
     # Segment loop: where the preview window starts, picked once at random
     # so a redo shows the same seconds. ``None`` previews the middle.
     preview_start: float | None = None
+    # The editor's own FlashVSR choice for this segment; when set it wins
+    # over what Gemini proposes.
+    upscale_override: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "strength": self.strength,
             "use_upscale": self.use_upscale,
             "preview_start": self.preview_start,
+            "upscale_override": self.upscale_override,
             "look": self.look.to_dict(),
             "reason": self.reason,
             "check": self.check.to_dict(),
@@ -151,6 +155,11 @@ class ShotRecipe:
             shimmer=_optional_number(data.get("shimmer")),
             use_upscale=data.get("use_upscale") is not False,
             preview_start=_optional_number(data.get("preview_start")),
+            upscale_override=(
+                data["upscale_override"]
+                if isinstance(data.get("upscale_override"), bool)
+                else None
+            ),
         )
 
 
@@ -178,7 +187,8 @@ class ShotPlan:
         scale = data.get("scale")
         error = data.get("error")
         return cls(
-            scale=scale if scale in (2, 4) else 2,
+            # 1 is the editor's "do not upscale" from the ready screen.
+            scale=scale if scale in (1, 2, 4) else 2,
             recipes=[ShotRecipe.from_dict(item) for item in data["recipes"]],
             error=str(error) if error else None,
         )
@@ -373,9 +383,7 @@ def apply_proposals(
         if item is None:
             missing.append(index)
             fallback = fallback_recipe(shot)
-            recipes[index] = replace(
-                fallback, rev=recipes[index].rev, note=recipes[index].note
-            )
+            recipes[index] = keep_editor_choices(fallback, recipes[index])
             continue
         strength = _clamp(item.get("strength"), 0.0, 1.0, DEFAULT_STRENGTH)
         recipes[index] = replace(
@@ -383,7 +391,11 @@ def apply_proposals(
             strength=cap_strength(strength, shot),
             look=look_from_model(item.get("look")),
             reason=" ".join(str(item.get("reason", "")).split())[:240],
-            use_upscale=item.get("use_upscale") is not False,
+        )
+        # The editor's own FlashVSR choice for the segment wins.
+        recipes[index] = keep_editor_choices(
+            replace(recipes[index], use_upscale=item.get("use_upscale") is not False),
+            recipes[index],
         )
     error = plan.error
     if missing:
@@ -699,6 +711,36 @@ def request_redo(
     recipes[index] = replace(recipes[index], stale=True, note=text[:500])
     if resample:
         recipes[index] = replace(recipes[index], preview_start=None)
+    return ShotPlan(scale=plan.scale, recipes=recipes, error=None)
+
+
+def keep_editor_choices(fresh: ShotRecipe, old: ShotRecipe) -> ShotRecipe:
+    """``fresh`` with what the editor set on ``old`` kept.
+
+    That is the preview count and window, a pending note, and their own
+    FlashVSR choice.
+    """
+    use = (
+        old.upscale_override if old.upscale_override is not None else fresh.use_upscale
+    )
+    return replace(
+        fresh,
+        rev=old.rev,
+        note=old.note,
+        preview_start=old.preview_start,
+        upscale_override=old.upscale_override,
+        use_upscale=use,
+    )
+
+
+def set_upscale(plan: ShotPlan, index: int, on: bool) -> ShotPlan:
+    """Use FlashVSR on one segment or not, as the editor chose; redo its preview."""
+    if not 0 <= index < len(plan.recipes):
+        raise ShotPlanError("no such shot")
+    recipes = list(plan.recipes)
+    recipes[index] = replace(
+        recipes[index], use_upscale=on, upscale_override=on, stale=True, note=""
+    )
     return ShotPlan(scale=plan.scale, recipes=recipes, error=None)
 
 

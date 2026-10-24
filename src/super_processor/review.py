@@ -73,6 +73,10 @@ _TRUSTED_FETCH_SITES = frozenset({"same-origin", "none"})
 _REJECTED_ORIGIN_TOKENS = frozenset({"*", "null"})
 # Wizard POSTs only carry a key, a path, or a short note.
 MAX_BODY_BYTES = 256 * 1024
+# A dropped video is streamed to disk; 30 minutes of high-bitrate 1080p fits.
+MAX_UPLOAD_BYTES = 32 * 1024**3
+_UPLOAD_CHUNK = 1024 * 1024
+_UPLOAD_PATHS = frozenset({"/upload", "/api/upload"})
 # Every state-changing wizard request carries this run's token, as this
 # header or a ``token`` field. Pages the wizard serves embed it; another site
 # cannot read them, so it cannot forge the request even without Origin.
@@ -460,6 +464,8 @@ _API_POSTS = {
     "/api/setup": "/setup",
     "/api/pick": "/pick",
     "/api/new": "/new",
+    "/api/browse": "/browse",
+    "/api/goto": "/goto",
     "/api/segments": "/segments",
     "/api/preview": "/preview",
     "/api/ready": "/ready",
@@ -668,9 +674,61 @@ def _wizard_handler(
             self.send_header("Access-Control-Max-Age", "600")
             self.end_headers()
 
+        def _upload(self) -> None:
+            """Stream a dropped video to disk, then pick it.
+
+            The body is the file itself, so it skips the small-body limit
+            and gets its own cap; the token must come as a header.
+            """
+            if not token_matches(self.headers.get(TOKEN_HEADER), token):
+                self._json(
+                    {"error": "missing or wrong wizard token; reload the page"},
+                    status=403,
+                )
+                return
+            raw = (self.headers.get("Content-Length") or "").strip()
+            if not raw.isdigit() or int(raw) <= 0:
+                self._json({"error": "the upload needs a Content-Length"}, status=411)
+                return
+            length = int(raw)
+            if length > MAX_UPLOAD_BYTES:
+                self._json({"error": "the file is too large to upload"}, status=413)
+                return
+            if controller.busy():
+                self._json({"error": "the last step is still running"}, status=409)
+                return
+            name = unquote(self.headers.get("X-File-Name") or "")
+            try:
+                dest = controller.upload_target(name)
+            except WizardError as exc:
+                self._json({"error": str(exc)}, status=415)
+                return
+            left = length
+            try:
+                with dest.open("xb") as out:
+                    while left:
+                        chunk = self.rfile.read(min(_UPLOAD_CHUNK, left))
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        left -= len(chunk)
+            except OSError as exc:
+                dest.unlink(missing_ok=True)
+                self._json({"error": f"could not save the upload: {exc}"}, status=500)
+                return
+            if left:
+                dest.unlink(missing_ok=True)
+                self._json({"error": "the upload stopped before the end"}, status=400)
+                return
+            controller.pick_upload(dest, name)
+            self._json(self._view())
+
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
             if self._refused(path, state_changing=True):
+                return
+            if path in _UPLOAD_PATHS:
+                self._upload()
                 return
             try:
                 fields = self._read_fields()

@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .file_dialog import VIDEO_EXTENSIONS, FileDialogError, choose_video
 from .gemini import (
     ChatTurn,
     GeminiClient,
@@ -52,6 +53,7 @@ from .shot_plan import (
     fallback_recipe,
     finish,
     guard_shimmer,
+    keep_editor_choices,
     load_plan,
     locate_stills,
     locate_targets,
@@ -62,6 +64,7 @@ from .shot_plan import (
     render_previews,
     request_redo,
     save_plan,
+    set_upscale,
     shots_payload,
 )
 from .shots import (
@@ -100,6 +103,7 @@ from .wizard_pages import (
     render_sampling,
     render_segments,
     render_setup,
+    with_navigation,
 )
 
 WIZARD_STATE_FILE = "wizard_state.json"
@@ -297,8 +301,8 @@ def _fallback_plan(plan: ShotPlan, shots: ShotList, indexes: list[int]) -> ShotP
     """Recipes from the measurements, keeping each shot's preview count."""
     recipes = list(plan.recipes)
     for index in indexes:
-        recipes[index] = replace(
-            fallback_recipe(shots.shots[index]), rev=recipes[index].rev
+        recipes[index] = keep_editor_choices(
+            fallback_recipe(shots.shots[index]), recipes[index]
         )
     return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
 
@@ -516,6 +520,30 @@ class WizardController:
             save_job_wizard_state(self.store.job_dir(state.job_id), state)
 
     def render(self) -> str:
+        return with_navigation(self._render_page(), self.navigation())
+
+    def navigation(self) -> dict[str, bool]:
+        """Which of setup, file, and segments the editor can go to now."""
+        state = self._state()
+        if self.busy() or state.step in {
+            WizardStep.INTRO,
+            WizardStep.LLM_CHOICE,
+            WizardStep.LOCAL_LLM_STUB,
+        }:
+            return {"setup": False, "file": False, "segments": False}
+        segments = False
+        if state.job_id:
+            with contextlib.suppress(SegmentLoopError):
+                found = load_segment_list(self.store.job_dir(state.job_id))
+                segments = found is not None and bool(found.segments)
+        return {
+            "setup": state.step is not WizardStep.SETUP,
+            "file": state.step is not WizardStep.PICK_FILE
+            and resolve_gemini_api_key() is not None,
+            "segments": segments and state.step is not WizardStep.SEGMENTS,
+        }
+
+    def _render_page(self) -> str:
         state = self._state()
         if state.step is WizardStep.INTRO:
             return render_intro()
@@ -553,7 +581,8 @@ class WizardController:
         if state.step is WizardStep.READY_TO_RENDER:
             assert state.job_id
             return render_ready(
-                self._looks_view(self.store.job_dir(state.job_id)), error=state.error
+                self._ready_view(self.store.job_dir(state.job_id), state.job_id),
+                error=state.error,
             )
         if state.step is WizardStep.RENDERING:
             return render_rendering(state.progress)
@@ -594,7 +623,7 @@ class WizardController:
                 seams, seam_error = report["seams"], report["error"]
         looks: dict[str, Any] | None = None
         if state.job_id and state.step is WizardStep.READY_TO_RENDER:
-            looks = self._looks_view(self.store.job_dir(state.job_id))
+            looks = self._ready_view(self.store.job_dir(state.job_id), state.job_id)
         segments: dict[str, Any] | None = None
         if state.job_id and state.step is WizardStep.SEGMENTS:
             segments = self._segments_view(self.store.job_dir(state.job_id))
@@ -609,6 +638,7 @@ class WizardController:
             "error": state.error,
             # A worker that died mid-run leaves its last progress behind.
             "progress": state.progress if self.busy() else None,
+            "navigation": self.navigation(),
             "segment_index": state.segment_index,
             "job_id": state.job_id,
             "has_gemini_key": resolve_gemini_api_key() is not None,
@@ -667,6 +697,12 @@ class WizardController:
         if path == "/pick":
             self._pick_file(state, fields.get("path", [""])[0])
             return
+        if path == "/browse":
+            self._browse(state)
+            return
+        if path == "/goto":
+            self._goto(state, fields.get("to", [""])[0])
+            return
         if path == "/new":
             self.start_new_job()
             return
@@ -717,7 +753,60 @@ class WizardController:
         )
         self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
 
-    def _pick_file(self, state: WizardState, raw_path: str) -> None:
+    def _goto(self, state: WizardState, target: str) -> None:
+        """Go back (or forward again) to setup, the file pick, or the segments.
+
+        Nothing is deleted: the job stays, and approving the same segments
+        again carries on from the segment the editor was on.
+        """
+        if not self.navigation().get(target):
+            state.error = f"you cannot go to {target or 'that step'} from here"
+        elif target == "setup":
+            state.step = WizardStep.SETUP
+        elif target == "file":
+            state.step = WizardStep.PICK_FILE
+        else:
+            state.step = WizardStep.SEGMENTS
+        self._save(state)
+
+    def _browse(self, state: WizardState) -> None:
+        """Pick the file the editor chooses in the system file dialog."""
+        try:
+            chosen = choose_video()
+        except FileDialogError as exc:
+            state.error = str(exc)
+            state.step = WizardStep.PICK_FILE
+            self._save(state)
+            return
+        if chosen is None:
+            state.step = WizardStep.PICK_FILE
+            self._save(state)
+            return
+        self._pick_file(state, str(chosen))
+
+    def upload_target(self, name: str) -> Path:
+        """Where an uploaded video is kept; refuses names that are not videos."""
+        base = Path(name.replace("\\", "/")).name.strip()
+        if Path(base).suffix.lower() not in VIDEO_EXTENSIONS:
+            raise WizardError(
+                "only video files can be uploaded (" + ", ".join(VIDEO_EXTENSIONS) + ")"
+            )
+        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in base)[-120:]
+        folder = self.jobs_dir / "uploads"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / f"{uuid.uuid4().hex[:12]}-{safe}"
+
+    def pick_upload(self, path: Path, name: str) -> None:
+        """Pick an uploaded file; it is removed again when the pick refuses it."""
+        state = self._state()
+        state.error = None
+        self._pick_file(state, str(path), shown_name=Path(name).name)
+        if self._state().step is not WizardStep.SAMPLING:
+            path.unlink(missing_ok=True)
+
+    def _pick_file(
+        self, state: WizardState, raw_path: str, *, shown_name: str | None = None
+    ) -> None:
         source = Path(raw_path.strip()).expanduser()
         if not source.is_file():
             state.error = f"file not found: {source}"
@@ -734,7 +823,18 @@ class WizardController:
                 return
             manifest = self.store.create(source)
             self.store.transition(manifest.job_id, JobState.PROBED)
-        except (JobError, ProbeError) as exc:
+        except ProbeError:
+            # FFprobe's own text names demuxers and internal paths; say what
+            # the editor can act on.
+            name = shown_name or source.name
+            state.error = (
+                f"{name} could not be read as a video; it may be damaged, "
+                "not a video, or still being copied"
+            )
+            state.step = WizardStep.PICK_FILE
+            self._save(state)
+            return
+        except JobError as exc:
             state.error = str(exc)
             state.step = WizardStep.PICK_FILE
             self._save(state)
@@ -952,6 +1052,7 @@ class WizardController:
                     "check": recipe.check.to_dict(),
                     "shimmer": recipe.shimmer,
                     "use_upscale": recipe.use_upscale,
+                    "upscale_override": recipe.upscale_override,
                     "before_url": before if recipe.rev else None,
                     "after_url": after if recipe.rev else None,
                 }
@@ -1195,6 +1296,10 @@ class WizardController:
                     if state.segment_index >= len(plan.recipes)
                     else WizardStep.ANALYZING
                 )
+            elif action == "upscale":
+                on = fields.get("on", [""])[0] == "1"
+                save_plan(job_dir, set_upscale(plan, state.segment_index, on))
+                state.step = WizardStep.ANALYZING
             elif action == "redo":
                 save_plan(
                     job_dir,
@@ -1225,12 +1330,39 @@ class WizardController:
             state.error = "send action=render to start the full render"
             self._save(state)
             return
+        raw = fields.get("scale", [""])[0]
+        if raw:
+            if not raw.isdigit() or int(raw) not in self._scale_options(state.job_id):
+                state.error = "pick one of the upscale options shown"
+                self._save(state)
+                return
+            plan.scale = int(raw)
+            save_plan(job_dir, plan)
         try:
             save_upscale_plan(job_dir, plan.to_upscale_plan(shots))
             state.step = WizardStep.RENDERING
         except ShotPlanError as exc:
             state.error = str(exc)
         self._save(state)
+
+    def _source_size(self, job_id: str) -> tuple[int, int]:
+        source = Path(self.store.load(job_id).source_path)
+        try:
+            video = probe_file(source).primary_video()
+        except ProbeError:
+            return 0, 0
+        return ((video.width or 0), (video.height or 0)) if video else (0, 0)
+
+    def _scale_options(self, job_id: str) -> tuple[int, ...]:
+        """1 (do not upscale) and the scales this source allows."""
+        return (1, *allowed_scales(*self._source_size(job_id)))
+
+    def _ready_view(self, job_dir: Path, job_id: str) -> dict[str, Any]:
+        view = self._looks_view(job_dir)
+        width, height = self._source_size(job_id)
+        view["source_size"] = [width, height]
+        view["scales"] = list(self._scale_options(job_id))
+        return view
 
     def _result_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
         mood = fields.get("mood", [""])[0]

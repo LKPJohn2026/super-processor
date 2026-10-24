@@ -2,21 +2,64 @@
 
 from __future__ import annotations
 
+import re
 from html import escape
 
-# Phase keys for the step rail (setup → result).
-_PHASE_ORDER = ("setup", "file", "segments", "previews", "upscale", "result")
+# Phase keys for the step rail (setup → result). Upscaling is a choice on the
+# ready screen, not a step of its own.
+_PHASE_ORDER = ("setup", "file", "segments", "previews", "result")
+_LABELS = {
+    "setup": "Setup",
+    "file": "File",
+    "segments": "Segments",
+    "previews": "Previews",
+    "result": "Result",
+}
+# The steps the editor can go back (or forward) to; see :func:`with_navigation`.
+NAV_TARGETS = ("setup", "file", "segments")
+_RAIL_STEP = re.compile(
+    r'<span class="(step [a-z]+)" data-phase="(setup|file|segments)">([^<]*)</span>'
+)
+_BACK_SLOT = re.compile(r"<!--back:(setup|file|segments)-->")
+_BACK_TEXT = {
+    "setup": "Back to Gemini setup",
+    "file": "Choose another file",
+    "segments": "Back to the segments",
+}
+
+
+def _goto_form(target: str, content: str, cls: str) -> str:
+    return (
+        f'<form method="post" action="/goto" class="goto">'
+        f'<input type="hidden" name="to" value="{target}">'
+        f'<button type="submit" class="{cls}">{content}</button></form>'
+    )
+
+
+def with_navigation(page: str, allowed: dict[str, bool]) -> str:
+    """Make the rail's setup, file, and segments steps links where allowed.
+
+    Pages mark a back link with ``<!--back:file-->``; it becomes a button when
+    that step can be reached and disappears when it cannot.
+    """
+
+    def rail(match: re.Match[str]) -> str:
+        cls, target, label = match.groups()
+        if not allowed.get(target):
+            return match.group(0)
+        return _goto_form(target, label, f"{cls} step-link")
+
+    def back(match: re.Match[str]) -> str:
+        target = match.group(1)
+        if not allowed.get(target):
+            return ""
+        return _goto_form(target, f"← {_BACK_TEXT[target]}", "link")
+
+    return _BACK_SLOT.sub(back, _RAIL_STEP.sub(rail, page))
 
 
 def _step_rail(active: str | None) -> str:
-    labels = {
-        "setup": "Setup",
-        "file": "File",
-        "segments": "Segments",
-        "previews": "Previews",
-        "upscale": "Upscale",
-        "result": "Result",
-    }
+    labels = _LABELS
     active_idx = _PHASE_ORDER.index(active) if active in _PHASE_ORDER else -1
     items: list[str] = []
     for index, key in enumerate(_PHASE_ORDER):
@@ -27,7 +70,7 @@ def _step_rail(active: str | None) -> str:
             cls = "step active"
         else:
             cls = "step upcoming"
-        items.append(f'<span class="{cls}">{escape(label)}</span>')
+        items.append(f'<span class="{cls}" data-phase="{key}">{escape(label)}</span>')
     return '<nav class="steps" aria-label="Progress">' + "".join(items) + "</nav>"
 
 
@@ -202,6 +245,56 @@ form + form {{ margin-top: 1.25rem; }}
 }}
 .step {{ color: rgba(243, 238, 228, 0.45); }}
 .step.done {{ color: rgba(243, 238, 228, 0.75); }}
+.steps form.goto {{ display: inline; margin: 0; }}
+button.step-link, button.link {{
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}}
+button.step-link {{
+  color: rgba(243, 238, 228, 0.8);
+  text-decoration: underline dotted;
+}}
+button.step-link:hover, button.step-link:focus-visible {{ color: var(--sand); }}
+button.link {{ color: var(--leaf); text-decoration: underline; font-size: 0.92rem; }}
+form.goto + form.goto {{ margin-top: 0; }}
+.back {{ margin-top: 1.25rem; }}
+.dropzone {{
+  display: block;
+  margin: 1rem 0;
+  padding: 1.6rem 1rem;
+  text-align: center;
+  border: 2px dashed var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}}
+.dropzone.over {{ border-color: var(--leaf); background: rgba(47, 61, 40, 0.06); }}
+.dropzone strong {{ display: block; margin-bottom: 0.25rem; }}
+.dropzone progress {{ width: 100%; margin-top: 0.75rem; }}
+details.fallback {{ margin-top: 1rem; }}
+details.fallback summary {{ cursor: pointer; color: var(--muted); }}
+fieldset.options {{ border: 0; padding: 0; margin: 1rem 0; }}
+fieldset.options legend {{ font-weight: 600; margin-bottom: 0.4rem; }}
+label.option {{
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0.6rem 0.8rem;
+  margin: 0.4rem 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+}}
+label.option:has(input:checked) {{
+  border-color: var(--leaf);
+  background: rgba(47, 61, 40, 0.06);
+}}
 .step.active {{
   color: var(--sand);
   font-weight: 600;
@@ -427,21 +520,84 @@ placeholder="AIza…">
     return _page("Gemini setup", body, phase="setup")
 
 
+# Drag and drop (or the browser's file input) uploads the video to the
+# wizard, which keeps it under the jobs folder and picks it. The token comes
+# from any form on the page; the wizard put it there.
+_UPLOAD_SCRIPT = """
+(() => {
+  const zone = document.getElementById("dropzone");
+  const input = document.getElementById("file-input");
+  const bar = document.getElementById("upload-progress");
+  const status = document.getElementById("upload-status");
+  const token = (document.querySelector('input[name="token"]') || {}).value || "";
+  function send(file) {
+    if (!file) return;
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/upload");
+    xhr.setRequestHeader("X-Wizard-Token", token);
+    xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    bar.hidden = false;
+    status.textContent = "Copying " + file.name + "…";
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) bar.value = Math.round((e.loaded / e.total) * 100);
+    };
+    xhr.onload = () => {
+      if (xhr.status === 200) { window.location.href = "/"; return; }
+      let message = "The upload failed (" + xhr.status + ").";
+      try { message = JSON.parse(xhr.responseText).error || message; } catch (e) {}
+      bar.hidden = true;
+      status.textContent = message;
+    };
+    xhr.onerror = () => {
+      bar.hidden = true;
+      status.textContent = "The upload failed.";
+    };
+    xhr.send(file);
+  }
+  input.addEventListener("change", () => send(input.files[0]));
+  ["dragenter", "dragover"].forEach((name) => zone.addEventListener(name, (e) => {
+    e.preventDefault(); zone.classList.add("over");
+  }));
+  ["dragleave", "drop"].forEach((name) => zone.addEventListener(name, (e) => {
+    e.preventDefault(); zone.classList.remove("over");
+  }));
+  zone.addEventListener("drop", (e) => send(e.dataTransfer.files[0]));
+})();
+"""
+
+
 def render_pick(*, error: str | None = None) -> str:
     err = f'<p class="error">{escape(error)}</p>' if error else ""
     body = f"""
 <h1>Pick a video file</h1>
 <p class="lede">Choose a video on this computer. Gemini splits it into
-segments, you approve a short before/after preview of each, and then the whole
-video is restored and upscaled on your GPU.</p>
+segments, you approve a short before/after preview of each, and then you choose
+whether to upscale the whole video on your GPU.</p>
 <p class="muted">Up to 1080p and 30 minutes.</p>
 {err}
+<form method="post" action="/browse">
+<button type="submit" class="full">Choose a file…</button>
+</form>
+<label class="dropzone" id="dropzone">
+<strong>…or drop a video here</strong>
+<span class="muted">A dropped file is copied into the jobs folder on this
+computer.</span>
+<input type="file" id="file-input" accept="video/*,.mkv,.mts,.ts" hidden>
+<progress id="upload-progress" max="100" value="0" hidden></progress>
+<span id="upload-status" class="muted" role="status"></span>
+</label>
+<details class="fallback">
+<summary>Type a path instead</summary>
 <form method="post" action="/pick">
 <label>Absolute path to video
 <input name="path" type="text" placeholder="/home/you/clip.mp4">
 </label>
-<button type="submit" class="full">Pick a video file</button>
+<button type="submit" class="secondary">Use this path</button>
 </form>
+</details>
+<div class="back"><!--back:setup--> <!--back:segments--></div>
+<script>{_UPLOAD_SCRIPT}</script>
 """
     return _page("Pick a video", body, phase="file")
 
@@ -688,6 +844,7 @@ def render_segments(view: dict[str, object], *, error: str | None = None) -> str
 </label>
 <button type="submit" class="secondary">Propose again</button>
 </form>
+<div class="back"><!--back:file--></div>
 """
     return _page("Segments", body, phase="segments")
 
@@ -721,8 +878,26 @@ or tell me what to change.</p>
 <input type="hidden" name="action" value="approve">
 <button type="submit" class="full">{approve}</button>
 </form>
+{_upscale_toggle(shot)}
+<div class="back"><!--back:segments--></div>
 """
     return _page("Segment preview", body, phase="previews")
+
+
+def _upscale_toggle(shot: object) -> str:
+    """Let the editor turn FlashVSR on or off for this segment."""
+    if not isinstance(shot, dict):
+        return ""
+    on = shot.get("use_upscale") is not False
+    who = "You" if isinstance(shot.get("upscale_override"), bool) else "Gemini"
+    state = "uses FlashVSR" if on else "skips FlashVSR (plain resize)"
+    label = "Skip FlashVSR for this segment" if on else "Use FlashVSR for this segment"
+    return f"""<form method="post" action="/preview">
+<p class="tags muted">{who} chose: this segment {state}.</p>
+<input type="hidden" name="action" value="upscale">
+<input type="hidden" name="on" value="{0 if on else 1}">
+<button type="submit" class="secondary">{label}</button>
+</form>"""
 
 
 def render_ready(view: dict[str, object], *, error: str | None = None) -> str:
@@ -745,16 +920,52 @@ def render_ready(view: dict[str, object], *, error: str | None = None) -> str:
         )
     body = f"""
 <h1>Ready to render</h1>
-<p class="lede">Every segment is approved. The whole video is now restored
-and upscaled with these settings.</p>
+<p class="lede">Every segment is approved. Choose whether to upscale, then
+render the whole video with these settings.</p>
 {err}
 <ul class="summary">{"".join(rows)}</ul>
 <form method="post" action="/ready">
 <input type="hidden" name="action" value="render">
+{_scale_options(view)}
 <button type="submit" class="full">Render the whole video</button>
 </form>
+<div class="back"><!--back:segments--></div>
 """
-    return _page("Ready to render", body, phase="upscale")
+    return _page("Ready to render", body, phase="previews")
+
+
+def _scale_options(view: dict[str, object]) -> str:
+    """Upscale 2× or 4× (when allowed), or keep the size."""
+    scales = [s for s in _items(view, "scales") if isinstance(s, int)]
+    if not scales:
+        return ""
+    size = view.get("source_size")
+    width, height = (
+        (int(size[0]), int(size[1]))
+        if isinstance(size, list) and len(size) == 2
+        else (0, 0)
+    )
+    chosen = view.get("scale") if view.get("scale") in scales else scales[-1]
+    rows = []
+    for scale in sorted(scales, reverse=True):
+        out = f" · {width * scale}×{height * scale}" if width and height else ""
+        if scale == 1:
+            text = (
+                f"<strong>Don't upscale</strong>{out} · clean-up and finishing "
+                "only, no FlashVSR"
+            )
+        else:
+            text = f"<strong>Upscale {scale}×</strong>{out} · FlashVSR on the GPU"
+        checked = " checked" if scale == chosen else ""
+        rows.append(
+            f'<label class="option"><input type="radio" name="scale" '
+            f'value="{scale}"{checked}> <span>{text}</span></label>'
+        )
+    return (
+        '<fieldset class="options"><legend>Upscale</legend>'
+        + "".join(rows)
+        + "</fieldset>"
+    )
 
 
 def _shimmer_text(value: object) -> str:
@@ -819,7 +1030,7 @@ def render_rendering(progress: object = None) -> str:
         "Restoring and upscaling on the local GPU. FFmpeg only trims, splices, "
         "and copies audio. A short clip finishes sooner than a longer one.",
         "/render?run=1",
-        "upscale",
+        "result",
         progress,
     )
 
