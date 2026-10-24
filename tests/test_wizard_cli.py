@@ -48,8 +48,9 @@ def test_store_gemini_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     import os
 
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    store_gemini_api_key("abc123")
+    path = store_gemini_api_key("abc123")
     assert os.environ["GEMINI_API_KEY"] == "abc123"
+    assert path.is_file()
 
 
 def test_run_review_starts_wizard(

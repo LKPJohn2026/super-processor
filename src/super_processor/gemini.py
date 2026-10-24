@@ -19,6 +19,7 @@ import base64
 import contextlib
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -30,6 +31,9 @@ from typing import Any, Protocol
 from .models import resolve_secret
 
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+CONFIG_DIR_ENV = "SUPER_PROCESSOR_CONFIG_DIR"
+CREDENTIALS_FILE = "credentials.json"
+_CREDENTIALS_KEY = "gemini_api_key"
 GEMINI_MODEL_ENV = "SUPER_PROCESSOR_GEMINI_MODEL"
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 CHAT_FILE_NAME = "gemini_chat.json"
@@ -474,31 +478,93 @@ class ChatTurn:
         )
 
 
+def config_dir() -> Path:
+    """Where Super Processor keeps per-user settings, such as the Gemini key.
+
+    ``SUPER_PROCESSOR_CONFIG_DIR`` overrides it (tests use this). Otherwise
+    the platform's usual place: ``$XDG_CONFIG_HOME`` or ``~/.config`` on
+    Linux, ``~/Library/Application Support`` on macOS, ``%APPDATA%`` on
+    Windows.
+    """
+    override = os.environ.get(CONFIG_DIR_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+        base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "super-processor"
+
+
+def credentials_path() -> Path:
+    return config_dir() / CREDENTIALS_FILE
+
+
+def _stored_gemini_api_key() -> str | None:
+    """The key saved by the setup screen, or ``None`` if there is none."""
+    try:
+        data = json.loads(credentials_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    key = data.get(_CREDENTIALS_KEY) if isinstance(data, dict) else None
+    if not isinstance(key, str) or not key.strip():
+        return None
+    return key.strip()
+
+
+def gemini_api_key_source() -> str | None:
+    """Where the key in use comes from, for the setup screen; ``None`` if none."""
+    if os.environ.get(GEMINI_API_KEY_ENV):
+        return f"the {GEMINI_API_KEY_ENV} environment variable"
+    if _stored_gemini_api_key():
+        return str(credentials_path())
+    if resolve_secret(GEMINI_API_KEY_ENV):
+        return "the system keyring (saved by an older version)"
+    return None
+
+
 def resolve_gemini_api_key() -> str | None:
-    """Resolve the Gemini API key from env or keyring."""
-    return resolve_secret(GEMINI_API_KEY_ENV)
+    """The Gemini API key: the environment, then the saved file, then the keyring.
+
+    The environment wins so a key set for one run is used for that run. The
+    keyring is only read, for keys saved by versions before the file.
+    """
+    return (
+        os.environ.get(GEMINI_API_KEY_ENV)
+        or _stored_gemini_api_key()
+        or resolve_secret(GEMINI_API_KEY_ENV)
+    )
 
 
-def store_gemini_api_key(api_key: str) -> None:
-    """Persist the key in the process env and optional OS keyring.
+def store_gemini_api_key(api_key: str) -> Path:
+    """Save the key where later runs find it, and use it in this process.
 
-    Env is always set so headless CI (no Secret Service / keyring backend)
-    still works. Keyring persistence is best-effort.
+    It goes to :func:`credentials_path`, readable only by the user (0600,
+    in a 0700 folder), written to a temporary file and moved into place so
+    a crash never leaves half a key. Returns the file's path.
     """
     cleaned = api_key.strip()
     if not cleaned:
         raise GeminiError("API key is empty")
+    path = credentials_path()
+    payload = json.dumps({_CREDENTIALS_KEY: cleaned}, indent=2) + "\n"
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp, path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise GeminiError(f"could not save the API key to {path}: {exc}") from exc
     os.environ[GEMINI_API_KEY_ENV] = cleaned
-    try:
-        import keyring
-        from keyring.errors import KeyringError
-    except ImportError:
-        return
-    try:
-        keyring.set_password("super-processor", GEMINI_API_KEY_ENV, cleaned)
-    except KeyringError:
-        # e.g. keyring.backends.fail.Keyring on Ubuntu runners.
-        return
+    return path
 
 
 def load_chat(job_dir: Path) -> list[ChatTurn]:

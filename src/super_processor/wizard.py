@@ -20,6 +20,7 @@ from .gemini import (
     GeminiClient,
     GeminiError,
     append_chat_turn,
+    gemini_api_key_source,
     resolve_gemini_api_key,
     store_gemini_api_key,
 )
@@ -553,7 +554,9 @@ class WizardController:
             return render_local_llm_stub()
         if state.step is WizardStep.SETUP:
             return render_setup(
-                has_key=bool(resolve_gemini_api_key()), error=state.error
+                has_key=bool(resolve_gemini_api_key()),
+                error=state.error,
+                key_source=gemini_api_key_source(),
             )
         if state.step is WizardStep.PICK_FILE:
             return render_pick(error=state.error)

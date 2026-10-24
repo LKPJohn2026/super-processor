@@ -483,12 +483,15 @@ for the full setup checklist.</p>
     return _page("Local LLM", body, phase="setup")
 
 
-def render_setup(*, has_key: bool, error: str | None = None) -> str:
-    status = (
-        "A Gemini API key is already configured on this machine."
-        if has_key
-        else "Follow these steps, then paste your key below."
-    )
+def render_setup(
+    *, has_key: bool, error: str | None = None, key_source: str | None = None
+) -> str:
+    if has_key and key_source:
+        status = f"A Gemini API key is saved: it comes from {key_source}."
+    elif has_key:
+        status = "A Gemini API key is already configured on this machine."
+    else:
+        status = "Follow these steps, then paste your key below."
     err = f'<p class="error">{escape(error)}</p>' if error else ""
     body = f"""
 <h1>Gemini API setup</h1>
@@ -507,6 +510,8 @@ rel="noreferrer">Google AI Studio</a></li>
 <input name="api_key" type="password" autocomplete="off"
 placeholder="AIza…">
 </label>
+<p class="muted">The key is saved in a file on this computer that only your
+user can read, and used on every later run. Pasting a new key replaces it.</p>
 <button type="submit">Save and continue</button>
 </form>
 """
