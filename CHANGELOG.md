@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Gemini key pasted on the setup screen is saved to `credentials.json` in
+  the user's config folder (`~/.config/super-processor` on Linux,
+  `~/Library/Application Support/super-processor` on macOS,
+  `%APPDATA%\super-processor` on Windows; `SUPER_PROCESSOR_CONFIG_DIR`
+  overrides it), readable only by the user, and used on every later run. It
+  used to live in the server process and, best-effort, the OS keyring, so a
+  restart could lose it. `GEMINI_API_KEY` still wins; an old keyring entry is
+  read last and never written. The setup screen says where the key in use
+  comes from, and a key that cannot be saved is an error instead of silently
+  lasting only until the next restart.
+
+### Fixed
+
+- Tests no longer touch the real keyring or config folder. A test that saved
+  a key used to overwrite the user's keyring entry with `abc123`.
+
 ## [3.5.0] - 2026-10-23
 
 ### Added

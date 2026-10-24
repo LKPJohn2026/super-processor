@@ -142,8 +142,12 @@ never receives a video file.
 ### Gemini-only planning for the wizard
 
 The wizard uses a Google AI Studio (Gemini) API key. Local Ollama/LM Studio and
-other BYOK providers are deferred. Credentials come from the environment or OS
-keyring (`GEMINI_API_KEY`).
+other BYOK providers are deferred. The key pasted on the setup screen is saved
+to `credentials.json` in the user's config folder (`$XDG_CONFIG_HOME` or
+`~/.config/super-processor` on Linux, `~/Library/Application Support` on macOS,
+`%APPDATA%` on Windows; `SUPER_PROCESSOR_CONFIG_DIR` overrides it), readable
+only by the user. The `GEMINI_API_KEY` environment variable wins over the file;
+a key an older version left in the OS keyring is still read, last.
 
 The durable product value remains the validated processing control plane, not
 dependence on one vendor. Additional providers can return later behind the same
