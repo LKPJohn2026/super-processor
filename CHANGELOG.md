@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- FlashVSR no longer crops the picture. Its loader centre-crops the upscaled
+  frame to whole 128-pixel blocks, so an 854x480 clip at 2x came back as the
+  middle 1664x896 of 1708x960, and the delivery blend laid that over the full
+  frame squeezed to the same size, out of line toward the edges. Each clip is
+  now padded with its own edge pixels to whole blocks before FlashVSR and
+  cropped back after, so the output is exactly the source times the scale and
+  lines up with it (SSIM against the source 0.97, was 0.87, on a trailer
+  clip).
+
 ## [3.5.1] - 2026-10-24
 
 ### Changed
