@@ -639,6 +639,93 @@ def _release_gpu(pipe: Any | None = None) -> None:
         ipc()
 
 
+# FlashVSR works on whole 128-pixel blocks of the upscaled picture, and its
+# input loader centre-crops anything past the last whole block.
+FLASHVSR_BLOCK = 128
+
+
+def flashvsr_padding(width: int, height: int, scale: int) -> tuple[int, int, int, int]:
+    """Edge padding (left, top, right, bottom) so FlashVSR crops nothing.
+
+    Without it, 854x480 at 2x would come back as the middle 1664x896 of
+    1708x960: smaller than promised, and out of line with the full-frame
+    base it is blended over. Padded to a multiple of ``128 / scale``, the
+    upscaled clip is whole blocks; the padding is cropped off afterwards.
+    Offsets stay even so 4:2:0 chroma lines up.
+    """
+    step = FLASHVSR_BLOCK // scale
+    padded_w = -(-width // step) * step
+    padded_h = -(-height // step) * step
+    left = (padded_w - width) // 4 * 2
+    top = (padded_h - height) // 4 * 2
+    return left, top, padded_w - width - left, padded_h - height - top
+
+
+def _pad_for_flashvsr(source: Path, pad: tuple[int, int, int, int]) -> Path:
+    """``source`` with its edge pixels repeated into the padding, losslessly."""
+    left, top, right, bottom = pad
+    padded = source.with_name(source.stem + ".pad.mp4")
+    _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-vf",
+            f"pad=iw+{left + right}:ih+{top + bottom}:{left}:{top},"
+            f"fillborders=left={left}:right={right}:top={top}:bottom={bottom}"
+            ":mode=smear",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-qp",
+            "0",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            str(padded),
+        ]
+    )
+    return padded
+
+
+def _crop_after_flashvsr(
+    output: Path, pad: tuple[int, int, int, int], size: tuple[int, int], scale: int
+) -> None:
+    """Cut the scaled padding off FlashVSR's output, in place, losslessly."""
+    left, top, _right, _bottom = pad
+    width, height = size
+    cropped = output.with_name(output.stem + ".crop.mp4")
+    _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(output),
+            "-vf",
+            f"crop={width * scale}:{height * scale}:{left * scale}:{top * scale}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-qp",
+            "0",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            str(cropped),
+        ]
+    )
+    cropped.replace(output)
+
+
 def _infer_loaded(
     module: Any,
     pipe: Any,
@@ -647,9 +734,17 @@ def _infer_loaded(
     *,
     scale: int,
 ) -> None:
-    """Run one already-loaded pipeline on a short clip."""
+    """Run one already-loaded pipeline on a short clip.
+
+    The clip is padded first so FlashVSR keeps every pixel, and the output
+    is cropped back to exactly ``scale`` times the clip (see
+    :func:`flashvsr_padding`).
+    """
+    size = _frame_size(source)
+    pad = flashvsr_padding(*size, scale) if size else (0, 0, 0, 0)
+    reads = _pad_for_flashvsr(source, pad) if any(pad) else source
     low, height, width, frames, fps = module.prepare_input_tensor(
-        str(source),
+        str(reads),
         scale=float(scale),
         dtype=module.torch.bfloat16,
         device="cuda",
@@ -678,6 +773,9 @@ def _infer_loaded(
     empty = getattr(getattr(module.torch, "cuda", None), "empty_cache", None)
     if empty is not None:
         empty()
+    if size and any(pad):
+        _crop_after_flashvsr(output, pad, size, scale)
+        reads.unlink(missing_ok=True)
     conform_frames(output, source)
 
 

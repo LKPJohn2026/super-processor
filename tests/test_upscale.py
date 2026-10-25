@@ -723,3 +723,103 @@ def test_chunked_flashvsr_reports_each_chunk(
     count = len(planned_chunks(12.0, scale=2, strength=0.5))
     assert count > 1
     assert seen == pytest.approx([(i + 1) / count for i in range(count)])
+
+
+# Like the real loader: upscale, then centre-crop to whole 128-pixel blocks.
+_CROPPING_INFER = _FAKE_INFER.replace(
+    '"-vf", f"scale=iw*{scale}:ih*{scale},setpts=N/({rate})/TB",',
+    '"-vf", f"scale=iw*{scale}:ih*{scale},crop=trunc(iw/128)*128:'
+    'trunc(ih/128)*128,setpts=N/({rate})/TB",',
+)
+
+
+@pytest.mark.parametrize(
+    ("size", "scale", "pad"),
+    [
+        ((854, 480), 2, (20, 16, 22, 16)),
+        ((1920, 1080), 2, (0, 4, 0, 4)),
+        ((640, 360), 4, (0, 12, 0, 12)),
+        ((128, 64), 2, (0, 0, 0, 0)),
+    ],
+)
+def test_flashvsr_padding_makes_whole_blocks(
+    size: tuple[int, int], scale: int, pad: tuple[int, int, int, int]
+) -> None:
+    from super_processor.upscale import FLASHVSR_BLOCK, flashvsr_padding
+
+    found = flashvsr_padding(*size, scale)
+    assert found == pad
+    left, top, right, bottom = found
+    assert (size[0] + left + right) * scale % FLASHVSR_BLOCK == 0
+    assert (size[1] + top + bottom) * scale % FLASHVSR_BLOCK == 0
+    assert left % 2 == 0 and top % 2 == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_flashvsr_output_keeps_the_whole_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _script = _flashvsr_tree(tmp_path, _CROPPING_INFER)
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+    source = tmp_path / "in.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=10:duration=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+    output = tmp_path / "out" / "clip.mp4"
+    FlashVsrEngine().upscale(UpscaleRequest(source, output, scale=2))
+    size = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    # Cropping to 128-pixel blocks would have left 256x128.
+    assert size == "320,180"
+    log = subprocess.run(
+        [
+            "ffmpeg",
+            "-i",
+            str(output),
+            "-i",
+            str(source),
+            "-lavfi",
+            "[0:v]scale=160:90:flags=area[a];[a][1:v]ssim",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stderr
+    ssim = float(log.rsplit("All:", 1)[1].split()[0])
+    assert ssim > 0.95
+    assert video_stream_facts(output)[0] == 20
+    assert not list(output.parent.glob("*.pad.mp4"))
