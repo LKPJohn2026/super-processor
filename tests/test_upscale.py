@@ -648,7 +648,7 @@ def test_flashvsr_refuses_a_badly_misaligned_clip(
     monkeypatch.setenv("FAKE_DROP", "20")
     source = tmp_path / "in.mp4"
     _tiny(source, seconds=6)
-    with pytest.raises(UpscaleError, match="40 frames for a 60-frame clip"):
+    with pytest.raises(UpscaleError, match=r"returned \d+ frames for a 60-frame clip"):
         FlashVsrEngine().upscale(
             UpscaleRequest(source, tmp_path / "out" / "clip.mp4", scale=2)
         )

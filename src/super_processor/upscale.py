@@ -661,10 +661,33 @@ def flashvsr_padding(width: int, height: int, scale: int) -> tuple[int, int, int
     return left, top, padded_w - width - left, padded_h - height - top
 
 
-def _pad_for_flashvsr(source: Path, pad: tuple[int, int, int, int]) -> Path:
-    """``source`` with its edge pixels repeated into the padding, losslessly."""
+def flashvsr_extra_frames(frames: int) -> int:
+    """Copies of the last frame to add so FlashVSR returns every real frame.
+
+    Its loader appends four copies of the last frame, keeps the largest
+    8n + 1 frames that fit, and returns four fewer: up to three short of the
+    clip, which the conform step used to fill by freezing the last frame.
+    With ``frames + extra + 3`` a multiple of 8 it returns ``frames + extra``,
+    and the conform step trims the copies off again.
+    """
+    return -(frames + 3) % 8
+
+
+def _pad_for_flashvsr(
+    source: Path, pad: tuple[int, int, int, int], extra_frames: int
+) -> Path:
+    """``source`` with its edge pixels repeated into the padding and its last
+    frame repeated ``extra_frames`` times, losslessly."""
     left, top, right, bottom = pad
     padded = source.with_name(source.stem + ".pad.mp4")
+    space = (
+        f"pad=iw+{left + right}:ih+{top + bottom}:{left}:{top},"
+        f"fillborders=left={left}:right={right}:top={top}:bottom={bottom}"
+        ":mode=smear"
+        if any(pad)
+        else ""
+    )
+    time = f"tpad=stop_mode=clone:stop={extra_frames}" if extra_frames else ""
     _run_ffmpeg(
         [
             "ffmpeg",
@@ -675,9 +698,7 @@ def _pad_for_flashvsr(source: Path, pad: tuple[int, int, int, int]) -> Path:
             "-i",
             str(source),
             "-vf",
-            f"pad=iw+{left + right}:ih+{top + bottom}:{left}:{top},"
-            f"fillborders=left={left}:right={right}:top={top}:bottom={bottom}"
-            ":mode=smear",
+            _join_filters(space, time),
             "-an",
             "-c:v",
             "libx264",
@@ -736,13 +757,15 @@ def _infer_loaded(
 ) -> None:
     """Run one already-loaded pipeline on a short clip.
 
-    The clip is padded first so FlashVSR keeps every pixel, and the output
-    is cropped back to exactly ``scale`` times the clip (see
-    :func:`flashvsr_padding`).
+    The clip is padded first so FlashVSR keeps every pixel and every frame,
+    and the output is cropped back to exactly ``scale`` times the clip (see
+    :func:`flashvsr_padding` and :func:`flashvsr_extra_frames`).
     """
     size = _frame_size(source)
     pad = flashvsr_padding(*size, scale) if size else (0, 0, 0, 0)
-    reads = _pad_for_flashvsr(source, pad) if any(pad) else source
+    extra = flashvsr_extra_frames(video_stream_facts(source)[0])
+    padded = any(pad) or extra > 0
+    reads = _pad_for_flashvsr(source, pad, extra) if padded else source
     low, height, width, frames, fps = module.prepare_input_tensor(
         str(reads),
         scale=float(scale),
@@ -775,6 +798,7 @@ def _infer_loaded(
         empty()
     if size and any(pad):
         _crop_after_flashvsr(output, pad, size, scale)
+    if padded:
         reads.unlink(missing_ok=True)
     conform_frames(output, source)
 
@@ -1580,6 +1604,19 @@ def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
     return out
 
 
+# Where a part is cut, in frames before the frame it starts on. FFmpeg rounds
+# a seek time to the nearest frame, so a cut half a frame early sits exactly on
+# the rounding edge: with the time written to six decimals, 141.5/24 became
+# 141.49999 and the part started a frame early, shifting the whole segment.
+# A quarter frame keeps clear of both that edge and the frame time itself.
+_CUT_MARGIN_FRAMES = 0.25
+
+
+def _cut_time(frame: int, fps: float) -> float:
+    """The seek time that starts (or ends) a part exactly at ``frame``."""
+    return max(0.0, (frame - _CUT_MARGIN_FRAMES) / fps)
+
+
 def render_shots(
     source: Path,
     output: Path,
@@ -1622,14 +1659,11 @@ def render_shots(
             continue
         # Each part's share of the work is its share of the source frames.
         part = _part_of(on_progress, first / want, (stop - first) / want)
-        # Half a frame early on both ends, so float rounding of the frame
-        # times cannot move a frame into the neighbouring shot. The clip then
-        # restarts at zero, or the encoder pads the half-frame gap with a copy.
         clip = trim_source(
             source,
             work / f"shot_{index}.mp4",
-            max(0.0, (first - 0.5) / fps),
-            (stop - 0.5) / fps,
+            _cut_time(first, fps),
+            _cut_time(stop, fps),
             ffmpeg_bin=ffmpeg_bin,
             video_filter="setpts=PTS-STARTPTS",
         )
