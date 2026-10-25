@@ -207,15 +207,18 @@ No video leaves the machine. FFmpeg saves a 480-pixel-wide still about every
 second into `segment_stills/t_<ms>.jpg`, always the first frame and one
 0.1 s before the end, and never more than 120: a longer clip keeps the even
 spacing and gets fewer stills a second. Gemini sees every still with its time
-and proposes segments where the photographic context changes (place, light,
+and proposes as few segments as the restoration needs, at most 10, each at
+least 3 s long, cut where the photographic context changes (place, light,
 camera, subject distance, image quality), each with a label and what it
 contains from `faces`, `hands`, `text`, `fine_pattern`.
 
 The reply is repaired to cover the clip exactly once: spans are clipped to
 the clip and sorted; a gap is split down the middle; on an overlap the later
-segment starts where it said; a span inside another adds no cut; and a cut
-less than 0.5 s from the previous one (or from the end) is dropped, its
-contents joining the segment around it. A note ("cut where we walk outside")
+segment starts where it said; and a span inside another adds no cut. Then,
+while there are more than 10 segments or one is shorter than 3 s, the
+shortest is merged into its shorter neighbour; the merged segment keeps the
+longer one's label and what both contain, so faces and text stay protected.
+A clip under 3 s is one segment. A note ("cut where we walk outside")
 sends the segments back to Gemini with the note and the earlier exchange.
 
 Approving measures each segment in its own short pass at 2 frames a second,

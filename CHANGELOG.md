@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- At most 10 segments, each at least 3 s, and fewer is better. Gemini is
+  asked for that, and the repair holds it whatever the reply: while there are
+  too many segments or one is too short, the shortest is merged into its
+  shorter neighbour, keeping the longer one's label and what both contain.
+  Gemini's 22 segments for the Sintel trailer (several only 1 s long) become
+  10 of 3.9-6.9 s with every face, hand, and text flag kept. The minimum was
+  0.5 s, and there was no maximum.
+
 ### Fixed
 
 - A failed FlashVSR call no longer keeps GPU memory. Its traceback held the

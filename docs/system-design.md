@@ -97,8 +97,12 @@ preview_segment) per segment → ready_to_render → rendering → result`.
   Gemini proposes segment boundaries from those stills and their times; no
   video file is uploaded. FFmpeg's `scdet` is not used for this flow: a cut
   is not the same as a change in what the restoration needs.
-- **Repair in code.** Gemini's segments are clipped, sorted, and made to
-  cover the clip exactly once, with no segment under 0.5 s.
+- **Few, long segments.** Each segment is planned, previewed, and approved
+  on its own, so Gemini is asked for as few as the footage needs: at most 10,
+  each at least 3 s. Code holds that whatever the reply: the segments are
+  clipped, sorted, made to cover the clip exactly once, and the shortest is
+  merged into its shorter neighbour while a rule is broken, keeping what
+  both contain.
 - **Feedback on cuts.** The editor approves the segments or sends a note;
   Gemini proposes again with the note and the earlier exchange.
 - **One segment at a time.** Each segment is measured, its faces, hands, and
