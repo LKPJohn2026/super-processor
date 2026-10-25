@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.2] - 2026-10-25
+
 ### Fixed
 
 - Every segment lines up with the source frame for frame. Parts were cut
