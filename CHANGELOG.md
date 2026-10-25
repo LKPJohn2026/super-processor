@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed FlashVSR call no longer keeps GPU memory. Its traceback held the
+  frames' tensors and the pipeline, and the error raised from it kept that
+  alive, so a preview that ran out of memory left 13 GiB taken until the
+  server restarted, and the retry failed too. The traceback is now cleared
+  before the memory is released, and the pipeline's own caches are cleared
+  after every clip.
+
+### Changed
+
+- FlashVSR fits next to other programs on the GPU. Its working memory grows
+  with the frames in one call (at 2x of 854x480: 15.5 GiB for 16 frames,
+  16.9 GiB for 24, against 3.4 GiB of weights), so a clip that runs out of
+  memory is retried in pieces of half the length, down to 17 frames. Each
+  finished piece goes to disk before the next starts, so memory follows the
+  piece, not the clip. With a game holding 9 GiB, a 130-frame clip now
+  finishes in 10 pieces instead of failing. Pieces are planned in whole
+  frames, and the last one is full length so no remainder falls below what
+  FlashVSR accepts. Keeping the weights in RAM was measured too: it saves
+  only about 0.5 GiB, so it is not used.
+
 ## [3.5.2] - 2026-10-25
 
 ### Fixed
