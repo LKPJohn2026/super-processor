@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- FlashVSR uses system RAM as well when the GPU is too full. If even the
+  shortest piece (17 frames) runs out of GPU memory, the clip is restored
+  once more in a child process that uses CUDA unified memory: what fits
+  stays on the GPU and the driver pages the rest to system RAM. It is slower,
+  not different: at 2x of 854x480 with 16, 12, or 8 GiB free, every clip
+  finished at 0.43-0.70 s a frame (0.27-0.30 s with the GPU to itself) and
+  matched the normal output's SSIM. Its allocator keeps freed blocks for
+  reuse like PyTorch's own; asking the driver for each block made it three
+  to four times slower. It is built with `nvcc` on first use; without the
+  CUDA toolkit the run fails as before, with the same advice.
+
 ### Changed
 
 - At most 10 segments, each at least 3 s, and fewer is better. Gemini is

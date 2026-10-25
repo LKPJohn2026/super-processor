@@ -86,6 +86,16 @@ asks the restorer for less invented texture. The job stores
 spans in about 8 s pieces with a short overlap, so clips up to 30 minutes
 fit in GPU memory.
 
+When another program holds GPU memory, a piece that runs out is retried at
+half the length, down to 17 frames. If even that does not fit, the clip is
+restored once more in a child process whose PyTorch allocator uses CUDA
+managed memory (`managed_alloc.cu`, built with `nvcc` on first use into the
+models folder): blocks stay on the GPU while they fit and the driver pages
+the rest to system RAM. It is slower but gives the same picture: at 2x of
+854x480 with 8 GiB free, 0.53-0.70 s a frame against 0.27-0.30 s with the
+GPU to itself. A child is needed because PyTorch only lets the allocator
+change before CUDA starts in a process.
+
 ### Segment loop
 
 The wizard works one segment at a time instead of planning every shot at
