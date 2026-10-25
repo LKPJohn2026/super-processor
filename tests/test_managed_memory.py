@@ -27,6 +27,11 @@ from super_processor.upscale import (
     UpscaleRequest,
 )
 
+# The fallback is Linux only, and the fake executables are shell scripts.
+linux_only = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="the fallback is Linux only"
+)
+
 
 def _script(path: Path, body: str) -> Path:
     """An executable that runs ``body`` in this Python.
@@ -56,6 +61,7 @@ def test_the_child_gets_the_whole_request(tmp_path: Path) -> None:
     assert back.on_progress is None
 
 
+@linux_only
 def test_the_allocator_is_built_once_per_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -76,6 +82,7 @@ def test_the_allocator_is_built_once_per_source(
     assert list((tmp_path / "build").iterdir()) == [first]
 
 
+@linux_only
 def test_no_compiler_is_a_plain_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -84,6 +91,7 @@ def test_no_compiler_is_a_plain_error(
         allocator_library(tmp_path / "build")
 
 
+@linux_only
 def test_a_failed_build_leaves_nothing_behind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -98,6 +106,7 @@ def test_a_failed_build_leaves_nothing_behind(
 
 
 # nvcc calls the host C++ compiler from PATH.
+@linux_only
 @pytest.mark.skipif(
     managed_memory.find_nvcc() is None or shutil.which("c++") is None,
     reason="nvcc and a C++ compiler required",
@@ -133,6 +142,7 @@ def _child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bool) -> No
     monkeypatch.setattr(sys, "executable", str(python))
 
 
+@linux_only
 def test_the_child_restores_and_reports_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -147,6 +157,7 @@ def test_the_child_restores_and_reports_progress(
     assert seen == [0.5, 1.0]
 
 
+@linux_only
 def test_the_childs_error_comes_back_as_itself(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -201,3 +212,9 @@ def test_a_failed_fallback_still_says_what_to_do(
     source = _numbered(tmp_path / "in.mp4", 60)
     with pytest.raises(GpuOutOfMemory, match="Close other programs that use the GPU"):
         FlashVsrEngine().upscale(UpscaleRequest(source, tmp_path / "out.mp4", scale=2))
+
+
+@pytest.mark.skipif(sys.platform.startswith("linux"), reason="checks other systems")
+def test_other_systems_say_it_needs_linux(tmp_path: Path) -> None:
+    with pytest.raises(UpscaleError, match="needs Linux"):
+        allocator_library(tmp_path / "build")

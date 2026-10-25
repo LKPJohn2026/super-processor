@@ -10,7 +10,8 @@ frame against 0.27-0.30 s normally, with the same picture.
 
 It runs in a child because PyTorch only lets the allocator change before CUDA
 has started in a process, and the wizard has started it long before. The
-allocator (``managed_alloc.cu``) is built with ``nvcc`` on first use.
+allocator (``managed_alloc.cu``) is built with ``nvcc`` on first use. Linux
+only: on Windows, managed memory cannot be larger than free VRAM.
 """
 
 from __future__ import annotations
@@ -67,6 +68,10 @@ def allocator_library(build_dir: Path | None = None) -> Path:
     """
     from .upscale import UpscaleError, models_dir
 
+    if not sys.platform.startswith("linux"):
+        # Windows drivers give managed memory no demand paging, so it cannot
+        # grow past free VRAM; macOS has no CUDA.
+        raise UpscaleError("falling back to system RAM needs Linux")
     source = _SOURCE.read_bytes()
     digest = hashlib.sha256(source).hexdigest()[:12]
     folder = build_dir or models_dir() / "managed-alloc"
