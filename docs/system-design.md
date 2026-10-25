@@ -94,7 +94,8 @@ models folder): blocks stay on the GPU while they fit and the driver pages
 the rest to system RAM. It is slower but gives the same picture: at 2x of
 854x480 with 8 GiB free, 0.53-0.70 s a frame against 0.27-0.30 s with the
 GPU to itself. A child is needed because PyTorch only lets the allocator
-change before CUDA starts in a process.
+change before CUDA starts in a process. It is Linux only: on Windows,
+managed memory cannot be larger than free VRAM.
 
 ### Segment loop
 

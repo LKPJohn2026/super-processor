@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched the normal output's SSIM. Its allocator keeps freed blocks for
   reuse like PyTorch's own; asking the driver for each block made it three
   to four times slower. It is built with `nvcc` on first use; without the
-  CUDA toolkit the run fails as before, with the same advice.
+  CUDA toolkit, or off Linux (Windows drivers do not let managed memory
+  grow past free VRAM), the run fails as before, with the same advice.
 
 ### Changed
 
