@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A look no longer pushes black below video black or white above video
+  white. FFmpeg's `eq` scales around the middle of 0-255, so the trailer's
+  credits look (contrast 1.10, brightness +0.02) took black from 16 to 7.5,
+  and black visibly changed at the cut into it. The finish step now ends by
+  holding luma to 16-235 and chroma to 16-240, after the grain; black now
+  stays at the source's 16.5 across that cut.
 - The final audio mux no longer drops frames. It used `-shortest`, so a
   source whose audio ends before its picture (the Sintel trailer: 51.95 s of
   audio, 52.21 s of picture) lost its last frames after the frame-count check
