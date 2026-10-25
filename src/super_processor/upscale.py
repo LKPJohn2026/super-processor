@@ -86,6 +86,41 @@ class UpscaleError(RuntimeError):
     """Raised when a local upscale cannot run or a param patch is invalid."""
 
 
+class GpuOutOfMemory(UpscaleError):
+    """FlashVSR ran out of GPU memory; a shorter piece may still fit."""
+
+
+# FlashVSR's working memory grows with the frames in one call: at 2x of
+# 854x480, 16 frames peak at 15.5 GiB and 24 at 16.9 GiB, against 3.4 GiB of
+# weights. When a clip does not fit (another program holds GPU memory), it is
+# retried in pieces of half the length, down to this many frames; finished
+# pieces go to disk, so memory follows the piece, not the clip.
+FLASHVSR_MIN_CHUNK_FRAMES = 17
+
+
+def _flashvsr_failure(exc: BaseException) -> UpscaleError:
+    """The error to raise for a failed FlashVSR call, holding no GPU memory.
+
+    The traceback keeps every frame's locals alive, and with them the input
+    and output tensors and the pipeline. Releasing the GPU while it exists
+    frees nothing, and an error raised ``from`` it keeps it after that: a
+    failed preview held 13 GiB until the server restarted. So the frames are
+    cleared and the new error does not chain to it.
+    """
+    import traceback
+
+    out_of_memory = type(exc).__name__ == "OutOfMemoryError" or (
+        "out of memory" in str(exc).lower()
+    )
+    text = str(exc).splitlines()[0] if str(exc) else repr(exc)
+    message = str(exc) if isinstance(exc, UpscaleError) else f"FlashVSR failed: {text}"
+    traceback.clear_frames(exc.__traceback__)
+    exc.__traceback__ = None
+    if out_of_memory and not isinstance(exc, GpuOutOfMemory):
+        return GpuOutOfMemory(message)
+    return exc if isinstance(exc, UpscaleError) else UpscaleError(message)
+
+
 @dataclass(frozen=True, slots=True)
 class UpscaleSpan:
     """One source-time span and the knobs used to restore it."""
@@ -513,13 +548,15 @@ class FlashVsrEngine:
                 )
                 request = replace(request, source=cleaned)
             ready.append(request)
+        failed: UpscaleError | None = None
         with _FLASHVSR_LOCK:
             try:
                 module, pipe, previous, path_added = _load_flashvsr(home, infer)
-            except UpscaleError:
-                raise
-            except Exception as exc:
-                raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
+                failure = _flashvsr_failure(exc)
+                del exc
+                _release_gpu()
+                raise failure from None
             try:
                 for request in ready:
                     _infer_loaded(
@@ -529,16 +566,20 @@ class FlashVsrEngine:
                         request.output,
                         scale=request.scale,
                     )
-            except UpscaleError:
-                raise
-            except Exception as exc:
-                raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
+                failed = _flashvsr_failure(exc)
+                del exc
             finally:
                 _release_gpu(pipe)
                 module = None
                 pipe = None
                 _release_gpu()
                 _unload_flashvsr(previous, path_added)
+        if isinstance(failed, GpuOutOfMemory):
+            # One at a time, each in pieces as short as it needs.
+            return [self.upscale(request) for request in requests]
+        if failed is not None:
+            raise failed from None
         missing = [r.output.name for r in ready if not r.output.is_file()]
         if missing:
             raise UpscaleError(f"FlashVSR produced no output for {missing[0]}")
@@ -559,22 +600,61 @@ class FlashVsrEngine:
             duration = float(probe_file(request.source).duration_s or 0.0)
         except ProbeError:
             duration = 0.0
+        chunk_s = CHUNK_SECONDS
         with _FLASHVSR_LOCK:
-            if duration > CHUNK_SECONDS + 0.05:
-                return _run_flashvsr_chunked(
-                    request, home=home, infer=infer, duration_s=duration
-                )
-            clean = request.look.clean_filter()
-            if clean:
-                cleaned = trim_source(
-                    request.source,
-                    request.output.with_name(request.output.stem + ".clean.mp4"),
-                    0.0,
-                    duration,
-                    video_filter=clean,
-                )
-                request = replace(request, source=cleaned)
-            return _run_flashvsr(request, home=home, infer=infer)
+            while True:
+                try:
+                    return self._upscale_once(
+                        request,
+                        home=home,
+                        infer=infer,
+                        duration=duration,
+                        chunk_s=chunk_s,
+                    )
+                except GpuOutOfMemory as exc:
+                    fps = _frame_rate(request.source)
+                    shortest = FLASHVSR_MIN_CHUNK_FRAMES / fps
+                    # Give up only once the piece is already the shortest.
+                    if min(chunk_s, duration) <= shortest + 0.5 / fps:
+                        raise GpuOutOfMemory(
+                            "FlashVSR ran out of GPU memory even in the shortest "
+                            "pieces. Close other programs that use the GPU (games, "
+                            f"other AI tools) and try again. ({exc})"
+                        ) from None
+                    chunk_s = max(shortest, min(chunk_s, duration) / 2)
+
+    def _upscale_once(
+        self,
+        request: UpscaleRequest,
+        *,
+        home: Path,
+        infer: Path,
+        duration: float,
+        chunk_s: float,
+    ) -> Path:
+        if duration > chunk_s + 0.05:
+            return _run_flashvsr_chunked(
+                request, home=home, infer=infer, chunk_s=chunk_s
+            )
+        clean = request.look.clean_filter()
+        if clean:
+            cleaned = trim_source(
+                request.source,
+                request.output.with_name(request.output.stem + ".clean.mp4"),
+                0.0,
+                duration,
+                video_filter=clean,
+            )
+            request = replace(request, source=cleaned)
+        return _run_flashvsr(request, home=home, infer=infer)
+
+
+def _frame_rate(video: Path) -> float:
+    """Frames per second of ``video``; 24 when it cannot be read."""
+    try:
+        return float(Fraction(video_stream_facts(video)[1]))
+    except (UpscaleError, ValueError, ZeroDivisionError):
+        return 24.0
 
 
 def _load_flashvsr(home: Path, infer: Path) -> tuple[Any, Any, str, list[str]]:
@@ -608,6 +688,32 @@ def _unload_flashvsr(previous: str, path_added: list[str]) -> None:
     for entry in path_added:
         with contextlib.suppress(ValueError):
             sys.path.remove(entry)
+
+
+def _clear_pipeline_state(pipe: Any) -> None:
+    """Drop what a loaded pipeline keeps from the clip it just restored.
+
+    FlashVSR clears its input-projection cache and decoder memory at the
+    start of a call, not the end, so they stayed on the GPU while the next
+    clip was loaded next to them: a 24-frame clip that fits on its own ran
+    out of memory right after a 16-frame one.
+    """
+    import gc
+
+    dit = getattr(pipe, "dit", None)
+    for holder, name in (
+        (getattr(dit, "LQ_proj_in", None), "clear_cache"),
+        (getattr(pipe, "TCDecoder", None), "clean_mem"),
+    ):
+        clear = getattr(holder, name, None)
+        if callable(clear):
+            with contextlib.suppress(Exception):
+                clear()
+    gc.collect()
+    torch_mod = sys.modules.get("torch")
+    cuda = getattr(torch_mod, "cuda", None) if torch_mod is not None else None
+    if cuda is not None and getattr(cuda, "is_available", lambda: False)():
+        cuda.empty_cache()
 
 
 def _release_gpu(pipe: Any | None = None) -> None:
@@ -791,11 +897,9 @@ def _infer_loaded(
     )
     pictures = module.tensor2video(video)
     del low, video
+    _clear_pipeline_state(pipe)
     output.parent.mkdir(parents=True, exist_ok=True)
     module.save_video(pictures, str(output), fps=fps, quality=6)
-    empty = getattr(getattr(module.torch, "cuda", None), "empty_cache", None)
-    if empty is not None:
-        empty()
     if size and any(pad):
         _crop_after_flashvsr(output, pad, size, scale)
     if padded:
@@ -899,10 +1003,12 @@ def _run_flashvsr(request: UpscaleRequest, *, home: Path, infer: Path) -> Path:
     """Load the upstream tiny script and run one file. Weights stay relative."""
     try:
         module, pipe, previous, path_added = _load_flashvsr(home, infer)
-    except UpscaleError:
-        raise
-    except Exception as exc:
-        raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
+        failure = _flashvsr_failure(exc)
+        del exc
+        _release_gpu()
+        raise failure from None
+    failed: UpscaleError | None = None
     try:
         _infer_loaded(
             module,
@@ -911,19 +1017,42 @@ def _run_flashvsr(request: UpscaleRequest, *, home: Path, infer: Path) -> Path:
             request.output,
             scale=request.scale,
         )
-    except UpscaleError:
-        raise
-    except Exception as exc:
-        raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
+        failed = _flashvsr_failure(exc)
+        del exc
     finally:
         _release_gpu(pipe)
         module = None
         pipe = None
         _release_gpu()
         _unload_flashvsr(previous, path_added)
+    if failed is not None:
+        raise failed from None
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
     return request.output
+
+
+def chunk_frames(total: int, length: int, overlap: int) -> list[tuple[int, int]]:
+    """``[first, stop)`` frame ranges of ``length`` overlapping by ``overlap``.
+
+    Planned in whole frames so a cut never lands between two frames (at 25
+    fps, 7.5 s is frame 187.5). The last range is a full ``length`` too,
+    reaching further back into the one before: a short remainder can be
+    below what FlashVSR accepts.
+    """
+    if total <= 0:
+        raise UpscaleError("media has no frames")
+    if length >= total:
+        return [(0, total)]
+    step = length - overlap
+    ranges: list[tuple[int, int]] = []
+    first = 0
+    while first + length < total:
+        ranges.append((first, first + length))
+        first += step
+    ranges.append((total - length, total))
+    return ranges
 
 
 def _run_flashvsr_chunked(
@@ -931,57 +1060,62 @@ def _run_flashvsr_chunked(
     *,
     home: Path,
     infer: Path,
-    duration_s: float,
+    chunk_s: float = CHUNK_SECONDS,
 ) -> Path:
-    """Upscale overlapping ~8s pieces so the whole clip is not resident on GPU."""
-    from .probe import probe_file
+    """Upscale overlapping pieces of ``chunk_s`` so the whole clip is not on the GPU.
 
-    chunks = planned_chunks(duration_s, scale=request.scale, strength=request.strength)
+    Each piece's restored picture goes to disk before the next one starts;
+    the join, blend, and delivery encode then run once on the files.
+    """
+    total, rate = video_stream_facts(request.source)
+    fps = float(Fraction(rate))
+    length = max(FLASHVSR_MIN_CHUNK_FRAMES, round(chunk_s * fps))
+    overlap = min(round(CHUNK_OVERLAP_S * fps), length // 4)
+    chunks = chunk_frames(total, length, overlap)
     work = request.output.parent / "flash_chunks"
     work.mkdir(parents=True, exist_ok=True)
     try:
         module, pipe, previous, path_added = _load_flashvsr(home, infer)
-    except UpscaleError:
-        raise
-    except Exception as exc:
-        raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
+        failure = _flashvsr_failure(exc)
+        del exc
+        _release_gpu()
+        raise failure from None
     pieces: list[Path] = []
+    failed: UpscaleError | None = None
+    covered = 0
     try:
-        for index, span in enumerate(chunks):
+        for index, (first, stop) in enumerate(chunks):
             clip = trim_source(
                 request.source,
                 work / f"in_{index}.mp4",
-                span.start_s,
-                span.end_s,
+                _cut_time(first, fps),
+                _cut_time(stop, fps),
                 video_filter=request.look.clean_filter(),
             )
             raw = work / f"up_{index}.mp4"
-            _infer_loaded(
-                module,
-                pipe,
-                clip,
-                raw,
-                scale=span.scale,
-            )
+            _infer_loaded(module, pipe, clip, raw, scale=request.scale)
             # Every piece goes through the same lossless encode so the join
-            # reads one set of codec parameters.
+            # reads one set of codec parameters; the frames the previous
+            # piece already covers are cut off here.
             kept = work / f"keep_{index}.mp4"
-            raw_duration = float(probe_file(raw).duration_s or 0.0)
-            skip = 0.0 if index == 0 else CHUNK_OVERLAP_S
-            trim_source(raw, kept, skip, raw_duration)
+            skip = covered - first
+            trim_source(raw, kept, _cut_time(skip, fps), _cut_time(stop - first, fps))
+            covered = stop
             pieces.append(kept)
             if request.on_progress is not None:
                 request.on_progress((index + 1) / len(chunks))
-    except UpscaleError:
-        raise
-    except Exception as exc:
-        raise UpscaleError(f"FlashVSR failed: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
+        failed = _flashvsr_failure(exc)
+        del exc
     finally:
         _release_gpu(pipe)
         module = None
         pipe = None
         _release_gpu()
         _unload_flashvsr(previous, path_added)
+    if failed is not None:
+        raise failed from None
     # Join, blend, and encode once into the delivery settings, so the caller
     # does not encode this picture a second time.
     listing = _write_listing(work / "join.txt", pieces)

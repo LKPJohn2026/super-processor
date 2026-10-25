@@ -262,6 +262,7 @@ def test_flashvsr_chunks_long_clips(
     assert str(home) not in sys.path
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_chunked_flashvsr_wraps_loader_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -273,9 +274,10 @@ def test_chunked_flashvsr_wraps_loader_errors(
         duration_s = 20.0
 
     monkeypatch.setattr("super_processor.probe.probe_file", lambda _path: _Facts())
+    # A real clip: the chunked runner counts its frames before loading.
     source = tmp_path / "in.mp4"
-    source.write_bytes(b"src")
-    with pytest.raises(UpscaleError, match="FlashVSR failed"):
+    _tiny(source, seconds=2)
+    with pytest.raises(UpscaleError, match="FlashVSR failed: boom"):
         FlashVsrEngine().upscale(
             UpscaleRequest(source, tmp_path / "out.mp4", scale=2, strength=0.5)
         )

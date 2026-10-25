@@ -14,10 +14,15 @@ from pathlib import Path
 import pytest
 
 from super_processor.upscale import (
+    FLASHVSR_MIN_CHUNK_FRAMES,
     FakeUpscaleEngine,
     FlashVsrEngine,
+    GpuOutOfMemory,
+    UpscaleError,
     UpscaleRequest,
     UpscaleSpan,
+    _flashvsr_failure,
+    chunk_frames,
     flashvsr_extra_frames,
     render_shots,
 )
@@ -160,11 +165,17 @@ def init_pipeline():
 
 
 def prepare_input_tensor(path, scale, dtype, device):
+    import os
+
     count = int(subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
          "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path],
         check=True, capture_output=True, text=True,
     ).stdout.strip())
+    limit = int(os.environ.get("FAKE_MAX_FRAMES", "100000"))
+    if count > limit:
+        # What PyTorch raises when the working memory does not fit.
+        raise RuntimeError(f"CUDA out of memory. Tried to allocate 2 GiB ({count})")
     _SOURCE.update(path=path, scale=int(scale), keep=((count + 3) // 8) * 8 + 1 - 4)
     return ("lq", 8, 8, 1, 24)
 
@@ -202,3 +213,100 @@ def test_flashvsr_tail_is_real_frames(
     )
     # Without the extra frames, 48 came back as 45 and the last three froze.
     assert _numbers(output) == _numbers(source)
+
+
+def _fake_flashvsr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from test_upscale import _flashvsr_tree
+
+    home, _script = _flashvsr_tree(tmp_path, _EIGHT_N_INFER)
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+
+
+@needs_ffmpeg
+def test_out_of_memory_retries_in_shorter_pieces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_flashvsr(tmp_path, monkeypatch)
+    # Like the trailer next to a game: 24 frames do not fit, 20 do.
+    monkeypatch.setenv("FAKE_MAX_FRAMES", "23")
+    source = _numbered(tmp_path / "in.mp4", 130)
+    seen: list[float] = []
+    output = FlashVsrEngine().upscale(
+        UpscaleRequest(
+            source, tmp_path / "out" / "clip.mp4", scale=2, on_progress=seen.append
+        )
+    )
+    assert _numbers(output) == _numbers(source)
+    assert seen and seen[-1] == pytest.approx(1.0)
+
+
+@needs_ffmpeg
+def test_out_of_memory_in_the_shortest_piece_says_what_to_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_flashvsr(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_MAX_FRAMES", "5")
+    source = _numbered(tmp_path / "in.mp4", 60)
+    with pytest.raises(GpuOutOfMemory, match="Close other programs that use the GPU"):
+        FlashVsrEngine().upscale(UpscaleRequest(source, tmp_path / "out.mp4", scale=2))
+
+
+@needs_ffmpeg
+def test_preview_batch_falls_back_to_pieces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_flashvsr(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_MAX_FRAMES", "30")
+    first = _numbered(tmp_path / "a.mp4", 48)
+    second = _numbered(tmp_path / "b.mp4", 20)
+    outputs = FlashVsrEngine().upscale_many(
+        [
+            UpscaleRequest(first, tmp_path / "out" / "a.mp4", scale=2),
+            UpscaleRequest(second, tmp_path / "out" / "b.mp4", scale=2),
+        ]
+    )
+    assert [_numbers(o) for o in outputs] == [_numbers(first), _numbers(second)]
+
+
+def test_a_failure_lets_go_of_what_the_call_held() -> None:
+    import gc
+    import weakref
+
+    class Tensor:
+        """Stands in for the frames and pipeline a failed call has in its locals."""
+
+    def infer() -> None:
+        held = Tensor()
+        alive.append(weakref.ref(held))
+        raise RuntimeError("CUDA out of memory. Tried to allocate 2.60 GiB")
+
+    alive: list[weakref.ref[Tensor]] = []
+    try:
+        infer()
+    except RuntimeError as exc:
+        failure = _flashvsr_failure(exc)
+    gc.collect()
+    assert alive[0]() is None
+    assert isinstance(failure, GpuOutOfMemory)
+    assert failure.__cause__ is None and failure.__traceback__ is None
+    other = _flashvsr_failure(ValueError("bad shape"))
+    assert type(other) is UpscaleError
+    assert str(other) == "FlashVSR failed: bad shape"
+
+
+def test_chunks_are_whole_frames_that_meet() -> None:
+    assert chunk_frames(100, 200, 12) == [(0, 100)]
+    # 8 s at 25 fps with 0.5 s overlap: no half frames anywhere.
+    ranges = chunk_frames(500, 200, 12)
+    # The last piece is a full 200, reaching back past the usual overlap.
+    assert ranges == [(0, 200), (188, 388), (300, 500)]
+    # A remainder shorter than FlashVSR accepts never happens.
+    short = chunk_frames(130, 17, 4)
+    assert all(stop - first == 17 for first, stop in short)
+    assert short[0][0] == 0 and short[-1][1] == 130
+    for before, after in zip(short, short[1:], strict=False):
+        assert after[0] < before[1]
+    assert FLASHVSR_MIN_CHUNK_FRAMES >= 17
+    with pytest.raises(UpscaleError):
+        chunk_frames(0, 200, 12)
