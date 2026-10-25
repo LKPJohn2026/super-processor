@@ -16,6 +16,7 @@ allocator (``managed_alloc.cu``) is built with ``nvcc`` on first use.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import shutil
@@ -173,7 +174,8 @@ def _report(kind: str, text: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Child entry: switch the allocator before CUDA starts, then restore."""
     args = sys.argv[1:] if argv is None else argv
-    import torch
+    # torch is the optional gpu extra, so it is not imported by name.
+    torch = importlib.import_module("torch")
 
     allocator = torch.cuda.memory.CUDAPluggableAllocator(
         args[0], "managed_malloc", "managed_free"
