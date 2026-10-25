@@ -249,7 +249,7 @@ def test_previews_are_versioned_and_replaced(tmp_path: Path) -> None:
 
 
 def _three_shots(path: Path) -> Path:
-    """Three 2s shots of different pictures, so scdet finds two cuts."""
+    """Three 3s shots of different pictures, so scdet finds two cuts."""
     subprocess.run(
         [
             "ffmpeg",
@@ -259,17 +259,17 @@ def _three_shots(path: Path) -> Path:
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=320x180:rate=10:duration=2",
+            "testsrc2=size=320x180:rate=10:duration=3",
             "-f",
             "lavfi",
             "-i",
-            "color=c=0x303030:size=320x180:rate=10:duration=2",
+            "color=c=0x303030:size=320x180:rate=10:duration=3",
             "-f",
             "lavfi",
             "-i",
             "mandelbrot=size=320x180:rate=10",
             "-filter_complex",
-            "[2:v]trim=duration=2,setpts=PTS-STARTPTS[m];"
+            "[2:v]trim=duration=3,setpts=PTS-STARTPTS[m];"
             "[0:v][1:v][m]concat=n=3:v=1[v]",
             "-map",
             "[v]",
@@ -373,7 +373,7 @@ class _Planner:
 
     def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
         return segments(
-            (0.0, 2.0, "shot 0", []), (2.0, 4.0, "shot 1", []), (4.0, 6.0, "shot 2", [])
+            (0.0, 3.0, "shot 0", []), (3.0, 6.0, "shot 1", []), (6.0, 9.0, "shot 2", [])
         )
 
     def propose_looks(self, **kwargs: Any) -> dict[str, Any]:

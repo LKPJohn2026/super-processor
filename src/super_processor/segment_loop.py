@@ -234,9 +234,11 @@ def load_segment_list(job_dir: Path) -> SegmentList | None:
     return SegmentList.from_dict(data)
 
 
-# Gemini's boundaries come from stills about a second apart, so a sliver
-# shorter than this is a rounding artefact, not a segment of its own.
-MIN_LOOP_SEGMENT_S = 0.5
+# Each segment is planned, previewed, and approved on its own, so fewer and
+# longer segments mean less to review and fewer seams. Gemini is asked for
+# this, and repair_coverage holds it whatever the reply.
+MAX_LOOP_SEGMENTS = 10
+MIN_LOOP_SEGMENT_S = 3.0
 
 
 def _contents(raw: Any) -> tuple[str, ...]:
@@ -266,46 +268,83 @@ def _proposed_spans(raw: list[dict[str, Any]], duration_s: float) -> list[_Span]
     return sorted(spans)
 
 
-def repair_coverage(raw: list[dict[str, Any]], duration_s: float) -> list[LoopSegment]:
-    """Turn Gemini's proposal into segments covering 0 to the end exactly once.
+_Piece = tuple[float, float, str, tuple[str, ...]]
 
-    Each segment starts where the one before it ends; the first starts at 0
-    and the last ends at ``duration_s``. Nothing is shorter than
-    :data:`MIN_LOOP_SEGMENT_S` unless the whole clip is.
+
+def _pieces(spans: list[_Span], duration_s: float) -> list[_Piece]:
+    """Gemini's spans as pieces that cover the clip once, end to end.
+
+    A gap is split down the middle; on an overlap the later span's start
+    wins, since Gemini saw the change somewhere inside it. A span wholly
+    inside an earlier one adds no cut.
     """
-    if not math.isfinite(duration_s) or duration_s <= 0:
-        raise SegmentLoopError("the video has no duration to segment")
-    spans = _proposed_spans(raw, duration_s)
-    if not spans:
-        return [LoopSegment(0.0, duration_s, label="whole video")]
-    # A gap is split down the middle; on an overlap the later span's start
-    # wins, since Gemini saw the change somewhere inside it. A span wholly
-    # inside an earlier one adds no cut. A cut too close to the last one
-    # would leave a sliver, so it is dropped and the newer span's label
-    # takes over the segment it would have started.
     cuts: list[float] = []
-    labels: list[tuple[str, tuple[str, ...]]] = [(spans[0][2], spans[0][3])]
+    names: list[tuple[str, tuple[str, ...]]] = [(spans[0][2], spans[0][3])]
     reach = spans[0][1]
     for start, end, label, contains in spans[1:]:
         if end <= reach:
             continue
         cut = (reach + start) / 2 if start > reach else start
         reach = end
-        if cut > duration_s - MIN_LOOP_SEGMENT_S:
+        if cut >= duration_s:
             break
-        if cut - (cuts[-1] if cuts else 0.0) < MIN_LOOP_SEGMENT_S:
-            # Keep what the sliver contained, so its faces stay protected.
-            merged = tuple(dict.fromkeys((*labels[-1][1], *contains)))
-            labels[-1] = (label, merged)
+        if cut <= (cuts[-1] if cuts else 0.0):
+            names[-1] = (label, contains)
             continue
         cuts.append(cut)
-        labels.append((label, contains))
+        names.append((label, contains))
     edges = [0.0, *cuts, duration_s]
     return [
-        LoopSegment(round(start, 3), round(end, 3), label=label, contains=contains)
+        (start, end, label, contains)
         for start, end, (label, contains) in zip(
-            edges[:-1], edges[1:], labels, strict=True
+            edges[:-1], edges[1:], names, strict=True
         )
+    ]
+
+
+def _merge(first: _Piece, second: _Piece) -> _Piece:
+    """Two neighbouring pieces as one: the longer one names it, both protect."""
+    longer = first if first[1] - first[0] >= second[1] - second[0] else second
+    contains = tuple(dict.fromkeys((*first[3], *second[3])))
+    return (first[0], second[1], longer[2], contains)
+
+
+def repair_coverage(raw: list[dict[str, Any]], duration_s: float) -> list[LoopSegment]:
+    """Turn Gemini's proposal into segments covering 0 to the end exactly once.
+
+    Each segment starts where the one before it ends; the first starts at 0
+    and the last ends at ``duration_s``. There are at most
+    :data:`MAX_LOOP_SEGMENTS`, and none is shorter than
+    :data:`MIN_LOOP_SEGMENT_S` unless the whole clip is. While a rule is
+    broken, the shortest segment is merged into its shorter neighbour; the
+    merged segment keeps the longer one's label and what both contain, so
+    faces and text stay protected.
+    """
+    if not math.isfinite(duration_s) or duration_s <= 0:
+        raise SegmentLoopError("the video has no duration to segment")
+    spans = _proposed_spans(raw, duration_s)
+    if not spans:
+        return [LoopSegment(0.0, duration_s, label="whole video")]
+    pieces = _pieces(spans, duration_s)
+
+    def length(index: int) -> float:
+        return pieces[index][1] - pieces[index][0]
+
+    while len(pieces) > 1:
+        shortest = min(range(len(pieces)), key=length)
+        if len(pieces) <= MAX_LOOP_SEGMENTS and length(shortest) >= MIN_LOOP_SEGMENT_S:
+            break
+        if shortest == 0:
+            other = 1
+        elif shortest == len(pieces) - 1:
+            other = shortest - 1
+        else:
+            other = min(shortest - 1, shortest + 1, key=length)
+        low, high = sorted((shortest, other))
+        pieces[low : high + 1] = [_merge(pieces[low], pieces[high])]
+    return [
+        LoopSegment(round(start, 3), round(end, 3), label=label, contains=contains)
+        for start, end, label, contains in pieces
     ]
 
 

@@ -13,6 +13,7 @@ import pytest
 
 from super_processor.segment_loop import (
     END_MARGIN_S,
+    MAX_LOOP_SEGMENTS,
     MAX_STILLS,
     MIN_LOOP_SEGMENT_S,
     LoopSegment,
@@ -409,3 +410,71 @@ def test_repair_coverage_keeps_known_contents() -> None:
     ]
     saved = SegmentList(segments=segments)
     assert SegmentList.from_dict(saved.to_dict()) == saved
+
+
+# Gemini's 22 segments for the Sintel trailer, before the limits existed.
+_TRAILER_22 = [
+    (0.0, 5.4, "Snowy mountain landscape", []),
+    (5.4, 9.3, "Traveler in blizzard", ["faces", "hands"]),
+    (9.3, 12.3, "Opening title text", ["text"]),
+    (12.3, 14.2, "Bearded elder in firelight", ["faces", "hands", "fine_pattern"]),
+    (14.2, 16.2, "Surprised girl in hut", ["faces", "fine_pattern"]),
+    (16.2, 17.2, "Girl falling into snow", ["faces", "hands"]),
+    (17.2, 18.2, "Black transition", []),
+    (18.2, 21.1, "Ruined alleyway", []),
+    (21.1, 22.1, "Black transition", []),
+    (22.1, 24.1, "Girl running through ruins", ["faces"]),
+    (24.1, 26.0, "Rooftop at sunset", ["fine_pattern"]),
+    (26.0, 27.0, "Creatures in the sky", []),
+    (27.0, 28.0, "Astonished girl close-up", ["faces"]),
+    (28.0, 30.0, "Girl watching creature", ["hands"]),
+    (30.0, 31.0, "Dragon talon", ["fine_pattern"]),
+    (31.0, 32.0, "Shocked girl close-up", ["faces"]),
+    (32.0, 36.0, "Baby dragon reaching to hand", ["hands"]),
+    (36.0, 41.8, "Traveler on dunes", ["text"]),
+    (41.8, 47.7, "Sintel logo", ["text"]),
+    (47.7, 48.7, "Coming soon", ["text"]),
+    (48.7, 50.6, "Production credits", ["text"]),
+    (50.6, 52.21, "Black outro", []),
+]
+
+
+def test_many_short_segments_become_at_most_ten_of_three_seconds() -> None:
+    raw = [
+        {"start_s": a, "end_s": b, "label": label, "contains": contains}
+        for a, b, label, contains in _TRAILER_22
+    ]
+    segments = repair_coverage(raw, 52.21)
+    assert len(segments) <= MAX_LOOP_SEGMENTS
+    _assert_covers(segments, 52.21)
+    assert min(s.end_s - s.start_s for s in segments) >= MIN_LOOP_SEGMENT_S
+    # Merging keeps every protection a merged piece had.
+    flagged = {kind for *_rest, contains in _TRAILER_22 for kind in contains}
+    assert {kind for s in segments for kind in s.contains} == flagged
+    girl = next(s for s in segments if s.start_s <= 16.5 < s.end_s)
+    assert {"faces", "hands"} <= set(girl.contains)
+    # A merged segment is named after its longest piece.
+    labels = {label for *_times, label, _contains in _TRAILER_22}
+    assert all(s.label in labels for s in segments)
+
+
+def test_limits_leave_a_good_proposal_alone() -> None:
+    raw = [
+        {"start_s": 5.0 * i, "end_s": 5.0 * (i + 1), "label": f"part {i}"}
+        for i in range(MAX_LOOP_SEGMENTS)
+    ]
+    segments = repair_coverage(raw, 50.0)
+    assert [s.label for s in segments] == [f"part {i}" for i in range(10)]
+    eleven = raw + [{"start_s": 50.0, "end_s": 55.0, "label": "part 10"}]
+    assert len(repair_coverage(eleven, 55.0)) == MAX_LOOP_SEGMENTS
+
+
+def test_a_clip_shorter_than_the_minimum_is_one_segment() -> None:
+    raw = [
+        {"start_s": 0, "end_s": 1, "label": "a", "contains": ["faces"]},
+        {"start_s": 1, "end_s": 2.5, "label": "b", "contains": ["text"]},
+    ]
+    segments = repair_coverage(raw, 2.5)
+    assert len(segments) == 1
+    assert (segments[0].start_s, segments[0].end_s) == (0.0, 2.5)
+    assert segments[0].label == "b" and segments[0].contains == ("faces", "text")

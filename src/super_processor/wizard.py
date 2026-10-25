@@ -29,6 +29,8 @@ from .look import LOOK_BOUNDS
 from .probe import MediaFacts, ProbeError, probe_file
 from .regions import MAX_REGIONS, REGION_STRENGTH
 from .segment_loop import (
+    MAX_LOOP_SEGMENTS,
+    MIN_LOOP_SEGMENT_S,
     LoopSegment,
     SegmentList,
     SegmentLoopError,
@@ -1118,6 +1120,8 @@ class WizardController:
                 duration_s=duration,
                 contains=CONTENTS,
                 note=earlier.note if earlier else "",
+                max_segments=MAX_LOOP_SEGMENTS,
+                min_segment_s=MIN_LOOP_SEGMENT_S,
                 job_dir=job_dir,
             )
             segments = repair_coverage(raw, duration)

@@ -1089,6 +1089,8 @@ class GeminiClient:
         duration_s: float,
         contains: tuple[str, ...] = (),
         note: str = "",
+        max_segments: int = 10,
+        min_segment_s: float = 3.0,
         job_dir: Path | None = None,
     ) -> list[dict[str, Any]]:
         """Cut the video into segments from a grid of stills and their times.
@@ -1104,10 +1106,14 @@ class GeminiClient:
         intro = (
             "These stills are sampled from one video an editor wants "
             "restored and upscaled, each with its time in seconds. The video "
-            f"is {duration_s:.2f}s long. Cut it into segments where the "
-            "photographic context changes: location, light, camera, subject "
-            "distance, or image quality, anywhere the restoration would need "
-            "different settings. Do not cut a stretch that looks the same. "
+            f"is {duration_s:.2f}s long. Cut it into as few segments as the "
+            "restoration needs, at most "
+            f"{max_segments}; fewer is better. Each segment is reviewed on its "
+            f"own, so it must be at least {min_segment_s:g} seconds long. Cut "
+            "only where the photographic context changes enough to need "
+            "different settings: location, light, camera, subject distance, or "
+            "image quality. Keep a short shot with the similar footage around "
+            "it rather than giving it its own segment. "
             "The segments run in order from 0 to the end with no gaps or "
             "overlaps. Give each a label of at most eight words saying what "
             "is in it and how it is lit, and what it contains from this list "

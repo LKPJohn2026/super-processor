@@ -252,9 +252,7 @@ def test_gemini_label_shots_sends_one_still_per_shot(tmp_path: Path) -> None:
 
 class _Labels:
     def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
-        return segments(
-            (0.0, 2.0, "shot 0", []), (2.0, 5.0, "shot 1", []), (5.0, 7.0, "shot 2", [])
-        )
+        return segments((0.0, 3.5, "shot 0", []), (3.5, 7.0, "shot 1", []))
 
     def label_shots(self, **kwargs: Any) -> list[dict[str, Any]]:
         return [
@@ -301,17 +299,13 @@ def test_loop_previews_each_segment_then_renders_alike_ones_once(
     with pytest.raises(WizardError, match="no segments"):
         controller.handle_post("/segments", {"action": ["approve"]})
     job_dir = to_ready(controller, clip)
-    assert engine.calls == 3  # one preview per segment
+    assert engine.calls == 2  # one preview per segment
     controller.handle_post("/ready", {"action": ["render"]})
     assert controller.current_state().step is WizardStep.RENDERING
     engine.calls = 0
     plan = load_upscale_plan(job_dir)
     assert plan is not None
-    assert [(s.start_s, s.end_s) for s in plan.spans] == [
-        (0.0, 2.0),
-        (2.0, 5.0),
-        (5.0, 7.0),
-    ]
+    assert [(s.start_s, s.end_s) for s in plan.spans] == [(0.0, 3.5), (3.5, 7.0)]
     controller.run_render()
     assert controller.current_state().step is WizardStep.RESULT
     # Every segment has the same settings, so they render as one part.

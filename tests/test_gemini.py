@@ -533,6 +533,8 @@ def test_propose_segments_sends_stills_with_times(tmp_path: Path) -> None:
     assert all("inlineData" in p for p in parts[2::2])
     assert "did not accept" not in parts[0]["text"]
     assert "faces, text" in parts[0]["text"]
+    assert "at most 10; fewer is better" in parts[0]["text"]
+    assert "at least 3 seconds long" in parts[0]["text"]
     schema = transport.last_body["generationConfig"]["responseSchema"]
     assert "contains" in schema["properties"]["segments"]["items"]["required"]
     turns = load_chat(tmp_path)
