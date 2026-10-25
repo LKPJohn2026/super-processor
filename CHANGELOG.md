@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-10-25
+
 ### Added
 
 - FlashVSR uses system RAM as well when the GPU is too full. If even the
@@ -31,17 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10 of 3.9-6.9 s with every face, hand, and text flag kept. The minimum was
   0.5 s, and there was no maximum.
 
-### Fixed
-
-- A failed FlashVSR call no longer keeps GPU memory. Its traceback held the
-  frames' tensors and the pipeline, and the error raised from it kept that
-  alive, so a preview that ran out of memory left 13 GiB taken until the
-  server restarted, and the retry failed too. The traceback is now cleared
-  before the memory is released, and the pipeline's own caches are cleared
-  after every clip.
-
-### Changed
-
 - FlashVSR fits next to other programs on the GPU. Its working memory grows
   with the frames in one call (at 2x of 854x480: 15.5 GiB for 16 frames,
   16.9 GiB for 24, against 3.4 GiB of weights), so a clip that runs out of
@@ -52,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frames, and the last one is full length so no remainder falls below what
   FlashVSR accepts. Keeping the weights in RAM was measured too: it saves
   only about 0.5 GiB, so it is not used.
+
+### Fixed
+
+- A failed FlashVSR call no longer keeps GPU memory. Its traceback held the
+  frames' tensors and the pipeline, and the error raised from it kept that
+  alive, so a preview that ran out of memory left 13 GiB taken until the
+  server restarted, and the retry failed too. The traceback is now cleared
+  before the memory is released, and the pipeline's own caches are cleared
+  after every clip.
 
 ## [3.5.2] - 2026-10-25
 
