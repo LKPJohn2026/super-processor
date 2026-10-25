@@ -66,7 +66,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-super_processor = ["*.pyi", "py.typed"]
+super_processor = ["*.pyi", "managed_alloc.cu", "py.typed"]
 
 [tool.setuptools.exclude-package-data]
 super_processor = ["*.c", "*.html", "*.pyx"]

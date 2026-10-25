@@ -27,3 +27,18 @@ def _own_config_dir(
     )
     monkeypatch.setitem(sys.modules, "keyring", empty)
     return folder
+
+
+@pytest.fixture(autouse=True)
+def _no_managed_memory_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A clip that runs out of memory never starts a real FlashVSR child.
+
+    Tests that check the fallback replace this with their own.
+    """
+    from super_processor import managed_memory
+    from super_processor.upscale import UpscaleError
+
+    def refuse(request: object, **_kwargs: object) -> Path:
+        raise UpscaleError("the system-RAM fallback is off in tests")
+
+    monkeypatch.setattr(managed_memory, "upscale_in_managed_memory", refuse)

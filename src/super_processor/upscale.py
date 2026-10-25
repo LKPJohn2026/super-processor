@@ -614,14 +614,12 @@ class FlashVsrEngine:
                 except GpuOutOfMemory as exc:
                     fps = _frame_rate(request.source)
                     shortest = FLASHVSR_MIN_CHUNK_FRAMES / fps
-                    # Give up only once the piece is already the shortest.
-                    if min(chunk_s, duration) <= shortest + 0.5 / fps:
-                        raise GpuOutOfMemory(
-                            "FlashVSR ran out of GPU memory even in the shortest "
-                            "pieces. Close other programs that use the GPU (games, "
-                            f"other AI tools) and try again. ({exc})"
-                        ) from None
-                    chunk_s = max(shortest, min(chunk_s, duration) / 2)
+                    if min(chunk_s, duration) > shortest + 0.5 / fps:
+                        chunk_s = max(shortest, min(chunk_s, duration) / 2)
+                        continue
+                    reason = str(exc)
+                    del exc
+                    return _last_resort(request, reason)
 
     def _upscale_once(
         self,
@@ -649,6 +647,38 @@ class FlashVsrEngine:
         return _run_flashvsr(request, home=home, infer=infer)
 
 
+def _last_resort(request: UpscaleRequest, reason: str) -> Path:
+    """Restore a clip whose shortest piece did not fit, using system RAM too.
+
+    Runs in a child with managed GPU memory (see
+    :mod:`super_processor.managed_memory`); inside that child, or when it
+    cannot run, the out-of-memory error is raised for the wizard.
+    """
+    from .managed_memory import in_managed_memory, upscale_in_managed_memory
+
+    advice = (
+        "Close other programs that use the GPU (games, other AI tools) and try again."
+    )
+    if in_managed_memory():
+        raise GpuOutOfMemory(
+            "FlashVSR ran out of GPU memory and system RAM even in the "
+            f"shortest pieces. {advice} ({reason})"
+        )
+    try:
+        return upscale_in_managed_memory(request)
+    except GpuOutOfMemory as exc:
+        # The child's own message already says GPU and RAM were both short.
+        message = str(exc)
+    except UpscaleError as exc:
+        # No system RAM to fall back on here (no nvcc, a failed build or
+        # child): still an out-of-memory error, with what stopped the fallback.
+        message = (
+            "FlashVSR ran out of GPU memory even in the shortest pieces, and "
+            f"could not use system RAM instead ({exc}). {advice} ({reason})"
+        )
+    raise GpuOutOfMemory(message) from None
+
+
 def _frame_rate(video: Path) -> float:
     """Frames per second of ``video``; 24 when it cannot be read."""
     try:
@@ -669,7 +699,9 @@ def _load_flashvsr(home: Path, infer: Path) -> tuple[Any, Any, str, list[str]]:
     sys.path[:0] = path_added
     # Lets a later 2GB block reuse the reserved cache instead of failing
     # while several gigabytes sit fragmented. Must be set before CUDA starts.
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # The managed-memory child brings its own allocator, which ignores this.
+    if os.environ.get("SUPER_PROCESSOR_MANAGED_MEMORY") != "1":
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.chdir(wan)
     try:
         loader.loader.exec_module(module)
