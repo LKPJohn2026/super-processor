@@ -243,3 +243,64 @@ def test_render_reports_progress_by_source_frames(tmp_path: Path) -> None:
         on_progress=single.append,
     )
     assert single == [0.5]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("audio_s", [4.7, 8.0])
+def test_audio_of_another_length_keeps_every_frame(
+    tmp_path: Path, audio_s: float
+) -> None:
+    source = tmp_path / "in.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=10:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:duration={audio_s}",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(source),
+        ],
+        check=True,
+    )
+    output = tmp_path / "out" / "output.mp4"
+    render_shots(
+        source,
+        output,
+        (UpscaleSpan(0, 3, strength=0.5), UpscaleSpan(3, 6, strength=0.2)),
+        engine=FakeUpscaleEngine(),
+        duration_s=6,
+    )
+    # -shortest used to cut the picture to 4.7 s of audio: 13 frames lost.
+    assert video_stream_facts(output)[0] == 60
+    assert "audio" in _streams(output)
+    length = float(
+        subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    assert length == pytest.approx(6.0, abs=0.1)

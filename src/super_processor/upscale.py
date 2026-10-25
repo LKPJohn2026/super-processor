@@ -1680,8 +1680,17 @@ def mux_source_audio(
     *,
     ffmpeg_bin: str = "ffmpeg",
 ) -> Path:
-    """Copy the source audio onto an upscaled picture. No audio is fine."""
+    """Copy the source audio onto an upscaled picture. No audio is fine.
+
+    The output is as long as the picture: longer audio is cut there, and
+    shorter audio just ends early. (``-shortest`` would instead drop the
+    last frames of a picture whose audio is shorter, which is common.) If
+    the frame count still changes, the picture is kept without audio.
+    """
     mixed = video.with_suffix(".mux.mp4")
+    ffprobe_bin = _ffprobe_for(ffmpeg_bin)
+    frames, rate = video_stream_facts(video, ffprobe_bin=ffprobe_bin)
+    length = frames / Fraction(rate)
     completed = subprocess.run(
         [
             ffmpeg_bin,
@@ -1701,7 +1710,8 @@ def mux_source_audio(
             "copy",
             "-c:a",
             "aac",
-            "-shortest",
+            "-t",
+            f"{float(length):.6f}",
             # moov at the front, so a browser can start playing and seeking
             # before the whole file has been read.
             "-movflags",
@@ -1712,6 +1722,9 @@ def mux_source_audio(
         capture_output=True,
     )
     if completed.returncode != 0 or not mixed.is_file():
+        return video
+    if video_stream_facts(mixed, ffprobe_bin=ffprobe_bin)[0] != frames:
+        mixed.unlink(missing_ok=True)
         return video
     mixed.replace(video)
     return video
