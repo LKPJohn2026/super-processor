@@ -304,3 +304,61 @@ def test_audio_of_another_length_keeps_every_frame(
         ).stdout
     )
     assert length == pytest.approx(6.0, abs=0.1)
+
+
+@needs_ffmpeg
+def test_a_look_does_not_shift_black_at_the_cut(tmp_path: Path) -> None:
+    from super_processor.look import ShotLook
+
+    source = tmp_path / "black.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:size=160x90:rate=10:duration=4",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+    output = tmp_path / "out" / "output.mp4"
+    credits = ShotLook(contrast=1.1, brightness=0.02)
+    render_shots(
+        source,
+        output,
+        (
+            UpscaleSpan(0, 2, strength=0.5),
+            UpscaleSpan(2, 4, strength=0.0, use_upscale=False, look=credits),
+        ),
+        engine=FakeUpscaleEngine(),
+        duration_s=4,
+    )
+    log = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-i",
+            str(output),
+            "-vf",
+            "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+            "-f",
+            "null",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    levels = [float(v.split()[0]) for v in log.split("YAVG=")[1:]]
+    assert len(levels) == 40
+    # The trailer's credits dropped black from 16 to 7.5 here.
+    assert max(levels) - min(levels) < 1.0
+    assert min(levels) >= 15.5

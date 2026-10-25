@@ -44,6 +44,12 @@ _DENOISE_MAX = (6.0, 4.5, 6.0, 4.5)
 # same shot is identical.
 _GRAIN_MAX = 12
 _GRAIN_SEED = 1
+# Limited ("video") range for 8-bit YUV: luma 16-235, chroma 16-240.
+_VIDEO_RANGE = (
+    "format=yuv420p",
+    "limiter=min=16:max=235:planes=1",
+    "limiter=min=16:max=240:planes=6",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,4 +123,10 @@ class ShotLook:
         strength = round(_GRAIN_MAX * self.grain)
         if strength > 0:
             parts.append(f"noise=alls={strength}:allf=t:all_seed={_GRAIN_SEED}")
+        if parts:
+            # eq works around the middle of 0-255, so contrast above 1 pulls
+            # video black (16) down and white (235) up, and grain spills past
+            # both. Next to a segment with another look, or none, black then
+            # jumps at the cut. Keep the result inside video range.
+            parts.extend(_VIDEO_RANGE)
         return ",".join(parts)

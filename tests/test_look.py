@@ -59,6 +59,9 @@ def test_look_filters_follow_the_fixed_order() -> None:
     finish = look.finish_filter()
     assert finish.index("eq=") < finish.index("noise=")
     assert "all_seed=1" in finish
+    # Video range is held last, after the grain.
+    assert finish.index("noise=") < finish.index("limiter=min=16:max=235:planes=1")
+    assert finish.endswith("limiter=min=16:max=240:planes=6")
     graph = blend_filter(320, 180, 0.5, look)
     # Clean on the plain-upscale base before scaling, finish after the mix.
     base = graph.split("[1:v]", 1)[1]
@@ -240,3 +243,70 @@ def test_render_plan_splices_a_range_and_rerenders_on_a_new_scale(
     assert len(lumas) == 40
     # The whole clip re-rendered at 4x, and the bright shot kept its look.
     assert lumas[15] - lumas[0] >= 15
+
+
+def _luma_range(clip: Path, vf: str) -> tuple[float, float, float]:
+    """(lowest, highest, average) luma of the first frame after ``vf``."""
+    log = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-i",
+            str(clip),
+            "-vf",
+            f"{vf},signalstats,metadata=print:file=-"
+            if vf
+            else "signalstats,metadata=print:file=-",
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    def value(key: str) -> float:
+        return float(log.split(f"lavfi.signalstats.{key}=", 1)[1].split()[0])
+
+    return value("YMIN"), value("YMAX"), value("YAVG")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+@pytest.mark.parametrize("level", ["black", "white"])
+def test_a_strong_look_stays_in_video_range(tmp_path: Path, level: str) -> None:
+    # Video black (Y 16) and video white (Y 235).
+    colour = "0x000000" if level == "black" else "0xffffff"
+    clip = tmp_path / f"{level}.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={colour}:size=64x64:rate=10:duration=1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-qp",
+            "0",
+            str(clip),
+        ],
+        check=True,
+    )
+    low, high, before = _luma_range(clip, "")
+    assert (round(low), round(high)) in {(16, 16), (235, 235)}
+    look = ShotLook(contrast=1.3, brightness=-0.05 if level == "black" else 0.05)
+    eq_only = look.finish_filter().split(",format=")[0]
+    raw_low, raw_high, _avg = _luma_range(clip, eq_only)
+    # Without the limit, eq alone crosses the range: that was the seam.
+    assert raw_low < 16 if level == "black" else raw_high > 235
+    low, high, after = _luma_range(clip, look.finish_filter())
+    assert low >= 16 and high <= 235
+    assert after == pytest.approx(before, abs=0.5)
