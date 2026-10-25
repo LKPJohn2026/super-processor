@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.1] - 2026-10-24
+
 ### Changed
 
 - The Gemini key pasted on the setup screen is saved to `credentials.json` in
