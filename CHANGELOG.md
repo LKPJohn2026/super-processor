@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every segment lines up with the source frame for frame. Parts were cut
+  half a frame before their first frame; with the time written to six
+  decimals that sits on FFmpeg's rounding edge, and in a file that keeps one
+  tick per frame (the Sintel trailer) 141.5/24 rounded down, so 4 of its 14
+  segments started a frame early and the seam check flagged the fade at
+  0:09.8. Parts are now cut a quarter frame early. FlashVSR also returns up
+  to three frames short of a clip, and the last frame used to be repeated in
+  their place; clips now get that many copies of the last frame before
+  FlashVSR, which are trimmed off after, so the tail is real frames.
 - A look no longer pushes black below video black or white above video
   white. FFmpeg's `eq` scales around the middle of 0-255, so the trailer's
   credits look (contrast 1.10, brightness +0.02) took black from 16 to 7.5,
