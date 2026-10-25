@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The final audio mux no longer drops frames. It used `-shortest`, so a
+  source whose audio ends before its picture (the Sintel trailer: 51.95 s of
+  audio, 52.21 s of picture) lost its last frames after the frame-count check
+  had passed. The mux now runs exactly as long as the picture, cutting longer
+  audio there, and keeps the picture without audio if the frame count would
+  still change.
 - FlashVSR no longer crops the picture. Its loader centre-crops the upscaled
   frame to whole 128-pixel blocks, so an 854x480 clip at 2x came back as the
   middle 1664x896 of 1708x960, and the delivery blend laid that over the full
