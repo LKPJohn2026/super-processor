@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The wizard no longer keeps about 10 GiB of RAM between previews. Loading
+  FlashVSR's weights and decoding the frames go through several GiB of host
+  memory; once freed it stayed in glibc's heap, split over one arena per
+  worker thread. After every FlashVSR call the heap is now trimmed back to
+  the system: across five trailer previews the wizard sits at 2.5 GiB
+  between calls, against 5.3 GiB before (10.4 GiB in the live wizard). The
+  peak during a call, about 10 GiB, is the upstream loader reading the
+  weights and is unchanged.
+
 ## [3.6.1] - 2026-10-26
 
 ### Fixed
