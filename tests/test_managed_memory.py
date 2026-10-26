@@ -13,18 +13,23 @@ from test_frame_alignment import _fake_flashvsr, _numbered, _numbers, needs_ffmp
 from super_processor import managed_memory
 from super_processor.look import ShotLook
 from super_processor.managed_memory import (
+    LIMIT_ENV,
     MANAGED_MEMORY_ENV,
     allocator_library,
+    memory_limit,
+    read_meminfo,
     request_from_dict,
     request_to_dict,
     upscale_in_managed_memory,
 )
 from super_processor.regions import Region
 from super_processor.upscale import (
+    FLASHVSR_MIN_CHUNK_FRAMES,
     FlashVsrEngine,
     GpuOutOfMemory,
     UpscaleError,
     UpscaleRequest,
+    _flashvsr_failure,
 )
 
 # The fallback is Linux only, and the fake executables are shell scripts.
@@ -116,11 +121,116 @@ def test_the_real_allocator_compiles(tmp_path: Path) -> None:
     assert library.stat().st_size > 0
 
 
+_LIMITED = """
+import sys
+import torch
+torch.cuda.memory.change_current_allocator(torch.cuda.memory.CUDAPluggableAllocator(
+    sys.argv[1], "managed_malloc", "managed_free"))
+first = torch.empty(600 << 20, dtype=torch.uint8, device="cuda")
+del first
+# Fits only once the cached 600 MiB goes back to the driver.
+kept = torch.ones(900 << 20, dtype=torch.uint8, device="cuda")
+try:
+    torch.empty(400 << 20, dtype=torch.uint8, device="cuda")
+except RuntimeError as exc:
+    print("refused", exc)
+del kept
+check = torch.ones(800 << 20, dtype=torch.uint8, device="cuda")
+torch.cuda.synchronize()
+print("still works", int(check[:10].sum()))
+"""
+
+
+def _cuda() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
+
+
+@linux_only
+@pytest.mark.skipif(
+    managed_memory.find_nvcc() is None or shutil.which("c++") is None or not _cuda(),
+    reason="nvcc, a C++ compiler, and a CUDA GPU required",
+)
+def test_the_real_allocator_refuses_past_its_limit(tmp_path: Path) -> None:
+    import os
+    import subprocess
+
+    library = allocator_library(tmp_path / "build")
+    script = tmp_path / "limited.py"
+    script.write_text(_LIMITED)
+    result = subprocess.run(
+        [sys.executable, str(script), str(library)],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, **{LIMIT_ENV: str(1 << 30)}),
+        timeout=120,
+        check=False,
+    )
+    # A refused block used to come back as a tensor at address 0, and the
+    # next write broke the CUDA context.
+    assert result.returncode == 0, result.stderr
+    assert "refused std::bad_alloc" in result.stdout
+    assert "still works 10" in result.stdout
+
+
+_GIB = 1 << 30
+
+
+def _meminfo(path: Path, *, total_gib: float, available_gib: float) -> Path:
+    path.write_text(
+        f"MemTotal:       {int(total_gib * _GIB) // 1024} kB\n"
+        f"MemFree:        1024 kB\n"
+        f"MemAvailable:   {int(available_gib * _GIB) // 1024} kB\n"
+        "HugePages_Total:       0\n"
+    )
+    return path
+
+
+def test_meminfo_is_read_in_bytes(tmp_path: Path) -> None:
+    info = read_meminfo(_meminfo(tmp_path / "meminfo", total_gib=4, available_gib=1))
+    assert info["MemTotal"] == 4 * _GIB
+    assert info["MemAvailable"] == _GIB
+    assert info["HugePages_Total"] == 0
+
+
+def test_the_limit_leaves_a_reserve_and_half_the_machine_at_most() -> None:
+    # This machine at the crash: 93.6 GiB of RAM, most of it free, 4 GiB of
+    # VRAM left next to a game. A quarter stays for everything else, and the
+    # child may not take more than half the RAM.
+    total = int(93.6 * _GIB)
+    bounds = memory_limit(4 * _GIB, {"MemTotal": total, "MemAvailable": 80 * _GIB})
+    assert bounds.limit == 4 * _GIB + total // 2
+    assert bounds.floor == int(total * 0.25) // 2
+    # Less free: what is past the reserve.
+    bounds = memory_limit(0, {"MemTotal": 32 * _GIB, "MemAvailable": 14 * _GIB})
+    assert bounds.limit == 14 * _GIB - 8 * _GIB
+    assert bounds.floor == 4 * _GIB
+
+
+def test_no_ram_to_spare_starts_no_child() -> None:
+    with pytest.raises(GpuOutOfMemory, match="not enough free system RAM"):
+        memory_limit(8 * _GIB, {"MemTotal": 32 * _GIB, "MemAvailable": 9 * _GIB})
+
+
+def test_the_allocators_refusal_is_out_of_memory() -> None:
+    # Past its limit the allocator throws std::bad_alloc; PyTorch raises it
+    # as a RuntimeError with that text.
+    failure = _flashvsr_failure(RuntimeError("std::bad_alloc"))
+    assert isinstance(failure, GpuOutOfMemory)
+
+
 _CHILD = """
-import json, os, shutil, sys
+import json, os, shutil, sys, time
 assert os.environ[{env!r}] == "1"
+assert int(os.environ[{limit_env!r}]) > 0
 assert sys.argv[1:3] == ["-m", "super_processor.managed_memory"]
 request = json.loads(sys.stdin.read())
+assert request["chunk_s"] == 0.75
+if {hang!r}:
+    time.sleep(60)
 print("FlashVSR's own chatter")
 for done in (0.5, 1.0):
     print("@@super-processor progress", done, flush=True)
@@ -131,27 +241,35 @@ shutil.copy(request["source"], request["output"])
 """
 
 
-def _child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bool) -> None:
+def _child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bool, hang: bool = False
+) -> Path:
+    """A fake child, and a meminfo with room to spare; returns the meminfo."""
     library = tmp_path / "managed_alloc.so"
     library.write_bytes(b"so")
     monkeypatch.setattr(
         managed_memory, "allocator_library", lambda build_dir=None: library
     )
-    body = _CHILD.format(env=MANAGED_MEMORY_ENV, fail=fail)
+    body = _CHILD.format(
+        env=MANAGED_MEMORY_ENV, limit_env=LIMIT_ENV, fail=fail, hang=hang
+    )
     python = _script(tmp_path / "python", body)
     monkeypatch.setattr(sys, "executable", str(python))
+    return _meminfo(tmp_path / "meminfo", total_gib=64, available_gib=48)
 
 
 @linux_only
 def test_the_child_restores_and_reports_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _child(tmp_path, monkeypatch, fail=False)
+    meminfo = _child(tmp_path, monkeypatch, fail=False)
     source = tmp_path / "in.mp4"
     source.write_bytes(b"clip")
     seen: list[float] = []
     out = upscale_in_managed_memory(
-        UpscaleRequest(source, tmp_path / "out.mp4", on_progress=seen.append)
+        UpscaleRequest(source, tmp_path / "out.mp4", on_progress=seen.append),
+        chunk_s=0.75,
+        meminfo=meminfo,
     )
     assert out.read_bytes() == b"clip"
     assert seen == [0.5, 1.0]
@@ -161,11 +279,39 @@ def test_the_child_restores_and_reports_progress(
 def test_the_childs_error_comes_back_as_itself(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _child(tmp_path, monkeypatch, fail=True)
+    meminfo = _child(tmp_path, monkeypatch, fail=True)
     with pytest.raises(GpuOutOfMemory, match="out of RAM too"):
         upscale_in_managed_memory(
-            UpscaleRequest(tmp_path / "in.mp4", tmp_path / "out.mp4")
+            UpscaleRequest(tmp_path / "in.mp4", tmp_path / "out.mp4"),
+            chunk_s=0.75,
+            meminfo=meminfo,
         )
+
+
+@linux_only
+def test_the_child_is_stopped_when_ram_runs_low(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    import time
+
+    meminfo = _child(tmp_path, monkeypatch, fail=False, hang=True)
+    monkeypatch.setattr(managed_memory, "WATCH_INTERVAL_S", 0.05)
+    # The child starts with room to spare; then RAM runs out under it.
+    timer = threading.Timer(
+        0.5,
+        lambda: _meminfo(meminfo, total_gib=64, available_gib=2),
+    )
+    timer.start()
+    started = time.monotonic()
+    with pytest.raises(GpuOutOfMemory, match="system RAM ran low"):
+        upscale_in_managed_memory(
+            UpscaleRequest(tmp_path / "in.mp4", tmp_path / "out.mp4"),
+            chunk_s=0.75,
+            meminfo=meminfo,
+        )
+    timer.join()
+    assert time.monotonic() - started < 10
 
 
 @needs_ffmpeg
@@ -175,9 +321,11 @@ def test_the_shortest_piece_out_of_memory_goes_to_system_ram(
     _fake_flashvsr(tmp_path, monkeypatch)
     monkeypatch.setenv("FAKE_MAX_FRAMES", "5")
     handed: list[UpscaleRequest] = []
+    pieces: list[object] = []
 
-    def in_ram(request: UpscaleRequest, **_kwargs: object) -> Path:
+    def in_ram(request: UpscaleRequest, **kwargs: object) -> Path:
         handed.append(request)
+        pieces.append(kwargs["chunk_s"])
         shutil.copy(request.source, request.output)
         return request.output
 
@@ -187,6 +335,8 @@ def test_the_shortest_piece_out_of_memory_goes_to_system_ram(
         UpscaleRequest(source, tmp_path / "out.mp4", scale=2)
     )
     assert len(handed) == 1 and handed[0].source == source.resolve()
+    # The child starts at the shortest piece, not the full 8 s.
+    assert pieces == [pytest.approx(FLASHVSR_MIN_CHUNK_FRAMES / 24)]
     assert _numbers(output) == _numbers(source)
 
 

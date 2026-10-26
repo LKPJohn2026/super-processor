@@ -109,8 +109,9 @@ def _flashvsr_failure(exc: BaseException) -> UpscaleError:
     """
     import traceback
 
-    out_of_memory = type(exc).__name__ == "OutOfMemoryError" or (
-        "out of memory" in str(exc).lower()
+    # The system-RAM allocator refuses past its limit with std::bad_alloc.
+    out_of_memory = type(exc).__name__ in ("OutOfMemoryError", "MemoryError") or any(
+        sign in str(exc).lower() for sign in ("out of memory", "bad_alloc")
     )
     text = str(exc).splitlines()[0] if str(exc) else repr(exc)
     message = str(exc) if isinstance(exc, UpscaleError) else f"FlashVSR failed: {text}"
@@ -514,6 +515,11 @@ def upscale_all(engine: UpscaleEngine, requests: list[UpscaleRequest]) -> list[P
 class FlashVsrEngine:
     """Temporal restoration via the FlashVSR v1.1 tiny pipeline."""
 
+    def __init__(self, *, chunk_s: float = CHUNK_SECONDS) -> None:
+        # Longest piece to try first; the system-RAM child starts at the
+        # shortest, since its memory has no GPU-sized ceiling of its own.
+        self._chunk_s = chunk_s
+
     def upscale_many(self, requests: list[UpscaleRequest]) -> list[Path]:
         """Restore several short clips (previews) with one model load."""
         if not requests:
@@ -600,7 +606,7 @@ class FlashVsrEngine:
             duration = float(probe_file(request.source).duration_s or 0.0)
         except ProbeError:
             duration = 0.0
-        chunk_s = CHUNK_SECONDS
+        chunk_s = self._chunk_s
         with _FLASHVSR_LOCK:
             while True:
                 try:
@@ -619,7 +625,7 @@ class FlashVsrEngine:
                         continue
                     reason = str(exc)
                     del exc
-                    return _last_resort(request, reason)
+                    return _last_resort(request, reason, shortest)
 
     def _upscale_once(
         self,
@@ -647,7 +653,7 @@ class FlashVsrEngine:
         return _run_flashvsr(request, home=home, infer=infer)
 
 
-def _last_resort(request: UpscaleRequest, reason: str) -> Path:
+def _last_resort(request: UpscaleRequest, reason: str, shortest_s: float) -> Path:
     """Restore a clip whose shortest piece did not fit, using system RAM too.
 
     Runs in a child with managed GPU memory (see
@@ -665,7 +671,7 @@ def _last_resort(request: UpscaleRequest, reason: str) -> Path:
             f"shortest pieces. {advice} ({reason})"
         )
     try:
-        return upscale_in_managed_memory(request)
+        return upscale_in_managed_memory(request, chunk_s=shortest_s)
     except GpuOutOfMemory as exc:
         # The child's own message already says GPU and RAM were both short.
         message = str(exc)

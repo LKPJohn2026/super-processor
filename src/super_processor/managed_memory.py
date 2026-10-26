@@ -12,6 +12,14 @@ It runs in a child because PyTorch only lets the allocator change before CUDA
 has started in a process, and the wizard has started it long before. The
 allocator (``managed_alloc.cu``) is built with ``nvcc`` on first use. Linux
 only: on Windows, managed memory cannot be larger than free VRAM.
+
+System RAM is bounded three ways. The child works in the shortest pieces,
+since FlashVSR's memory grows with the frames in one call. The allocator
+refuses past a byte limit: the free VRAM plus a share of the RAM that is
+available when the child starts (see :func:`memory_limit`). And the parent
+stops the child if the RAM still available falls below half the reserve
+left for everything else. Without these, one 12 s preview next to a game
+paged 80 GiB into RAM and the kernel began killing programs.
 """
 
 from __future__ import annotations
@@ -23,6 +31,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +49,68 @@ MANAGED_MEMORY_ENV = "SUPER_PROCESSOR_MANAGED_MEMORY"
 # own lines to the same stdout.
 _MARK = "@@super-processor "
 _SOURCE = Path(__file__).with_name("managed_alloc.cu")
+# The allocator's byte limit, read by managed_alloc.cu.
+LIMIT_ENV = "SUPER_PROCESSOR_MANAGED_LIMIT"
+_GIB = 1 << 30
+# RAM left for everything else: a quarter of it, and never under 8 GiB.
+RAM_RESERVE_SHARE = 0.25
+RAM_RESERVE_MIN = 8 * _GIB
+# The child never takes more than half the machine's RAM.
+RAM_SHARE_MAX = 0.5
+# Below this much RAM to spare, the child is not started at all.
+RAM_SHARE_MIN = 2 * _GIB
+WATCH_INTERVAL_S = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryLimit:
+    """What the child may hold, and when the parent stops it."""
+
+    limit: int  # bytes the allocator may take from the driver
+    floor: int  # stop the child when MemAvailable falls below this
+
+
+def read_meminfo(path: Path = Path("/proc/meminfo")) -> dict[str, int]:
+    """``/proc/meminfo`` in bytes."""
+    values: dict[str, int] = {}
+    for line in path.read_text().splitlines():
+        name, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts and parts[0].isdigit():
+            scale = 1024 if parts[1:] == ["kB"] else 1
+            values[name] = int(parts[0]) * scale
+    return values
+
+
+def memory_limit(free_vram: int, meminfo: dict[str, int]) -> MemoryLimit:
+    """The child's byte limit: free VRAM plus RAM the rest can spare.
+
+    A reserve of RAM is left for everything else (the desktop, a game, the
+    wizard itself); of what is available past it, the child takes at most
+    half the machine. Too little to spare raises, so no child is started.
+    """
+    from .upscale import GpuOutOfMemory
+
+    total = meminfo.get("MemTotal", 0)
+    available = meminfo.get("MemAvailable", 0)
+    reserve = max(RAM_RESERVE_MIN, int(total * RAM_RESERVE_SHARE))
+    share = min(available - reserve, int(total * RAM_SHARE_MAX))
+    if share < RAM_SHARE_MIN:
+        raise GpuOutOfMemory(
+            "there is not enough free system RAM to fall back on "
+            f"({available / _GIB:.1f} GiB available, {reserve / _GIB:.1f} GiB "
+            "kept for other programs)"
+        )
+    return MemoryLimit(limit=max(free_vram, 0) + share, floor=reserve // 2)
+
+
+def _free_vram() -> int:
+    """Free GPU memory as this process sees it; 0 without CUDA."""
+    torch = sys.modules.get("torch")
+    try:
+        return int(torch.cuda.mem_get_info()[0]) if torch is not None else 0
+    except Exception:  # noqa: BLE001 - no GPU means no VRAM to count
+        return 0
 
 
 def in_managed_memory() -> bool:
@@ -130,18 +202,27 @@ def request_from_dict(data: dict[str, Any]) -> UpscaleRequest:
 
 
 def upscale_in_managed_memory(
-    request: UpscaleRequest, *, build_dir: Path | None = None
+    request: UpscaleRequest,
+    *,
+    chunk_s: float,
+    build_dir: Path | None = None,
+    meminfo: Path = Path("/proc/meminfo"),
 ) -> Path:
     """Restore ``request`` in a child process that uses managed GPU memory.
 
-    Progress lines from the child reach ``request.on_progress``; a failure in
-    the child is raised here with its message.
+    The child works in pieces of ``chunk_s`` under a byte limit, and is
+    stopped if available RAM falls below the floor anyway. Progress lines
+    from the child reach ``request.on_progress``; a failure in the child is
+    raised here with its message.
     """
     from .upscale import GpuOutOfMemory, UpscaleError
 
     library = allocator_library(build_dir)
-    env = dict(os.environ, **{MANAGED_MEMORY_ENV: "1"})
+    bounds = memory_limit(_free_vram(), read_meminfo(meminfo))
+    env = dict(os.environ, **{MANAGED_MEMORY_ENV: "1", LIMIT_ENV: str(bounds.limit)})
     failure: tuple[str, str] | None = None
+    low_ram = threading.Event()
+    done = threading.Event()
     with subprocess.Popen(
         [sys.executable, "-m", "super_processor.managed_memory", str(library)],
         stdin=subprocess.PIPE,
@@ -149,19 +230,36 @@ def upscale_in_managed_memory(
         text=True,
         env=env,
     ) as child:
-        assert child.stdin is not None and child.stdout is not None
-        child.stdin.write(json.dumps(request_to_dict(request)))
-        child.stdin.close()
-        for line in child.stdout:
-            if not line.startswith(_MARK):
-                continue
-            kind, _, rest = line[len(_MARK) :].rstrip("\n").partition(" ")
-            if kind == "progress" and request.on_progress is not None:
-                request.on_progress(float(rest))
-            elif kind == "error":
-                name, _, message = rest.partition(" ")
-                failure = (name, message)
+        watch = threading.Thread(
+            target=_watch_ram,
+            args=(child, bounds.floor, meminfo, low_ram, done),
+            daemon=True,
+        )
+        watch.start()
+        try:
+            assert child.stdin is not None and child.stdout is not None
+            child.stdin.write(
+                json.dumps({**request_to_dict(request), "chunk_s": chunk_s})
+            )
+            child.stdin.close()
+            for line in child.stdout:
+                if not line.startswith(_MARK):
+                    continue
+                kind, _, rest = line[len(_MARK) :].rstrip("\n").partition(" ")
+                if kind == "progress" and request.on_progress is not None:
+                    request.on_progress(float(rest))
+                elif kind == "error":
+                    name, _, message = rest.partition(" ")
+                    failure = (name, message)
+        finally:
+            done.set()
+            watch.join()
     code = child.returncode
+    if low_ram.is_set():
+        raise GpuOutOfMemory(
+            "FlashVSR was stopped because system RAM ran low "
+            f"(under {bounds.floor / _GIB:.1f} GiB available)"
+        )
     if failure is not None:
         name, message = failure
         raise (GpuOutOfMemory if name == "GpuOutOfMemory" else UpscaleError)(message)
@@ -170,6 +268,30 @@ def upscale_in_managed_memory(
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
     return request.output
+
+
+def _watch_ram(
+    child: subprocess.Popen[str],
+    floor: int,
+    meminfo: Path,
+    low_ram: threading.Event,
+    done: threading.Event,
+) -> None:
+    """Kill ``child`` once available RAM falls below ``floor``.
+
+    The allocator's limit covers the blocks it hands out, not what the driver
+    and the rest of the system need around them; this is the last guard.
+    Killing the child returns every managed page at once.
+    """
+    while not done.wait(WATCH_INTERVAL_S):
+        try:
+            available = read_meminfo(meminfo).get("MemAvailable")
+        except OSError:
+            continue
+        if available is not None and available < floor:
+            low_ram.set()
+            child.kill()
+            return
 
 
 def _report(kind: str, text: str) -> None:
@@ -190,12 +312,13 @@ def main(argv: list[str] | None = None) -> int:
 
     from .upscale import FlashVsrEngine, UpscaleError
 
+    data = json.loads(sys.stdin.read())
     request = replace(
-        request_from_dict(json.loads(sys.stdin.read())),
+        request_from_dict(data),
         on_progress=lambda done: _report("progress", f"{done:.4f}"),
     )
     try:
-        FlashVsrEngine().upscale(request)
+        FlashVsrEngine(chunk_s=float(data["chunk_s"])).upscale(request)
     except UpscaleError as exc:
         first = str(exc).splitlines()[0] if str(exc) else ""
         _report("error", f"{type(exc).__name__} {first}")
