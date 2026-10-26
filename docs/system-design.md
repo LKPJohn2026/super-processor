@@ -97,6 +97,15 @@ GPU to itself. A child is needed because PyTorch only lets the allocator
 change before CUDA starts in a process. It is Linux only: on Windows,
 managed memory cannot be larger than free VRAM.
 
+System RAM is bounded three ways, since the driver pages managed memory to
+RAM without a ceiling of its own (one preview took 80 GiB). The child works
+in the shortest pieces. Its allocator refuses past a byte limit of the free
+VRAM plus the RAM available past a reserve (a quarter of the RAM, at least
+8 GiB), at most half the machine; it throws `std::bad_alloc`, which ends as
+the usual out-of-memory error. And the wizard kills the child if available
+RAM drops below half the reserve. With too little RAM to spare, no child is
+started.
+
 ### Segment loop
 
 The wizard works one segment at a time instead of planning every shot at

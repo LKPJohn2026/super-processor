@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The system-RAM fallback can no longer run the computer out of memory. A
+  preview next to a game paged about 80 GiB into RAM and the kernel began
+  killing programs. Three limits now hold it:
+  - The child works in the shortest pieces (17 frames) instead of starting
+    again at 8 s, since FlashVSR's memory grows with the frames in a call.
+  - Its allocator stops at a byte limit: the free VRAM plus what RAM can be
+    spared, which is what is available past a reserve of a quarter of the
+    RAM (at least 8 GiB), and never more than half the machine. Past the
+    limit it returns its cache to the driver and then refuses, which ends
+    in the usual out-of-memory message. It throws to refuse: PyTorch does
+    not check a null block, which came back as a tensor at address 0 and
+    broke the CUDA context.
+  - The wizard stops the child if available RAM falls below half that
+    reserve, whatever the cause.
+  With too little RAM to spare, no child is started. The allocator's cache
+  also reuses any block up to twice the size asked for and returns itself
+  to the driver once more than 2 GiB sits idle: reusing only exact sizes
+  had left 13.6 of 27.6 GiB idle for one 72-frame preview. That preview,
+  with 8 GiB of VRAM free, now peaks at 22.3 GiB held and leaves 53.6 of
+  78.9 GiB of RAM available, in 45 s.
+
 ## [3.6.0] - 2026-10-25
 
 ### Added
