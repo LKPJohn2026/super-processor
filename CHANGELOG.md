@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.2] - 2026-10-26
+
 ### Fixed
 
 - The wizard no longer keeps about 10 GiB of RAM between previews. Loading
