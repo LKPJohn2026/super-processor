@@ -142,8 +142,11 @@ print("still works", int(check[:10].sum()))
 
 
 def _cuda() -> bool:
+    # torch is the optional gpu extra, so it is not imported by name.
+    import importlib
+
     try:
-        import torch
+        torch = importlib.import_module("torch")
     except ImportError:
         return False
     return bool(torch.cuda.is_available())
