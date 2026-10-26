@@ -771,6 +771,7 @@ def _release_gpu(pipe: Any | None = None) -> None:
     del pipe
     sys.modules.pop("flashvsr_infer_tiny", None)
     gc.collect()
+    _return_freed_heap()
     torch_mod = sys.modules.get("torch")
     cuda = getattr(torch_mod, "cuda", None) if torch_mod is not None else None
     if cuda is None or not getattr(cuda, "is_available", lambda: False)():
@@ -781,6 +782,25 @@ def _release_gpu(pipe: Any | None = None) -> None:
     ipc = getattr(cuda, "ipc_collect", None)
     if ipc is not None:
         ipc()
+
+
+def _return_freed_heap() -> None:
+    """Hand the heap a FlashVSR call freed back to the system (glibc only).
+
+    Loading the weights and decoding the frames go through several GiB of
+    host memory. Freed, it stays in glibc's heap, split over one arena per
+    worker thread, so the wizard kept about 10 GiB between previews. Asking
+    glibc to trim takes a process from 5.1 to 2.5 GiB after each call; what
+    is left is mostly CUDA's own host state. Elsewhere this does nothing.
+    """
+    import ctypes
+    import ctypes.util
+
+    name = ctypes.util.find_library("c")
+    if not name or not sys.platform.startswith("linux"):
+        return
+    with contextlib.suppress(OSError, AttributeError):
+        ctypes.CDLL(name).malloc_trim(0)
 
 
 # FlashVSR works on whole 128-pixel blocks of the upscaled picture, and its

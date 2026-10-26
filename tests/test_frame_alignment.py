@@ -310,3 +310,36 @@ def test_chunks_are_whole_frames_that_meet() -> None:
     assert FLASHVSR_MIN_CHUNK_FRAMES >= 17
     with pytest.raises(UpscaleError):
         chunk_frames(0, 200, 12)
+
+
+def test_releasing_the_gpu_returns_freed_heap(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ctypes
+    import ctypes.util
+    import sys
+
+    import super_processor.upscale as up
+
+    trims: list[int] = []
+
+    class Libc:
+        def malloc_trim(self, pad: int) -> int:
+            trims.append(pad)
+            return 1
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: "libc.so.6")
+    monkeypatch.setattr(ctypes, "CDLL", lambda name: Libc())
+    up._release_gpu(None)
+    assert trims == [0]
+
+
+def test_no_libc_trim_is_fine(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ctypes
+
+    import super_processor.upscale as up
+
+    def missing(name: str) -> object:
+        raise OSError("no libc here")
+
+    monkeypatch.setattr(ctypes, "CDLL", missing)
+    up._release_gpu(None)
