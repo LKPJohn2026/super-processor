@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.3] - 2026-10-26
+
 ### Fixed
 
 - Segment previews run at 2× again, on the GPU. The preview plan started at
