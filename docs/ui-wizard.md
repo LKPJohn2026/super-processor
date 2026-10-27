@@ -242,8 +242,11 @@ Segments are planned one at a time, in order. Each gets a recipe: a FlashVSR
 `look.py`), and `use_upscale`. Gemini sets `use_upscale: false` where
 FlashVSR would only harm (footage already clean and sharp, or fine texture it
 would invent over); that segment is then resized with lanczos and keeps its
-look. The whole video shares one scale; Gemini picks it on the first segment,
-and 4× is only offered when the source's long edge is 960 pixels or less.
+look. The whole video shares one scale. Segments are previewed at 2×, so the
+previews run on the GPU; the Ready screen starts at 2× and also offers
+"Don't upscale" and, when the source's long edge is 960 pixels or less, 4×.
+At 854×480, 4× is 3456×1920, which FlashVSR cannot fit in 32 GB of VRAM, so a
+4× render runs through the slower system-RAM fallback.
 Faces, hands, and text are boxed and held down inside the boxes (see Protected
 regions); a segment that contains them without boxes is capped at 0.6 as a
 whole.

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Segment previews run at 2× again, on the GPU. The preview plan started at
+  the largest scale the source allows, and Gemini, offered 2× or 4×, picked
+  4×. At 854×480 that is 3456×1920, which FlashVSR cannot fit in 32 GB of
+  VRAM even 21 frames at a time, so every preview went to the system-RAM
+  fallback: in the trailer run each one took about 33 GiB of RAM for about
+  four minutes, and with a game holding VRAM the first one, before the
+  fallback had limits, crashed the computer. 4× is still offered on the
+  Ready screen, which now starts at 2×.
+
 ## [3.6.2] - 2026-10-26
 
 ### Fixed
