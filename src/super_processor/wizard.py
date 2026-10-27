@@ -116,6 +116,12 @@ WIZARD_SCHEMA_VERSION = 3
 # and the job directory are sized for.
 MAX_INPUT_LONG_EDGE = 1920
 MAX_INPUT_SHORT_EDGE = 1080
+# Segment previews are restored at 2x, so Gemini is offered only 2x and the
+# Ready screen starts there. 4x stays a choice on that screen: at 854x480 it
+# is 3456x1920, which FlashVSR cannot fit in 32 GB of VRAM even 21 frames at
+# a time, so every 4x preview went to the system-RAM fallback and took about
+# 33 GiB of RAM while it ran.
+PREVIEW_SCALE = 2
 
 
 class WizardError(RuntimeError):
@@ -1231,16 +1237,11 @@ class WizardController:
                 shots = shots_from_segments(
                     source, job_dir, found.segments, ffmpeg_bin=self.ffmpeg_bin
                 )
-                video = probe_file(source).primary_video()
             except (SegmentLoopError, ProbeError) as exc:
                 self._analyze_failed(state, str(exc))
                 return
             save_shots(job_dir, shots)
-            scales = allowed_scales(
-                (video.width or 0) if video else 0,
-                (video.height or 0) if video else 0,
-            )
-            plan = new_plan(shots, max(scales))
+            plan = new_plan(shots, PREVIEW_SCALE)
             save_plan(job_dir, plan)
         index = state.segment_index
         if index >= len(plan.recipes):

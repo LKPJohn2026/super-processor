@@ -427,12 +427,12 @@ def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
     pick_and_segment(controller, clip)
     state = approve_segments(controller)
     assert state.step is WizardStep.PREVIEW_SEGMENT, state.error
-    # The scale is chosen once, on the first segment.
-    assert planner.scales == [(2, 4)]
+    # Previews are 2x even where 4x is allowed; the planner's 4x is refused.
+    assert planner.scales == [(2,)]
     first = preview(controller)
-    assert first["scale"] == 4 and first["error"] is None
+    assert first["scale"] == 2 and first["error"] is None
     assert first["shot"]["strength"] == 0.7 and first["shot"]["check"]["ok"] is True
-    assert "upscaled 4×" in controller.render()
+    assert "upscaled 2×" in controller.render()
 
     approve_preview(controller)
     # The check failed segment 2: its settings changed and its preview was redone.
@@ -452,7 +452,7 @@ def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
         "/preview", {"action": ["redo"], "note": ["keep the sign crisp"]}
     )
     assert analyze(controller).step is WizardStep.PREVIEW_SEGMENT
-    assert planner.scales[-1] == (4,)
+    assert planner.scales[-1] == (2,)
     assert [shot["index"] for shot in planner.proposals[-1]] == [2]
     assert planner.proposals[-1][0]["editor_note"] == "keep the sign crisp"
     third = preview(controller)["shot"]
@@ -468,7 +468,7 @@ def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
     assert state.job_id
     plan = load_upscale_plan(controller.store.job_dir(state.job_id))
     assert plan is not None
-    assert [span.scale for span in plan.spans] == [4, 4, 4]
+    assert [span.scale for span in plan.spans] == [2, 2, 2]
     assert [span.strength for span in plan.spans] == [0.7, 0.4, 0.3]
     assert plan.spans[2].look.denoise == pytest.approx(0.2)
 

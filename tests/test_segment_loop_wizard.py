@@ -418,3 +418,53 @@ def test_segments_page_says_when_gemini_could_not_split() -> None:
     assert "Approve 1 segment<" in page and "Nothing to protect" in page
     empty = render_segments({"segments": [], "error": None})
     assert '<div class="timeline"' not in empty
+
+
+class _Gemini4x(_Gemini):
+    """Asks for 4x, as Gemini did for the trailer, and records what it was offered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.offered: list[tuple[int, ...]] = []
+
+    def propose_looks(self, **kwargs: Any) -> dict[str, Any]:
+        self.offered.append(tuple(kwargs["scales"]))
+        return {**super().propose_looks(**kwargs), "scale": 4}
+
+
+class _ScaleEngine(FakeUpscaleEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scales: list[int] = []
+
+    def upscale(self, request: UpscaleRequest) -> Path:
+        self.scales.append(request.scale)
+        return super().upscale(request)
+
+
+@needs_ffmpeg
+def test_previews_are_2x_even_where_4x_is_allowed(tmp_path: Path) -> None:
+    # 320x180 allows 4x, which at 854x480 never fits FlashVSR on the GPU:
+    # every 4x preview went to the system-RAM fallback.
+    clip = _clip(tmp_path / "in.mp4")
+    gemini = _Gemini4x()
+    engine = _ScaleEngine()
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=gemini,  # type: ignore[arg-type]
+        upscale_engine=engine,
+    )
+    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
+    controller.handle_post("/pick", {"path": [str(clip)]})
+    assert _run(controller, "start_segmenting").step is WizardStep.SEGMENTS
+    controller.handle_post("/segments", {"action": ["approve"]})
+    assert _run(controller, "start_analyze").step is WizardStep.PREVIEW_SEGMENT
+
+    assert gemini.offered == [(2,)]
+    assert engine.scales == [2]
+    state = controller.current_state()
+    assert state.job_id
+    plan = load_plan(controller.store.job_dir(state.job_id))
+    assert plan is not None and plan.scale == 2
+    # 4x is still a choice when the render starts, with 2x picked.
+    assert controller._scale_options(state.job_id) == (1, 2, 4)
