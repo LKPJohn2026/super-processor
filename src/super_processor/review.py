@@ -669,7 +669,8 @@ def _wizard_handler(
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header(
-                "Access-Control-Allow-Headers", f"Content-Type, Accept, {TOKEN_HEADER}"
+                "Access-Control-Allow-Headers",
+                f"Content-Type, Accept, {TOKEN_HEADER}, X-File-Name",
             )
             self.send_header("Access-Control-Max-Age", "600")
             self.end_headers()

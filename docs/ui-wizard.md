@@ -60,6 +60,68 @@ Upscale runs on a single worker thread. `GET /render?run=1` and
 The page refreshes, and the React shell polls `/api/state` (which reports
 `busy`) until the step changes. Posts are refused while a pass runs.
 
+## React shell connection and recovery
+
+`super-processor review` binds an **ephemeral backend port** and prints its URL
+(and a separate token). Keep that process running. `45143` is only the React
+shell's historical fallback, not a guaranteed backend port.
+
+For same-origin proxy mode, start the backend, then in `web/`:
+
+```bash
+npm ci
+# Example only: replace 54321 with the port in the printed backend URL.
+VITE_PROXY_TARGET=http://127.0.0.1:54321 npm run dev
+# Or serve the production build locally:
+npm run build
+VITE_PROXY_TARGET=http://127.0.0.1:54321 npm run preview
+```
+
+Open the Vite URL (`http://localhost:5173` for dev,
+`http://localhost:4173/super-processor/` for preview) without an `api` override.
+Both servers proxy `/api` (including uploads), `/output.mp4`, `/segment_stills`,
+`/shot_stills`, and `/previews` to `VITE_PROXY_TARGET`. Restart Vite with the new
+target if restarting the backend changes its port. `VITE_PROXY_TARGET` is read
+from the environment when dev/preview starts; it is not a URL baked into the
+published static app.
+
+For a **direct connection**, enter the backend URL in the shell's connection
+form, or use `http://localhost:5173/?api=http://127.0.0.1:54321` (preview:
+`http://localhost:4173/super-processor/?api=http://127.0.0.1:54321`). A build-time
+`VITE_API_ORIGIN` also selects a direct backend; omit it for proxy mode. Direct
+requests use the backend's CORS allowlist above, including upload preflight
+for `Content-Type`, `X-Wizard-Token`, and `X-File-Name`. Keep Vite on the allowed
+ports; if it chooses another port, configure that explicit origin. HTTPS Pages
+cannot reliably call an HTTP loopback backend because of browser mixed-content
+and local-network restrictions; use local dev/preview instead. An origin
+allowlist entry alone does not override browser security restrictions.
+
+Long-pass start requests and state polls have a 10-second timeout including
+response-body reads. Network failures, timeouts, HTTP 408/429 and 5xx responses
+retry at most three times, after 0.5, 1 and 2 seconds. Successful requests reset
+the retry budget; authentication, malformed states and other permanent failures
+do not retry automatically. State polls never restart work. The backend's
+step/worker-lock checks make retrying a start request safe.
+
+After retries are exhausted, progress updates stop and the UI explains that
+server work may still be running. **Retry connection** first reloads current
+state and its token, then resumes polling if necessary; **Disconnect** lets you
+choose a new printed URL. Neither action cancels server work. Shared operations
+are keyed by backend origin (including port) and route. Effect cleanup detaches
+its progress subscriber without killing work; re-subscription receives the
+latest progress. Tokens are also origin-scoped, so a delayed response from one
+connection cannot replace another server's token.
+
+`cd web && npm test` runs Node's built-in test runner with the existing
+TypeScript/Vite dependencies (Node 22.12+ recommended). It covers actual dev and
+preview proxy forwarding, range headers, upload token isolation, effect-style
+re-subscriptions, retry exhaustion/recovery, and header/body timeouts without
+paid APIs, GPUs or browsers. This is **not browser end-to-end acceptance**:
+a real-browser upload/playback/seeking/progress/recovery walkthrough remains a
+separate check. `npm run a11y` additionally requires an already-installed
+Playwright Chromium and a built app; do not infer browser availability from
+Playwright's npm package alone.
+
 ## Range revise and re-encoding
 
 The upscaled picture is encoded once into delivery settings: libx264 CRF 16,

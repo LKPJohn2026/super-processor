@@ -1,5 +1,6 @@
-import { useEffect, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import {
+  loadState,
   outputSrc,
   postAction,
   runAnalyze,
@@ -56,7 +57,33 @@ type LiveWizardProps = {
 export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardProps) {
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [runFailed, setRunFailed] = useState(false);
+  const [recovery, setRecovery] = useState(0);
+  const connection = useRef<AbortController | null>(null);
   const active = railIndex(view.step);
+
+  useEffect(() => {
+    const current = new AbortController();
+    connection.current = current;
+    return () => current.abort();
+  }, [origin]);
+
+  async function recover() {
+    const current = connection.current;
+    setBusy(true);
+    const next = await loadState(origin);
+    // A disconnected/replaced server must not update the new connection's view.
+    if (current?.signal.aborted) return;
+    setBusy(false);
+    if (!next) {
+      setLocalError("Still unable to reach the wizard. Check its printed URL, then retry or disconnect.");
+      return;
+    }
+    onView(next);
+    setRunFailed(false);
+    setLocalError(null);
+    setRecovery((value) => value + 1);
+  }
 
   async function send(action: string, fields: Record<string, string>) {
     setBusy(true);
@@ -72,26 +99,33 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
 
   useEffect(() => {
     const run = RUNNERS[view.step];
+    setRunFailed(false);
     if (!run) return;
     let cancelled = false;
+    const subscription = new AbortController();
     setLocalError(null);
     // Each poll while the worker runs carries its progress.
     const progress = (next: WizardView) => {
       if (!cancelled) onView(next);
     };
-    run(origin, progress)
+    run(origin, progress, subscription.signal)
       .then((next) => {
         if (!cancelled) onView(next);
       })
       .catch((error: unknown) => {
         if (!cancelled) {
-          setLocalError(error instanceof Error ? error.message : "The step failed");
+          setRunFailed(true);
+          const detail = error instanceof Error ? error.message : "The step failed";
+          setLocalError(
+            `Progress updates stopped: ${detail}. Work may still be running on the server. Retry the connection to refresh its state.`,
+          );
         }
       });
     return () => {
       cancelled = true;
+      subscription.abort();
     };
-  }, [origin, view.step, onView]);
+  }, [origin, view.step, onView, recovery]);
 
   const message = localError || view.error;
 
@@ -129,6 +163,11 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           onView={onView}
         />
         <div className="actions">
+          {runFailed && (
+            <button type="button" disabled={busy} onClick={() => void recover()}>
+              {busy ? "Reconnecting…" : "Retry connection"}
+            </button>
+          )}
           <button type="button" className="secondary" onClick={onDisconnect}>
             Disconnect
           </button>

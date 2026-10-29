@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Frontend integration: Vite dev and preview proxy segment/shot stills and
+  preview videos alongside API/uploads and output. Direct upload CORS preflight
+  permits `X-File-Name` while preserving the local-origin allowlist.
+- Long-pass requests and progress polls time out after 10 seconds and retry
+  transient failures with bounded backoff. Exhausted connections show an explicit
+  retry action that refreshes server state/token without cancelling server work.
+  Shared runners retain all active progress subscribers across effect cleanup
+  and StrictMode re-subscription, keyed by origin and route; tokens are scoped
+  by origin rather than shared across backend connections.
+- Document the printed ephemeral backend URL, `VITE_PROXY_TARGET`, and direct
+  connection setup. Add offline Node frontend regressions for dev/preview media
+  forwarding, subscriptions, token isolation, retries and timeouts, plus backend
+  upload preflight regressions. Browser E2E remains a separate acceptance check.
 - Seam checks share the renderer's coalesced, frame-snapped parts and nominal
   FlashVSR chunk ranges. Check retained joins (first at 8 s, not the 7.5 s
   overlap start), including end-anchored chunks; respect `use_upscale` and

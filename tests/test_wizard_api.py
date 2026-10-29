@@ -119,6 +119,53 @@ def test_api_state_and_cors_before_a_job(tmp_path: Path) -> None:
         server.stop()
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "https://evil.example",
+        "null",
+        None,
+    ],
+)
+def test_upload_preflight(tmp_path: Path, origin: str | None) -> None:
+    server = WizardServer(tmp_path, token=TOKEN)
+    base = server.start()
+    connection = _connection(base)
+    headers = {
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": ("content-type,x-wizard-token,x-file-name"),
+    }
+    if origin is not None:
+        headers["Origin"] = origin
+    try:
+        connection.request("OPTIONS", "/api/upload", headers=headers)
+        response = connection.getresponse()
+        response.read()
+        if origin is None or origin in {"https://evil.example", "null"}:
+            assert response.status == 403
+            assert response.getheader("Access-Control-Allow-Origin") is None
+            assert response.getheader("Access-Control-Allow-Headers") is None
+        else:
+            assert response.status == 204
+            assert response.getheader("Access-Control-Allow-Origin") == origin
+            assert response.getheader("Vary") == "Origin"
+            allowed = {
+                header.strip().lower()
+                for header in (
+                    response.getheader("Access-Control-Allow-Headers") or ""
+                ).split(",")
+            }
+            assert {"content-type", "x-wizard-token", "x-file-name"} <= allowed
+            assert "POST" in (response.getheader("Access-Control-Allow-Methods") or "")
+    finally:
+        connection.close()
+        server.stop()
+
+
 def _tiny_clip(path: Path) -> Path:
     subprocess.run(
         [

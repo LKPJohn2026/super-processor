@@ -135,8 +135,20 @@ See [docs/ui-wizard.md](docs/ui-wizard.md) and
 
 The `web/` app is a React shell for that wizard. GitHub Pages can host it as
 a static preview. The GPU upscale still runs only from `super-processor review`.
-Locally: `cd web && npm install && npm run dev` (proxy target
-`VITE_PROXY_TARGET`, default `http://127.0.0.1:45143`).
+Start `super-processor review` first and copy its printed backend URL: the
+server chooses an ephemeral port, not necessarily `45143`. In `web/`, install
+with `npm ci`, then run `VITE_PROXY_TARGET=http://127.0.0.1:PRINTED_PORT npm run dev`
+(replace `PRINTED_PORT` with the actual port). This proxies API, uploads, stills,
+previews, and output. For a built app, use the same variable with
+`npm run preview` after `npm run build`. The fallback proxy target
+`http://127.0.0.1:45143` works only if that is the backend's actual address.
+
+Alternatively, enter the printed backend URL in the local shell's connection
+form or open `http://localhost:5173/?api=http://127.0.0.1:PRINTED_PORT` for a
+direct connection (preview uses port `4173`). See
+[frontend connection and recovery](docs/ui-wizard.md#react-shell-connection-and-recovery)
+for CORS, HTTPS restrictions, and retry behavior. Offline frontend regressions:
+`cd web && npm test && npm run build` (no API key, GPU, or browser required).
 
 ## Development checks
 

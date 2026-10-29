@@ -27,6 +27,22 @@ python -m build
 python -m twine check dist/*
 ```
 
+For frontend integration changes, use the installed Node/TypeScript/Vite tools
+(no API key, GPU or browser needed):
+
+```bash
+cd web
+npm ci
+npm test
+npm run build
+```
+
+The Node regressions simulate effect subscription lifecycles and failed/hung
+requests and exercise real dev/preview proxy forwarding. Browser end-to-end
+acceptance is separate; `npm run a11y` needs a built app and an already-installed
+Playwright Chromium. See [connection and recovery](docs/ui-wizard.md#react-shell-connection-and-recovery)
+for the printed backend port and manual browser checks.
+
 To apply automatic formatting:
 
 ```bash
