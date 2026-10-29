@@ -28,11 +28,11 @@ from pathlib import Path
 from .probe import ProbeError, probe_file
 from .shots import ShotError, parse_metadata_log
 from .upscale import (
-    CHUNK_OVERLAP_S,
     CHUNK_SECONDS,
     STRUCTURE_SIGMA,
     UpscalePlan,
-    shot_timeline,
+    flashvsr_chunks,
+    render_shot_parts,
 )
 
 # A restored clip whose texture is this much less stable than the source's
@@ -154,34 +154,47 @@ def shimmer_index(
     return restored.instability / max(source.instability, 0.05)
 
 
-def seam_candidates(plan: UpscalePlan, duration_s: float) -> list[float]:
-    """Times where a render may have restarted FlashVSR.
+def seam_candidates(
+    plan: UpscalePlan,
+    duration_s: float,
+    *,
+    fps: float,
+    total_frames: int,
+    revised_range: tuple[float, float] | None = None,
+) -> list[float]:
+    """Frame-snapped joins introduced by the latest render.
 
-    Shot parts with different settings start fresh, a part longer than one
-    chunk restarts every ``CHUNK_SECONDS - CHUNK_OVERLAP_S``, and a revise
-    splices at its edges. Checking a time that turns out clean costs a second
-    of decoding.
+    Full renders share the renderer's coalesced parts and nominal FlashVSR
+    ranges. A splice checks only the actual keyframe-expanded replacement
+    and its edges, not hypothetical re-renders of the untouched head/tail.
+    ``revised_range`` comes from the renderer before pending is cleared.
+
+    Runtime OOM retries (including the system-RAM child) can shorten chunks.
+    Their actual joins are not recorded, so these nominal candidates cannot
+    cover them reliably. Threshold calibration on real footage is separate.
     """
-    times: set[float] = set()
-    try:
-        ordered = shot_timeline(plan.spans, duration_s)
-    except Exception:  # noqa: BLE001 - a plan that no longer tiles: check edges
-        ordered = sorted(plan.spans, key=lambda span: span.start_s)
-    step = CHUNK_SECONDS - CHUNK_OVERLAP_S
-    previous = None
-    for span in ordered:
-        settings = (span.scale, span.strength, span.look, span.regions)
-        if previous is not None and settings != previous:
-            times.add(span.start_s)
-        previous = settings
-        cursor = span.start_s + step
-        while span.end_s - cursor > 0.5:
-            times.add(cursor)
-            cursor += step
-    pending = plan.pending
-    if pending is not None:
-        times.update((pending.start_s, pending.end_s))
-    return sorted(t for t in times if 0.5 < t < duration_s - 0.5)
+    if revised_range is not None:
+        if plan.pending is None:
+            raise ValueError("a revised range requires a pending span")
+        start, end = revised_range
+        parts = [(plan.pending, round(start * fps), round(end * fps))]
+    else:
+        parts = render_shot_parts(plan.spans, duration_s, total_frames, fps)
+    frames: set[int] = set()
+    for span, first, stop in parts:
+        frames.update((first, stop))
+        # restore_clip bypasses FlashVSR for pass-through and scale 1. The
+        # engine dispatch also allows 0.05 s beyond chunk_s before chunking.
+        if (
+            span.use_upscale
+            and span.scale != 1
+            and (stop - first) / fps > (CHUNK_SECONDS + 0.05)
+        ):
+            chunks = flashvsr_chunks(stop - first, fps)
+            frames.update(first + end for _start, end in chunks[:-1])
+    return sorted(
+        frame / fps for frame in frames if 0.5 < frame / fps < total_frames / fps - 0.5
+    )
 
 
 def video_size(video: Path) -> tuple[int, int]:

@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -85,12 +86,14 @@ from .upscale import (
     UpscaleError,
     UpscalePlan,
     UpscaleSpan,
+    _ffprobe_for,
     default_span,
     load_upscale_plan,
     render_plan,
     replace_overlapping,
     require_supported_timing,
     save_upscale_plan,
+    video_stream_facts,
 )
 from .wizard_pages import (
     render_analyzing,
@@ -1480,6 +1483,7 @@ class WizardController:
             if plan is None:
                 plan = UpscalePlan(spans=(default_span(duration),))
                 save_upscale_plan(job_dir, plan)
+            revised_ranges: list[tuple[float, float]] = []
             render_plan(
                 source,
                 output,
@@ -1488,10 +1492,21 @@ class WizardController:
                 ffmpeg_bin=self.ffmpeg_bin,
                 duration_s=duration,
                 on_progress=self._render_progress(state),
+                on_revise_range=lambda start, end: revised_ranges.append((start, end)),
             )
-            # Candidates include the pending revise's edges, so read them
-            # before the pending span is cleared.
-            candidates = seam_candidates(plan, duration)
+            # The renderer probes the old output's keyframes (after legacy
+            # delivery conversion, if needed). Keep its actual splice edges,
+            # not the requested range or the new output's different keyframes.
+            total_frames, rate = video_stream_facts(
+                source, ffprobe_bin=_ffprobe_for(self.ffmpeg_bin)
+            )
+            candidates = seam_candidates(
+                plan,
+                duration,
+                fps=float(Fraction(rate)),
+                total_frames=total_frames,
+                revised_range=revised_ranges[0] if revised_ranges else None,
+            )
             plan = UpscalePlan(spans=plan.spans, pending=None)
             save_upscale_plan(job_dir, plan)
             self._progress(state, "rendering", 90, "Checking for seams")

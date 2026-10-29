@@ -239,6 +239,22 @@ def test_out_of_memory_retries_in_shorter_pieces(
     )
     assert _numbers(output) == _numbers(source)
     assert seen and seen[-1] == pytest.approx(1.0)
+    # Runtime retries introduce joins even in clips below the nominal 8s
+    # limit. The plan alone cannot recover those joins: no render trace is
+    # retained. Keep this limitation explicit rather than claiming coverage.
+    from super_processor.stability import seam_candidates
+    from super_processor.upscale import UpscalePlan
+
+    assert len(list((output.parent / "flash_chunks").glob("keep_*.mp4"))) > 1
+    assert (
+        seam_candidates(
+            UpscalePlan(spans=(UpscaleSpan(0, 130 / FPS),)),
+            130 / FPS,
+            fps=FPS,
+            total_frames=130,
+        )
+        == []
+    )
 
 
 @needs_ffmpeg

@@ -1154,6 +1154,15 @@ def chunk_frames(total: int, length: int, overlap: int) -> list[tuple[int, int]]
     return ranges
 
 
+def flashvsr_chunks(
+    total: int, fps: float, *, chunk_s: float = CHUNK_SECONDS
+) -> list[tuple[int, int]]:
+    """Inference ranges; retained pieces join at each preceding range's stop."""
+    length = max(FLASHVSR_MIN_CHUNK_FRAMES, round(chunk_s * fps))
+    overlap = min(round(CHUNK_OVERLAP_S * fps), length // 4)
+    return chunk_frames(total, length, overlap)
+
+
 def _run_flashvsr_chunked(
     request: UpscaleRequest,
     *,
@@ -1168,9 +1177,7 @@ def _run_flashvsr_chunked(
     """
     total, rate = video_stream_facts(request.source)
     fps = float(Fraction(rate))
-    length = max(FLASHVSR_MIN_CHUNK_FRAMES, round(chunk_s * fps))
-    overlap = min(round(CHUNK_OVERLAP_S * fps), length // 4)
-    chunks = chunk_frames(total, length, overlap)
+    chunks = flashvsr_chunks(total, fps, chunk_s=chunk_s)
     work = request.output.parent / "flash_chunks"
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -1654,13 +1661,15 @@ def apply_range_revise(
     ffmpeg_bin: str = "ffmpeg",
     duration_s: float,
     on_progress: ProgressFn | None = None,
+    on_revise_range: Callable[[float, float], None] | None = None,
 ) -> Path:
     """Re-upscale ``span`` from the original source and splice it into ``current``.
 
     The range widens out to the keyframes of ``current``. The head and tail are
     stream-copied, so repeated revises never re-encode the untouched parts.
     A ``current`` from before the delivery settings existed is encoded into
-    them once first.
+    them once first. ``on_revise_range`` reports the actual expanded interval
+    after probing that delivery's keyframes, for seam checks.
     """
     require_supported_timing(source, ffmpeg_bin=ffmpeg_bin)
     work = output.parent / "range_work"
@@ -1680,6 +1689,8 @@ def apply_range_revise(
         current = encode_delivery(current, work / "current.mp4", ffmpeg_bin=ffmpeg_bin)
     keys = keyframe_times(current, ffprobe_bin=_ffprobe_for(ffmpeg_bin))
     start, end = snap_to_keyframes(keys, span.start_s, span.end_s, duration_s)
+    if on_revise_range is not None:
+        on_revise_range(start, duration_s if end is None else end)
     if start == 0.0 and end is None:
         return _upscale_full(
             source,
@@ -1763,10 +1774,13 @@ def render_plan(
     ffmpeg_bin: str = "ffmpeg",
     duration_s: float,
     on_progress: ProgressFn | None = None,
+    on_revise_range: Callable[[float, float], None] | None = None,
 ) -> Path:
     """Render what ``plan`` asks for into ``output``.
 
     ``on_progress`` gets the share of the work done, 0 to 1, by source frames.
+    ``on_revise_range`` receives the actual keyframe-expanded interval when
+    revising an existing output; full shot renders do not call it.
 
     A pending range on an existing output is spliced in by
     :func:`apply_range_revise`. Anything else (the first render, a pending
@@ -1788,6 +1802,7 @@ def render_plan(
             ffmpeg_bin=ffmpeg_bin,
             duration_s=duration_s,
             on_progress=on_progress,
+            on_revise_range=on_revise_range,
         )
     return render_shots(
         source,
@@ -1823,7 +1838,7 @@ def shot_timeline(
 
 
 def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
-    """Join neighbouring spans whose scale, strength, and look match."""
+    """Join neighbouring spans whose complete restoration settings match."""
     out: list[UpscaleSpan] = []
     for span in ordered:
         last = out[-1] if out else None
@@ -1846,6 +1861,19 @@ def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
 # 141.49999 and the part started a frame early, shifting the whole segment.
 # A quarter frame keeps clear of both that edge and the frame time itself.
 _CUT_MARGIN_FRAMES = 0.25
+
+
+def render_shot_parts(
+    spans: tuple[UpscaleSpan, ...], duration_s: float, total: int, fps: float
+) -> list[tuple[UpscaleSpan, int, int]]:
+    """Coalesced render parts and their exact source-frame edges."""
+    ordered = _coalesce(shot_timeline(spans, duration_s))
+    edges = [0, *(round(span.start_s * fps) for span in ordered[1:]), total]
+    return [
+        (span, first, stop)
+        for span, first, stop in zip(ordered, edges, edges[1:], strict=False)
+        if stop > first
+    ]
 
 
 def _cut_time(frame: int, fps: float) -> float:
@@ -1888,12 +1916,9 @@ def render_shots(
     ffprobe_bin = _ffprobe_for(ffmpeg_bin)
     want, rate = video_stream_facts(source, ffprobe_bin=ffprobe_bin)
     fps = float(Fraction(rate))
-    edges = [0, *(round(span.start_s * fps) for span in ordered[1:]), want]
+    timeline = render_shot_parts(spans, duration_s, want, fps)
     parts: list[Path] = []
-    for index, span in enumerate(ordered):
-        first, stop = edges[index], edges[index + 1]
-        if stop <= first:
-            continue
+    for index, (span, first, stop) in enumerate(timeline):
         # Each part's share of the work is its share of the source frames.
         part = _part_of(on_progress, first / want, (stop - first) / want)
         clip = trim_source(

@@ -303,10 +303,32 @@ Gemini also sees the number. A clip with almost no fine detail is not judged.
 
 ### Seams
 
-FlashVSR starts again at every chunk (every 7.5 s inside a long part), at
-every boundary between segments with different settings, and at the edges of a
-revised range. After each render, a 1 s window around each of those times is
-read from the output and the source at 320 pixels wide. The largest
+After a full render, seam candidates come from the same coalesced,
+source-frame-snapped parts and nominal chunk ranges as the renderer. Adjacent
+segments with equal scale, strength, look, protected regions, and `use_upscale`
+render as one part; changing the FlashVSR toggle creates a part boundary too.
+Only FlashVSR-enabled parts above scale 1 can have chunk joins, and only when
+long enough for the engine's chunked dispatch (over 8.05 s by default).
+
+The first chunk is retained in full: its join is at 8 s, not the next chunk's
+7.5 s overlap start. Subsequent joins are at the preceding chunk's stop frame.
+Chunk length and overlap round to whole source frames; the last chunk is
+anchored to the end, so a guessed repeating seconds interval is not exact.
+For example, at 25 fps a 20 s part joins at 8 and 15.52 s. A range revision
+checks the renderer's actual, outward-keyframe-expanded splice edges and the
+replacement's nominal internal joins, not the raw requested edges or
+hypothetical joins in the untouched head and tail. Those edges are captured
+before the pending revision is cleared, including for legacy delivery conversion.
+A pending request that instead triggers a full render uses the full timeline.
+
+This is nominal chunk coverage, not a complete render history. OOM retries,
+custom chunk lengths, and the system-RAM fallback can use shorter chunks whose
+actual joins are not recorded; the checker can miss those seams. Synthetic
+CPU-only tests establish boundary mechanics and visible-jump detection, not
+quality calibration on real footage. Shimmer and seam thresholds are unchanged.
+
+After each render, a 1 s window around each candidate more than 0.5 s from
+either end is read from the output and the source at 320 pixels wide. The largest
 frame-to-frame jump in the output's window, relative to its median, is
 compared with the source's at the same frame; a jump at least 2.5× what the
 source does there (and at least 2 grey levels) is a seam. The Result screen

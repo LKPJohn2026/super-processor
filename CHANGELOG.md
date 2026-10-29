@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Seam checks share the renderer's coalesced, frame-snapped parts and nominal
+  FlashVSR chunk ranges. Check retained joins (first at 8 s, not the 7.5 s
+  overlap start), including end-anchored chunks; respect `use_upscale` and
+  scale-1/pass-through parts. Range revisions check actual keyframe-expanded
+  splice edges and replacement joins before pending state is cleared. Synthetic
+  regressions cover visible jumps, equal spans, toggles, fractional frame rates,
+  and revision edges. Thresholds are unchanged; runtime OOM/custom/fallback
+  chunk joins are not recorded and remain a documented coverage limitation.
 - Result-note revisions preserve each shot's FlashVSR/pass-through choice,
   look, and protected regions, including notes spanning multiple shots. A
   cross-shot revision re-renders the timeline rather than splicing one shot's
