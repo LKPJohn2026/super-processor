@@ -42,7 +42,7 @@ Super Processor targets a different market:
 | Processing | Usually hosted | Local FlashVSR and FFmpeg |
 | Main risk | Invented content and temporal drift | Invented fine texture (bounded by strength) and flicker |
 | Recovery | Regenerate | Re-run a time range at a lower strength |
-| Trust model | Inspect final pixels | Same frames and timing as the source; each revise is stored as JSON |
+| Trust model | Inspect final pixels | Same frames and timing as supported CFR sources; each revise is stored as JSON |
 
 The closest alternatives are manual FFmpeg scripts, conventional nonlinear
 editors, and black-box enhancement applications. Super Processor aims to
@@ -50,6 +50,30 @@ combine FFmpeg's determinism with guided diagnosis, while keeping every
 operation inspectable.
 
 ## Product decisions
+
+### Interim timing safety: verified CFR only
+
+The restoration path still converts frame indexes to times with a constant
+frame-rate clock. It does not yet preserve arbitrary variable-frame-rate
+(VFR) timelines. To keep the same-frames/timing contract honest, the wizard
+checks timing before creating a job, and shared render, revise, preview, and
+engine entry points check before GPU work or replacing an output.
+
+The guard CPU-decodes the complete first video stream with ffprobe. Decoded
+presentation timestamps must be strictly increasing and compatible with a
+uniform rational clock at the rate the renderer uses, allowing only consistent
+source-time-base quantization. The final frame duration must also agree with
+that clock. Missing/unverifiable timestamps, decode failures, incompatible rate
+metadata, and nonuniform timing fail closed. The `is_vfr` metadata heuristic is
+informational, not an admission decision.
+
+Successful checks use a bounded process-local cache keyed by resolved source,
+file identity, size, and modification metadata. Nested calls and retries reuse
+checks; internal chunks do not re-scan the original. Changed sources and new
+processes require verification again. The guard does not normalize inputs;
+errors advise that external CFR conversion may change frames/timing. Supporting
+VFR later requires a source-frame/timestamp mapping across selection, inference,
+blending, concatenation, revises, and audio, not a different average-rate guess.
 
 ### Restoration upscale instead of an FFmpeg grade
 

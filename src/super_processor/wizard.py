@@ -89,6 +89,7 @@ from .upscale import (
     load_upscale_plan,
     render_plan,
     replace_overlapping,
+    require_supported_timing,
     save_upscale_plan,
     span_at,
 )
@@ -841,6 +842,7 @@ class WizardController:
                 state.step = WizardStep.PICK_FILE
                 self._save(state)
                 return
+            require_supported_timing(source, ffmpeg_bin=self.ffmpeg_bin)
             manifest = self.store.create(source)
             self.store.transition(manifest.job_id, JobState.PROBED)
         except ProbeError:
@@ -854,7 +856,7 @@ class WizardController:
             state.step = WizardStep.PICK_FILE
             self._save(state)
             return
-        except JobError as exc:
+        except (JobError, UpscaleError) as exc:
             state.error = str(exc)
             state.step = WizardStep.PICK_FILE
             self._save(state)

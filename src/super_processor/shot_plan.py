@@ -34,6 +34,7 @@ from .upscale import (
     UpscaleRequest,
     UpscaleSpan,
     encode_delivery,
+    require_supported_timing,
     restore_clip,
     trim_source,
     upscale_all,
@@ -536,6 +537,7 @@ def render_previews(
     Each shot's ``rev`` goes up by one, so its files get new names and a
     browser never shows a cached older preview. Older files are removed.
     """
+    require_supported_timing(source, ffmpeg_bin=ffmpeg_bin)
     folder = job_dir / PREVIEWS_DIR
     work = folder / "work"
     work.mkdir(parents=True, exist_ok=True)

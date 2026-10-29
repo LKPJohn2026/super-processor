@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,126 @@ MEDIA_FACTS_SCHEMA_VERSION = 1
 
 class ProbeError(JobError):
     """Raised when ffprobe cannot produce usable media facts."""
+
+
+class UnsupportedTimingError(ProbeError):
+    """The decoded timeline cannot safely use the renderer's CFR clock."""
+
+
+_TIMING_ADVICE = (
+    "VFR/unsupported video timing: only verified constant frame rate (CFR) "
+    "is supported for restoration. Convert externally to CFR before retrying; "
+    "conversion may change frames/timing."
+)
+_TimingIdentity = tuple[int, int, int, int, int]
+
+
+def _timing_identity(source: Path) -> _TimingIdentity:
+    stat = source.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def require_cfr_timing(source: Path, *, ffprobe: str | None = None) -> None:
+    """Refuse timing the rate-based renderer cannot preserve, without using is_vfr.
+
+    Successful full CPU decodes are cached in memory by file identity and change
+    metadata. Nested entry points and retries reuse the check; replaced or edited
+    files and a restarted process must be checked again.
+    """
+    try:
+        resolved = source.expanduser().resolve()
+        identity = _timing_identity(resolved)
+        _check_cfr_timing(resolved, identity, ffprobe or find_ffprobe())
+    except UnsupportedTimingError:
+        raise
+    except (OSError, ProbeError) as exc:
+        raise UnsupportedTimingError(
+            f"{_TIMING_ADVICE} Could not verify timing: {exc}"
+        ) from exc
+
+
+@lru_cache(maxsize=32)
+def _check_cfr_timing(source: Path, identity: _TimingIdentity, ffprobe: str) -> None:
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-threads",
+                "1",
+                "-select_streams",
+                "v:0",
+                "-show_frames",
+                "-show_entries",
+                "frame=pts,duration,pkt_duration:"
+                "stream=r_frame_rate,time_base,start_pts,duration_ts",
+                "-of",
+                "json",
+                str(source),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UnsupportedTimingError(
+            f"{_TIMING_ADVICE} Could not decode timestamps: {exc}"
+        ) from exc
+    if completed.returncode != 0 or completed.stderr.strip():
+        raise UnsupportedTimingError(
+            f"{_TIMING_ADVICE} FFprobe could not decode a clean presentation timeline."
+        )
+    try:
+        _validate_cfr_timing(json.loads(completed.stdout))
+    except (ValueError, TypeError, KeyError, IndexError, ZeroDivisionError) as exc:
+        raise UnsupportedTimingError(
+            f"{_TIMING_ADVICE} Could not verify a uniform presentation timeline: {exc}"
+        ) from exc
+    if _timing_identity(source) != identity:
+        raise UnsupportedTimingError(
+            f"{_TIMING_ADVICE} The source changed during verification."
+        )
+
+
+def _validate_cfr_timing(payload: Any) -> None:
+    stream = payload["streams"][0]
+    rate = Fraction(stream["r_frame_rate"])
+    time_base = Fraction(stream["time_base"])
+    if rate <= 0 or time_base <= 0:
+        raise ValueError("invalid video clock")
+    period = 1 / (rate * time_base)
+    frames = payload["frames"]
+    if not frames:
+        raise ValueError("no decoded video frames")
+    origin = int(frames[0]["pts"])
+    previous = origin - 1
+    low = high = Fraction(0)
+    for index, frame in enumerate(frames):
+        pts = int(frame["pts"])
+        if pts <= previous:
+            raise ValueError(
+                "missing, duplicate, or nonmonotonic presentation timestamps"
+            )
+        previous = pts
+        error = pts - origin - index * period
+        low, high = min(low, error), max(high, error)
+        # A uniform rational clock rounded to integer ticks has a common phase
+        # with residual spread strictly below one tick. Unlike a per-delta
+        # tolerance, this also catches cumulative drift and coarse-clock gaps.
+        if high - low >= 1:
+            raise ValueError("nonuniform timestamps or a mismatched nominal frame rate")
+    last = frames[-1]
+    duration = int(last.get("duration") or last.get("pkt_duration") or 0)
+    if duration > 0:
+        end = previous + duration
+    else:
+        end = int(stream["start_pts"]) + int(stream["duration_ts"])
+    # Decoders can report a rounded duration independently of rounded PTS.
+    # A fractional period may therefore differ by less than one source tick.
+    if end <= previous or abs((end - previous) - period) >= 1:
+        raise ValueError("nonuniform or unverifiable final frame duration")
 
 
 @dataclass(slots=True)

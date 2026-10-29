@@ -114,6 +114,10 @@ def test_missing_weights_and_cuda(
     with pytest.raises(UpscaleError, match="weights"):
         resolve_flashvsr_weights(tmp_path)
     monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: False)
+    # This unit test isolates readiness; media timing has its own preflight.
+    monkeypatch.setattr(
+        "super_processor.upscale.require_supported_timing", lambda _p: None
+    )
     engine = FlashVsrEngine()
     with pytest.raises(UpscaleError, match="CUDA"):
         engine.upscale(UpscaleRequest(tmp_path / "a.mp4", tmp_path / "b.mp4"))

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Refuse VFR/unsupported restoration timing before wizard job creation, GPU
+  processing, or replacing an output. Admission now checks the complete decoded
+  presentation timeline and final frame duration, rather than trusting the
+  `is_vfr` rate-metadata heuristic. Shared render, revise, preview, and engine
+  entry points protect resumed jobs and direct callers too; successful checks
+  are cached by source identity and modification metadata. External CFR
+  conversion is an explicit workaround that may change frames/timing, not an
+  automatic normalization or full VFR support.
 - `review JOB_ID` resumes the requested wizard job instead of the last active
   job. Reopened review windows keep their own session, so another window cannot
   redirect their media, approvals, or revisions to a different job.

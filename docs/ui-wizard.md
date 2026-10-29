@@ -103,6 +103,22 @@ the video is larger than 1080p (long edge over 1920 or short edge over 1080,
 so portrait 1080x1920 is allowed) or longer than 30 minutes. A file with no
 video stream, or no readable resolution or duration, is refused too.
 
+Restoration currently supports only verified constant frame rate (CFR). After
+the basic limits pass, the pick step decodes the complete first video stream
+on the CPU and checks its presentation timestamps and final frame duration
+against the renderer's constant-rate clock. Equal `avg_frame_rate` and
+`r_frame_rate` values, or `is_vfr: false`, do not bypass this check. Timestamp
+rounding consistent with a uniform rational clock is allowed; nonuniform,
+missing, nonmonotonic, or incompatible timing is refused before creating a job.
+The error identifies VFR/unsupported timing and explains that external CFR
+conversion may change frames/timing. The wizard does not normalize the source.
+
+Shared restoration and preview entry points enforce the same check for resumed
+jobs and direct callers, before GPU work or replacing an output. Successful
+checks are cached only in memory, keyed by file identity, size, and modification
+metadata; changed files and a restarted process are checked again. Internal
+chunks do not repeatedly decode the whole original file for this guard.
+
 ## Serving output
 
 `/output.mp4` and files under `previews/` are streamed in 1 MiB chunks with
@@ -112,6 +128,10 @@ memory. Responses carry `Cache-Control: no-store` because a revise rewrites
 `output.mp4` in place. The final mux uses `-movflags +faststart`.
 
 ## Frame alignment
+
+The same-frame/timing contract applies to supported CFR inputs; arbitrary VFR
+preservation is not implemented. The admission check above prevents the
+constant-rate shot and chunk arithmetic from silently changing a VFR timeline.
 
 Range revises and chunk joins cut by time, so each FlashVSR clip must hold
 exactly the frames it was given, at the source rate. After every FlashVSR
@@ -129,7 +149,7 @@ frame count is refused and the previous `output.mp4` is kept.
 | LLM type | `GET/POST /llm` (state `llm_choice`) | A: no local LLM → Gemini; B: have local LLM → stub |
 | Local LLM stub | `GET/POST /local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
 | Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key. The key is saved to `credentials.json` in the user's config folder (mode 0600) and used on every later run; the screen says where the key in use comes from (`GEMINI_API_KEY`, the file, or an older keyring entry) |
-| Pick file | `POST /browse` (`/api/browse`), `POST /upload` (`/api/upload`), `POST /pick` | "Choose a file…" opens the desktop's own file dialog on the wizard's machine (zenity through the XDG portal, then kdialog; `osascript` on macOS, PowerShell on Windows) and picks the real path. A file dropped on the page is uploaded: the body is the file, `X-File-Name` its name, `X-Wizard-Token` the token; it is streamed to `<jobs>/uploads/` (video extensions only, at most 32 GiB) and removed again if the pick refuses it. Typing a path is under "Type a path instead". Up to 1080p and 30 minutes |
+| Pick file | `POST /browse` (`/api/browse`), `POST /upload` (`/api/upload`), `POST /pick` | "Choose a file…" opens the desktop's own file dialog on the wizard's machine (zenity through the XDG portal, then kdialog; `osascript` on macOS, PowerShell on Windows) and picks the real path. A file dropped on the page is uploaded: the body is the file, `X-File-Name` its name, `X-Wizard-Token` the token; it is streamed to `<jobs>/uploads/` (video extensions only, at most 32 GiB) and removed again if the pick refuses it. Typing a path is under "Type a path instead". Verified CFR, up to 1080p and 30 minutes |
 | Go back | `POST /goto` (`/api/goto`) with `to=setup`, `file`, or `segments` | Setup, File, and Segments in the step rail are links when they can be reached, and each of those screens has a back link. Nothing is deleted: going back to the segments keeps the approved segments and previews, and approving them again carries on at the same segment. `/api/state` returns `navigation` |
 | Finding segments | `GET /segment?run=1` (`/api/segment?run=1`) | States `sampling` then `proposing`: FFmpeg saves the still grid; Gemini proposes segments |
 | Segments | `POST /segments` (`/api/segments`) | `action=approve`, or `action=note` with `note` to propose again |

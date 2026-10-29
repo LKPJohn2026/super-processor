@@ -86,6 +86,16 @@ class UpscaleError(RuntimeError):
     """Raised when a local upscale cannot run or a param patch is invalid."""
 
 
+def require_supported_timing(source: Path, *, ffmpeg_bin: str = "ffmpeg") -> None:
+    """Preflight original media before GPU work or replacing any output."""
+    from .probe import ProbeError, require_cfr_timing
+
+    try:
+        require_cfr_timing(source, ffprobe=_ffprobe_for(ffmpeg_bin))
+    except ProbeError as exc:
+        raise UpscaleError(str(exc)) from exc
+
+
 class GpuOutOfMemory(UpscaleError):
     """FlashVSR ran out of GPU memory; a shorter piece may still fit."""
 
@@ -410,6 +420,7 @@ class FakeUpscaleEngine:
         self.ffmpeg_bin = ffmpeg_bin
 
     def upscale(self, request: UpscaleRequest) -> Path:
+        require_supported_timing(request.source, ffmpeg_bin=self.ffmpeg_bin)
         request.output.parent.mkdir(parents=True, exist_ok=True)
         _run_ffmpeg(
             [
@@ -458,6 +469,7 @@ def _flashvsr_ready() -> tuple[Path, Path]:
 
 def plain_upscale(request: UpscaleRequest, *, ffmpeg_bin: str = "ffmpeg") -> Path:
     """Resize ``request.source`` by its scale with lanczos, without FlashVSR."""
+    require_supported_timing(request.source, ffmpeg_bin=ffmpeg_bin)
     request.output.parent.mkdir(parents=True, exist_ok=True)
     _run_ffmpeg(
         [
@@ -499,6 +511,7 @@ def restore_clip(
     delivery encode keeps just its lanczos base with the look applied, so a
     pass-through span matches its neighbours' size and frame timing.
     """
+    require_supported_timing(request.source, ffmpeg_bin=ffmpeg_bin)
     if use_upscale and request.scale > 1:
         return engine.upscale(request), request.strength
     return plain_upscale(request, ffmpeg_bin=ffmpeg_bin), 0.0
@@ -506,6 +519,8 @@ def restore_clip(
 
 def upscale_all(engine: UpscaleEngine, requests: list[UpscaleRequest]) -> list[Path]:
     """Run several short requests, loading the model once when the engine can."""
+    for request in requests:
+        require_supported_timing(request.source)
     many = getattr(engine, "upscale_many", None)
     if callable(many):
         return list(many(requests))
@@ -524,6 +539,8 @@ class FlashVsrEngine:
         """Restore several short clips (previews) with one model load."""
         if not requests:
             return []
+        for request in requests:
+            require_supported_timing(request.source)
         home, infer = _flashvsr_ready()
         from .probe import ProbeError, probe_file
 
@@ -592,6 +609,7 @@ class FlashVsrEngine:
         return [request.output for request in ready]
 
     def upscale(self, request: UpscaleRequest) -> Path:
+        require_supported_timing(request.source)
         home, infer = _flashvsr_ready()
         from .probe import ProbeError, probe_file
 
@@ -1621,6 +1639,7 @@ def apply_range_revise(
     A ``current`` from before the delivery settings existed is encoded into
     them once first.
     """
+    require_supported_timing(source, ffmpeg_bin=ffmpeg_bin)
     work = output.parent / "range_work"
     work.mkdir(parents=True, exist_ok=True)
     if _covers_all(span, duration_s) or not current.is_file():
@@ -1633,6 +1652,7 @@ def apply_range_revise(
             ffmpeg_bin=ffmpeg_bin,
             on_progress=on_progress,
         )
+    require_supported_timing(current, ffmpeg_bin=ffmpeg_bin)
     if not is_delivery(current):
         current = encode_delivery(current, work / "current.mp4", ffmpeg_bin=ffmpeg_bin)
     keys = keyframe_times(current, ffprobe_bin=_ffprobe_for(ffmpeg_bin))
@@ -1729,6 +1749,7 @@ def render_plan(
     :func:`apply_range_revise`. Anything else (the first render, a pending
     span over the whole file, a scale change) renders every shot again.
     """
+    require_supported_timing(source, ffmpeg_bin=ffmpeg_bin)
     pending = plan.pending
     if (
         pending is not None
@@ -1827,6 +1848,7 @@ def render_shots(
     shots with the same settings render as one part, so FlashVSR is not
     loaded once per shot when most shots look alike.
     """
+    require_supported_timing(source, ffmpeg_bin=ffmpeg_bin)
     ordered = _coalesce(shot_timeline(spans, duration_s))
     work = output.parent / "shot_work"
     work.mkdir(parents=True, exist_ok=True)

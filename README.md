@@ -40,6 +40,14 @@ segment review, a before/after preview of each segment in turn, a FlashVSR
 upscale on an NVIDIA GPU, and a result screen where a note re-runs one time
 range.
 
+The wizard and restoration entry points currently require verified constant
+frame rate (CFR). Before a job is created or restoration starts, a CPU decode
+checks the complete presentation timeline, not just reported frame-rate
+metadata. VFR, nonuniform timing, or timing that cannot be verified is refused
+before GPU work or replacing an existing output. There is no automatic
+normalization: external CFR conversion may change frames/timing. This is an
+interim safety limit, not VFR support.
+
 Without a GPU, the wizard works up to the Segments screen (the still grid and
 Gemini's segments). The segment previews and the upscale need FlashVSR on
 CUDA.
