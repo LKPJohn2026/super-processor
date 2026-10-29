@@ -107,8 +107,9 @@ frame. Gemini sets it where FlashVSR would only harm.
 Text-to-video, inpainting, and face reenactment stay out. A lower strength
 asks the restorer for less invented texture. The job stores
 `upscale_plan.json` with ordered spans, one per segment; FlashVSR runs long
-spans in about 8 s pieces with a short overlap, so clips up to 30 minutes
-fit in GPU memory.
+spans in about 8 s pieces with a short overlap to bound per-chunk memory.
+This does not guarantee GPU memory fit, especially at 4x; long/1080p and
+memory-pressure acceptance remain pending.
 
 When another program holds GPU memory, a piece that runs out is retried at
 half the length, down to 17 frames. If even that does not fit, the clip is
@@ -179,8 +180,9 @@ and stills.
 ### Media remains local
 
 FFprobe, frame sampling, previews, and final FFmpeg encodes run on the user's
-machine. Expected inputs can be large (roughly 4–10 GB and 90–120 minutes);
-cloud upload of the full source is avoided.
+machine. The wizard accepts verified CFR inputs up to 1080p and 30 minutes;
+90–120 minute inputs are not supported. The full source is not uploaded to
+Gemini.
 
 Gemini receives only sampled stills the user has consented to send through the
 wizard: the segment grid (480 pixels wide, at most 120), one still per
@@ -260,10 +262,13 @@ The processing vocabulary stays allowlisted:
 
 `reframe_vertical` and `encode_hevc_size_cap` are out of wizard v1 defaults.
 
-### Software HEVC with optional hardware
+### Wizard H.264 delivery; legacy HEVC with optional hardware
 
-Final HEVC output defaults to `libx265`. NVENC, QSV, AMF, and VideoToolbox may
-be selected when present. The software path remains the quality reference.
+Wizard previews and restoration delivery use `libx264`; delivery is CRF 16
+with a forced IDR every second and no B-frames for range splicing. The wizard
+does not offer HEVC or hardware-encoder selection. Software `libx265` defaults
+and optional NVENC, QSV, AMF, and VideoToolbox selection belong to the legacy
+CLI encode paths. Doctor currently requires both `libx264` and `libx265`.
 
 ### Reference-based offline evaluation
 
@@ -274,13 +279,13 @@ integrity, and user acceptance.
 ## Architecture
 
 ```text
-Pick file (localhost wizard) ──► FFprobe ──► 1080p / 30 min check
+Pick file (localhost wizard) ──► FFprobe ──► 1080p / 30 min + decoded CFR check
    │
    ▼
 still grid (~1/s, ≤ 120) ──► Gemini: segments ──► editor: approve or note
    │
    ▼  for each segment
-measure + box faces/text ──► Gemini: recipe ──► 3 s preview (FlashVSR or resize)
+measure + box faces/hands/text ──► Gemini: recipe ──► 3 s preview (FlashVSR or resize)
    │                                              │
    │                         Gemini check ◄───────┘
    ▼
@@ -354,12 +359,17 @@ may remain for compatibility; the wizard is the primary product path.
 
 ## Security and privacy
 
-- Gemini API keys come from environment variables or the OS keychain and are
-  redacted from logs.
+- Gemini key lookup is `GEMINI_API_KEY`, then the per-user `credentials.json`,
+  then a read-only legacy OS keyring fallback. Setup writes the credential file
+  (0600 in a 0700 config directory), not a new keyring entry. Keys are redacted
+  from logs; the file is a local secret, not an encrypted credential vault.
 - The validator accepts only declared operations and bounded parameters.
 - User-selected paths are normalized and passed without invoking a shell.
-- Sampled frames leave the machine only through the Gemini path after setup.
-- Telemetry is opt-in and excludes media, secrets, and full filesystem paths.
+- Selected stills, preview stills, notes, and conversation context leave the
+  machine through Gemini after setup; obtain permission for sensitive footage.
+  Local job JSON and chat logs may retain that context.
+- No telemetry implementation is present. An opt-in telemetry policy is not an
+  implemented feature.
 
 ## Boundary
 
@@ -369,19 +379,34 @@ Included:
 - local FlashVSR restoration upscale with FFmpeg trim, splice, and encode;
 - Gemini structured result notes (range, scale, strength);
 - CLI FFmpeg-filter grade paths (diagnose, plan, segment, plans);
-- software encoding (optional hardware);
+- wizard `libx264` encoding; legacy CLI HEVC and optional hardware encoding;
 - reference-based regression helpers where already present.
 
 Deferred:
 
 - local LLM in the wizard;
-- model-emitted FFmpeg shell strings;
 - vertical social export as the wizard default;
 - desktop shell (Tauri/Electron);
 - classical CV as product diagnosis;
 - cloud render workers;
 - generative video features;
 - multi-track nonlinear editing.
+
+Model-generated shell commands and FFmpeg shell strings are **prohibited**,
+not deferred features. Models supply bounded structured data only.
+
+## Acceptance and release evidence
+
+The [acceptance matrix](acceptance.md) separates synthetic regression mechanics
+from real GPU, Gemini, and browser acceptance. Real-footage calibration and
+runtime OOM chunk-join coverage remain open: seam candidates describe nominal
+renderer joins, not every shorter join produced by OOM retries or managed-memory
+fallback. Do not infer quality, memory fit, or full seam coverage from fake-engine
+tests or earlier timing examples.
+
+The [ordered release plan](release-plan.md) records the pushed implementation
+ledger and validation checkpoints. `v3.7.0` is proposed, not released; live
+acceptance, remote CI verification, and release authorization are pending.
 
 Super Processor's market position follows directly from these choices: use AI
 to restore footage the camera already captured, never new scenes or frames,

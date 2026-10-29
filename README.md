@@ -138,8 +138,10 @@ super-processor apply JOB_ID --approve
 super-processor show JOB_ID
 ```
 
-See [docs/ui-wizard.md](docs/ui-wizard.md) and
-[docs/system-design.md](docs/system-design.md).
+See [docs/ui-wizard.md](docs/ui-wizard.md),
+[docs/system-design.md](docs/system-design.md), the
+[ordered release plan](docs/release-plan.md), and the
+[acceptance matrix and pending evidence](docs/acceptance.md).
 
 The `web/` app is a React shell for that wizard. GitHub Pages can host it as
 a static preview. The GPU upscale still runs only from `super-processor review`.

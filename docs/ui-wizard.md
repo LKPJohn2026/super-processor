@@ -29,11 +29,28 @@ super-processor doctor
 super-processor --jobs-dir .dogfood/jobs review
 ```
 
-Walk introduction → LLM type (Gemini) → setup → pick file → upscale → result.
-Send one note with a time range (for example "less artificial detail from 2s
-to 5s"), wait for the range revise, then choose happy. Confirm `output.mp4` in
-the job directory. CI also runs `@pytest.mark.gemini_live` against
-`Gemini_API_Test` on main.
+Use footage you have permission to send as sampled images to Gemini. Calls
+consume API quota and may incur charges; full video files stay local, but
+selected stills/previews, notes, and chat context are sent to Google.
+
+Walk introduction → LLM type (Gemini) → setup → pick file → sampling/proposing
+→ **Segments**. Inspect the proposed ranges and content labels, send a boundary
+note, then approve. For **each segment**, wait for analyzing → before/after
+preview; play and seek both clips, inspect protection boxes and checks, send a
+recipe note, and approve. On **Ready to render**, inspect the scale and every
+segment's FlashVSR/pass-through choice, then render → result. Send a range
+note (for example "less artificial detail from 2s to 5s"), wait for the revise,
+and inspect it before choosing happy. Confirm `output.mp4`, the plans, chat,
+and `render_report.json` in the job directory. Reopen with `review JOB_ID` and
+verify explicit resumption; also exercise a restart note that keeps chat.
+
+Use the [acceptance matrix](acceptance.md) for mixed pass-through, repeated
+revisions, audio, memory pressure, and both browser interfaces. Real GPU/Gemini/
+browser evidence is pending; this walkthrough is a procedure, not a passing run.
+Routine tests exclude `gemini_live`. CI has a separate live structured-output
+job using `Gemini_API_Test` on main; it is not the real-footage visual acceptance
+matrix. For an intentional local API check, configure a test key and run
+`python -m pytest -m gemini_live --no-cov` separately.
 
 ## Local-only server
 
@@ -496,10 +513,23 @@ shows worker progress. Pages itself cannot run the GPU.
 
 ## CI coverage
 
-`tests/test_wizard_full_flow.py` posts through the live `WizardServer` from
-introduction → LLM choice → setup → pick → local upscale → result note →
-range splice → done. The GPU engine is faked. Gemini, when the note is sent,
-returns only a time range plus scale and strength.
+`tests/test_wizard_full_flow.py` drives the actual localhost `WizardServer`
+over HTTP: introduction → LLM choice → setup → pick → sampling/proposing →
+segments approval → analyzing → segment before/after preview and check →
+preview approval → ready to render → render → result note → range revise →
+done. It uses synthetic CFR video with audio and real local FFmpeg operations,
+but `FakeUpscaleEngine` and a fake Gemini transport for segment proposals,
+recipes, preview checks, and the result-note range/scale/strength. It also tests
+the local-LLM stub returning to Gemini setup. It does not prove real model
+quality, GPU memory behavior, or browser playback.
+
+Routine Python CI excludes live Gemini tests; the separate live API job checks
+structured output, not the full visual dogfood flow. Frontend Node regressions
+and the production build are separate offline checks (see connection and
+recovery above). CI runs these frontend checks in a dedicated job and requires
+that job before packaging. Local passing results are recorded in the
+[acceptance record](acceptance.md); remote CI outcomes still need verification.
+Do not treat local frontend checks as a recorded final CI pass.
 
 ## Non-goals
 
