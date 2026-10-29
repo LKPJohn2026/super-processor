@@ -827,7 +827,9 @@ class ReviewServer:
         self.token: str | None = None
         wizard_state = load_job_wizard_state(job_dir)
         if wizard_state is not None and wizard_state.step is not WizardStep.INTRO:
-            controller = WizardController(jobs_dir or job_dir.parent)
+            controller = WizardController(
+                jobs_dir or job_dir.parent, job_id=job_dir.name
+            )
             self.token = new_wizard_token()
             handler: type[BaseHTTPRequestHandler] = _wizard_handler(
                 controller, self.token

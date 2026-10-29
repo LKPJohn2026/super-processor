@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `review JOB_ID` resumes the requested wizard job instead of the last active
+  job. Reopened review windows keep their own session, so another window cannot
+  redirect their media, approvals, or revisions to a different job.
+
 ## [3.6.3] - 2026-10-26
 
 ### Fixed

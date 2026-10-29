@@ -14,7 +14,9 @@ super-processor review JOB_ID
 
 Without a job id the server starts at the introduction screen. With a job id it
 resumes that job’s wizard state when present, otherwise shows the legacy split
-review page when `segments.json` exists.
+review page when `segments.json` exists. An explicitly reopened wizard stays on
+that job even if another review window changes the last active job. Choosing
+“Start a new job” still leaves the reopened job intact and starts a fresh flow.
 
 ## Live dogfood (real Gemini)
 

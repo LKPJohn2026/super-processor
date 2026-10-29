@@ -382,12 +382,19 @@ class WizardController:
         self,
         jobs_dir: Path,
         *,
+        job_id: str | None = None,
         gemini: GeminiClient | None = None,
         ffmpeg_bin: str = "ffmpeg",
         upscale_engine: UpscaleEngine | None = None,
     ) -> None:
         self.store = JobStore(jobs_dir)
         self.jobs_dir = self.store.root
+        # An explicitly reopened job must not follow another window's session.
+        self._session_state: WizardState | None = None
+        if job_id is not None:
+            self._session_state = load_job_wizard_state(self.store.job_dir(job_id))
+            if self._session_state is None:
+                raise WizardError(f"no wizard state for job {job_id}")
         self.ffmpeg_bin = ffmpeg_bin
         self._gemini = gemini
         self._upscale = upscale_engine
@@ -410,7 +417,7 @@ class WizardController:
 
     def current_state(self) -> WizardState:
         """Return the active wizard state (job-scoped when a job exists)."""
-        session = load_session_state(self.jobs_dir)
+        session = self._session_state or load_session_state(self.jobs_dir)
         if session.job_id:
             job_dir = self.store.job_dir(session.job_id)
             job_state = load_job_wizard_state(job_dir)
@@ -527,6 +534,8 @@ class WizardController:
         save_session_state(self.jobs_dir, state)
         if state.job_id:
             save_job_wizard_state(self.store.job_dir(state.job_id), state)
+        if self._session_state is not None:
+            self._session_state = state
 
     def render(self) -> str:
         return with_navigation(self._render_page(), self.navigation())

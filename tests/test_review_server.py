@@ -22,6 +22,15 @@ from super_processor.segments import (
     write_samples,
     write_segments,
 )
+from super_processor.wizard import (
+    WizardController,
+    WizardError,
+    WizardState,
+    WizardStep,
+    load_job_wizard_state,
+    save_job_wizard_state,
+    save_session_state,
+)
 
 PIXELS = 160 * 90
 
@@ -114,6 +123,90 @@ def _proposed_job(tmp_path: Path) -> tuple[JobStore, str]:
         ],
     )
     return store, job_id
+
+
+@pytest.mark.parametrize("session", ["other", "empty", "missing"])
+@pytest.mark.parametrize("explicit_root", [True, False])
+def test_reopened_wizard_uses_requested_job(
+    tmp_path: Path, session: str, explicit_root: bool
+) -> None:
+    store = JobStore(tmp_path / "jobs")
+    (tmp_path / "clip.mp4").write_bytes(b"source")
+    requested_id = "aaaaaaaaaaaaaaaa"
+    other_id = "bbbbbbbbbbbbbbbb"
+    for job_id in (requested_id, other_id):
+        store.create(tmp_path / "clip.mp4", job_id=job_id)
+        job_dir = store.job_dir(job_id)
+        save_job_wizard_state(
+            job_dir, WizardState(step=WizardStep.RESULT, job_id=job_id)
+        )
+        (job_dir / "output.mp4").write_bytes(job_id.encode())
+    other_state = load_job_wizard_state(store.job_dir(other_id))
+    assert other_state is not None
+    if session == "other":
+        save_session_state(store.root, other_state)
+    elif session == "empty":
+        save_session_state(store.root, WizardState())
+
+    server = ReviewServer(
+        store.job_dir(requested_id),
+        jobs_dir=store.root if explicit_root else None,
+        job_id=requested_id if explicit_root else None,
+    )
+    base = server.start()
+    try:
+        with urlopen(base + "/api/state") as response:
+            assert json.load(response)["job_id"] == requested_id
+        with urlopen(base + "/output.mp4") as response:
+            assert response.read() == requested_id.encode()
+
+        # Another window selecting a different job must not redirect this one.
+        save_session_state(store.root, other_state)
+        request = Request(
+            base + "/api/result",
+            data=b'{"mood": "happy"}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Wizard-Token": server.token or "",
+            },
+            method="POST",
+        )
+        with urlopen(request) as response:
+            view = json.load(response)
+        assert view["job_id"] == requested_id
+        assert view["step"] == "done"
+        requested = load_job_wizard_state(store.job_dir(requested_id))
+        assert requested is not None and requested.step is WizardStep.DONE
+        assert load_job_wizard_state(store.job_dir(other_id)) == other_state
+    finally:
+        server.stop()
+
+
+def test_reopened_controller_can_start_a_new_session(tmp_path: Path) -> None:
+    (tmp_path / "clip.mp4").write_bytes(b"source")
+    store = JobStore(tmp_path / "jobs")
+    job_id = "aaaaaaaaaaaaaaaa"
+    store.create(tmp_path / "clip.mp4", job_id=job_id)
+    saved = WizardState(step=WizardStep.DONE, job_id=job_id)
+    save_job_wizard_state(store.job_dir(job_id), saved)
+    controller = WizardController(store.root, job_id=job_id)
+
+    controller.start_new_job()
+    fresh = controller.current_state()
+    assert fresh.job_id is None
+    assert fresh.step in {WizardStep.PICK_FILE, WizardStep.SETUP}
+    save_session_state(store.root, saved)
+    assert controller.current_state() == fresh
+    assert load_job_wizard_state(store.job_dir(job_id)) == saved
+
+
+def test_reopened_controller_requires_job_wizard_state(tmp_path: Path) -> None:
+    (tmp_path / "clip.mp4").write_bytes(b"source")
+    store = JobStore(tmp_path / "jobs")
+    job_id = "aaaaaaaaaaaaaaaa"
+    store.create(tmp_path / "clip.mp4", job_id=job_id)
+    with pytest.raises(WizardError, match="no wizard state"):
+        WizardController(store.root, job_id=job_id)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
