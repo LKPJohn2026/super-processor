@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,41 @@ def test_plan_roundtrip_and_chunks(tmp_path: Path) -> None:
     assert len(chunks) >= 2
     assert chunks[0].end_s - chunks[0].start_s <= 8.05
     assert chunks[-1].end_s == 20
+
+
+def test_latest_revision_roundtrip_and_legacy_plans(tmp_path: Path) -> None:
+    span = default_span(12)
+    legacy = UpscalePlan.from_dict({"spans": [span.to_dict()]})
+    assert legacy.latest_revision is None
+    assert "latest_revision" not in legacy.to_dict()
+    assert (
+        UpscalePlan.from_dict({"spans": [span.to_dict()], "latest_revision": None})
+        == legacy
+    )
+    revision = UpscaleSpan(2, 5, scale=4, strength=0.2)
+    plan = UpscalePlan((span,), pending=span, latest_revision=revision)
+    save_upscale_plan(tmp_path, replace(plan, pending=None))
+    loaded = load_upscale_plan(tmp_path)
+    assert loaded == replace(plan, pending=None)
+    assert loaded is not None
+    assert loaded.to_dict()["latest_revision"] == revision.to_dict()
+    with pytest.raises(UpscaleError):
+        UpscalePlan.from_dict({"spans": [span.to_dict()], "latest_revision": {}})
+
+
+@pytest.mark.parametrize("preserve", [False, True])
+@pytest.mark.parametrize("start,end,scale", [(1, 5, 2), (1, 2, 4), (0, 99, 4)])
+def test_latest_revision_is_requested_patch_not_render_sentinel(
+    preserve: bool, start: float, end: float, scale: int
+) -> None:
+    plan = UpscalePlan((UpscaleSpan(0, 3), UpscaleSpan(3, 6, strength=0.3)))
+    patch = UpscaleSpan(start, end, scale=scale, strength=0.2)
+    updated = replace_overlapping(plan, patch, 6, preserve_shot_settings=preserve)
+    assert updated.latest_revision == clamp_span(patch, 6)
+    assert UpscalePlan.from_dict(updated.to_dict()) == updated
+    if scale == 4 or preserve:
+        assert updated.pending is not None
+        assert (updated.pending.start_s, updated.pending.end_s) == (0, 6)
 
 
 def test_replace_overlapping_keeps_scale_and_range() -> None:

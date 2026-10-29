@@ -331,6 +331,67 @@ def test_batch_preflights_all_inputs_before_starting_any(
 
 
 @needs_ffmpeg
+@pytest.mark.parametrize("batch_method", [False, True])
+def test_batch_uses_engine_binary_without_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batch_method: bool
+) -> None:
+    executable = shutil.which("ffmpeg")
+    assert executable is not None
+    ffmpeg = str(Path(executable).resolve())
+    ffprobe = upscale._ffprobe_for(ffmpeg)
+    if not Path(ffprobe).is_absolute():
+        pytest.skip("requires ffprobe beside the explicit ffmpeg binary")
+    source = _clip(tmp_path / "good.mp4")
+    bad = _clip(tmp_path / "bad.mp4", vfr=True)
+    engine = FakeUpscaleEngine(ffmpeg_bin=ffmpeg)
+    requests = [UpscaleRequest(source, tmp_path / "out.mp4")]
+    batches: list[list[UpscaleRequest]] = []
+
+    def many(batch: list[UpscaleRequest]) -> list[Path]:
+        batches.append(batch)
+        return [engine.upscale(request) for request in batch]
+
+    if batch_method:
+        monkeypatch.setattr(engine, "upscale_many", many, raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "no-tools"))
+    assert upscale_all(engine, requests) == [requests[0].output]
+    assert video_stream_facts(requests[0].output, ffprobe_bin=ffprobe)[0] == 60
+    assert len(batches) == int(batch_method)
+    refused = [
+        UpscaleRequest(source, tmp_path / "untouched.mp4"),
+        UpscaleRequest(bad, tmp_path / "bad_out.mp4"),
+    ]
+    with pytest.raises(UpscaleError, match="VFR/unsupported"):
+        upscale_all(engine, refused)
+    assert not any(request.output.exists() for request in refused)
+    assert len(batches) == int(batch_method)
+    with pytest.raises(UpscaleError, match="Could not decode timestamps"):
+        upscale_all(engine, requests, ffmpeg_bin=str(tmp_path / "ffmpeg"))
+
+
+@needs_ffmpeg
+def test_batch_binary_override_without_engine_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = shutil.which("ffmpeg")
+    assert executable is not None
+    ffmpeg = str(Path(executable).resolve())
+    if not Path(upscale._ffprobe_for(ffmpeg)).is_absolute():
+        pytest.skip("requires ffprobe beside the explicit ffmpeg binary")
+    source = _clip(tmp_path / "good.mp4")
+
+    class ExternalEngine:
+        def upscale(self, request: UpscaleRequest) -> Path:
+            return request.output
+
+    request = UpscaleRequest(source, tmp_path / "out.mp4")
+    monkeypatch.setenv("PATH", str(tmp_path / "no-tools"))
+    assert upscale_all(ExternalEngine(), [request], ffmpeg_bin=ffmpeg) == [
+        request.output
+    ]
+
+
+@needs_ffmpeg
 def test_nested_entry_checks_reuse_scan_but_replaced_sources_are_rechecked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

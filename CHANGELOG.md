@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve the latest requested revision range and knobs separately from split
+  render spans, including after rendering and reloading a job, so follow-up
+  result notes receive the complete previous range. Older plan JSON still loads.
+- Batch timing preflight honors an engine's explicit FFmpeg binary, with an
+  optional caller override, instead of requiring a separate ffprobe on PATH.
+- Normalize packaging-test fixture paths to native separators so manifest
+  exclusions are checked correctly on Windows as well as POSIX systems.
 - FFmpeg cancellation escalates after a one-second grace period when a process
   ignores SIGTERM; the runner owns signaling and reaping to avoid delayed PID
   races. Progress reads FFmpeg's `out_time_ms` as microseconds.

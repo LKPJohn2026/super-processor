@@ -145,11 +145,13 @@ class _RevisionTransport:
             "strength": 0.2,
         }
         self.calls = 0
+        self.prompts: list[str] = []
 
     def generate(
         self, *, model: str, api_key: str, body: dict[str, Any]
     ) -> dict[str, Any]:
         self.calls += 1
+        self.prompts.append(body["contents"][-1]["parts"][0]["text"])
         return {
             "candidates": [{"content": {"parts": [{"text": json.dumps(self.payload)}]}}]
         }
@@ -202,6 +204,7 @@ def test_result_note_preserves_each_shots_settings(
     state = controller.current_state()
     assert state.step is WizardStep.RENDERING and state.error is None
     assert transport.calls == 1
+    assert "scale=2, strength=0.50, applied from 3.0s to 6.0s." in transport.prompts[0]
     updated = load_upscale_plan(job_dir)
     assert updated is not None
     for span in updated.spans:
@@ -223,6 +226,47 @@ def test_result_note_preserves_each_shots_settings(
     assert video_stream_facts(output)[0] == 60
     assert _streams(output)["video"] == (160 * scale, 90 * scale)
     assert "audio" in _streams(output)
+    saved = load_upscale_plan(job_dir)
+    assert saved is not None and saved.pending is None
+    assert saved.latest_revision == UpscaleSpan(start, end, scale=scale, strength=0.2)
+
+    # Reopen after rendering: the full request must survive splitting and saving.
+    controller = WizardController(
+        controller.jobs_dir,
+        gemini=GeminiClient(api_key="fake", transport=transport),
+        upscale_engine=engine,
+    )
+    transport.payload["strength"] = 0.1
+    controller.handle_post("/result", {"note": ["lower it again over the same range"]})
+    state = controller.current_state()
+    assert state.step is WizardStep.RENDERING and state.error is None
+    assert transport.calls == 2
+    assert (
+        f"scale={scale}, strength=0.20, applied from {start:.1f}s to {end:.1f}s."
+        in transport.prompts[-1]
+    )
+    followup = load_upscale_plan(job_dir)
+    assert followup is not None
+    assert followup.latest_revision == UpscaleSpan(
+        start, end, scale=scale, strength=0.1
+    )
+    for span in followup.spans:
+        under = span_at(original, (span.start_s + span.end_s) / 2)
+        assert under is not None
+        assert (span.use_upscale, span.look, span.regions) == (
+            under.use_upscale,
+            under.look,
+            under.regions,
+        )
+        overlaps = span.start_s < end and span.end_s > start
+        assert span.strength == (0.1 if overlaps else under.strength)
+    controller.run_render()
+    state = controller.current_state()
+    assert state.step is WizardStep.RESULT and state.error is None
+    saved = load_upscale_plan(job_dir)
+    assert saved is not None and saved.pending is None
+    assert saved.latest_revision == followup.latest_revision
+    assert video_stream_facts(output)[0] == 60
 
 
 @needs_ffmpeg

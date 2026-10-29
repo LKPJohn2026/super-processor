@@ -201,6 +201,8 @@ class UpscalePlan:
 
     spans: tuple[UpscaleSpan, ...]
     pending: UpscaleSpan | None = None
+    # Requested knobs/range, independent of split spans and render scheduling.
+    latest_revision: UpscaleSpan | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -210,6 +212,8 @@ class UpscalePlan:
         }
         if self.pending is not None:
             payload["pending"] = self.pending.to_dict()
+        if self.latest_revision is not None:
+            payload["latest_revision"] = self.latest_revision.to_dict()
         return payload
 
     @classmethod
@@ -221,9 +225,14 @@ class UpscalePlan:
             raise UpscaleError("upscale plan needs at least one span")
         pending_raw = data.get("pending")
         pending = UpscaleSpan.from_dict(pending_raw) if pending_raw else None
+        revision_raw = data.get("latest_revision")
+        latest_revision = (
+            UpscaleSpan.from_dict(revision_raw) if revision_raw is not None else None
+        )
         return cls(
             spans=tuple(UpscaleSpan.from_dict(item) for item in raw_spans),
             pending=pending,
+            latest_revision=latest_revision,
         )
 
 
@@ -400,7 +409,7 @@ def replace_overlapping(
     patch = clamp_span(patch, duration_s)
     if _covers_all(patch, duration_s) and not preserve_shot_settings:
         full = replace(patch, start_s=0.0, end_s=duration_s)
-        return UpscalePlan(spans=(full,), pending=full)
+        return UpscalePlan(spans=(full,), pending=full, latest_revision=patch)
     spans = plan.spans
     rescale = patch.scale not in {span.scale for span in spans}
     if rescale:
@@ -432,8 +441,7 @@ def replace_overlapping(
     pending = patches[-1]
     if rescale or len(patches) > 1:
         pending = replace(patch, start_s=0.0, end_s=duration_s)
-    # The latest patches stay last; the wizard reads the prior knobs there.
-    return UpscalePlan(spans=(*kept, *patches), pending=pending)
+    return UpscalePlan(spans=(*kept, *patches), pending=pending, latest_revision=patch)
 
 
 class FakeUpscaleEngine:
@@ -540,10 +548,17 @@ def restore_clip(
     return plain_upscale(request, ffmpeg_bin=ffmpeg_bin), 0.0
 
 
-def upscale_all(engine: UpscaleEngine, requests: list[UpscaleRequest]) -> list[Path]:
-    """Run several short requests, loading the model once when the engine can."""
+def upscale_all(
+    engine: UpscaleEngine,
+    requests: list[UpscaleRequest],
+    *,
+    ffmpeg_bin: str | None = None,
+) -> list[Path]:
+    """Batch clips, preflighting with the override or engine's FFmpeg selection."""
+    if ffmpeg_bin is None:
+        ffmpeg_bin = getattr(engine, "ffmpeg_bin", "ffmpeg")
     for request in requests:
-        require_supported_timing(request.source)
+        require_supported_timing(request.source, ffmpeg_bin=ffmpeg_bin)
     many = getattr(engine, "upscale_many", None)
     if callable(many):
         return list(many(requests))

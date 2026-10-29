@@ -1414,7 +1414,7 @@ class WizardController:
             plan = load_upscale_plan(job_dir) or UpscalePlan(
                 spans=(default_span(duration),)
             )
-            prior = plan.spans[-1]
+            prior = plan.latest_revision or plan.spans[-1]
             raw = self.gemini().revise_upscale_params(
                 note=note,
                 prior_scale=prior.scale,
@@ -1507,7 +1507,7 @@ class WizardController:
                 total_frames=total_frames,
                 revised_range=revised_ranges[0] if revised_ranges else None,
             )
-            plan = UpscalePlan(spans=plan.spans, pending=None)
+            plan = replace(plan, pending=None)
             save_upscale_plan(job_dir, plan)
             self._progress(state, "rendering", 90, "Checking for seams")
             self._check_seams(job_dir, output, source, candidates)

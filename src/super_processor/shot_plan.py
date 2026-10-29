@@ -577,7 +577,9 @@ def render_previews(
                 engine, request, use_upscale=False, ffmpeg_bin=ffmpeg_bin
             )[0]
     upscaled = [index for index in indexes if index not in plain]
-    raws = dict(zip(upscaled, upscale_all(engine, requests), strict=True))
+    raws = dict(
+        zip(upscaled, upscale_all(engine, requests, ffmpeg_bin=ffmpeg_bin), strict=True)
+    )
     raws.update(plain)
     for index in indexes:
         raw = raws[index]

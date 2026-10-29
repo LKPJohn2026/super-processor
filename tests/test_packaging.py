@@ -33,6 +33,9 @@ def test_manifest_keeps_web_html_but_excludes_cython_annotations() -> None:
         "src/super_processor/_core.so",
         "src/super_processor/_version.py",
     ]
+    # FileList matches native separators, just like setuptools' real file list.
+    tracked = [str(Path(path)) for path in tracked]
+    generated = [str(Path(path)) for path in generated]
     manifest = FileList()
     manifest.set_allfiles(tracked + generated)
     manifest.files = tracked + generated
