@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from setuptools._distutils.filelist import FileList
+import pytest
+
+# Build tooling is a dev extra, not a dependency of an installed wheel.
+filelist = pytest.importorskip("setuptools._distutils.filelist")
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,7 +39,7 @@ def test_manifest_keeps_web_html_but_excludes_cython_annotations() -> None:
     # FileList matches native separators, just like setuptools' real file list.
     tracked = [str(Path(path)) for path in tracked]
     generated = [str(Path(path)) for path in generated]
-    manifest = FileList()
+    manifest = filelist.FileList()
     manifest.set_allfiles(tracked + generated)
     manifest.files = tracked + generated
     for line in (ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines():

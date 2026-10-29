@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI runs the offline frontend regressions and production build before packaging.
+  The manifest regression skips in wheel-only environments without development
+  build tools instead of adding setuptools as a runtime dependency.
 - Preserve the latest requested revision range and knobs separately from split
   render spans, including after rendering and reloading a job, so follow-up
   result notes receive the complete previous range. Older plan JSON still loads.
