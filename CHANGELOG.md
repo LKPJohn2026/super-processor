@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Result-note revisions preserve each shot's FlashVSR/pass-through choice,
+  look, and protected regions, including notes spanning multiple shots. A
+  cross-shot revision re-renders the timeline rather than splicing one shot's
+  settings across its neighbours.
+- Keep the whole-shot restoration strength cap when any flagged face, hand,
+  or text kind lacks a valid box, even if another kind was boxed successfully.
+  Shots with valid boxes for every flagged protected kind keep their requested
+  strength outside the boxes.
 - Refuse VFR/unsupported restoration timing before wizard job creation, GPU
   processing, or replacing an output. Admission now checks the complete decoded
   presentation timeline and final frame duration, rather than trusting the

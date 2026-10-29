@@ -66,8 +66,10 @@ The upscaled picture is encoded once into delivery settings: libx264 CRF 16,
 a forced IDR frame every second, no B-frames. A sidecar
 `output.mp4.delivery.json` records those settings. A result note re-upscales
 its range widened out to the nearest keyframes, and the head and tail are
-stream-copied, so earlier parts of the output are never encoded again. A note
-that changes scale re-renders the whole clip. Clips handed to FlashVSR are
+stream-copied for a single-recipe revision. A note that changes scale or crosses
+multiple stored recipe spans re-renders the whole clip from the source. Each
+span keeps its look, protected regions, and FlashVSR/pass-through choice; only
+the requested strength and scale are retuned. Clips handed to FlashVSR are
 encoded losslessly (`-qp 0`).
 
 ## Strength
@@ -92,9 +94,10 @@ frame. Inside a box, the FlashVSR share is held to 0.3 for faces and hands
 and 0.15 for text (or the shot's strength, if lower), and it rises back to
 the shot's strength over a 3% feather outside the box, so there is no seam.
 The segment preview draws the boxes over both previews. A segment that
-contains faces, hands, or text but got no boxes (Gemini failed or found none)
-is held to 0.6 as a whole instead. Boxes are per segment, not tracked frame by
-frame.
+contains faces, hands, or text is held to 0.6 as a whole whenever any of those
+flagged content kinds lacks a valid matching box. A face box alone does not
+remove fallback protection for unboxed text. Boxes are per segment, not tracked
+frame by frame.
 
 ## Input limits
 

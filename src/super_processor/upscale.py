@@ -379,7 +379,11 @@ def _covers_all(span: UpscaleSpan, duration_s: float) -> bool:
 
 
 def replace_overlapping(
-    plan: UpscalePlan, patch: UpscaleSpan, duration_s: float
+    plan: UpscalePlan,
+    patch: UpscaleSpan,
+    duration_s: float,
+    *,
+    preserve_shot_settings: bool = False,
 ) -> UpscalePlan:
     """Store a range revise. A scale change re-renders the whole timeline.
 
@@ -388,9 +392,13 @@ def replace_overlapping(
     resolution, so a new scale cannot be spliced into part of it: every span
     takes the new scale, and the pending span covers the whole file, which
     :func:`render_plan` reads as "render every shot again".
+
+    Result notes set ``preserve_shot_settings`` to retune only scale and
+    strength. Split those patches at shot boundaries; a multi-shot revision
+    uses the full-render path because a range splice accepts only one recipe.
     """
     patch = clamp_span(patch, duration_s)
-    if _covers_all(patch, duration_s):
+    if _covers_all(patch, duration_s) and not preserve_shot_settings:
         full = replace(patch, start_s=0.0, end_s=duration_s)
         return UpscalePlan(spans=(full,), pending=full)
     spans = plan.spans
@@ -398,19 +406,34 @@ def replace_overlapping(
     if rescale:
         spans = tuple(replace(span, scale=patch.scale) for span in spans)
     kept: list[UpscaleSpan] = []
+    patches: list[UpscaleSpan] = []
     for span in spans:
         if span.end_s <= patch.start_s + 0.05 or span.start_s >= patch.end_s - 0.05:
             kept.append(span)
             continue
+        if preserve_shot_settings:
+            patches.append(
+                replace(
+                    span,
+                    start_s=max(span.start_s, patch.start_s),
+                    end_s=min(span.end_s, patch.end_s),
+                    scale=patch.scale,
+                    strength=patch.strength,
+                )
+            )
         if patch.start_s - span.start_s > 0.05:
             kept.append(replace(span, end_s=patch.start_s))
         if span.end_s - patch.end_s > 0.05:
             kept.append(replace(span, start_s=patch.end_s))
-    pending = patch
-    if rescale:
+    if not preserve_shot_settings:
+        patches = [patch]
+    if not patches:
+        raise UpscaleError("the revised range does not overlap the plan")
+    pending = patches[-1]
+    if rescale or len(patches) > 1:
         pending = replace(patch, start_s=0.0, end_s=duration_s)
-    # The latest patch stays last; the wizard reads it as the prior knobs.
-    return UpscalePlan(spans=(*kept, patch), pending=pending)
+    # The latest patches stay last; the wizard reads the prior knobs there.
+    return UpscalePlan(spans=(*kept, *patches), pending=pending)
 
 
 class FakeUpscaleEngine:

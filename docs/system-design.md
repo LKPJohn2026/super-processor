@@ -217,8 +217,10 @@ are built by engineering-owned code.
 The first pass restores the whole clip. The result screen asks whether the
 user is happy; otherwise a note such as "less artificial detail from 2s to
 5s" re-restores that range from the original source and splices it back.
-Untouched parts of the output are stream-copied and never re-encoded. A note
-that changes scale re-renders the whole clip. Strength is the share of the
+For a single-recipe revision, untouched parts are stream-copied. A note that
+changes scale or crosses multiple stored recipe spans re-renders the whole clip
+from the source, preserving each span's look, regions, and pass-through choice.
+Strength is the share of the
 FlashVSR picture in the output; the rest is a lanczos upscale of the same
 frames.
 

@@ -31,10 +31,13 @@ from super_processor.regions import (
 )
 from super_processor.shot_plan import (
     PROTECTED_STRENGTH,
+    apply_checks,
+    apply_proposals,
     apply_regions,
     cap_strength,
     locate_stills,
     locate_targets,
+    new_plan,
 )
 from super_processor.shots import Shot, ShotList, load_shots
 from super_processor.upscale import (
@@ -153,6 +156,46 @@ def test_caps_targets_and_regions_from_gemini() -> None:
     assert [r.kind for r in updated.shots[1].regions] == ["faces"]
     assert updated.shots[2].regions == ()
     assert updated.shots[0] == shots.shots[0]
+
+
+@pytest.mark.parametrize("text_box", [None, [1, 2], [0, 0, 1, 1]])
+def test_partial_boxes_keep_the_global_cap(text_box: list[int] | None) -> None:
+    shots = ShotList(shots=[Shot(0, 2, contains=("faces", "text"))])
+    boxes: list[dict[str, Any]] = [{"kind": "faces", "box_2d": [100, 100, 400, 300]}]
+    if text_box is not None:
+        boxes.append({"kind": "text", "box_2d": text_box})
+    shots = apply_regions(shots, [{"index": 0, "regions": boxes}], [0])
+    assert [region.kind for region in shots.shots[0].regions] == ["faces"]
+    assert cap_strength(0.9, shots.shots[0]) == PROTECTED_STRENGTH
+    assert cap_strength(0.4, shots.shots[0]) == 0.4
+    plan = apply_proposals(
+        new_plan(shots, 2), shots, [{"index": 0, "strength": 0.9}], [0]
+    )
+    assert plan.recipes[0].strength == PROTECTED_STRENGTH
+    plan, _ = apply_checks(
+        plan, shots, [{"index": 0, "ok": False, "strength": 0.95}], [0]
+    )
+    assert plan.recipes[0].strength == PROTECTED_STRENGTH
+
+
+@pytest.mark.parametrize("missing_kind", [None, "faces", "hands", "text"])
+def test_global_cap_requires_boxes_for_every_protected_kind(
+    missing_kind: str | None,
+) -> None:
+    kinds = ("faces", "hands", "text")
+    shots = ShotList(shots=[Shot(0, 2, contains=(*kinds, "fine_pattern"))])
+    boxes = [
+        {"kind": kind, "box_2d": [100, 100, 400, 300]}
+        for kind in kinds
+        if kind != missing_kind
+    ]
+    shots = apply_regions(shots, [{"index": 0, "regions": boxes}], [0])
+    strength = 0.9 if missing_kind is None else PROTECTED_STRENGTH
+    assert cap_strength(0.9, shots.shots[0]) == strength
+    plan = apply_proposals(
+        new_plan(shots, 2), shots, [{"index": 0, "strength": 0.9}], [0]
+    )
+    assert plan.recipes[0].strength == strength
 
 
 def test_spans_store_and_find_regions() -> None:

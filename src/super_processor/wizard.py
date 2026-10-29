@@ -91,7 +91,6 @@ from .upscale import (
     replace_overlapping,
     require_supported_timing,
     save_upscale_plan,
-    span_at,
 )
 from .wizard_pages import (
     render_analyzing,
@@ -1423,12 +1422,9 @@ class WizardController:
                 job_dir=job_dir,
             )
             patch = UpscaleSpan.from_dict(raw)
-            # A note retunes scale and strength; the shot keeps its look and
-            # its protected regions.
-            under = span_at(plan, patch.start_s)
-            if under is not None:
-                patch = replace(patch, look=under.look, regions=under.regions)
-            updated = replace_overlapping(plan, patch, duration)
+            updated = replace_overlapping(
+                plan, patch, duration, preserve_shot_settings=True
+            )
             save_upscale_plan(job_dir, updated)
             state.error = None
             state.step = WizardStep.RENDERING

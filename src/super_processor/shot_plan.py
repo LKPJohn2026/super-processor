@@ -11,8 +11,8 @@ writes a note on one shot, which sends only that shot round again.
 Model numbers are clamped into :data:`~super_processor.look.LOOK_BOUNDS`.
 Faces, hands, and text are where invented detail shows, so before the first
 proposal Gemini boxes them (:func:`locate_targets`) and the blend holds
-FlashVSR down inside the boxes. A shot that contains them but got no boxes is
-capped at :data:`PROTECTED_STRENGTH` as a whole instead.
+FlashVSR down inside the boxes. If any protected content kind lacks a valid
+box, the whole shot is also capped at :data:`PROTECTED_STRENGTH`.
 """
 
 from __future__ import annotations
@@ -260,8 +260,11 @@ def allowed_scales(width: int, height: int) -> tuple[int, ...]:
 
 
 def cap_strength(strength: float, shot: Shot) -> float:
-    """Hold strength down on shots with faces, hands, or text but no boxes."""
-    if PROTECTED_CONTENTS.intersection(shot.contains) and not shot.regions:
+    """Hold strength down if any protected content kind lacks a valid box."""
+    unboxed = PROTECTED_CONTENTS.intersection(shot.contains) - {
+        region.kind for region in shot.regions
+    }
+    if unboxed:
         return min(strength, PROTECTED_STRENGTH)
     return strength
 

@@ -6,9 +6,13 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from super_processor.gemini import GeminiClient
+from super_processor.look import ShotLook
+from super_processor.regions import Region
 from super_processor.shot_plan import new_plan, render_previews
 from super_processor.shots import Shot, ShotList
 from super_processor.upscale import (
@@ -17,8 +21,18 @@ from super_processor.upscale import (
     UpscaleRequest,
     UpscaleSpan,
     apply_range_revise,
+    load_upscale_plan,
     render_shots,
+    save_upscale_plan,
+    span_at,
     video_stream_facts,
+)
+from super_processor.wizard import (
+    WizardController,
+    WizardState,
+    WizardStep,
+    save_job_wizard_state,
+    save_session_state,
 )
 
 needs_ffmpeg = pytest.mark.skipif(
@@ -120,6 +134,95 @@ def test_span_keeps_use_upscale() -> None:
     assert UpscaleSpan.from_dict({"start_s": 0, "end_s": 2}).use_upscale is True
     plan = UpscalePlan(spans=(span,))
     assert UpscalePlan.from_dict(plan.to_dict()).spans[0].use_upscale is False
+
+
+class _RevisionTransport:
+    def __init__(self, start: float, end: float, scale: int) -> None:
+        self.payload = {
+            "start_s": start,
+            "end_s": end,
+            "scale": scale,
+            "strength": 0.2,
+        }
+        self.calls = 0
+
+    def generate(
+        self, *, model: str, api_key: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.calls += 1
+        return {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(self.payload)}]}}]
+        }
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    ("start", "end", "scale", "revision_calls"),
+    [(1, 2, 2, 0), (1, 5, 2, 2), (0, 6, 2, 1), (1, 2, 4, 1), (1, 5, 4, 2)],
+)
+def test_result_note_preserves_each_shots_settings(
+    tmp_path: Path, start: float, end: float, scale: int, revision_calls: int
+) -> None:
+    source = _clip(tmp_path / "in.mp4")
+    engine = _CountingEngine()
+    transport = _RevisionTransport(start, end, scale)
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=GeminiClient(api_key="fake", transport=transport),
+        upscale_engine=engine,
+    )
+    job_id = controller.store.create(source).job_id
+    job_dir = controller.store.job_dir(job_id)
+    original = UpscalePlan(
+        spans=(
+            UpscaleSpan(
+                0,
+                3,
+                use_upscale=False,
+                look=ShotLook(brightness=0.02),
+                regions=(Region("text", 0.1, 0.1, 0.4, 0.4),),
+            ),
+            UpscaleSpan(
+                3,
+                6,
+                look=ShotLook(saturation=0.9),
+                regions=(Region("faces", 0.5, 0.2, 0.8, 0.6),),
+            ),
+        )
+    )
+    save_upscale_plan(job_dir, original)
+    state = WizardState(step=WizardStep.RENDERING, job_id=job_id)
+    save_job_wizard_state(job_dir, state)
+    save_session_state(controller.jobs_dir, state)
+    controller.run_render()
+    assert controller.current_state().step is WizardStep.RESULT
+    assert engine.calls == 1
+
+    controller.handle_post("/result", {"note": ["less invented detail"]})
+    state = controller.current_state()
+    assert state.step is WizardStep.RENDERING and state.error is None
+    assert transport.calls == 1
+    updated = load_upscale_plan(job_dir)
+    assert updated is not None
+    for span in updated.spans:
+        under = span_at(original, (span.start_s + span.end_s) / 2)
+        assert under is not None
+        assert (span.use_upscale, span.look, span.regions) == (
+            under.use_upscale,
+            under.look,
+            under.regions,
+        )
+        assert span.scale == scale
+        overlaps = span.start_s < end and span.end_s > start
+        assert span.strength == (0.2 if overlaps else under.strength)
+    controller.run_render()
+    state = controller.current_state()
+    assert state.step is WizardStep.RESULT and state.error is None
+    assert engine.calls == 1 + revision_calls
+    output = job_dir / "output.mp4"
+    assert video_stream_facts(output)[0] == 60
+    assert _streams(output)["video"] == (160 * scale, 90 * scale)
+    assert "audio" in _streams(output)
 
 
 @needs_ffmpeg
