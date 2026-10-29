@@ -22,6 +22,9 @@ class WorkerError(RuntimeError):
 
 ProgressCallback = Callable[[dict[str, str]], None]
 
+_CANCEL_GRACE_S = 1.0
+_PROCESS_POLL_S = 0.1
+
 
 @dataclass(slots=True)
 class StepResult:
@@ -110,12 +113,13 @@ def format_progress_status(
     duration_s: float | None = None,
 ) -> str:
     """Render a short human-readable progress status for stderr."""
+    # FFmpeg's out_time_ms is in microseconds, despite its historical name.
     out_ms = progress.get("out_time_ms")
     out_time = progress.get("out_time")
     seconds: float | None = None
     if out_ms is not None:
         with contextlib.suppress(ValueError):
-            seconds = int(out_ms) / 1000.0
+            seconds = int(out_ms) / 1_000_000.0
     if seconds is None and out_time is not None:
         parts = out_time.split(":")
         with contextlib.suppress(ValueError):
@@ -143,9 +147,8 @@ class FFmpegWorker:
         """Request cancellation of the active FFmpeg process group."""
         with self._lock:
             self._cancel_requested = True
-            proc = self._current
-        if proc is not None:
-            _terminate_process_group(proc)
+        # The runner owns both signaling and reaping. A separate cancel thread
+        # must not signal a saved PID after the runner has reaped that process.
 
     def run_plan(
         self,
@@ -259,10 +262,6 @@ class FFmpegWorker:
 
         with self._lock:
             self._current = proc
-            cancel_now = self._cancel_requested
-
-        if cancel_now:
-            _terminate_process_group(proc)
 
         def _read_stdout() -> None:
             assert proc.stdout is not None
@@ -286,7 +285,26 @@ class FFmpegWorker:
         stdout_thread.start()
         stderr_thread.start()
 
-        returncode = proc.wait()
+        while True:
+            with self._lock:
+                cancelled = self._cancel_requested
+            if cancelled:
+                _terminate_process_group(proc)
+                try:
+                    returncode = proc.wait(timeout=_CANCEL_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    _kill_process_group(proc)
+                    returncode = proc.wait()
+                break
+            try:
+                returncode = proc.wait(timeout=_PROCESS_POLL_S)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        with self._lock:
+            self._current = None
+
         stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
         if proc.stdout is not None:
@@ -295,14 +313,7 @@ class FFmpegWorker:
             proc.stderr.close()
 
         with self._lock:
-            self._current = None
             cancelled = self._cancel_requested
-
-        if cancelled and returncode == 0:
-            # Rare race: process exited successfully as cancel arrived.
-            pass
-        elif cancelled and returncode not in (0, -signal.SIGTERM, -15):
-            _kill_process_group(proc)
 
         stderr_tail = "".join(stderr_chunks[-40:]).strip()
         return StepResult(

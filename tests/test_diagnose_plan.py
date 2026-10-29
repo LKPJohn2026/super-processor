@@ -133,13 +133,45 @@ def test_format_progress_status() -> None:
 
     assert "encoding" in format_progress_status({})
     line = format_progress_status(
-        {"out_time_ms": "5000", "speed": "1.2x"},
+        {"out_time_ms": "5000000", "speed": "1.2x"},
         duration_s=10.0,
     )
-    assert "50.0%" in line
-    assert "1.2x" in line
+    assert line == "encoding  50.0% (5.0/10.0s) speed=1.2x"
     clock = format_progress_status({"out_time": "00:00:02.5", "speed": "1x"})
     assert "2.5s" in clock
+
+
+@pytest.mark.parametrize(
+    ("progress", "duration_s", "expected"),
+    [
+        ({"out_time_ms": "5000"}, None, "encoding 0.0s speed=?"),
+        ({"out_time_ms": "2500000"}, None, "encoding 2.5s speed=?"),
+        (
+            {"out_time_ms": "2500000", "out_time": "00:00:02.500000"},
+            10.0,
+            "encoding  25.0% (2.5/10.0s) speed=?",
+        ),
+        (
+            {"out_time_ms": "N/A", "out_time": "00:00:02.500000"},
+            10.0,
+            "encoding  25.0% (2.5/10.0s) speed=?",
+        ),
+        ({"out_time_ms": "N/A"}, None, "encoding… speed=?"),
+        (
+            {"out_time_ms": "12000000"},
+            10.0,
+            "encoding 100.0% (12.0/10.0s) speed=?",
+        ),
+    ],
+)
+def test_format_progress_status_ffmpeg_microseconds(
+    progress: dict[str, str],
+    duration_s: float | None,
+    expected: str,
+) -> None:
+    from super_processor.worker import format_progress_status
+
+    assert format_progress_status(progress, duration_s=duration_s) == expected
 
 
 def test_resolve_secret_and_diagnose_ack(

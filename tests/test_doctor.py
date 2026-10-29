@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -102,7 +103,7 @@ def test_doctor_reports_each_hardware_encoder(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         "super_processor.doctor._ffmpeg_listing",
         lambda kind: (
-            " V..... libx265\n V..... hevc_nvenc\n"
+            " V..... libx264\n V..... libx265\n V..... hevc_nvenc\n"
             if kind == "encoders"
             else " T. deshake\n"
         ),
@@ -126,7 +127,9 @@ def test_doctor_reports_each_hardware_decoder(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         "super_processor.doctor._ffmpeg_listing",
         lambda kind: (
-            " V..... hevc_cuvid\n" if kind == "decoders" else " V..... libx265\n"
+            " V..... hevc_cuvid\n"
+            if kind == "decoders"
+            else " V..... libx264\n V..... libx265\n"
         ),
     )
     results = {item.name: item for item in doctor.collect_doctor_report()}
@@ -134,6 +137,59 @@ def test_doctor_reports_each_hardware_decoder(monkeypatch: pytest.MonkeyPatch) -
     for name in ("hevc_qsv", "hevc_amf", "hevc_videotoolbox"):
         assert "missing" in results[f"decoder:{name}"].detail
     assert doctor.doctor_report_as_dict(list(results.values()))["ok"] is True
+
+
+@pytest.mark.parametrize(
+    ("encoders", "ready"),
+    [
+        ("libx264 libx265", True),
+        ("libx265", False),
+        ("libx264", False),
+        ("", False),
+    ],
+)
+def test_doctor_requires_both_software_encoders(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    encoders: str,
+    ready: bool,
+) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "check_tool",
+        lambda name, *_args, **_kwargs: doctor.CheckResult(name, True, "present"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_ffmpeg_listing",
+        lambda kind: (
+            "Encoders:\n" + "".join(f" V..... {name}\n" for name in encoders.split())
+            if kind == "encoders"
+            else "Filters:\n"
+        ),
+    )
+    for json_output in (False, True):
+        args = ["--jobs-dir", str(tmp_path / "jobs"), "doctor"]
+        if json_output:
+            args.append("--json")
+        assert cli.main(args) == (0 if ready else 1)
+        output = capsys.readouterr().out
+        if json_output:
+            payload = json.loads(output)
+            assert payload["ok"] is ready
+            checks = {item["name"]: item for item in payload["checks"]}
+            for encoder in ("libx264", "libx265"):
+                assert checks[f"encoder:{encoder}"]["ok"] is (
+                    encoder in encoders.split()
+                )
+        else:
+            assert f"required tools: {'ready' if ready else 'missing'}" in output
+            for encoder in ("libx264", "libx265"):
+                mark = "ok" if encoder in encoders.split() else "FAIL"
+                assert f"[{mark}] encoder:{encoder}" in output
+            if not ready:
+                assert "missing ffmpeg/ffprobe/libx264/libx265" in output
 
 
 def test_ffmpeg_capability_present(monkeypatch: pytest.MonkeyPatch) -> None:

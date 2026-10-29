@@ -17,8 +17,13 @@ engineering-owned argument lists. Models never write shell commands.
 ## Requirements
 
 - Python 3.10 or newer and a C compiler (Cython extension)
-- FFmpeg 6 or newer with `libx265` (and optionally `libvmaf` for offline
-  regression). The shot step uses `scdet`, `blockdetect`, and `blurdetect`.
+- FFmpeg 6 or newer and `ffprobe`, with both `libx264` (previews and
+  restoration delivery) and `libx265` (HEVC export). `super-processor doctor`
+  requires both encoders for readiness; hardware codecs are optional.
+  The wizard uses Gemini to propose segments from local stills, then measures
+  those ranges with `blockdetect`, `blurdetect`, `signalstats`, `hqdn3d`, and
+  `psnr`. `scdet` is used by legacy shot detection, not wizard segmentation.
+  `libvmaf` is optional for offline regression.
 - A Gemini API key from [Google AI Studio](https://aistudio.google.com/) for the wizard
 - For the upscale itself: an NVIDIA GPU with CUDA, PyTorch, and a FlashVSR
   v1.1 checkout with its weights (see [GPU setup](#gpu-setup))
@@ -82,11 +87,14 @@ piece:
 ```bash
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 python -c "from super_processor.upscale import resolve_flashvsr_weights as r; print(r())"
-ffmpeg -hide_banner -filters | grep -E ' (scdet|blockdetect|blurdetect) '
+super-processor doctor
+ffmpeg -hide_banner -filters | grep -E ' (blockdetect|blurdetect|signalstats|hqdn3d|psnr) '
 ```
 
 The first should print `CUDA: True`, the second the weights folder (it raises
-with the missing file names otherwise), and the third three filter lines.
+with the missing file names otherwise). Doctor should report required tools
+ready, and the final command should show all five wizard measurement filters.
+Legacy shot detection additionally needs `scdet`.
 
 ## Testing on your own footage
 
@@ -156,9 +164,15 @@ for CORS, HTTPS restrictions, and retry behavior. Offline frontend regressions:
 python -m ruff format --check .
 python -m ruff check .
 python -m mypy
-python -m pytest
+python -m pytest -m 'not gemini_live'
 python -m build
 super-processor self-test
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
+Routine tests exclude live Gemini calls even when `GEMINI_API_KEY` is set.
+Live tests are a separate, explicit opt-in: with a test key configured, run
+`python -m pytest -m gemini_live --no-cov`. These contact Google, send test
+prompts/context, and consume API quota (potentially incurring charges).
+Wizard use also sends selected stills/previews and notes; do not use sensitive
+footage without permission. See [CONTRIBUTING.md](CONTRIBUTING.md) for testing
+and packaging checks, and [CHANGELOG.md](CHANGELOG.md) for changes.

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- FFmpeg cancellation escalates after a one-second grace period when a process
+  ignores SIGTERM; the runner owns signaling and reaping to avoid delayed PID
+  races. Progress reads FFmpeg's `out_time_ms` as microseconds.
+- Doctor requires `libx264` for wizard previews/delivery as well as `libx265`
+  for legacy HEVC export. Requirements now distinguish current wizard filters
+  from legacy scene detection, and routine test instructions exclude live Gemini
+  calls with separate opt-in quota/privacy guidance.
+- Source distributions retain the React HTML entry point while excluding Cython
+  annotation pages. Source/wheel metadata and a React build from an unpacked
+  source distribution are checked during development.
 - Frontend integration: Vite dev and preview proxy segment/shot stills and
   preview videos alongside API/uploads and output. Direct upload CORS preflight
   permits `X-File-Name` while preserving the local-origin allowlist.

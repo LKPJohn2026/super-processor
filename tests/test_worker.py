@@ -2,27 +2,39 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock, call
 
 import pytest
 
 from super_processor import cli
+from super_processor import worker as worker_mod
 from super_processor.jobs import JobState, JobStore
 from super_processor.probe import probe_file, write_media_facts
 from super_processor.recipe import OpName, TargetMode, empty_recipe, write_recipe
-from super_processor.templates import build_ffmpeg_plan
-from super_processor.worker import FFmpegWorker, parse_progress_line
+from super_processor.templates import FFmpegPlan, FFmpegStep, build_ffmpeg_plan
+from super_processor.worker import (
+    FFmpegWorker,
+    RunResult,
+    format_progress_status,
+    parse_progress_line,
+)
 
 
 def _have_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-pytestmark = pytest.mark.skipif(not _have_ffmpeg(), reason="ffmpeg not on PATH")
+requires_ffmpeg = pytest.mark.skipif(not _have_ffmpeg(), reason="ffmpeg not on PATH")
 
 
 def _make_clip(path: Path, *, duration: float = 1.0) -> Path:
@@ -54,13 +66,188 @@ def _make_clip(path: Path, *, duration: float = 1.0) -> Path:
 
 def test_parse_progress_line() -> None:
     progress: dict[str, str] = {}
-    parse_progress_line("out_time_ms=1234", progress)
+    parse_progress_line("out_time_ms=1234000", progress)
     parse_progress_line("progress=continue", progress)
     parse_progress_line("ignored", progress)
-    assert progress["out_time_ms"] == "1234"
+    assert progress["out_time_ms"] == "1234000"
     assert progress["progress"] == "continue"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX SIGTERM handlers")
+@pytest.mark.parametrize("resist_term", [False, True], ids=["cooperative", "resistant"])
+def test_worker_cancel_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resist_term: bool,
+) -> None:
+    monkeypatch.setattr(worker_mod, "_CANCEL_GRACE_S", 0.2)
+    kill_group = Mock(wraps=worker_mod._kill_process_group)
+    monkeypatch.setattr(worker_mod, "_kill_process_group", kill_group)
+    output = tmp_path / "output.mp4"
+    output.write_text("original")
+    partial = output.with_suffix(".partial.mp4")
+    later_step = tmp_path / "later-step"
+    handler = "signal.SIG_IGN" if resist_term else "lambda *_: sys.exit(0)"
+    script = (
+        "import pathlib, signal, sys, time; "
+        f"signal.signal(signal.SIGTERM, {handler}); "
+        "pathlib.Path(sys.argv[1]).write_text('partial'); "
+        "print('ready=1', flush=True); "
+        "time.sleep(30)"
+    )
+    plan = FFmpegPlan(
+        mode="preview",
+        input_path="unused",
+        output_path=str(output),
+        steps=[
+            FFmpegStep("encode", [sys.executable, "-c", script, str(output)]),
+            FFmpegStep(
+                "later",
+                [sys.executable, "-c", f"open({str(later_step)!r}, 'w').close()"],
+            ),
+        ],
+        filter_graph="",
+    )
+    worker = FFmpegWorker()
+    ready = threading.Event()
+    results: list[RunResult] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(
+                worker.run_plan(plan, on_progress=lambda progress: ready.set())
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        assert ready.wait(timeout=5), "child did not install its signal handler"
+        started = time.monotonic()
+        worker.cancel()
+        worker.cancel()  # Repeated requests must not restart the grace period.
+        thread.join(timeout=3)
+        assert not thread.is_alive(), "cancellation did not finish within its bound"
+        assert time.monotonic() - started < 3
+    finally:
+        # Also bound cleanup when this regression runs against the old worker.
+        if thread.is_alive():
+            with worker._lock:
+                proc = worker._current
+            if proc is not None:
+                worker_mod._kill_process_group(proc)
+            thread.join(timeout=3)
+
+    assert not errors
+    result = results[0]
+    assert result.cancelled is True
+    assert result.ok is False
+    assert len(result.steps) == 1
+    assert result.steps[0].returncode == (
+        -signal.SIGKILL if resist_term else -signal.SIGTERM
+    )
+    assert kill_group.call_count == int(resist_term)
+    assert output.read_text() == "original"
+    assert not partial.exists()
+    assert not later_step.exists()
+    assert worker._current is None
+
+    # A completed cancellation must never leave a timer targeting a later run.
+    plan.steps = [
+        FFmpegStep(
+            "encode",
+            [
+                sys.executable,
+                "-c",
+                "import pathlib, sys, time; time.sleep(0.3); "
+                "pathlib.Path(sys.argv[1]).write_text('replacement')",
+                str(output),
+            ],
+        )
+    ]
+    assert worker.run_plan(plan).ok is True
+    assert output.read_text() == "replacement"
+    assert kill_group.call_count == int(resist_term)
+
+
+def test_worker_cancel_during_process_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = FFmpegWorker()
+    popen = subprocess.Popen
+
+    def cancel_on_start(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        proc: subprocess.Popen[str] = popen(*args, **kwargs)
+        worker.cancel()
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", cancel_on_start)
+    plan = FFmpegPlan(
+        mode="preview",
+        input_path="unused",
+        output_path=str(tmp_path / "output.mp4"),
+        steps=[
+            FFmpegStep("prepare", [sys.executable, "-c", "import time; time.sleep(30)"])
+        ],
+        filter_graph="",
+    )
+    result = worker.run_plan(plan)
+    assert result.cancelled is True
+    assert result.ok is False
+    assert result.steps[0].returncode != 0
+    assert worker._current is None
+
+
+def test_process_group_signals_skip_reaped_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = Mock()
+    proc.poll.return_value = 0
+    killpg = Mock()
+    monkeypatch.setattr(worker_mod, "os", SimpleNamespace(name="posix", killpg=killpg))
+    worker_mod._terminate_process_group(proc)
+    worker_mod._kill_process_group(proc)
+    killpg.assert_not_called()
+    proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX signal constants")
+def test_process_group_posix_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = Mock(pid=123)
+    proc.poll.return_value = None
+    killpg = Mock()
+    monkeypatch.setattr(worker_mod, "os", SimpleNamespace(name="posix", killpg=killpg))
+    worker_mod._terminate_process_group(proc)
+    worker_mod._kill_process_group(proc)
+    assert killpg.call_args_list == [
+        call(proc.pid, signal.SIGTERM),
+        call(proc.pid, signal.SIGKILL),
+    ]
+    proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()
+
+
+def test_process_group_windows_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = Mock()
+    proc.poll.return_value = None
+    monkeypatch.setattr(worker_mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", 123, raising=False)
+    worker_mod._terminate_process_group(proc)
+    proc.send_signal.assert_called_once_with(123)
+    worker_mod._kill_process_group(proc)
+    proc.kill.assert_called_once_with()
+
+    # Console-less Windows processes may reject CTRL_BREAK_EVENT.
+    proc.send_signal.side_effect = OSError("no console")
+    worker_mod._terminate_process_group(proc)
+    proc.terminate.assert_called_once_with()
+
+
+@requires_ffmpeg
 def test_worker_preview_encode_atomic(tmp_path: Path) -> None:
     source = _make_clip(tmp_path / "src.mp4")
     recipe = empty_recipe("abcd1234abcd1234", str(source))
@@ -80,13 +267,22 @@ def test_worker_preview_encode_atomic(tmp_path: Path) -> None:
         work_dir=tmp_path / "work",
         duration_s=1.0,
     )
-    result = FFmpegWorker().run_plan(plan)
+    updates: list[dict[str, str]] = []
+    result = FFmpegWorker().run_plan(plan, on_progress=updates.append)
     assert result.ok is True
     assert output.is_file()
     assert not output.with_name(f"{output.stem}.partial{output.suffix}").exists()
     assert result.steps[0].returncode == 0
+    assert updates
+    progress = result.steps[0].progress
+    assert int(progress["out_time_ms"]) > 0
+    # Compare the two time formats emitted by an actual FFmpeg encode.
+    assert format_progress_status(
+        {"out_time_ms": progress["out_time_ms"]}, duration_s=0.5
+    ) == format_progress_status({"out_time": progress["out_time"]}, duration_s=0.5)
 
 
+@requires_ffmpeg
 def test_worker_cancel(tmp_path: Path) -> None:
     source = _make_clip(tmp_path / "src.mp4", duration=8.0)
     recipe = empty_recipe("abcd1234abcd1234", str(source))
@@ -115,10 +311,13 @@ def test_worker_cancel(tmp_path: Path) -> None:
     thread.start()
     result = worker.run_plan(plan)
     thread.join()
-    assert result.cancelled is True or result.ok is False
+    assert result.cancelled is True
+    assert result.ok is False
     assert not output.is_file()
+    assert not output.with_suffix(".partial.mp4").exists()
 
 
+@requires_ffmpeg
 def test_job_run_dry_run_and_preview(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -180,6 +379,7 @@ def test_job_run_dry_run_and_preview(
     assert (store.job_dir(manifest.job_id) / "preview.mp4").is_file()
 
 
+@requires_ffmpeg
 def test_job_run_final_requires_approve(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -224,6 +424,7 @@ def test_job_run_final_requires_approve(
     assert "requires --approve" in capsys.readouterr().out
 
 
+@requires_ffmpeg
 def test_job_run_final_approve(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -260,6 +461,7 @@ def test_job_run_final_approve(
     assert (store.job_dir(manifest.job_id) / "output.mp4").is_file()
 
 
+@requires_ffmpeg
 def test_job_validate_transitions_to_validated(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

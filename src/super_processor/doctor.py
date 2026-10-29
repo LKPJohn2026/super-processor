@@ -183,6 +183,13 @@ def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
         check_tool("ffmpeg", "ffmpeg", "-version"),
         check_tool("ffprobe", "ffprobe", "-version"),
         check_ffmpeg_capability(
+            "encoder:libx264",
+            kind="encoders",
+            token="libx264",
+            required=True,
+            hint="required for previews and restoration delivery",
+        ),
+        check_ffmpeg_capability(
             f"encoder:{SOFTWARE_ENCODER}",
             kind="encoders",
             token=SOFTWARE_ENCODER,
@@ -240,7 +247,7 @@ def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
 
 def doctor_report_as_dict(results: list[CheckResult]) -> dict[str, Any]:
     """Serialize doctor results for JSON output."""
-    required = {"ffmpeg", "ffprobe", "encoder:libx265"}
+    required = {"ffmpeg", "ffprobe", "encoder:libx264", "encoder:libx265"}
     return {
         "ok": all(item.ok for item in results if item.name in required),
         "checks": [asdict(item) for item in results],
@@ -257,7 +264,7 @@ def format_doctor_text(results: list[CheckResult]) -> str:
     summary = doctor_report_as_dict(results)
     lines.append(
         "required tools: "
-        + ("ready" if summary["ok"] else "missing ffmpeg/ffprobe/libx265")
+        + ("ready" if summary["ok"] else "missing ffmpeg/ffprobe/libx264/libx265")
     )
     return "\n".join(lines)
 
