@@ -21,6 +21,9 @@ def _own_config_dir(
     """
     folder = tmp_path_factory.mktemp("config")
     monkeypatch.setenv("SUPER_PROCESSOR_CONFIG_DIR", str(folder))
+    # An exported FlashVSR+ choice would send the v1.1 tests to the real model.
+    for name in ("SUPER_PROCESSOR_FLASHVSR", "FLASHVSR_PLUS_HOME"):
+        monkeypatch.delenv(name, raising=False)
     empty = types.SimpleNamespace(
         get_password=lambda service, name: None,
         set_password=lambda service, name, value: None,
