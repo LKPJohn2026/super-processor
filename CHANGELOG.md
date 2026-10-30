@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Result line describes the whole render instead of its last span. A
+  render that ended on credits passed through without FlashVSR read
+  "strength 0.00" although every restored segment ran at 0.30–0.45; it now
+  reads "strength 0.30–0.45 · FlashVSR off for 9.9 s". The JSON API adds this
+  as `strength_summary`, which the React shell shows; `strength` is unchanged.
 - CI runs the offline frontend regressions and production build before packaging.
   The manifest regression skips in wheel-only environments without development
   build tools instead of adding setuptools as a runtime dependency.
