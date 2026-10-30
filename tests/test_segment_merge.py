@@ -9,7 +9,8 @@ from super_processor.segments import SegmentError, merge_short_and_cap
 
 def test_short_tail_is_absorbed() -> None:
     pieces = merge_short_and_cap([(0.0, 40.0), (40.0, 43.0)])
-    assert pieces == pytest.approx([(0.0, 43.0)])
+    # One approx per piece: pytest 9.2 refuses approx of nested data.
+    assert pieces == [pytest.approx((0.0, 43.0))]
 
 
 def test_short_middle_joins_the_quieter_neighbor() -> None:
@@ -20,7 +21,7 @@ def test_short_middle_joins_the_quieter_neighbor() -> None:
         [(0.0, 40.0), (40.0, 43.0), (43.0, 90.0)],
         scores=scores,
     )
-    assert pieces == pytest.approx([(0.0, 40.0), (40.0, 90.0)])
+    assert pieces == [pytest.approx((0.0, 40.0)), pytest.approx((40.0, 90.0))]
 
 
 def test_overlong_absorb_is_split_again() -> None:
