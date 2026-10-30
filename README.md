@@ -96,6 +96,27 @@ with the missing file names otherwise). Doctor should report required tools
 ready, and the final command should show all five wizard measurement filters.
 Legacy shot detection additionally needs `scdet`.
 
+### FlashVSR+ (optional)
+
+`SUPER_PROCESSOR_FLASHVSR=plus` restores with
+[FlashVSR+](https://github.com/OpenImagingLab/FlashVSR_Plus) turbo instead
+of v1.1 (the default). It uses about 60% less GPU memory: 4x of 854x480 fits
+in 32 GB, where v1.1 needs the system-RAM fallback (about 90 s against 274 s
+for a 4 s clip on an RTX 5090). At 2x it is slower, about 31 s against 17 s
+per 4 s clip. Against their sources, its pictures were closer and flickered
+less on all four test clips, with colour correction on, as it is here.
+
+Clone it to `.dogfood/models/FlashVSR_Plus` (or set `FLASHVSR_PLUS_HOME`),
+install its requirements, and download `turbo/` and `TCDecoder.ckpt` from
+`ruchangyao/FlashVSR_plus` into its `ckpts` folder:
+
+```bash
+git clone https://github.com/OpenImagingLab/FlashVSR_Plus .dogfood/models/FlashVSR_Plus
+python -c "from super_processor.upscale import resolve_flashvsr_plus as r; print(r())"
+```
+
+The check names any missing file. Unset the variable to go back to v1.1.
+
 ## Testing on your own footage
 
 ```bash

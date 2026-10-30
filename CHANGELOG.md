@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SUPER_PROCESSOR_FLASHVSR=plus` restores with FlashVSR+ turbo (colour
+  correction on) instead of FlashVSR v1.1, which stays the default. It needs
+  about 60% less GPU memory, so 4x of 854x480 fits in 32 GB without the
+  system-RAM fallback, but it is slower at 2x. `FLASHVSR_PLUS_HOME` points at
+  the checkout; missing code or weights are named before anything runs.
+
 ### Fixed
+
+- A refused host-memory allocation (torch's "can't allocate memory", or a
+  `MemoryError` subclass) now counts as out of memory, so the clip is retried
+  in shorter pieces instead of failing outright.
 
 - The Result line describes the whole render instead of its last span. A
   render that ended on credits passed through without FlashVSR read

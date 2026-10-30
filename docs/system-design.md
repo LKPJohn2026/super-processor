@@ -85,6 +85,16 @@ turns a result note into `start_s`, `end_s`, `scale` (2 or 4), and
 `strength` (0–1). Re-runs read the original source for that range so detail
 does not stack.
 
+`SUPER_PROCESSOR_FLASHVSR` picks the model: v1.1 through its tiny example
+script (the default), or FlashVSR+ turbo through its Python API. Both run
+behind one backend interface (`load()` returns the pipeline and a `run`), so
+chunking, the out-of-memory ladder, and the system-RAM child are shared; the
+child inherits the variable. FlashVSR+ is padded to 128-pixel blocks like
+v1.1. Its frames go straight into one lossless encode that also crops the
+padding, rather than through its own CRF 25 writer. Its packages have
+generic names (`inference`, `models`), so the loader refuses to load next to
+a different module of those names and removes its own when done.
+
 Each span in the plan is a segment with its own look (`look.py`): bounded
 FFmpeg settings that always run in the same order.
 
