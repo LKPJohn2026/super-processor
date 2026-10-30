@@ -1045,7 +1045,7 @@ def render_result(
     output_url: str,
     error: str | None = None,
     scale: int | None = None,
-    strength: float | None = None,
+    strength: str | None = None,
     seams: list[dict[str, object]] | None = None,
     seam_error: str | None = None,
 ) -> str:
@@ -1054,7 +1054,7 @@ def render_result(
     knobs = ""
     if scale is not None and strength is not None:
         knobs = (
-            f'<p class="muted">Scale {scale}× · strength {strength:.2f}. '
+            f'<p class="muted">Scale {scale}× · {escape(strength)}. '
             "Lower strength means less invented texture.</p>"
         )
     body = f"""

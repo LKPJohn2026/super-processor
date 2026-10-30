@@ -102,6 +102,8 @@ export type WizardView = {
   output_url: string | null;
   scale: number | null;
   strength: number | null;
+  // Every span's strength, for the Result line; `strength` is the latest span's.
+  strength_summary?: string | null;
   progress?: Progress | null;
   navigation?: Navigation;
   segment_index?: number;

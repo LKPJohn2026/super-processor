@@ -370,12 +370,36 @@ def load_render_report(job_dir: Path) -> dict[str, Any]:
     return {"seams": seams, "error": str(error) if error else None}
 
 
-def _active_knobs(job_dir: Path) -> tuple[int | None, float | None]:
+def _active_knobs(job_dir: Path) -> tuple[int | None, float | None, str | None]:
+    """Scale, the latest span's strength (the JSON API's ``strength``), and a
+    summary of every span for the Result line."""
     plan = load_upscale_plan(job_dir)
     if plan is None or not plan.spans:
-        return None, None
+        return None, None, None
     span = plan.pending or plan.spans[-1]
-    return span.scale, span.strength
+    # The summary reads the spans alone: they are what the output holds, and a
+    # pending span never reached it.
+    return span.scale, span.strength, strength_summary(plan.spans)
+
+
+def strength_summary(spans: tuple[UpscaleSpan, ...]) -> str:
+    """Describe the strength of a whole render for the Result line.
+
+    Each segment has its own recipe, so one span's strength misdescribes the
+    rest. Spans with ``use_upscale`` False skip FlashVSR, so their strength
+    does not apply to the picture.
+    """
+    restored = sorted({round(span.strength, 2) for span in spans if span.use_upscale})
+    if not restored:
+        return "FlashVSR off"
+    low, high = restored[0], restored[-1]
+    summary = f"strength {low:.2f}" if low == high else f"strength {low:.2f}–{high:.2f}"
+    # Seconds, not a count: a range revision splits spans, so spans are not
+    # segments.
+    skipped = sum(span.end_s - span.start_s for span in spans if not span.use_upscale)
+    if skipped:
+        summary += f" · FlashVSR off for {skipped:.1f} s"
+    return summary
 
 
 class WizardController:
@@ -612,13 +636,13 @@ class WizardController:
         if state.step is WizardStep.RESULT:
             assert state.job_id
             job_dir = self.store.job_dir(state.job_id)
-            scale, strength = _active_knobs(job_dir)
+            scale, _strength, summary = _active_knobs(job_dir)
             report = load_render_report(job_dir)
             return render_result(
                 output_url="/output.mp4",
                 error=state.error,
                 scale=scale,
-                strength=strength,
+                strength=summary,
                 seams=report["seams"],
                 seam_error=report["error"],
             )
@@ -633,6 +657,7 @@ class WizardController:
         output_url: str | None = None
         scale: int | None = None
         strength: float | None = None
+        summary: str | None = None
         seams: list[dict[str, Any]] = []
         seam_error: str | None = None
         if state.job_id and state.step in {WizardStep.RESULT, WizardStep.DONE}:
@@ -641,7 +666,7 @@ class WizardController:
                 output_ready = True
                 output_url = "/output.mp4"
             if state.step is WizardStep.RESULT:
-                scale, strength = _active_knobs(job_dir)
+                scale, strength, summary = _active_knobs(job_dir)
                 report = load_render_report(job_dir)
                 seams, seam_error = report["seams"], report["error"]
         looks: dict[str, Any] | None = None
@@ -669,6 +694,7 @@ class WizardController:
             "output_url": output_url,
             "scale": scale,
             "strength": strength,
+            "strength_summary": summary,
             "looks": looks,
             "segments": segments,
             "segment_preview": segment_preview,

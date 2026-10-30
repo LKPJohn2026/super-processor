@@ -681,8 +681,9 @@ function ResultStep({
       <h1>Result</h1>
       {view.scale !== null && view.strength !== null ? (
         <p className="muted">
-          Scale {view.scale}× · strength {view.strength.toFixed(2)}. Lower
-          strength means less invented texture.
+          Scale {view.scale}× ·{" "}
+          {view.strength_summary ?? `strength ${view.strength.toFixed(2)}`}.
+          Lower strength means less invented texture.
         </p>
       ) : null}
       {src ? (

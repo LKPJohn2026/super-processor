@@ -276,6 +276,7 @@ def test_json_api_drives_upscale_flow(
         assert result["output_url"] == "/output.mp4"
         assert result["scale"] == 2
         assert result["strength"] == 0.5
+        assert result["strength_summary"] == "strength 0.50"
         with urlopen(base + "/output.mp4") as response:
             assert response.headers.get_content_type() == "video/mp4"
         _status, again, _origin = _json_request(

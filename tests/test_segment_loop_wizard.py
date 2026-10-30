@@ -15,7 +15,7 @@ from loop_driver import to_ready
 
 from super_processor.review import WizardServer
 from super_processor.shot_plan import load_plan
-from super_processor.upscale import FakeUpscaleEngine, UpscaleRequest
+from super_processor.upscale import FakeUpscaleEngine, UpscaleRequest, UpscaleSpan
 from super_processor.wizard import (
     WizardController,
     WizardError,
@@ -23,7 +23,9 @@ from super_processor.wizard import (
     WizardStep,
     save_job_wizard_state,
     save_session_state,
+    strength_summary,
 )
+from super_processor.wizard_pages import render_result
 
 TOKEN = "test-token"
 
@@ -468,3 +470,26 @@ def test_previews_are_2x_even_where_4x_is_allowed(tmp_path: Path) -> None:
     assert plan is not None and plan.scale == 2
     # 4x is still a choice when the render starts, with 2x picked.
     assert controller._scale_options(state.job_id) == (1, 2, 4)
+
+
+def test_result_strength_describes_every_restored_span() -> None:
+    # Run 9 ended on credits that skip FlashVSR, and the Result line read
+    # "strength 0.00" although the restored segments ran at 0.30-0.45.
+    spans = (
+        UpscaleSpan(0.0, 6.9, strength=0.45),
+        UpscaleSpan(6.9, 12.8, strength=0.3),
+        UpscaleSpan(12.8, 17.7, strength=0.4),
+        UpscaleSpan(42.3, 52.2, strength=0.0, use_upscale=False),
+    )
+    summary = strength_summary(spans)
+    assert summary == "strength 0.30–0.45 · FlashVSR off for 9.9 s"
+    page = render_result(output_url="/output.mp4", scale=2, strength=summary)
+    assert "Scale 2× · strength 0.30–0.45 · FlashVSR off for 9.9 s." in page
+
+
+def test_result_strength_for_one_recipe_or_none() -> None:
+    # A revision split leaves equal strengths; they read as one value.
+    same = (UpscaleSpan(0.0, 2.0, strength=0.4), UpscaleSpan(2.0, 5.0, strength=0.4))
+    assert strength_summary(same) == "strength 0.40"
+    off = (UpscaleSpan(0.0, 5.0, use_upscale=False),)
+    assert strength_summary(off) == "FlashVSR off"
