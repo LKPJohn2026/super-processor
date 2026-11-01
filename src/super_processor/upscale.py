@@ -63,11 +63,15 @@ _WEIGHT_FILES = (
     "LQ_proj_in.ckpt",
     "TCDecoder.ckpt",
 )
-# Which FlashVSR restores: "v1.1" (the default, the tiny script) or "plus"
+# Which FlashVSR restores: "v1.1" (the default, the tiny script), "plus"
 # (FlashVSR+ turbo: about 60% less GPU memory, and 4x of 854x480 fits in
-# 32 GB without the system-RAM fallback).
+# 32 GB without the system-RAM fallback), or "auto" (each clip by its scale).
 FLASHVSR_MODEL_ENV = "SUPER_PROCESSOR_FLASHVSR"
-FLASHVSR_MODELS = ("v1.1", "plus")
+FLASHVSR_MODELS = ("v1.1", "plus", "auto")
+# "auto" restores this scale and up with FlashVSR+. At 2x, replaying a
+# trailer plan gave the same picture (47.8 dB between the two) in 1.57x the
+# time; at 4x v1.1 needed system RAM (274 s against 90 s per 4 s clip).
+AUTO_PLUS_FROM_SCALE = 4
 # FlashVSR+ preset and the files it reads under its checkout.
 PLUS_MODE = "turbo"
 # Its wavelet colour correction, like v1.1's color_fix. Off, a face clip
@@ -594,8 +598,8 @@ class _Plus:
         )
 
 
-def _flashvsr_ready() -> _V11 | _Plus:
-    """The FlashVSR to run, checked, or a wizard-facing error."""
+def _flashvsr_ready(scale: int) -> _V11 | _Plus:
+    """The FlashVSR to run at ``scale``, checked, or a wizard-facing error."""
     model = flashvsr_model()
     if not cuda_available():
         raise UpscaleError(
@@ -603,7 +607,31 @@ def _flashvsr_ready() -> _V11 | _Plus:
             "back to an FFmpeg grade. Install the gpu extra and a driver."
         )
     if model == "plus":
-        return _Plus(resolve_flashvsr_plus())
+        return _plus_ready()
+    if model == "v1.1":
+        return _v11_ready()
+    # auto: the model suited to the scale, or the other when only its
+    # checkout is there. A checkout that is there but incomplete names its
+    # missing files rather than being passed over.
+    plus = (flashvsr_plus_home(), _plus_ready)
+    v11 = (flashvsr_home(), _v11_ready)
+    choices = (plus, v11) if scale >= AUTO_PLUS_FROM_SCALE else (v11, plus)
+    for home, ready in choices:
+        if home.is_dir():
+            return ready()
+    raise UpscaleError(
+        f"{FLASHVSR_MODEL_ENV}=auto found no FlashVSR checkout at {v11[0]} "
+        f"or {plus[0]}. Clone OpenImagingLab/FlashVSR (v1.1) or "
+        "OpenImagingLab/FlashVSR_Plus there with their weights; FlashVSR+ "
+        "suits 4x, v1.1 2x."
+    )
+
+
+def _plus_ready() -> _Plus:
+    return _Plus(resolve_flashvsr_plus())
+
+
+def _v11_ready() -> _V11:
     home = flashvsr_home()
     infer = home / "examples" / "WanVSR" / "infer_flashvsr_v1.1_tiny.py"
     if not infer.is_file():
@@ -696,7 +724,20 @@ class FlashVsrEngine:
             return []
         for request in requests:
             require_supported_timing(request.source)
-        backend = _flashvsr_ready()
+        # With "auto" a batch can mix models; each loads once for its clips.
+        batches: dict[_V11 | _Plus, list[int]] = {}
+        for index, request in enumerate(requests):
+            batches.setdefault(_flashvsr_ready(request.scale), []).append(index)
+        restored: list[Path] = [Path()] * len(requests)
+        for backend, indexes in batches.items():
+            outputs = self._upscale_batch([requests[i] for i in indexes], backend)
+            for index, output in zip(indexes, outputs, strict=True):
+                restored[index] = output
+        return restored
+
+    def _upscale_batch(
+        self, requests: list[UpscaleRequest], backend: _V11 | _Plus
+    ) -> list[Path]:
         from .probe import ProbeError, probe_file
 
         ready: list[UpscaleRequest] = []
@@ -758,7 +799,7 @@ class FlashVsrEngine:
 
     def upscale(self, request: UpscaleRequest) -> Path:
         require_supported_timing(request.source)
-        backend = _flashvsr_ready()
+        backend = _flashvsr_ready(request.scale)
         from .probe import ProbeError, probe_file
 
         # The loader chdirs into the FlashVSR checkout; relative job paths

@@ -6,10 +6,12 @@ import shutil
 import subprocess
 import sys
 import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
+from super_processor import upscale
 from super_processor.upscale import (
     FLASHVSR_BLOCK,
     FlashVsrEngine,
@@ -204,9 +206,131 @@ def test_the_setting_picks_the_model(monkeypatch: pytest.MonkeyPatch) -> None:
     assert flashvsr_model() == "v1.1"
     monkeypatch.setenv("SUPER_PROCESSOR_FLASHVSR", " Plus ")
     assert flashvsr_model() == "plus"
+    monkeypatch.setenv("SUPER_PROCESSOR_FLASHVSR", "AUTO")
+    assert flashvsr_model() == "auto"
     monkeypatch.setenv("SUPER_PROCESSOR_FLASHVSR", "v2")
     with pytest.raises(UpscaleError, match="must be one of v1.1, plus"):
         flashvsr_model()
+
+
+def _v11_tree(tmp_path: Path) -> Path:
+    home = tmp_path / "FlashVSR"
+    wan = home / "examples" / "WanVSR"
+    for name in (
+        "infer_flashvsr_v1.1_tiny.py",
+        "FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors",
+        "FlashVSR-v1.1/LQ_proj_in.ckpt",
+        "FlashVSR-v1.1/TCDecoder.ckpt",
+    ):
+        (wan / name).parent.mkdir(parents=True, exist_ok=True)
+        (wan / name).write_text("w", encoding="utf-8")
+    return home
+
+
+@pytest.mark.parametrize(
+    ("installed", "scale", "runs"),
+    [
+        ({"v1.1", "plus"}, 2, "v1.1"),
+        ({"v1.1", "plus"}, 4, "plus"),
+        ({"plus"}, 2, "plus"),
+        ({"v1.1"}, 4, "v1.1"),
+    ],
+)
+def test_auto_picks_the_model_by_scale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    installed: set[str],
+    scale: int,
+    runs: str,
+) -> None:
+    monkeypatch.setenv("SUPER_PROCESSOR_FLASHVSR", "auto")
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    v11 = _v11_tree(tmp_path) if "v1.1" in installed else tmp_path / "no-v11"
+    plus = _plus_tree(tmp_path) if "plus" in installed else tmp_path / "no-plus"
+    monkeypatch.setenv("FLASHVSR_HOME", str(v11))
+    monkeypatch.setenv("FLASHVSR_PLUS_HOME", str(plus))
+    backend = upscale._flashvsr_ready(scale)
+    assert isinstance(backend, upscale._Plus if runs == "plus" else upscale._V11)
+
+
+def test_auto_with_neither_says_auto_found_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SUPER_PROCESSOR_FLASHVSR", "auto")
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    monkeypatch.setenv("FLASHVSR_HOME", str(tmp_path / "no-v11"))
+    monkeypatch.setenv("FLASHVSR_PLUS_HOME", str(tmp_path / "no-plus"))
+    for scale in (2, 4):
+        with pytest.raises(UpscaleError, match="=auto found no FlashVSR checkout"):
+            upscale._flashvsr_ready(scale)
+
+
+def test_auto_names_what_an_incomplete_checkout_lacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SUPER_PROCESSOR_FLASHVSR", "auto")
+    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
+    plus = _plus_tree(tmp_path)
+    (plus / "ckpts" / "turbo" / "dit.safetensors").unlink()
+    monkeypatch.setenv("FLASHVSR_HOME", str(_v11_tree(tmp_path)))
+    monkeypatch.setenv("FLASHVSR_PLUS_HOME", str(plus))
+    # Not passed over for the slower v1.1: the missing weight is named.
+    with pytest.raises(UpscaleError, match=r"ckpts/turbo/dit\.safetensors"):
+        upscale._flashvsr_ready(4)
+    assert isinstance(upscale._flashvsr_ready(2), upscale._V11)
+
+
+@dataclass(frozen=True)
+class _PlainV11:
+    """Stands in for v1.1: a lanczos resize, with each clip noted in ``log``."""
+
+    log: Path
+
+    def load(self) -> upscale._Loaded:
+        with self.log.open("a") as handle:
+            handle.write("v1.1 load\n")
+
+        def run(
+            _module: object, _pipe: object, source: Path, output: Path, *, scale: int
+        ) -> None:
+            with self.log.open("a") as handle:
+                handle.write(f"v1.1 {source.name} {scale}\n")
+            upscale.plain_upscale(UpscaleRequest(source, output, scale=scale))
+
+        return upscale._Loaded(None, None, run, lambda: None)
+
+
+@needs_ffmpeg
+def test_auto_batches_each_model_once_and_keeps_the_order(
+    plus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SUPER_PROCESSOR_FLASHVSR", "auto")
+    calls = tmp_path / "v11.log"
+    monkeypatch.setattr(upscale, "_v11_ready", lambda: _PlainV11(calls))
+    loads: list[str] = []
+    real_load = upscale._Plus.load
+
+    def counted_load(self: upscale._Plus) -> upscale._Loaded:
+        loads.append("plus")
+        return real_load(self)
+
+    monkeypatch.setattr(upscale._Plus, "load", counted_load)
+    requests = []
+    for index, scale in enumerate((4, 2, 4, 2)):
+        clip = tmp_path / f"clip_{index}.mp4"
+        _testsrc(clip, seconds=1, size="128x72")
+        requests.append(
+            UpscaleRequest(clip, tmp_path / "out" / f"{index}.mp4", scale=scale)
+        )
+    outputs = FlashVsrEngine().upscale_many(requests)
+    assert outputs == [r.output.resolve() for r in requests]
+    assert [_size(o) for o in outputs] == ["512,288", "256,144", "512,288", "256,144"]
+    assert loads == ["plus"]
+    assert calls.read_text().split("\n")[:-1] == [
+        "v1.1 load",
+        "v1.1 clip_1.mp4 2",
+        "v1.1 clip_3.mp4 2",
+    ]
 
 
 def test_missing_plus_files_are_named(tmp_path: Path) -> None:

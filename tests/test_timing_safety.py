@@ -267,7 +267,7 @@ def test_vfr_is_rejected_before_work_or_overwriting_output(
     span = UpscaleSpan(0, 4.5)
     engine = _NoWorkEngine()
 
-    def no_gpu() -> tuple[Path, Path]:
+    def no_gpu(_scale: int) -> tuple[Path, Path]:
         pytest.fail("unsupported media reached GPU readiness / loading")
 
     monkeypatch.setattr(upscale, "_flashvsr_ready", no_gpu)
@@ -318,7 +318,7 @@ def test_batch_preflights_all_inputs_before_starting_any(
         for i, source in enumerate([good, bad])
     ]
 
-    def no_gpu() -> tuple[Path, Path]:
+    def no_gpu(_scale: int) -> tuple[Path, Path]:
         pytest.fail("batch loaded the GPU before checking every input")
 
     monkeypatch.setattr(upscale, "_flashvsr_ready", no_gpu)
