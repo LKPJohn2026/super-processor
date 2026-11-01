@@ -86,10 +86,14 @@ turns a result note into `start_s`, `end_s`, `scale` (2 or 4), and
 does not stack.
 
 `SUPER_PROCESSOR_FLASHVSR` picks the model: v1.1 through its tiny example
-script (the default), or FlashVSR+ turbo through its Python API. Both run
-behind one backend interface (`load()` returns the pipeline and a `run`), so
-chunking, the out-of-memory ladder, and the system-RAM child are shared; the
-child inherits the variable. FlashVSR+ is padded to 128-pixel blocks like
+script (the default), FlashVSR+ turbo through its Python API, or `auto`,
+which picks per clip from its scale: FlashVSR+ at 4x, v1.1 below, and the
+other when only its checkout folder is present (an incomplete checkout
+names its missing files instead of being passed over). Both run behind one backend interface
+(`load()` returns the pipeline and a `run`), so chunking, the out-of-memory
+ladder, and the system-RAM child are shared; the child inherits the variable
+and the clip's scale, so it picks the same model. A preview batch that mixes
+scales under `auto` loads each model once for its own clips. FlashVSR+ is padded to 128-pixel blocks like
 v1.1. Its frames go straight into one lossless encode that also crops the
 padding, rather than through its own CRF 25 writer. Its packages have
 generic names (`inference`, `models`), so the loader refuses to load next to

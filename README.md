@@ -117,6 +117,12 @@ python -c "from super_processor.upscale import resolve_flashvsr_plus as r; print
 
 The check names any missing file. Unset the variable to go back to v1.1.
 
+`SUPER_PROCESSOR_FLASHVSR=auto` picks per clip: FlashVSR+ at 4x, where it
+avoids the system-RAM fallback, and v1.1 at 2x, where the wizard's blended
+strengths left the two pictures the same and v1.1 rendered a trailer in 257 s
+against 403 s. With only one checkout folder present, `auto` uses that one; a checkout
+that is there but missing files is reported, not skipped.
+
 ## Testing on your own footage
 
 ```bash

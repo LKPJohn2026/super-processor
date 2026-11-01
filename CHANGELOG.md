@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about 60% less GPU memory, so 4x of 854x480 fits in 32 GB without the
   system-RAM fallback, but it is slower at 2x. `FLASHVSR_PLUS_HOME` points at
   the checkout; missing code or weights are named before anything runs.
+- `SUPER_PROCESSOR_FLASHVSR=auto` uses FlashVSR+ for 4x clips and v1.1 for
+  2x, or the other when only its checkout folder is present. Replaying a trailer plan at the
+  wizard's 2x strengths gave the same picture with v1.1 in 64% of the time;
+  at 4x, v1.1 needs the slower system-RAM fallback.
 
 ### Fixed
 
