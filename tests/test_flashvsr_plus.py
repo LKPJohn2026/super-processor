@@ -306,6 +306,10 @@ def test_auto_batches_each_model_once_and_keeps_the_order(
 ) -> None:
     monkeypatch.setenv("SUPER_PROCESSOR_FLASHVSR", "auto")
     calls = tmp_path / "v11.log"
+    # Auto looks for the checkout folder before calling _v11_ready, so the
+    # folder must exist here rather than depend on the machine's models.
+    (tmp_path / "FlashVSR").mkdir()
+    monkeypatch.setenv("FLASHVSR_HOME", str(tmp_path / "FlashVSR"))
     monkeypatch.setattr(upscale, "_v11_ready", lambda: _PlainV11(calls))
     loads: list[str] = []
     real_load = upscale._Plus.load
