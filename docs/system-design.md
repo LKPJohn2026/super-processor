@@ -1,15 +1,15 @@
 # Super Processor — System Design
 
 Super Processor is a local-first video processor. A localhost wizard has
-Gemini cut footage you already shot into segments from a grid of local
-stills, plans and previews each segment in turn for you to approve, runs a
-local FlashVSR restoration upscale, then lets you revise a time range or
-start over with a plain-language note. Gemini only proposes segments, picks
-bounded per-segment settings, checks previews, and turns a note into a
-bounded range, scale, and strength; FFmpeg samples, measures, trims, splices,
-encodes, and copies audio. No model writes
-shell commands. The CLI keeps the older
-FFmpeg-filter grade paths for automation.
+Gemini watch a small, audio-free copy of footage you already shot, cut it
+into segments, and choose the output size; it then plans and previews each
+segment in turn for you to approve, runs a local FlashVSR restoration
+upscale, and lets you revise a time range or start over with a
+plain-language note. Gemini only proposes segments and a scale from the
+offered ones, picks bounded per-segment settings, checks previews, and turns
+a note into a bounded range, scale, and strength; FFmpeg samples, measures,
+trims, splices, encodes, and copies audio. No model writes shell commands.
+The CLI keeps the older FFmpeg-filter grade paths for automation.
 
 ## Market context
 
@@ -151,11 +151,34 @@ The wizard works one segment at a time instead of planning every shot at
 once. The steps are `sampling → proposing → segments → (analyzing ⇄
 preview_segment) per segment → ready_to_render → rendering → result`.
 
-- **Dense local sampling.** FFmpeg saves a still about every second (at most
-  120, evenly spaced, first and last frame included) inside the job folder.
-  Gemini proposes segment boundaries from those stills and their times; no
-  video file is uploaded. FFmpeg's `scdet` is not used for this flow: a cut
-  is not the same as a change in what the restoration needs.
+- **Gemini watches the video.** FFmpeg writes `gemini_upload.mp4` in the job
+  folder: no audio, long edge shrunk to at most 960 px (even dimensions),
+  `libx264` veryfast CRF 28, original frame rate. It goes to the Gemini File
+  API with a resumable upload; Google deletes it after about 48 hours, and
+  `gemini_video.json` records it so later requests reuse it while it has at
+  least an hour left.
+  Gemini samples it at 1 fps: the segment request gets the whole video, and
+  each segment's settings request gets that segment's stretch
+  (`startOffset`/`endOffset`) with one full-size still. Video requests wait
+  up to 300 s; a busy model (HTTP 500 or 503) is skipped at once rather than
+  retried, and
+  a timeout ends the model failover, since every model would read the same
+  video.
+- **Still grid as fallback.** FFmpeg also saves a still about every second
+  (at most 120, evenly spaced, first and last frame included). The Segments
+  screen shows them. If the copy or upload fails, or the client has no File
+  API, Gemini proposes segments from those stills and their times, and the
+  Segments screen says why. A segment request that fails with the video is
+  asked again with the stills; the upload is kept for later requests.
+  FFmpeg's `scdet` is not used for this flow: a cut is not the same as a
+  change in what the restoration needs.
+- **Gemini picks the scale.** With the segments, Gemini returns `scale` (1 =
+  don't upscale, 2, or 4) and `scale_reason` for the whole video, from the
+  options code offers; 2 is the default when it gives none. 4x is offered
+  only when the source's long edge is 960 px or less and the GPU has at
+  least 24 GB (decimal, `MIN_4X_VRAM_BYTES`). GPU memory comes from
+  `SUPER_PROCESSOR_GPU_VRAM_GB`, else `nvidia-smi`, else PyTorch if loaded,
+  else 0, which rules out 4x. The editor can still change it on Ready.
 - **Few, long segments.** Each segment is planned, previewed, and approved
   on its own, so Gemini is asked for as few as the footage needs: at most 10,
   each at least 3 s. Code holds that whatever the reply: the segments are
@@ -169,8 +192,9 @@ preview_segment) per segment → ready_to_render → rendering → result`.
   it previewed and checked. The window is seeded by job, segment, and preview
   count, and is kept when the segment is redone, so a note is judged on the
   same seconds. The editor approves it, moving to the next segment, or sends
-  a note that redoes only that segment. The scale is chosen on the first
-  segment and shared by all.
+  a note that redoes only that segment. All segments share the scale chosen
+  with the segments. Previews are rendered at no more than 2x, and a 1x plan
+  never runs FlashVSR for its previews.
 - **Full render** builds `upscale_plan.json` from the approved recipes and
   renders it as before, with pass-through spans where `use_upscale` is false.
 
@@ -195,13 +219,14 @@ and stills.
 
 FFprobe, frame sampling, previews, and final FFmpeg encodes run on the user's
 machine. The wizard accepts verified CFR inputs up to 1080p and 30 minutes;
-90–120 minute inputs are not supported. The full source is not uploaded to
-Gemini.
+90–120 minute inputs are not supported. The full-quality source is not
+uploaded to Gemini, and no audio is ever sent.
 
-Gemini receives only sampled stills the user has consented to send through the
-wizard: the segment grid (480 pixels wide, at most 120), one still per
-segment, the stills it boxes faces in, and a still from each preview pair. It
-never receives a video file.
+Gemini receives what the user has consented to send through the wizard: an
+audio-free copy of the whole video (long edge at most 960 px), kept on
+Google's File API about 48 hours; one still per segment, the stills it boxes
+faces in, and a still from each preview pair; and, when the video cannot be
+used, the segment grid (480 pixels wide, at most 120).
 
 ### Gemini-only planning for the wizard
 
@@ -221,12 +246,13 @@ structured-ops contract.
 
 Gemini emits parseable JSON through
 [structured outputs](https://ai.google.dev/gemini-api/docs/structured-output).
-Each wizard call has its own schema: segments (times, label, contents), a
-recipe per segment (strength, `use_upscale`, look, and once the scale),
-protection boxes, a preview check, and a result note's range (`start_s`,
-`end_s`, a `scale` the source allows, `strength` 0–1). Values are validated, clamped, and
-unknown names dropped before anything runs. The model has no shell tool, and FFmpeg argument lists
-are built by engineering-owned code.
+Each wizard call has its own schema: segments (times, label, contents) with
+the output `scale` and its reason, a recipe per segment (strength,
+`use_upscale`, look), protection boxes, a preview check, and a result note's
+range (`start_s`, `end_s`, a `scale` the source allows, `strength` 0–1).
+Values are validated, clamped, and unknown names dropped before anything runs.
+The model has no shell tool, and FFmpeg argument lists are built by
+engineering-owned code.
 
 ### Result note and range revise
 
@@ -296,7 +322,10 @@ integrity, and user acceptance.
 Pick file (localhost wizard) ──► FFprobe ──► 1080p / 30 min + decoded CFR check
    │
    ▼
-still grid (~1/s, ≤ 120) ──► Gemini: segments ──► editor: approve or note
+silent copy (≤ 960 px) ──► Gemini File API, 1 fps (still grid if it fails)
+   │
+   ▼
+Gemini: segments + scale ──► editor: approve or note
    │
    ▼  for each segment
 measure + box faces/hands/text ──► Gemini: recipe ──► 3 s preview (FlashVSR or resize)
@@ -317,7 +346,7 @@ result player ──► happy, a range note, or start over
                       │                       │
                       ▼                       ▼
           Gemini: note → range,       clear plans, keep chat,
-          scale, strength             back to the still grid
+          scale, strength             back to sampling
                       │
                       ▼
           re-restore range from source ──► keyframe splice ──► result
@@ -336,8 +365,11 @@ Each job has an on-disk directory containing:
   progress);
 - `gemini_chat.json`, every Gemini exchange of the job, kept across a full
   restart;
-- `segment_stills/` and `segments.json` (the proposal, its approval, and the
-  editor's note);
+- `gemini_upload.mp4`, the audio-free copy Gemini watches, and
+  `gemini_video.json`, its File API record (name, URI, expiry) or why it
+  could not be used;
+- `segment_stills/` and `segments.json` (the proposal, Gemini's scale and
+  reason, its approval, and the editor's note);
 - `shots.json` and `shot_plan.json` (each segment's measurements, boxes,
   recipe, preview window, and check), with `previews/`;
 - `upscale_plan.json` spans with scale, strength, look, and `use_upscale`;
@@ -379,8 +411,10 @@ may remain for compatibility; the wizard is the primary product path.
   from logs; the file is a local secret, not an encrypted credential vault.
 - The validator accepts only declared operations and bounded parameters.
 - User-selected paths are normalized and passed without invoking a shell.
-- Selected stills, preview stills, notes, and conversation context leave the
-  machine through Gemini after setup; obtain permission for sensitive footage.
+- An audio-free copy of the whole video (long edge at most 960 px), selected
+  stills, preview stills, notes, and conversation context leave the machine
+  through Gemini after setup. The copy stays on Google's File API about 48
+  hours. Obtain permission for sensitive footage.
   Local job JSON and chat logs may retain that context.
 - No telemetry implementation is present. An opt-in telemetry policy is not an
   implemented feature.

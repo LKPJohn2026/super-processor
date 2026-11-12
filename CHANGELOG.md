@@ -18,6 +18,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2x, or the other when only its checkout folder is present. Replaying a trailer plan at the
   wizard's 2x strengths gave the same picture with v1.1 in 64% of the time;
   at 4x, v1.1 needs the slower system-RAM fallback.
+- Gemini watches the video. The wizard uploads an audio-free copy
+  (`gemini_upload.mp4`: long edge at most 960 px, `libx264` CRF 28, source
+  frame rate) to the Gemini File API, which samples it at 1 fps. Segments
+  are proposed from the whole video and each segment's settings from its
+  stretch of it. Google deletes the upload after about 48 hours;
+  `gemini_video.json` records it so later requests reuse it while it lives.
+  If the copy or upload fails, Gemini works from the still grid as before and
+  the Segments screen says why. Video requests wait up to 300 s, skip a busy
+  model without retrying, and stop the model failover on a timeout.
+- Gemini chooses the output size (1x, 2x, or 4x) while it proposes segments,
+  and the Segments and Ready screens show its reason. 2x stays the default. 4x is offered
+  only for sources up to 960 px on a GPU with at least 24 GB, read from
+  `SUPER_PROCESSOR_GPU_VRAM_GB`, `nvidia-smi`, or a loaded PyTorch; on a small
+  source the Ready screen says when the GPU is too small for 4x.
+- Both shells show the whole job's percentage ("N% of the job") and the
+  running step's time left ("about 4 min 05 s left"), or the time spent while
+  Gemini is thinking. `/api/state` progress adds `overall`, `eta_s`,
+  `elapsed_s`, and `updated_at`. The estimate ignores model loading and
+  blends the step's average rate with its recent one; the React shell counts
+  it down between polls.
+
+### Changed
+
+- Render progress is weighted by work: a frame FlashVSR restores counts 20
+  times a frame that is only resized, so a pass-through span no longer makes
+  the percentage and time left jump. The message now reads "N% of the work".
+- Segment previews still render at no more than 2x now that a plan can start
+  at 4x, so they stay out of the system-RAM fallback, and a 1x plan runs no
+  FlashVSR for its previews.
 
 ### Fixed
 

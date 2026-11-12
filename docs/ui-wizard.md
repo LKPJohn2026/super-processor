@@ -29,9 +29,11 @@ super-processor doctor
 super-processor --jobs-dir .dogfood/jobs review
 ```
 
-Use footage you have permission to send as sampled images to Gemini. Calls
-consume API quota and may incur charges; full video files stay local, but
-selected stills/previews, notes, and chat context are sent to Google.
+Use footage you have permission to send to Gemini. Calls consume API quota
+and may incur charges. An audio-free copy of the whole video (long edge at
+most 960 px) is uploaded to Google's File API and kept there about 48 hours;
+selected stills/previews, notes, and chat context are sent too. The
+full-quality file and its audio stay local.
 
 Walk introduction → LLM type (Gemini) → setup → pick file → sampling/proposing
 → **Segments**. Inspect the proposed ranges and content labels, send a boundary
@@ -236,11 +238,11 @@ frame count is refused and the previous `output.mp4` is kept.
 | Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key. The key is saved to `credentials.json` in the user's config folder (mode 0600) and used on every later run; the screen says where the key in use comes from (`GEMINI_API_KEY`, the file, or an older keyring entry) |
 | Pick file | `POST /browse` (`/api/browse`), `POST /upload` (`/api/upload`), `POST /pick` | "Choose a file…" opens the desktop's own file dialog on the wizard's machine (zenity through the XDG portal, then kdialog; `osascript` on macOS, PowerShell on Windows) and picks the real path. A file dropped on the page is uploaded: the body is the file, `X-File-Name` its name, `X-Wizard-Token` the token; it is streamed to `<jobs>/uploads/` (video extensions only, at most 32 GiB) and removed again if the pick refuses it. Typing a path is under "Type a path instead". Verified CFR, up to 1080p and 30 minutes |
 | Go back | `POST /goto` (`/api/goto`) with `to=setup`, `file`, or `segments` | Setup, File, and Segments in the step rail are links when they can be reached, and each of those screens has a back link. Nothing is deleted: going back to the segments keeps the approved segments and previews, and approving them again carries on at the same segment. `/api/state` returns `navigation` |
-| Finding segments | `GET /segment?run=1` (`/api/segment?run=1`) | States `sampling` then `proposing`: FFmpeg saves the still grid; Gemini proposes segments |
+| Finding segments | `GET /segment?run=1` (`/api/segment?run=1`) | States `sampling` then `proposing`: FFmpeg saves the still grid and a silent copy, which is uploaded to Gemini; Gemini watches it and proposes segments and the output scale (from the stills if the video cannot be used) |
 | Segments | `POST /segments` (`/api/segments`) | `action=approve`, or `action=note` with `note` to propose again |
 | Analyzing | `GET /analyze?run=1` (`/api/analyze?run=1`) | The current segment only: Gemini proposes its settings, a short preview renders, Gemini checks it |
 | Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one; `action=upscale` with `on=0` or `on=1` overrides Gemini's FlashVSR choice for this segment, which later proposals keep |
-| Ready to render | `POST /ready` (`/api/ready`) | Choose the upscale: `scale=2`, `4` (when the source's long edge is 960 or less), or `1` ("Don't upscale": same size, clean-up and finishing only, no FlashVSR). `action=render` starts the full render from every approved segment |
+| Ready to render | `POST /ready` (`/api/ready`) | Starts at Gemini's scale and shows its reason. Choose the upscale: `scale=2`, `4` (when the source's long edge is 960 or less and the GPU has at least 24 GB), or `1` ("Don't upscale": same size, clean-up and finishing only, no FlashVSR). `action=render` starts the full render from every approved segment |
 | Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, a note that retunes a time range, or a note with `restart=1` that starts over from the segments |
 | Done | `GET /` (state `done`) | Confirmation |
@@ -292,14 +294,41 @@ schema 3).
 ### Progress
 
 While a worker runs, `/api/state` returns `progress`:
-`{"phase": "analyzing", "pct": 50, "message": "Rendering previews on the GPU"}`.
-While sampling and analyzing, the percentage marks fixed milestones (stills
-saved, Gemini asked, previews rendered, previews checked). During the full
-render it follows the work: each part counts for its share of the source
-frames, FlashVSR reports after every chunk of about 8 s, and the bar runs from
-5% to 90% with "Upscaling on the GPU: N% of the frames"; the seam check is the
-last 10%. Both shells show them as a progress bar; `progress` is `null` when
-nothing runs.
+
+```json
+{"phase": "rendering", "pct": 46, "message": "Upscaling on the GPU: 49% of the work",
+ "overall": 67, "eta_s": 312.5, "elapsed_s": 288.0, "updated_at": 1762970000.0}
+```
+
+- `pct` is the running step's own percentage. While segmenting, saving the
+  stills is 2–25%, the copy and upload for Gemini 25–75%, and Gemini's reply
+  the rest. While analyzing, it marks milestones (faces boxed, Gemini asked,
+  previews rendered, previews checked); if the upload has to be made again,
+  its copy and upload take 20–30%. During the full render it runs from
+  5% to 90% with "Upscaling on the GPU: N% of the work"; the seam check is
+  the last 10%.
+- `overall` places that in the whole job: segmenting 0–8%, the previews
+  8–38% split evenly per segment, the render 38–100%. A render started from a
+  result note counts 0–100% on its own.
+- `eta_s` is the seconds left in the running step's measurable task (saving
+  stills, the copy, the upload, the render), or `null` while Gemini is
+  thinking or too little has been measured (under 0.5% or 3 s). The time
+  before the task's first report, such as loading FlashVSR, is ignored. The
+  rate is the average of the task's own average rate and a recent, smoothed
+  one (`progress.py`, `StepClock`).
+- `elapsed_s` is the time since the worker step began; `updated_at` is when
+  the worker last saved. Between saves, `/api/state` counts `eta_s` down and
+  `elapsed_s` up by the age of the save.
+
+The render's work is weighted: a frame FlashVSR restores counts 1, a plain
+resize frame 0.05 (`PLAIN_FRAME_COST`), and 92% of a FlashVSR part is the
+restore, the rest its encode (`RESTORE_SHARE`). A part FlashVSR skips does not
+make the time left jump.
+
+Both shells show a bar for the whole job, "N% of the job", and "This step:
+pct · message · about X left" (or "X so far" while there is no estimate). The
+React shell counts the time down each second between polls. `progress` is
+`null` when nothing runs.
 
 ## LLM choice (sketch paths)
 
@@ -310,13 +339,32 @@ nothing runs.
 
 ## Segments (loop 1)
 
-No video leaves the machine. FFmpeg saves a 480-pixel-wide still about every
-second into `segment_stills/t_<ms>.jpg`, always the first frame and one
-0.1 s before the end, and never more than 120: a longer clip keeps the even
-spacing and gets fewer stills a second. Gemini sees every still with its time
-and proposes as few segments as the restoration needs, at most 10, each at
-least 3 s long, cut where the photographic context changes (place, light,
-camera, subject distance, image quality), each with a label and what it
+Gemini watches the video. FFmpeg writes `gemini_upload.mp4` in the job
+folder: the first video stream only, no audio, the long edge shrunk to at
+most 960 pixels with even dimensions, `libx264` veryfast CRF 28, at the
+source's frame rate. It is uploaded to the Gemini File API with a resumable
+upload. Google deletes uploads after about 48 hours; `gemini_video.json`
+records the upload and the wizard reuses it while it has at least an hour
+left, uploading again for a job resumed later. Gemini samples it at 1 frame a second: the segment
+request gets the whole video, and each segment's settings request gets that
+segment's stretch (`startOffset`/`endOffset`) with one full-size still. A
+request with the video waits up to 300 s; a busy model (HTTP 500 or 503) is
+skipped at once rather than retried, and a timeout ends the model failover, since every
+model would read the same video.
+
+FFmpeg also saves a 480-pixel-wide still about every second into
+`segment_stills/t_<ms>.jpg`, always the first frame and one 0.1 s before the
+end, and never more than 120: a longer clip keeps the even spacing and gets
+fewer stills a second. The Segments screen shows them. If the copy or upload
+fails, or the client has no File API, Gemini sees every still with its time
+instead, and the Segments screen says "Gemini saw stills instead of the
+video: <reason>" (`segments.video_problem` in `/api/state`). A failed upload
+is not tried again for that job. A segment request that fails with the video is
+asked again with the stills, and the upload is kept for later requests.
+
+Either way, Gemini proposes as few segments as the restoration needs, at most
+10, each at least 3 s long, cut where the photographic context changes (place,
+light, camera, subject distance, image quality), each with a label and what it
 contains from `faces`, `hands`, `text`, `fine_pattern`.
 
 The reply is repaired to cover the clip exactly once: spans are clipped to
@@ -349,11 +397,21 @@ Segments are planned one at a time, in order. Each gets a recipe: a FlashVSR
 `look.py`), and `use_upscale`. Gemini sets `use_upscale: false` where
 FlashVSR would only harm (footage already clean and sharp, or fine texture it
 would invent over); that segment is then resized with lanczos and keeps its
-look. The whole video shares one scale. Segments are previewed at 2×, so the
-previews run on the GPU; the Ready screen starts at 2× and also offers
-"Don't upscale" and, when the source's long edge is 960 pixels or less, 4×.
-At 854×480, 4× is 3456×1920, which FlashVSR cannot fit in 32 GB of VRAM, so a
-4× render runs through the slower system-RAM fallback.
+look. The whole video shares one scale, which Gemini chooses while it
+proposes segments: `scale` 1 ("Don't upscale"), 2, or 4, with a
+`scale_reason`, from the options code offers. Without a valid choice the plan
+starts at 2×. 4× is offered only when the source's long edge is 960 pixels or
+less and the GPU has at least 24 GB (decimal: `MIN_4X_VRAM_BYTES` is
+24 × 1000³, so a 24564 MiB card counts). GPU memory comes from
+`SUPER_PROCESSOR_GPU_VRAM_GB` (GB; a value that is not a number is ignored),
+else `nvidia-smi` `memory.total`, else PyTorch if it is already loaded, else 0,
+which rules out 4×. Previews are rendered at no more than 2×
+(`preview_scale`), so a 4× job previews at 2×; at 854×480, 4× is 3456×1920,
+which FlashVSR v1.1 cannot fit in 32 GB of VRAM. A 1× plan never runs FlashVSR
+for its previews. The Segments screen shows Gemini's choice and reason, and
+the Ready screen shows the reason while that choice stands and, on a small
+source, says when the GPU is too small for 4×. The editor can still change
+the scale there.
 Faces, hands, and text are boxed and held down inside the boxes (see Protected
 regions); a segment that contains them without boxes is capped at 0.6 as a
 whole.
@@ -434,10 +492,10 @@ lower strength where there was damage to clean.
 The segments:
 
 ```json
-{"segments": [{"start_s": 0, "end_s": 14.5, "label": "night street, neon sign", "contains": ["text"]}]}
+{"segments": [{"start_s": 0, "end_s": 14.5, "label": "night street, neon sign", "contains": ["text"]}], "scale": 2, "scale_reason": "Small web video; 2x adds detail without inventing much."}
 ```
 
-A recipe for the current segment (and, on the first segment, the scale):
+A recipe for the current segment (the scale is the one already chosen):
 
 ```json
 {"scale": 2, "shots": [{"index": 0, "strength": 0.4, "use_upscale": true, "look": {"deblock": 0.3, "denoise": 0.2, "contrast": 1.05, "brightness": 0, "saturation": 1, "gamma": 1, "grain": 0}, "reason": "Blocky street at night; clean before upscaling."}]}
@@ -458,16 +516,16 @@ A result note becomes a range and knobs.
 ```
 
 `scale` must be one the Ready screen offers for this source (1, 2, and 4 when
-its long edge is 960 or less) and `strength` 0–1; the range is clamped to the
-file. The size changes only when the note names a multiple as a request ("make
-it 4x", "go back to 2x", or "4x" alone). Code holds that whatever Gemini replies:
-any other note keeps the current scale, even "make it bigger", and if Gemini
-answered a different scale the Result screen says so and how to ask. A named size
-the source does not offer is refused before anything runs. A note on a "Don't
-upscale" render that names no size is refused too, since strength does not apply
-without FlashVSR. If a scale change fails to render, the plan goes back to what
-`output.mp4` holds.
-A scale change re-renders the whole clip (see Range revise above).
+its long edge is 960 or less and the GPU has at least 24 GB) and `strength`
+0–1; the range is clamped to the file. The size changes only when the note
+names a multiple as a request ("make it 4x", "go back to 2x", or "4x" alone).
+Code holds that whatever Gemini replies: any other note keeps the current
+scale, even "make it bigger", and if Gemini answered a different scale the
+Result screen says so and how to ask. A named size the source does not offer
+is refused before anything runs. A note on a "Don't upscale" render that names
+no size is refused too, since strength does not apply without FlashVSR. If a
+scale change fails to render, the plan goes back to what `output.mp4` holds. A
+scale change re-renders the whole clip (see Range revise above).
 
 ## Multi-turn chat
 
@@ -494,10 +552,12 @@ name in the URL.
 | File | Meaning |
 |---|---|
 | `manifest.json` | Job id, source, state |
-| `wizard_state.json` | Wizard step, job id, last error |
+| `wizard_state.json` | Wizard step, job id, last error, segment index, the running worker's progress |
 | `gemini_chat.json` | Every Gemini exchange of the job, replayed on each call |
+| `gemini_upload.mp4` | The audio-free copy Gemini watches (long edge at most 960 px) |
+| `gemini_video.json` | The File API upload (name, URI, expiry) reused while it lives, or why the video could not be used |
 | `segment_stills/` | The still grid, `t_<ms>.jpg` |
-| `segments.json` | Proposed segments (schema 2, `kind: "wizard"`), whether they are approved, and the editor's last note |
+| `segments.json` | Proposed segments (schema 2, `kind: "wizard"`), Gemini's `scale` and `scale_reason`, whether they are approved, and the editor's last note |
 | `shots.json` | Approved segments as the planner's shots: ranges, measurements, contents, boxes, still names |
 | `shot_stills/` | One JPEG per segment, served at `/shot_stills/<name>.jpg` |
 | `shot_plan.json` | Per-segment recipe, `use_upscale`, preview window, reason, check result, preview revision, pending editor note |

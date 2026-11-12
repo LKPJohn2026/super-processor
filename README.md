@@ -5,25 +5,26 @@
 Local-first AI video restoration: FlashVSR upscaling, with a strength
 control for how much new detail it adds.
 
-Super Processor enhances existing footage. A localhost wizard has Gemini split
-the video into segments from a grid of local stills, then plans each segment
-in turn with bounded settings and a short before/after preview you approve or
-send back with a note. It runs a local FlashVSR restoration upscale (or a
-plain resize where FlashVSR would only harm), then lets you revise a time
-range with a note. Gemini structured output only labels, picks numbers inside
-fixed bounds, and checks previews. FFmpeg detects, measures, trims, splices, and encodes from
-engineering-owned argument lists. Models never write shell commands.
+Super Processor enhances existing footage. A localhost wizard has Gemini watch
+a small, silent copy of the video, split it into segments, and choose the
+output size, then plans each segment in turn with bounded settings and a short
+before/after preview you approve or send back with a note. It runs a local
+FlashVSR restoration upscale (or a plain resize where FlashVSR would only
+harm), then lets you revise a time range with a note. Gemini structured output
+only labels, picks numbers inside fixed bounds, and checks previews. FFmpeg
+detects, measures, trims, splices, and encodes from engineering-owned argument
+lists. Models never write shell commands.
 
 ## Requirements
 
 - Python 3.10 or newer and a C compiler (Cython extension)
 - FFmpeg 6 or newer and `ffprobe`, with both `libx264` (previews and
   restoration delivery) and `libx265` (HEVC export). `super-processor doctor`
-  requires both encoders for readiness; hardware codecs are optional.
-  The wizard uses Gemini to propose segments from local stills, then measures
-  those ranges with `blockdetect`, `blurdetect`, `signalstats`, `hqdn3d`, and
-  `psnr`. `scdet` is used by legacy shot detection, not wizard segmentation.
-  `libvmaf` is optional for offline regression.
+  requires both encoders for readiness; hardware codecs are optional. The
+  wizard makes a small, audio-free copy for Gemini to watch, then measures the
+  segments Gemini proposes with `blockdetect`, `blurdetect`, `signalstats`,
+  `hqdn3d`, and `psnr`. `scdet` is used by legacy shot detection, not wizard
+  segmentation. `libvmaf` is optional for offline regression.
 - A Gemini API key from [Google AI Studio](https://aistudio.google.com/) for the wizard
 - For the upscale itself: an NVIDIA GPU with CUDA, PyTorch, and a FlashVSR
   v1.1 checkout with its weights (see [GPU setup](#gpu-setup))
@@ -54,8 +55,8 @@ normalization: external CFR conversion may change frames/timing. This is an
 interim safety limit, not VFR support.
 
 Without a GPU, the wizard works up to the Segments screen (the still grid and
-Gemini's segments). The segment previews and the upscale need FlashVSR on
-CUDA.
+Gemini's segments), and 4x is never offered. The segment previews and the
+upscale need FlashVSR on CUDA.
 
 ## GPU setup
 
@@ -122,6 +123,33 @@ avoids the system-RAM fallback, and v1.1 at 2x, where the wizard's blended
 strengths left the two pictures the same and v1.1 rendered a trailer in 257 s
 against 403 s. With only one checkout folder present, `auto` uses that one; a checkout
 that is there but missing files is reported, not skipped.
+
+### Output size
+
+While it proposes segments, Gemini also picks the output size for the whole
+video and says why: 1x (keep the size, no FlashVSR), 2x (the default), or 4x.
+It can only pick from what the code offers. 4x is offered when the source's
+long edge is 960 px or less and the GPU has at least 24 GB (decimal, so a
+24564 MiB card counts). GPU memory comes from `nvidia-smi`, or from PyTorch if
+it is already loaded; `SUPER_PROCESSOR_GPU_VRAM_GB=24` overrides both (a value
+that is not a number is ignored). With no GPU found, 4x is not offered.
+
+The Segments screen shows Gemini's choice and reason. The Ready screen shows
+the reason while that choice stands and, on a small source, says when the GPU
+is too small for 4x. You can still change the size
+there. Segment previews are rendered at no more than 2x, so a 4x job previews
+at 2x, and a 1x job never runs FlashVSR for its previews.
+
+### Progress and time left
+
+Both interfaces show a bar for the whole job ("N% of the job") and a line for
+the running step: its percentage, what it is doing, and "about X left", or
+"X so far" while Gemini is thinking. Segmenting is the first 8% of the job,
+the previews the next 30% (split evenly per segment), and the render the
+rest; a render from a result note counts 0–100% on its own. The time left
+ignores time before the step's first report, such as loading FlashVSR, and
+follows both the step's average speed and its recent speed. In the render,
+a FlashVSR frame counts far more than a frame that is only resized.
 
 ## Testing on your own footage
 
@@ -202,6 +230,8 @@ Routine tests exclude live Gemini calls even when `GEMINI_API_KEY` is set.
 Live tests are a separate, explicit opt-in: with a test key configured, run
 `python -m pytest -m gemini_live --no-cov`. These contact Google, send test
 prompts/context, and consume API quota (potentially incurring charges).
-Wizard use also sends selected stills/previews and notes; do not use sensitive
-footage without permission. See [CONTRIBUTING.md](CONTRIBUTING.md) for testing
+Wizard use also uploads an audio-free copy of the whole video (long edge at most
+960 px) to Google's File API, where it is kept about 48 hours, and sends
+selected stills, notes, and chat context; do not use sensitive footage without
+permission. See [CONTRIBUTING.md](CONTRIBUTING.md) for testing
 and packaging checks, and [CHANGELOG.md](CHANGELOG.md) for changes.
