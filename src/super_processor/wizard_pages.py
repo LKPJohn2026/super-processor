@@ -708,8 +708,40 @@ poster="{escape(_poster(after))}"></video>{boxes}</div></figure>
 </div>"""
 
 
+def format_duration(seconds: float) -> str:
+    """``42 s``, ``3 min 05 s``, or ``1 h 07 min``: as a person says it."""
+    total = max(0, round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min {secs:02d} s"
+    return f"{secs} s"
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def progress_timing(progress: dict[str, object]) -> str:
+    """``about 4 min 10 s left``, or the time spent while nothing measures it."""
+    eta = _number(progress.get("eta_s"))
+    if eta is not None:
+        return f"about {format_duration(eta)} left"
+    elapsed = _number(progress.get("elapsed_s"))
+    if elapsed is not None:
+        return f"{format_duration(elapsed)} so far"
+    return ""
+
+
 def _progress_bar(progress: dict[str, object] | None) -> str:
-    """How far the running worker is, from the wizard state."""
+    """How far the job and its running step are, and how long is left."""
     if not progress:
         return ""
     try:
@@ -717,9 +749,20 @@ def _progress_bar(progress: dict[str, object] | None) -> str:
     except ValueError:
         return ""
     message = escape(str(progress.get("message") or ""))
+    overall = _number(progress.get("overall"))
+    timing = progress_timing(progress)
+    step = f"{pct}% · {message}" + (f" · {timing}" if timing else "")
+    if overall is None:
+        return (
+            f'<p class="progress"><progress max="100" value="{pct}">{pct}%'
+            f"</progress> {step}</p>"
+        )
+    whole = max(0, min(100, round(overall)))
     return (
-        f'<p class="progress"><progress max="100" value="{pct}">{pct}%</progress> '
-        f"{pct}% · {message}</p>"
+        f'<p class="progress"><progress max="100" value="{whole}" '
+        f'aria-label="Whole job">{whole}%</progress> '
+        f"<strong>{whole}% of the job</strong></p>"
+        f'<p class="progress muted">This step: {step}</p>'
     )
 
 
@@ -738,9 +781,10 @@ def _busy(title: str, lede: str, run_url: str, phase: str, progress: object) -> 
 def render_sampling(progress: object = None) -> str:
     return _busy(
         "Finding the segments",
-        "FFmpeg saves a small still about every second, on this computer. "
-        "Gemini looks at them and splits the video where the light, place, or "
-        "picture quality changes.",
+        "A small copy of the video, without its sound, is uploaded to Gemini, "
+        "which watches it at one frame a second and splits it where the light, "
+        "place, or picture quality changes. If the upload fails, Gemini works "
+        "from stills FFmpeg saves on this computer.",
         "/segment?run=1",
         "segments",
         progress,
@@ -828,6 +872,11 @@ def render_segments(view: dict[str, object], *, error: str | None = None) -> str
             "Approve the segments, or say where the cuts should go and Gemini "
             "will try again."
         )
+    problem = view.get("video_problem")
+    if problem:
+        warn = (f"{warn} " if warn else "") + (
+            f"Gemini saw stills instead of the video: {problem}."
+        )
     count = len(segments)
     noun = "segment" if count == 1 else "segments"
     body = f"""
@@ -835,6 +884,7 @@ def render_segments(view: dict[str, object], *, error: str | None = None) -> str
 <p class="lede">{lede}</p>
 {err}
 {_notice(warn)}
+{_scale_choice(view.get("scale"), view.get("scale_reason"))}
 {_timeline(segments)}
 <p class="muted">{count} {noun}</p>
 {"".join(rows)}
@@ -867,7 +917,7 @@ def render_preview_segment(view: dict[str, object], *, error: str | None = None)
     )
     scale = view.get("scale")
     scale_line = (
-        f'<p class="muted">The whole video is upscaled {scale}×.</p>' if scale else ""
+        f'<p class="muted">{escape(output_size_line(scale))}</p>' if scale else ""
     )
     last = index + 1 >= count
     approve = "Approve and finish" if last else "Approve and go to the next segment"
@@ -929,14 +979,55 @@ def render_ready(view: dict[str, object], *, error: str | None = None) -> str:
 render the whole video with these settings.</p>
 {err}
 <ul class="summary">{"".join(rows)}</ul>
+{
+        _scale_choice(
+            view.get("scale") if view.get("scale_reason") else None,
+            view.get("scale_reason"),
+        )
+    }
 <form method="post" action="/ready">
 <input type="hidden" name="action" value="render">
 {_scale_options(view)}
+{_vram_note(view)}
 <button type="submit" class="full">Render the whole video</button>
 </form>
 <div class="back"><!--back:segments--></div>
 """
     return _page("Ready to render", body, phase="previews")
+
+
+def output_size_line(scale: object) -> str:
+    """What the whole video becomes, said on each segment's preview."""
+    if scale == 1:
+        return "The whole video keeps its size; these previews show the clean-up."
+    if isinstance(scale, int) and scale > 2:
+        return (
+            f"The whole video is upscaled {scale}×; previews are 2×, which "
+            "shows the same restoration at a size any GPU fits."
+        )
+    return f"The whole video is upscaled {scale}×."
+
+
+def _scale_choice(scale: object, reason: object) -> str:
+    """Gemini's output scale and its reason, as one line."""
+    if not isinstance(scale, int) or isinstance(scale, bool):
+        return ""
+    what = "keep the size (no upscaling)" if scale == 1 else f"upscale {scale}×"
+    why = f": {escape(str(reason))}" if reason else "."
+    return f'<p class="muted">Gemini chose to {what}{why}</p>'
+
+
+def _vram_note(view: dict[str, object]) -> str:
+    """Say so when a small source could go to 4× on a larger GPU."""
+    scales = _items(view, "scales")
+    vram = _number(view.get("gpu_vram_gb"))
+    if 4 in scales or not view.get("small_source") or vram is None:
+        return ""
+    have = f"this one has {vram:g} GB" if vram else "none was found"
+    return (
+        '<p class="muted">4× needs an NVIDIA GPU with at least 24 GB of '
+        f"memory; {have}.</p>"
+    )
 
 
 def _scale_options(view: dict[str, object]) -> str:

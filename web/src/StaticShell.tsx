@@ -24,7 +24,7 @@ const TOUR = [
   {
     id: "segments",
     title: "Segments",
-    body: "FFmpeg saves a small still about every second, on your machine. Gemini looks at them and splits the video where the light, place, or picture quality changes. You approve the segments, or say where the cuts should go.",
+    body: "A small copy of the video, without its sound, is uploaded to Gemini, which watches it at one frame a second and splits it where the light, place, or picture quality changes. Gemini also chooses whether to upscale. You approve the segments, or say where the cuts should go.",
   },
   {
     id: "previews",

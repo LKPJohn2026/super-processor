@@ -16,6 +16,8 @@ from super_processor.regions import Region
 from super_processor.shot_plan import new_plan, render_previews
 from super_processor.shots import Shot, ShotList
 from super_processor.upscale import (
+    PLAIN_FRAME_COST,
+    RESTORE_SHARE,
     FakeUpscaleEngine,
     UpscalePlan,
     UpscaleRequest,
@@ -364,7 +366,7 @@ class _HalfwayEngine(FakeUpscaleEngine):
 
 
 @needs_ffmpeg
-def test_render_reports_progress_by_source_frames(tmp_path: Path) -> None:
+def test_render_reports_progress_by_the_work_left(tmp_path: Path) -> None:
     source = _clip(tmp_path / "in.mp4")
     seen: list[float] = []
     render_shots(
@@ -379,8 +381,22 @@ def test_render_reports_progress_by_source_frames(tmp_path: Path) -> None:
         duration_s=6,
         on_progress=seen.append,
     )
-    # Part one: halfway, then done; the pass-through part only reports done.
-    assert seen == pytest.approx([0.25, 0.5, 0.75, 0.875, 1.0])
+    # Frames weigh by what they cost: a pass-through frame is a small share
+    # of a FlashVSR one, and a FlashVSR part's restore comes before its
+    # encode. Part one: halfway, then done; the pass-through part only
+    # reports done.
+    costs = [3.0, 1.5 * PLAIN_FRAME_COST, 1.5]
+    total = sum(costs)
+    one, two = costs[0] / total, (costs[0] + costs[1]) / total
+    assert seen == pytest.approx(
+        [
+            0.5 * RESTORE_SHARE * one,
+            one,
+            two,
+            two + 0.5 * RESTORE_SHARE * costs[2] / total,
+            1.0,
+        ]
+    )
     single: list[float] = []
     render_shots(
         source,

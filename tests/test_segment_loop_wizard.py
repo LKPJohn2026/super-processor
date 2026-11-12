@@ -396,14 +396,96 @@ def test_render_worker_shows_frames_done(tmp_path: Path) -> None:
     controller.handle_post("/ready", {"action": ["render"]})
     assert _run(controller, "start_render").step is WizardStep.RESULT
     # Both segments share settings, so they render as one part.
-    assert seen == [
-        {
-            "phase": "rendering",
-            "pct": 47,
-            "message": "Upscaling on the GPU: 50% of the frames",
-        }
-    ]
+    assert len(seen) == 1
+    shown = seen[0]
+    assert {k: shown[k] for k in ("phase", "pct", "message")} == {
+        "phase": "rendering",
+        "pct": 47,
+        "message": "Upscaling on the GPU: 50% of the work",
+    }
+    # 47% of the render step is that far into the render's share of the job.
+    assert shown["overall"] == round(38 + 62 * 0.475)
+    # One report is not enough to know the speed yet.
+    assert shown["eta_s"] is None
+    assert shown["elapsed_s"] >= 0
     assert controller.current_state().progress is None
+
+
+@needs_ffmpeg
+def test_only_a_render_from_a_result_note_counts_on_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from super_processor import wizard as wizard_module
+
+    seen: list[Any] = []
+
+    class _Watching(FakeUpscaleEngine):
+        def upscale(self, request: UpscaleRequest) -> Path:
+            if request.on_progress is not None:
+                request.on_progress(0.5)
+                seen.append(controller.api_view()["progress"]["overall"])
+            return super().upscale(request)
+
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Gemini(),  # type: ignore[arg-type]
+        upscale_engine=_Watching(),
+    )
+    to_ready(controller, _clip(tmp_path / "in.mp4"))
+    controller.handle_post("/ready", {"action": ["render"]})
+    assert _run(controller, "start_render").step is WizardStep.RESULT
+    state = controller.current_state()
+    assert state.job_id
+    job_dir = controller.store.job_dir(state.job_id)
+    assert (job_dir / "output.mp4").is_file()
+
+    # Rendering again with an output on disk, but not from a note (the job
+    # went back through the segments): still the render band of the job.
+    state.step = WizardStep.RENDERING
+    controller._save(state)
+    assert _run(controller, "start_render").step is WizardStep.RESULT
+    # A result note leaves the plan before the note behind: a revise.
+    plan_file = job_dir / "upscale_plan.json"
+    (job_dir / wizard_module._PLAN_BEFORE_NOTE).write_text(
+        plan_file.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    state = controller.current_state()
+    state.step = WizardStep.RENDERING
+    controller._save(state)
+    assert _run(controller, "start_render").step is WizardStep.RESULT
+    first, again, revise = seen
+    assert first == again == round(38 + 62 * 0.475)
+    assert revise == round(47.5)
+
+
+def test_task_progress_saves_again_after_a_while_within_one_percent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from super_processor import wizard as wizard_module
+
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Gemini(),  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    state = controller.current_state()
+    saves: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_progress",
+        lambda *args, **kwargs: saves.append(args[3]),
+    )
+    now = [1000.0]
+    monkeypatch.setattr("super_processor.wizard.time.time", lambda: now[0])
+    report = controller._task_progress(
+        state, "proposing", 0, 10, "gemini-upload", lambda done: f"{done:.3f}"
+    )
+    report(0.50)
+    report(0.51)  # same whole percent, no time passed: not saved
+    now[0] += wizard_module._PROGRESS_SAVE_S + 0.1
+    report(0.52)  # same whole percent, but the time left would go stale
+    report(0.80)  # a new whole percent
+    assert saves == ["0.500", "0.520", "0.800"]
 
 
 def test_segments_page_says_when_gemini_could_not_split() -> None:

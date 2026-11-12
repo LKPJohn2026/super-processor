@@ -60,6 +60,9 @@ from super_processor.wizard import (
 )
 from super_processor.wizard_pages import check_summary, settings_summary
 
+# A 32 GB GPU, which allows 4x for a small source.
+GB_32 = 32 * 1000**3
+
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg required"
 )
@@ -81,9 +84,9 @@ def test_model_looks_are_clamped() -> None:
     )
     assert look == ShotLook(deblock=1.0, contrast=LOOK_BOUNDS["contrast"][0])
     assert look_from_model(None) == ShotLook()
-    assert allowed_scales(960, 540) == (2, 4)
-    assert allowed_scales(540, 960) == (2, 4)
-    assert allowed_scales(1280, 720) == (2,)
+    assert allowed_scales(960, 540, vram_bytes=GB_32) == (2, 4)
+    assert allowed_scales(540, 960, vram_bytes=GB_32) == (2, 4)
+    assert allowed_scales(1280, 720, vram_bytes=GB_32) == (2,)
 
 
 def test_fallback_recipes_follow_the_measurements() -> None:

@@ -526,7 +526,7 @@ def test_propose_segments_sends_stills_with_times(tmp_path: Path) -> None:
         contains=("faces", "text"),
         job_dir=tmp_path,
     )
-    assert out == reply["segments"]
+    assert out == {"segments": reply["segments"], "scale": None, "scale_reason": ""}
     assert transport.last_body is not None
     parts = transport.last_body["contents"][-1]["parts"]
     assert [p["text"] for p in parts[1::2]] == ["t=0.000s", "t=1.000s", "t=2.000s"]

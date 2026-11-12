@@ -8,9 +8,10 @@ names its model in the URL and must resend ``systemInstruction``,
 the next model. ``responseMimeType`` / ``responseSchema`` keep replies
 parseable.
 
-The wizard asks Gemini to label the shots FFmpeg found, plan and check
-per-shot looks, and turn a result note into a time range, scale, and
-strength. Transport is injectable for tests.
+The wizard asks Gemini to cut the video into segments (watching an
+audio-free copy uploaded through the File API, sampled at 1 fps), choose the
+output scale, plan and check per-shot looks, and turn a result note into a
+time range, scale, and strength. Transport is injectable for tests.
 """
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -61,6 +64,20 @@ _TRANSIENT_RETRIES = 2
 # Per-model read timeout. A model that stops answering is skipped for the next
 # candidate, so a full failover stays close to one slow call.
 _REQUEST_TIMEOUT_S = 60
+# A request that carries video waits for Gemini to watch it; a 20-minute video
+# at 1 fps is about 1200 frames. A timeout here ends the failover (see
+# _generate_with_failover): every model would read the same video.
+_VIDEO_REQUEST_TIMEOUT_S = 300
+_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+_FILES_URL = "https://generativelanguage.googleapis.com/v1beta/files"
+# Uploads go in pieces so the wizard can show how far they are. The File API
+# wants every piece but the last to be a multiple of 256 KiB.
+_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+# How often, and for how long, to wait for an upload to become ACTIVE.
+_FILE_POLL_S = 2.0
+_FILE_ACTIVE_TIMEOUT_S = 600.0
+# Frames per second Gemini samples from a video (its own default).
+VIDEO_FPS = 1.0
 
 
 class GeminiError(RuntimeError):
@@ -82,6 +99,108 @@ class GeminiTransport(Protocol):
         body: dict[str, Any],
     ) -> dict[str, Any]:
         """Return the parsed JSON response body."""
+
+
+class GeminiFileUploader(Protocol):
+    """Optional transport capability for the File API (video uploads)."""
+
+    def upload_file(
+        self,
+        *,
+        api_key: str,
+        path: Path,
+        mime_type: str,
+        display_name: str,
+        on_progress: Callable[[float], None] | None = None,
+    ) -> dict[str, Any]:
+        """Upload ``path`` and return the File resource."""
+
+    def get_file(self, *, api_key: str, name: str) -> dict[str, Any]:
+        """Return the File resource called ``name`` (``files/...``)."""
+
+
+@dataclass(frozen=True)
+class GeminiVideo:
+    """A video uploaded through the File API, valid until ``expires_at``."""
+
+    name: str
+    uri: str
+    mime_type: str = "video/mp4"
+    # Seconds since the epoch; uploads are deleted after about 48 hours.
+    expires_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "uri": self.uri,
+            "mime_type": self.mime_type,
+            "expires_at": self.expires_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> GeminiVideo | None:
+        if not isinstance(data, dict):
+            return None
+        name, uri = data.get("name"), data.get("uri")
+        if not isinstance(name, str) or not isinstance(uri, str):
+            return None
+        expires = data.get("expires_at")
+        return cls(
+            name=name,
+            uri=uri,
+            mime_type=str(data.get("mime_type") or "video/mp4"),
+            expires_at=float(expires) if isinstance(expires, (int, float)) else 0.0,
+        )
+
+    def usable(self, now: float, *, margin_s: float = 3600.0) -> bool:
+        """True while the upload has at least ``margin_s`` left to live."""
+        return self.expires_at - margin_s > now
+
+
+def video_part(
+    video: GeminiVideo,
+    *,
+    start_s: float | None = None,
+    end_s: float | None = None,
+    fps: float = VIDEO_FPS,
+) -> dict[str, Any]:
+    """A ``fileData`` part Gemini samples at ``fps``, clipped when asked."""
+    metadata: dict[str, Any] = {"fps": fps}
+    if start_s is not None:
+        metadata["startOffset"] = f"{max(0.0, start_s):.3f}s"
+    if end_s is not None:
+        metadata["endOffset"] = f"{max(0.0, end_s):.3f}s"
+    return {
+        "fileData": {"mimeType": video.mime_type, "fileUri": video.uri},
+        "videoMetadata": metadata,
+    }
+
+
+def _has_video(body: dict[str, Any]) -> bool:
+    return any(
+        "fileData" in part
+        for content in body.get("contents", [])
+        if isinstance(content, dict)
+        for part in content.get("parts", [])
+        if isinstance(part, dict)
+    )
+
+
+def _parse_expiry(raw: Any) -> float:
+    """Seconds since the epoch from an RFC 3339 time; 0 when unreadable."""
+    if not isinstance(raw, str) or not raw:
+        return 0.0
+    text = raw.replace("Z", "+00:00")
+    # Python 3.10 reads at most six fractional digits.
+    head, dot, rest = text.partition(".")
+    if dot:
+        digits = "".join(ch for ch in rest if ch.isdigit())
+        zone = rest[len(digits) :]
+        text = f"{head}.{digits[:6]}{zone}"
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return 0.0
 
 
 class GeminiModelLister(Protocol):
@@ -386,8 +505,9 @@ class UrllibGeminiTransport:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        timeout = _VIDEO_REQUEST_TIMEOUT_S if _has_video(body) else _REQUEST_TIMEOUT_S
         try:
-            with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as response:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 parsed: object = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             status, detail = _http_error_detail(exc)
@@ -404,6 +524,97 @@ class UrllibGeminiTransport:
             raise GeminiError(f"Gemini request failed: {exc}") from exc
         if not isinstance(parsed, dict):
             raise GeminiError("Gemini response root must be an object")
+        return parsed
+
+    def upload_file(
+        self,
+        *,
+        api_key: str,
+        path: Path,
+        mime_type: str,
+        display_name: str,
+        on_progress: Callable[[float], None] | None = None,
+    ) -> dict[str, Any]:  # pragma: no cover - needs the network; faked in tests
+        """Resumable File API upload, in pieces, reporting the share sent."""
+        size = path.stat().st_size
+        start = urllib.request.Request(
+            f"{_UPLOAD_URL}?key={api_key}",
+            data=json.dumps({"file": {"display_name": display_name}}).encode(),
+            headers={
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(size),
+                "X-Goog-Upload-Header-Content-Type": mime_type,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(start, timeout=_REQUEST_TIMEOUT_S) as response:
+                upload_url = response.headers.get("X-Goog-Upload-URL", "")
+            if not upload_url:
+                raise GeminiError("Gemini did not return an upload address")
+            offset = 0
+            result: object = None
+            with path.open("rb") as handle:
+                while True:
+                    piece = handle.read(_UPLOAD_CHUNK_BYTES)
+                    last = offset + len(piece) >= size
+                    req = urllib.request.Request(
+                        upload_url,
+                        data=piece,
+                        headers={
+                            "X-Goog-Upload-Command": (
+                                "upload, finalize" if last else "upload"
+                            ),
+                            "X-Goog-Upload-Offset": str(offset),
+                            "Content-Length": str(len(piece)),
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(
+                        req, timeout=_VIDEO_REQUEST_TIMEOUT_S
+                    ) as response:
+                        body = response.read()
+                    offset += len(piece)
+                    if on_progress is not None:
+                        on_progress(offset / size if size else 1.0)
+                    if last:
+                        result = json.loads(body.decode("utf-8"))
+                        break
+        except urllib.error.HTTPError as exc:
+            status, detail = _http_error_detail(exc)
+            raise GeminiError(
+                f"Gemini upload HTTP {status}: "
+                f"{summarize_gemini_error(status, detail)}",
+                status=status,
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise GeminiError(f"Gemini upload failed: {exc}") from exc
+        file = result.get("file") if isinstance(result, dict) else None
+        if not isinstance(file, dict):
+            raise GeminiError("Gemini upload returned no file")
+        return file
+
+    def get_file(
+        self, *, api_key: str, name: str
+    ) -> dict[str, Any]:  # pragma: no cover - needs the network; faked in tests
+        req = urllib.request.Request(
+            f"{_FILES_URL}/{name.removeprefix('files/')}?key={api_key}", method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as response:
+                parsed: object = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            status, detail = _http_error_detail(exc)
+            raise GeminiError(
+                f"Gemini HTTP {status}: {summarize_gemini_error(status, detail)}",
+                status=status,
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise GeminiError(f"Gemini request failed: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise GeminiError("Gemini file response root must be an object")
         return parsed
 
     def list_models(
@@ -737,6 +948,25 @@ _SEGMENTS_SCHEMA: dict[str, Any] = {
     },
     "required": ["segments"],
 }
+
+
+def _segments_schema(scales: tuple[int, ...]) -> dict[str, Any]:
+    """The segment schema, plus one output scale when ``scales`` are offered."""
+    if not scales:
+        return _SEGMENTS_SCHEMA
+    return {
+        "type": "object",
+        "properties": {
+            **_SEGMENTS_SCHEMA["properties"],
+            # Gemini allows enums only on strings; the reply is checked
+            # against the offered scales instead.
+            "scale": {"type": "integer"},
+            "scale_reason": {"type": "string"},
+        },
+        "required": ["segments", "scale", "scale_reason"],
+    }
+
+
 _REGIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -873,9 +1103,14 @@ class GeminiClient:
         the full conversation, so a fallback model sees the same context.
         """
         errors: list[str] = []
+        # A video request is long: a busy model is skipped at once rather
+        # than retried, and a timeout ends the failover, since every model
+        # would read the same video and the caller can fall back to stills.
+        video = _has_video(body)
+        retries = 0 if video else _TRANSIENT_RETRIES
         for model in self.candidate_models():
             last_exc: GeminiError | None = None
-            for attempt in range(_TRANSIENT_RETRIES + 1):
+            for attempt in range(retries + 1):
                 try:
                     response = self.transport.generate(
                         model=model,
@@ -888,7 +1123,12 @@ class GeminiClient:
                         self._exhausted_models.add(model)
                         errors.append(f"{model}: {exc}")
                         break
-                    if _is_transient_error(exc) and attempt < _TRANSIENT_RETRIES:
+                    if video and "timed out" in str(exc).lower():
+                        errors.append(f"{model}: {exc}")
+                        raise GeminiError(
+                            f"Gemini timed out watching the video: {_grouped(errors)}"
+                        ) from exc
+                    if _is_transient_error(exc) and attempt < retries:
                         time.sleep(1.5 * (attempt + 1))
                         continue
                     if _is_retryable_error(exc):
@@ -1017,6 +1257,61 @@ class GeminiClient:
             )
         return [item for item in labels if isinstance(item, dict)]
 
+    def upload_video(
+        self,
+        path: Path,
+        *,
+        on_progress: Callable[[float], None] | None = None,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> GeminiVideo:
+        """Upload ``path`` through the File API and wait until Gemini can use it.
+
+        ``on_progress`` gets the share of bytes sent, 0 to 1.
+        """
+        uploader = getattr(self.transport, "upload_file", None)
+        getter = getattr(self.transport, "get_file", None)
+        if not callable(uploader) or not callable(getter):
+            raise GeminiError("this Gemini transport cannot upload video")
+        file = uploader(
+            api_key=self.api_key,
+            path=path,
+            mime_type="video/mp4",
+            display_name=path.name,
+            on_progress=on_progress,
+        )
+        deadline = clock() + _FILE_ACTIVE_TIMEOUT_S
+        while True:
+            state = str(file.get("state") or "")
+            if state == "ACTIVE":
+                break
+            if state == "FAILED":
+                raise GeminiError("Gemini could not process the uploaded video")
+            if clock() > deadline:
+                raise GeminiError("Gemini took too long to process the uploaded video")
+            sleep(_FILE_POLL_S)
+            file = getter(api_key=self.api_key, name=str(file.get("name") or ""))
+        video = GeminiVideo(
+            name=str(file.get("name") or ""),
+            uri=str(file.get("uri") or ""),
+            mime_type=str(file.get("mimeType") or "video/mp4"),
+            expires_at=_parse_expiry(file.get("expirationTime")),
+        )
+        if not video.name or not video.uri:
+            raise GeminiError("Gemini returned an upload without a name or address")
+        return video
+
+    def video_alive(self, video: GeminiVideo) -> bool:
+        """True when the File API still has ``video`` and it is ACTIVE."""
+        getter = getattr(self.transport, "get_file", None)
+        if not callable(getter):
+            return False
+        try:
+            file = getter(api_key=self.api_key, name=video.name)
+        except GeminiError:
+            return False
+        return str(file.get("state") or "") == "ACTIVE"
+
     def propose_looks(
         self,
         *,
@@ -1026,11 +1321,13 @@ class GeminiClient:
         scales: tuple[int, ...],
         protected_strength: float,
         job_dir: Path | None = None,
+        video: GeminiVideo | None = None,
     ) -> dict[str, Any]:
         """Propose a strength and look per shot, and one scale for the video.
 
         ``shots`` carry their label, problems, contents, measurements, and,
-        on a redo, the current settings and the editor's note.
+        on a redo, the current settings and the editor's note. With
+        ``video``, Gemini also watches each shot's stretch of the upload.
         """
         if len(stills) != len(shots):
             raise GeminiError("propose_looks needs one still per shot")
@@ -1063,9 +1360,22 @@ class GeminiClient:
             "shot has an editor_note, follow it; current shows its settings "
             "now. Return a short reason per shot in plain words."
         )
+        if video is not None:
+            intro += (
+                " Each shot comes with its stretch of the video, sampled at "
+                f"{VIDEO_FPS:g} frame per second, and one full-size still."
+            )
         parts: list[dict[str, Any]] = [{"text": intro}]
         for shot, still in zip(shots, stills, strict=True):
             parts.append({"text": f"Shot: {json.dumps(shot)}"})
+            if video is not None:
+                parts.append(
+                    video_part(
+                        video,
+                        start_s=float(shot.get("start_s", 0.0)),
+                        end_s=float(shot.get("end_s", 0.0)) or None,
+                    )
+                )
             parts.append(_jpeg_part(still, under=job_dir))
         reply = self._generate(
             contents=[{"role": "user", "parts": parts}],
@@ -1084,28 +1394,43 @@ class GeminiClient:
     def propose_segments(
         self,
         *,
-        stills: list[Path],
-        times: list[float],
+        stills: list[Path] | None = None,
+        times: list[float] | None = None,
         duration_s: float,
         contains: tuple[str, ...] = (),
         note: str = "",
         max_segments: int = 10,
         min_segment_s: float = 3.0,
         job_dir: Path | None = None,
-    ) -> list[dict[str, Any]]:
-        """Cut the video into segments from a grid of stills and their times.
+        video: GeminiVideo | None = None,
+        scales: tuple[int, ...] = (),
+        source_size: tuple[int, int] = (0, 0),
+    ) -> dict[str, Any]:
+        """Cut the video into segments, from the uploaded video or a still grid.
 
         A segment is a stretch where the picture asks for the same
         restoration. ``note`` is the editor's reason for rejecting the last
-        proposal; the replayed chat shows Gemini what it proposed then.
-        Returns ``[{start_s, end_s, label, contains}]``; the caller repairs
-        gaps and overlaps and drops any name outside ``contains``.
+        proposal; the replayed chat shows Gemini what it proposed then. With
+        ``video``, Gemini watches the upload at 1 fps; otherwise it sees
+        ``stills`` with their ``times``. When ``scales`` are offered, Gemini
+        also picks the output scale for the whole video and says why.
+        Returns ``{segments: [{start_s, end_s, label, contains}], scale,
+        scale_reason}`` (``scale`` None when none was offered); the caller
+        repairs gaps and overlaps and drops any name outside ``contains``.
         """
-        if not stills or len(stills) != len(times):
+        stills = stills or []
+        times = times or []
+        if video is None and (not stills or len(stills) != len(times)):
             raise GeminiError("propose_segments needs one time per still")
+        seen = (
+            f"This video, sampled at {VIDEO_FPS:g} frame per second, is one an "
+            "editor wants restored. Times are in seconds from its start."
+            if video is not None
+            else "These stills are sampled from one video an editor wants "
+            "restored, each with its time in seconds."
+        )
         intro = (
-            "These stills are sampled from one video an editor wants "
-            "restored and upscaled, each with its time in seconds. The video "
+            f"{seen} The video "
             f"is {duration_s:.2f}s long. Cut it into as few segments as the "
             "restoration needs, at most "
             f"{max_segments}; fewer is better. Each segment is reviewed on its "
@@ -1120,31 +1445,48 @@ class GeminiClient:
             "only, where restoration mistakes would be obvious: "
             f"{', '.join(contains)}."
         )
+        if scales:
+            intro += " " + _scale_question(scales, source_size)
         text = " ".join(note.split())
         if text:
             intro += (
                 " The editor did not accept your last segments and wrote: "
                 f"{text[:500]!r}. Follow that note."
             )
-        parts: list[dict[str, Any]] = [{"text": intro}]
-        for t_s, still in zip(times, stills, strict=True):
-            parts.append({"text": f"t={t_s:.3f}s"})
-            parts.append(_jpeg_part(still, under=job_dir))
+        # Gemini reads the request's text better after its video.
+        parts: list[dict[str, Any]] = []
+        if video is not None:
+            parts.append(video_part(video))
+            parts.append({"text": intro})
+        else:
+            parts.append({"text": intro})
+            for t_s, still in zip(times, stills, strict=True):
+                parts.append({"text": f"t={t_s:.3f}s"})
+                parts.append(_jpeg_part(still, under=job_dir))
         reply = self._generate(
             contents=[{"role": "user", "parts": parts}],
-            schema=_SEGMENTS_SCHEMA,
+            schema=_segments_schema(scales),
             system=(
-                "You split videos into segments for a restoration tool. You "
-                "never suggest commands or settings. Return JSON matching the "
-                "schema."
+                "You split videos into segments for a restoration tool and "
+                "choose its output size from the options given. You never "
+                "suggest commands. Return JSON matching the schema."
             ),
             prior=load_chat(job_dir) if job_dir is not None else None,
         )
         segments = reply.get("segments")
         if not isinstance(segments, list) or not segments:
             raise GeminiError("Gemini returned no segments")
-        self._log(job_dir, intro + f" ({len(stills)} stills)", reply)
-        return [item for item in segments if isinstance(item, dict)]
+        seen_as = "the video" if video is not None else f"{len(stills)} stills"
+        self._log(job_dir, intro + f" ({seen_as})", reply)
+        scale = _offered_scale(reply.get("scale"), scales)
+        reason = reply.get("scale_reason")
+        return {
+            "segments": [item for item in segments if isinstance(item, dict)],
+            "scale": scale,
+            "scale_reason": " ".join(str(reason).split())[:240]
+            if scale is not None and isinstance(reason, str)
+            else "",
+        }
 
     def locate_regions(
         self,
@@ -1292,6 +1634,37 @@ class GeminiClient:
                 ChatTurn(role="model", text=json.dumps(data), structured=data),
             )
         return data
+
+
+def _scale_question(scales: tuple[int, ...], source_size: tuple[int, int]) -> str:
+    """Ask for one output scale for the whole video, 2 unless there is a reason."""
+    width, height = source_size
+    size = f"The source is {width}x{height}. " if width and height else ""
+    options = {
+        1: "1 keeps the source size: clean-up and finishing only, no FlashVSR",
+        2: "2 doubles it with FlashVSR, the default",
+        4: "4 quadruples it with FlashVSR, for a small, soft source",
+    }
+    listed = "; ".join(options[scale] for scale in scales if scale in options)
+    return (
+        f"{size}Also choose one output scale for the whole video from "
+        f"{list(scales)} ({listed}). Use 2 unless the video gives a reason: "
+        "1 when it is already large and sharp enough that upscaling would add "
+        "nothing but invented detail, 4 when it is small enough that 2 would "
+        "still look small on a modern screen and its picture can bear it. Say "
+        "why in scale_reason, one short sentence an editor understands."
+    )
+
+
+def _offered_scale(raw: Any, scales: tuple[int, ...]) -> int | None:
+    """``raw`` as one of the offered ``scales``, or None."""
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value in scales and float(raw) == value else None
 
 
 def _jpeg_part(path: Path, *, under: Path | None = None) -> dict[str, Any]:

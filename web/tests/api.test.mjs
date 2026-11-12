@@ -268,3 +268,33 @@ for (const [name, makeResponse] of [
     assert.equal(attempts, 1);
   });
 }
+
+test("progress text counts the time left down between polls", async (t) => {
+  const api = await fixture(t, async () => Response.json({}));
+  assert.equal(api.formatDuration(42.4), "42 s");
+  assert.equal(api.formatDuration(185), "3 min 05 s");
+  assert.equal(api.formatDuration(4020), "1 h 07 min");
+  assert.equal(api.formatDuration(-3), "0 s");
+  const running = { phase: "rendering", pct: 50, message: "m", eta_s: 250, elapsed_s: 10 };
+  assert.equal(api.progressTiming(running), "about 4 min 10 s left");
+  assert.equal(api.progressTiming(running, 10), "about 4 min 00 s left");
+  // Nothing to measure (a Gemini call): the time spent counts up instead.
+  const waiting = { ...running, eta_s: null };
+  assert.equal(api.progressTiming(waiting, 5), "15 s so far");
+  assert.equal(api.progressTiming({ phase: "x", pct: 1, message: "" }), "");
+});
+
+test("scale lines say what Gemini chose and what the GPU allows", async (t) => {
+  const api = await fixture(t, async () => Response.json({}));
+  assert.equal(api.scaleChoiceText(4, "small and soft"), "Gemini chose to upscale 4×: small and soft");
+  assert.equal(api.scaleChoiceText(1), "Gemini chose to keep the size (no upscaling).");
+  assert.equal(api.scaleChoiceText(null, "x"), "");
+  assert.match(api.outputSizeLine(4), /previews are 2×/);
+  assert.match(api.outputSizeLine(1), /keeps its size/);
+  assert.equal(api.outputSizeLine(2), "The whole video is upscaled 2×.");
+  const looks = { scale: 2, error: null, shots: [], scales: [1, 2], small_source: true, gpu_vram_gb: 16 };
+  assert.equal(api.vramNote(looks), "4× needs an NVIDIA GPU with at least 24 GB of memory; this one has 16 GB.");
+  assert.equal(api.vramNote({ ...looks, gpu_vram_gb: 0 }), "4× needs an NVIDIA GPU with at least 24 GB of memory; none was found.");
+  assert.equal(api.vramNote({ ...looks, scales: [1, 2, 4] }), "");
+  assert.equal(api.vramNote({ ...looks, small_source: false }), "");
+});

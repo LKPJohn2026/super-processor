@@ -364,9 +364,16 @@ def test_segmenting_reports_progress_while_busy(tmp_path: Path) -> None:
     controller.handle_post("/pick", {"path": [str(clip)]})
     assert controller.start_segmenting()
     assert controller.wait_idle(60)
-    assert seen == [
-        {"phase": "proposing", "pct": 50, "message": "Gemini is proposing segments"}
-    ]
+    assert len(seen) == 1
+    shown = seen[0]
+    assert {k: shown[k] for k in ("phase", "pct", "message", "eta_s")} == {
+        "phase": "proposing",
+        "pct": 75,
+        "message": "Gemini is proposing segments from the stills",
+        # A Gemini call reports nothing to measure: no time left, only spent.
+        "eta_s": None,
+    }
+    assert shown["overall"] == 6
     state = controller.current_state()
     assert state.step is WizardStep.SEGMENTS
     assert state.progress is None

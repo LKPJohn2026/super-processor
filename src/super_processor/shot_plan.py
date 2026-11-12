@@ -48,6 +48,12 @@ PREVIEW_S = 3.0
 CHECK_STILL_WIDTH = 960
 # 4x only for small sources; on larger ones it is mostly invented detail.
 MAX_4X_LONG_EDGE = 960
+# ... and only on a GPU with at least this much memory. Decimal GB, so a card
+# sold as 24 GB (24564 MiB on an RTX 4090) qualifies.
+MIN_4X_VRAM_BYTES = 24 * 1000**3
+MAX_PREVIEW_SCALE = 2
+# Output scale when Gemini gives none.
+DEFAULT_SCALE = 2
 DEFAULT_STRENGTH = 0.5
 PROTECTED_CONTENTS = frozenset({"faces", "hands", "text"})
 PROTECTED_STRENGTH = 0.6
@@ -267,13 +273,27 @@ _NOTE_SIZE_REQUEST = re.compile(
 )
 
 
-def allowed_scales(width: int, height: int) -> tuple[int, ...]:
-    """4x only when the long edge is small enough for it to recover detail.
+def allowed_scales(width: int, height: int, *, vram_bytes: int) -> tuple[int, ...]:
+    """4x only for a small source on a GPU with at least 24 GB.
 
-    An unknown size (0) does not qualify: it must not unlock 4x.
+    The long edge must be small enough for 4x to recover detail rather than
+    invent it, and the GPU large enough to restore it without spilling into
+    system RAM for most of the run. An unknown size or GPU (0) does not
+    qualify: it must not unlock 4x.
     """
     long_edge = max(width, height)
-    return (2, 4) if 0 < long_edge <= MAX_4X_LONG_EDGE else (2,)
+    small = 0 < long_edge <= MAX_4X_LONG_EDGE
+    return (2, 4) if small and vram_bytes >= MIN_4X_VRAM_BYTES else (2,)
+
+
+def preview_scale(scale: int) -> int:
+    """Previews are at most 2x, whatever the output scale.
+
+    At 4x a preview of 854x480 is 3456x1920, which v1.1 cannot restore in
+    32 GB of VRAM; every 4x preview went to the system-RAM fallback. A 2x
+    preview shows the same restoration at a size any GPU fits.
+    """
+    return min(scale, MAX_PREVIEW_SCALE)
 
 
 def note_scale(note: str, current: int, allowed: tuple[int, ...]) -> int:
@@ -613,12 +633,12 @@ def render_previews(
         request = UpscaleRequest(
             clip,
             work / f"shot_{index:03d}_up.mp4",
-            scale=plan.scale,
+            scale=preview_scale(plan.scale),
             strength=recipe.strength,
             look=recipe.look,
             regions=shots.shots[index].regions,
         )
-        if recipe.use_upscale:
+        if recipe.use_upscale and request.scale > 1:
             requests.append(request)
         else:
             plain[index] = restore_clip(
@@ -683,7 +703,7 @@ def measure_shimmer(
             value = shimmer_index(
                 before,
                 after,
-                scale=plan.scale,
+                scale=preview_scale(plan.scale),
                 after_size=video_size(after),
                 ffmpeg_bin=ffmpeg_bin,
             )

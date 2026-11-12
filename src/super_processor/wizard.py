@@ -20,6 +20,7 @@ from .gemini import (
     ChatTurn,
     GeminiClient,
     GeminiError,
+    GeminiVideo,
     append_chat_turn,
     gemini_api_key_source,
     resolve_gemini_api_key,
@@ -28,6 +29,7 @@ from .gemini import (
 from .jobs import JobError, JobState, JobStore
 from .look import LOOK_BOUNDS
 from .probe import MediaFacts, ProbeError, probe_file
+from .progress import StepClock, overall_pct
 from .regions import MAX_REGIONS, REGION_STRENGTH
 from .segment_loop import (
     MAX_LOOP_SEGMENTS,
@@ -38,6 +40,7 @@ from .segment_loop import (
     extract_segment_stills,
     load_segment_list,
     load_segment_stills,
+    make_gemini_copy,
     repair_coverage,
     sample_times,
     save_segment_list,
@@ -46,6 +49,8 @@ from .segment_loop import (
 from .segments import MAX_DURATION_S
 from .shot_plan import (
     CHECK_PROBLEMS,
+    DEFAULT_SCALE,
+    MAX_4X_LONG_EDGE,
     PROTECTED_STRENGTH,
     ShotPlan,
     ShotPlanError,
@@ -91,6 +96,7 @@ from .upscale import (
     UpscaleSpan,
     _ffprobe_for,
     default_span,
+    gpu_vram_bytes,
     load_upscale_plan,
     render_plan,
     replace_overlapping,
@@ -122,12 +128,11 @@ WIZARD_SCHEMA_VERSION = 3
 # and the job directory are sized for.
 MAX_INPUT_LONG_EDGE = 1920
 MAX_INPUT_SHORT_EDGE = 1080
-# Segment previews are restored at 2x, so Gemini is offered only 2x and the
-# Ready screen starts there. 4x stays a choice on that screen: at 854x480 it
-# is 3456x1920, which FlashVSR cannot fit in 32 GB of VRAM even 21 frames at
-# a time, so every 4x preview went to the system-RAM fallback and took about
-# 33 GiB of RAM while it ran.
-PREVIEW_SCALE = 2
+# The upload Gemini watches, and its File API record (see _gemini_video).
+GEMINI_VIDEO_FILE = "gemini_video.json"
+# A render's time left is saved at least this often, so the page's estimate
+# stays fresh between whole-percent steps.
+_PROGRESS_SAVE_S = 5.0
 
 
 class WizardError(RuntimeError):
@@ -433,6 +438,28 @@ def strength_summary(spans: tuple[UpscaleSpan, ...]) -> str:
     return summary
 
 
+def _aged(progress: dict[str, Any] | None, now: float) -> dict[str, Any] | None:
+    """``progress`` as of ``now``: time left counted down, time spent counted up.
+
+    The worker saves it every few seconds; between saves the page should
+    still see the clock move.
+    """
+    if progress is None:
+        return None
+    updated = progress.get("updated_at")
+    if not isinstance(updated, (int, float)) or isinstance(updated, bool):
+        return progress
+    age = max(0.0, now - float(updated))
+    aged = dict(progress)
+    eta = progress.get("eta_s")
+    if isinstance(eta, (int, float)) and not isinstance(eta, bool):
+        aged["eta_s"] = round(max(0.0, float(eta) - age), 1)
+    elapsed = progress.get("elapsed_s")
+    if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+        aged["elapsed_s"] = round(float(elapsed) + age, 1)
+    return aged
+
+
 class WizardController:
     """Drive wizard actions against a jobs directory."""
 
@@ -462,6 +489,11 @@ class WizardController:
         self._work_lock = threading.Lock()
         self._worker_guard = threading.Lock()
         self._worker: threading.Thread | None = None
+        # The running worker's time-left estimate, per measurable task.
+        self._clock: StepClock | None = None
+        self._clock_task = ""
+        self._step_started = 0.0
+        self._revising = False
 
     def gemini(self) -> GeminiClient:
         if self._gemini is None:
@@ -532,6 +564,13 @@ class WizardController:
             worker.start()
             return True
 
+    def _begin_step(self) -> None:
+        """Start the clocks for a worker step (called under the work lock)."""
+        self._clock = None
+        self._clock_task = ""
+        self._step_started = time.time()
+        self._revising = False
+
     def _run_worker(self, target: Callable[[], None]) -> None:
         try:
             target()
@@ -550,37 +589,100 @@ class WizardController:
                 return
             self._save(state)
 
-    def _progress(self, state: WizardState, phase: str, pct: int, message: str) -> None:
-        """Record how far the running worker is, for ``/api/state``."""
+    def _progress(
+        self,
+        state: WizardState,
+        phase: str,
+        pct: float,
+        message: str,
+        *,
+        task: str = "",
+        done: float | None = None,
+    ) -> None:
+        """Record how far the running worker is, for ``/api/state``.
+
+        ``pct`` is the worker's own step, 0 to 100. ``task`` names a stretch
+        of work that reports ``done`` (0 to 1) as it goes, such as saving
+        stills, an upload, or the render; its time left is estimated from
+        how fast ``done`` moves. Without ``task`` (a Gemini call, a check)
+        there is nothing to measure, and the page shows the time spent.
+        """
+        now = time.time()
+        eta: float | None = None
+        if task:
+            if self._clock is None or self._clock_task != task:
+                self._clock = StepClock(started_at=now)
+                self._clock_task = task
+            eta = self._clock.update(0.0 if done is None else done, now)
+        else:
+            self._clock = None
+            self._clock_task = ""
         state.progress = {
             "phase": phase,
             "pct": max(0, min(100, int(pct))),
             "message": message,
+            "overall": overall_pct(
+                phase,
+                pct,
+                segment_index=state.segment_index,
+                segment_count=self._segment_count(state),
+                revising=self._revising,
+            ),
+            "eta_s": None if eta is None else round(eta, 1),
+            "elapsed_s": round(max(0.0, now - self._step_started), 1),
+            "updated_at": round(now, 3),
         }
         self._save(state)
 
-    def _render_progress(self, state: WizardState) -> Callable[[float], None]:
-        """Show the share of frames rendered as 5% to 90% of the render step.
+    def _segment_count(self, state: WizardState) -> int:
+        if not state.job_id:
+            return 1
+        try:
+            found = load_segment_list(self.store.job_dir(state.job_id))
+        except (SegmentLoopError, OSError):
+            return 1
+        return max(1, len(found.segments)) if found else 1
 
-        The state is saved only when the whole percentage changes, so a long
-        render does not rewrite it for every chunk.
+    def _task_progress(
+        self,
+        state: WizardState,
+        phase: str,
+        low: float,
+        high: float,
+        task: str,
+        describe: Callable[[float], str],
+    ) -> Callable[[float], None]:
+        """Report a task's 0-1 as ``low`` to ``high`` percent of the step.
+
+        Saved when the whole percentage changes or every few seconds, so a
+        long task neither rewrites the state per chunk nor lets its time
+        left go stale.
         """
-        shown = [-1]
+        shown = [-1, 0.0]
 
         def report(done: float) -> None:
-            frames = round(min(max(done, 0.0), 1.0) * 100)
-            pct = 5 + round(frames * 0.85)
-            if pct == shown[0]:
+            done = min(max(done, 0.0), 1.0)
+            pct = low + (high - low) * done
+            now = time.time()
+            if round(pct) == shown[0] and now - shown[1] < _PROGRESS_SAVE_S:
+                if self._clock is not None and self._clock_task == task:
+                    self._clock.update(done, now)
                 return
-            shown[0] = pct
-            self._progress(
-                state,
-                "rendering",
-                pct,
-                f"Upscaling on the GPU: {frames}% of the frames",
-            )
+            shown[0], shown[1] = round(pct), now
+            self._progress(state, phase, pct, describe(done), task=task, done=done)
 
         return report
+
+    def _render_progress(self, state: WizardState) -> Callable[[float], None]:
+        """Show the share of the render done as 5% to 90% of the render step."""
+        return self._task_progress(
+            state,
+            "rendering",
+            5,
+            90,
+            "render",
+            lambda done: f"Upscaling on the GPU: {round(done * 100)}% of the work",
+        )
 
     def _clear_progress(self) -> None:
         state = self._state()
@@ -715,7 +817,7 @@ class WizardController:
             "busy": self.busy(),
             "error": state.error,
             # A worker that died mid-run leaves its last progress behind.
-            "progress": state.progress if self.busy() else None,
+            "progress": _aged(state.progress, time.time()) if self.busy() else None,
             "navigation": self.navigation(),
             "segment_index": state.segment_index,
             "job_id": state.job_id,
@@ -943,28 +1045,28 @@ class WizardController:
     ) -> None:
         """Propose, preview, and check ``indexes``; then go to ``done``."""
         warnings: list[str] = []
-        # The scale is chosen once, on the first pass; every shot shares it.
+        # The scale was chosen with the segments, watching the whole video;
+        # every shot shares it.
         first = not any(recipe.reason for recipe in plan.recipes)
-        scales = tuple(sorted({2, plan.scale})) if first else (plan.scale,)
         if first:
             self._progress(state, phase, 10, "Boxing faces, hands, and text")
             shots = self._locate(shots, source, job_dir, warnings)
+        video = self._gemini_video(state, job_dir, source, phase, 20, 30)
         self._progress(state, phase, 30, "Gemini is proposing settings")
         try:
+            kwargs: dict[str, Any] = {"video": video} if video is not None else {}
             reply = self.gemini().propose_looks(
                 shots=shots_payload(shots, plan, indexes),
                 stills=[job_dir / shots.shots[i].still for i in indexes],
                 bounds=LOOK_BOUNDS,
-                scales=scales,
+                scales=(plan.scale,),
                 protected_strength=PROTECTED_STRENGTH,
                 job_dir=job_dir,
+                **kwargs,
             )
-            scale = reply.get("scale")
-            plan.scale = scale if first and scale in scales else min(scales)
             plan = apply_proposals(plan, shots, list(reply["shots"]), indexes)
         except GeminiError as exc:
             warnings.append(f"Gemini could not propose settings ({exc})")
-            plan.scale = min(scales)
             plan = _fallback_plan(plan, shots, indexes)
         self._progress(state, phase, 50, "Rendering previews on the GPU")
         try:
@@ -1149,6 +1251,7 @@ class WizardController:
     def run_segmenting(self) -> None:
         if not self._work_lock.acquire(blocking=False):
             return
+        self._begin_step()
         try:
             state = self._state()
             if state.job_id and state.step is WizardStep.SAMPLING:
@@ -1164,11 +1267,26 @@ class WizardController:
         assert state.job_id
         job_dir = self.store.job_dir(state.job_id)
         source = Path(self.store.load(state.job_id).source_path)
-        self._progress(state, "sampling", 5, "Saving stills from the video")
+        self._progress(state, "sampling", 2, "Saving stills from the video")
         try:
             duration = float(probe_file(source).duration_s or 0.0)
+            times = sample_times(duration)
             extract_segment_stills(
-                source, job_dir, sample_times(duration), ffmpeg_bin=self.ffmpeg_bin
+                source,
+                job_dir,
+                times,
+                ffmpeg_bin=self.ffmpeg_bin,
+                on_progress=self._task_progress(
+                    state,
+                    "sampling",
+                    2,
+                    25,
+                    "stills",
+                    lambda done: (
+                        "Saving stills from the video: "
+                        f"{round(done * len(times))} of {len(times)}"
+                    ),
+                ),
             )
         except (SegmentLoopError, ProbeError, ValueError, OSError) as exc:
             self._segmenting_failed(state, str(exc))
@@ -1191,29 +1309,179 @@ class WizardController:
         if not stills:
             self._segmenting_failed(state, "the stills are missing")
             return
-        self._progress(state, "proposing", 50, "Gemini is proposing segments")
+        assert state.job_id
+        video = self._gemini_video(state, job_dir, source, "proposing", 25, 75)
+        scales = self._scale_options(state.job_id)
+        self._progress(
+            state,
+            "proposing",
+            75,
+            "Gemini is watching the video and proposing segments"
+            if video is not None
+            else "Gemini is proposing segments from the stills",
+        )
         error: str | None = None
+        scale: int | None = None
+        reason = ""
+        ask: dict[str, Any] = {
+            "duration_s": duration,
+            "contains": CONTENTS,
+            "note": earlier.note if earlier else "",
+            "max_segments": MAX_LOOP_SEGMENTS,
+            "min_segment_s": MIN_LOOP_SEGMENT_S,
+            "job_dir": job_dir,
+            "scales": scales,
+            "source_size": self._source_size(state.job_id),
+        }
+        stills_ask: dict[str, Any] = {
+            "stills": [job_dir / still.path for still in stills],
+            "times": [still.t_s for still in stills],
+        }
         try:
-            raw = self.gemini().propose_segments(
-                stills=[job_dir / still.path for still in stills],
-                times=[still.t_s for still in stills],
-                duration_s=duration,
-                contains=CONTENTS,
-                note=earlier.note if earlier else "",
-                max_segments=MAX_LOOP_SEGMENTS,
-                min_segment_s=MIN_LOOP_SEGMENT_S,
-                job_dir=job_dir,
-            )
-            segments = repair_coverage(raw, duration)
+            try:
+                media: dict[str, Any] = (
+                    stills_ask if video is None else {"video": video}
+                )
+                raw = self.gemini().propose_segments(**media, **ask)
+            except GeminiError as exc:
+                if video is None:
+                    raise
+                # The upload is a convenience: the stills still work. The
+                # upload stays usable for the next request.
+                self._note_video_problem(
+                    job_dir, f"watching the video failed: {exc}", video=video
+                )
+                raw = self.gemini().propose_segments(**stills_ask, **ask)
+            else:
+                if video is not None:
+                    self._save_video_record(job_dir, video)
+            # Test doubles may still answer with the bare segment list.
+            found = raw if isinstance(raw, list) else raw.get("segments", [])
+            if isinstance(raw, dict):
+                scale = raw.get("scale") if raw.get("scale") in scales else None
+                reason = str(raw.get("scale_reason") or "") if scale else ""
+            segments = repair_coverage(found, duration)
         except (GeminiError, SegmentLoopError) as exc:
             error = (
                 f"Gemini could not propose segments ({exc}); the whole video is one."
             )
             segments = [LoopSegment(0.0, duration, label="whole video")]
-        save_segment_list(job_dir, SegmentList(segments=segments, error=error))
+        save_segment_list(
+            job_dir,
+            SegmentList(
+                segments=segments, error=error, scale=scale, scale_reason=reason
+            ),
+        )
         state.error = None
         state.step = WizardStep.SEGMENTS
         self._save(state)
+
+    def _gemini_video(
+        self,
+        state: WizardState,
+        job_dir: Path,
+        source: Path,
+        phase: str,
+        low: float,
+        high: float,
+    ) -> GeminiVideo | None:
+        """The upload Gemini watches, made and uploaded on first use.
+
+        An upload lives about 48 hours, so a job resumed later uploads
+        again. None when the video cannot be used (no File API in this
+        client, an encode or upload failure); the reason is kept for the
+        Segments screen, and Gemini works from the stills instead.
+        """
+        try:
+            client = self.gemini()
+        except GeminiError:
+            # No key: the callers' own fallbacks report it.
+            return None
+        upload = getattr(client, "upload_video", None)
+        if not callable(upload):
+            return None
+        record = job_dir / GEMINI_VIDEO_FILE
+        try:
+            saved = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        known = GeminiVideo.from_dict(
+            saved.get("video") if isinstance(saved, dict) else None
+        )
+        alive = getattr(client, "video_alive", None)
+        if (
+            known is not None
+            and known.usable(time.time())
+            and (not callable(alive) or alive(known))
+        ):
+            return known
+        if isinstance(saved, dict) and saved.get("error") and known is None:
+            # It failed for this job already; do not try on every call.
+            return None
+        middle = low + (high - low) * 0.4
+        try:
+            duration = float(probe_file(source).duration_s or 0.0)
+            copy = make_gemini_copy(
+                source,
+                job_dir,
+                duration,
+                ffmpeg_bin=self.ffmpeg_bin,
+                on_progress=self._task_progress(
+                    state,
+                    phase,
+                    low,
+                    middle,
+                    "gemini-copy",
+                    lambda done: (
+                        f"Preparing a silent copy for Gemini: {round(done * 100)}%"
+                    ),
+                ),
+            )
+            self._progress(state, phase, middle, "Uploading the video to Gemini")
+            video = upload(
+                copy,
+                on_progress=self._task_progress(
+                    state,
+                    phase,
+                    middle,
+                    high,
+                    "gemini-upload",
+                    lambda done: f"Uploading the video to Gemini: {round(done * 100)}%",
+                ),
+            )
+            if not isinstance(video, GeminiVideo):
+                raise GeminiError("the upload returned no video")
+        except (GeminiError, SegmentLoopError, ProbeError, OSError) as exc:
+            self._note_video_problem(job_dir, str(exc))
+            return None
+        self._save_video_record(job_dir, video)
+        return video
+
+    def _save_video_record(
+        self, job_dir: Path, video: GeminiVideo | None, error: str | None = None
+    ) -> None:
+        record = job_dir / GEMINI_VIDEO_FILE
+        payload = {"video": video.to_dict() if video else None, "error": error}
+        record.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def _note_video_problem(
+        self, job_dir: Path, detail: str, *, video: GeminiVideo | None = None
+    ) -> None:
+        """Keep ``detail`` for the Segments screen.
+
+        With ``video`` (the upload worked but one request with it failed),
+        the upload is kept so later requests use it again; without, the
+        upload failed and is not tried again for this job.
+        """
+        self._save_video_record(job_dir, video, detail)
+
+    def _video_problem(self, job_dir: Path) -> str:
+        try:
+            saved = json.loads((job_dir / GEMINI_VIDEO_FILE).read_text("utf-8"))
+        except (OSError, ValueError):
+            return ""
+        error = saved.get("error") if isinstance(saved, dict) else None
+        return error if isinstance(error, str) else ""
 
     def _segmenting_failed(self, state: WizardState, detail: str) -> None:
         """Sampling or proposing failed; mark the job failed and go back to pick."""
@@ -1244,7 +1512,15 @@ class WizardController:
             nearest = min(stills, key=lambda s: abs(s.t_s - middle), default=None)
             item["still_url"] = f"/{nearest.path}" if nearest else None
             items.append(item)
-        return {"segments": items, "error": found.error, "note": found.note}
+        return {
+            "segments": items,
+            "error": found.error,
+            "note": found.note,
+            "scale": found.scale,
+            "scale_reason": found.scale_reason,
+            # Why Gemini worked from the stills, when it could not watch.
+            "video_problem": self._video_problem(job_dir),
+        }
 
     def _segments_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
         """Approve the segments, or send them back to Gemini with a note."""
@@ -1283,6 +1559,7 @@ class WizardController:
     def run_analyze(self) -> None:
         if not self._work_lock.acquire(blocking=False):
             return
+        self._begin_step()
         try:
             state = self._state()
             if state.step is WizardStep.ANALYZING and state.job_id:
@@ -1315,7 +1592,12 @@ class WizardController:
                 self._analyze_failed(state, str(exc))
                 return
             save_shots(job_dir, shots)
-            plan = new_plan(shots, PREVIEW_SCALE)
+            scale = (
+                found.scale
+                if found.scale in self._scale_options(state.job_id)
+                else DEFAULT_SCALE
+            )
+            plan = new_plan(shots, scale)
             save_plan(job_dir, plan)
         index = state.segment_index
         if index >= len(plan.recipes):
@@ -1437,13 +1719,24 @@ class WizardController:
 
     def _scale_options(self, job_id: str) -> tuple[int, ...]:
         """1 (do not upscale) and the scales this source allows."""
-        return (1, *allowed_scales(*self._source_size(job_id)))
+        width, height = self._source_size(job_id)
+        return (1, *allowed_scales(width, height, vram_bytes=gpu_vram_bytes()))
 
     def _ready_view(self, job_dir: Path, job_id: str) -> dict[str, Any]:
         view = self._looks_view(job_dir)
         width, height = self._source_size(job_id)
         view["source_size"] = [width, height]
         view["scales"] = list(self._scale_options(job_id))
+        # Why the scale is what it is: Gemini's reason while its choice
+        # stands, and whether the GPU is what keeps 4x off the list.
+        try:
+            found = load_segment_list(job_dir)
+        except SegmentLoopError:
+            found = None
+        chose = found is not None and found.scale == view.get("scale")
+        view["scale_reason"] = found.scale_reason if found and chose else ""
+        view["gpu_vram_gb"] = round(gpu_vram_bytes() / 1000**3, 1)
+        view["small_source"] = 0 < max(width, height) <= MAX_4X_LONG_EDGE
         return view
 
     def _result_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
@@ -1483,6 +1776,7 @@ class WizardController:
                 *allowed_scales(
                     (video.width or 0) if video else 0,
                     (video.height or 0) if video else 0,
+                    vram_bytes=gpu_vram_bytes(),
                 ),
             )
             scale = note_scale(note, current, allowed)
@@ -1552,6 +1846,7 @@ class WizardController:
     def run_render(self) -> None:
         if not self._work_lock.acquire(blocking=False):
             return
+        self._begin_step()
         try:
             self._run_render()
         finally:
@@ -1567,6 +1862,10 @@ class WizardController:
         assert state.job_id
         source = Path(self.store.load(state.job_id).source_path)
         output = job_dir / "output.mp4"
+        # A render from a result note revises the output: its percentage is
+        # its own. Only that path leaves the plan before the note behind; a
+        # job re-planned from the segments renders as part of the whole job.
+        self._revising = (job_dir / _PLAN_BEFORE_NOTE).is_file()
         self._progress(state, "rendering", 5, "Upscaling on the GPU")
         try:
             facts = probe_file(source)

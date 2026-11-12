@@ -27,13 +27,72 @@ export type SegmentList = {
   segments: Segment[];
   error: string | null;
   note: string;
+  // The output scale Gemini chose watching the whole video, and why.
+  scale?: number | null;
+  scale_reason?: string;
+  // Why Gemini worked from stills, when it could not watch the video.
+  video_problem?: string;
 };
 
 export type Progress = {
   phase: string;
+  // The running step's own percentage.
   pct: number;
   message: string;
+  // The whole job's percentage.
+  overall?: number;
+  // Seconds left in the running task, when its speed can be measured.
+  eta_s?: number | null;
+  elapsed_s?: number;
+  updated_at?: number;
 };
+
+/** `42 s`, `3 min 05 s`, or `1 h 07 min`, as the server says it. */
+export function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  if (hours) return `${hours} h ${pad(minutes)} min`;
+  if (minutes) return `${minutes} min ${pad(secs)} s`;
+  return `${secs} s`;
+}
+
+/** Time left, counted down `sinceS` seconds after the view arrived. */
+export function progressTiming(progress: Progress, sinceS = 0): string {
+  if (typeof progress.eta_s === "number") {
+    return `about ${formatDuration(progress.eta_s - sinceS)} left`;
+  }
+  if (typeof progress.elapsed_s === "number") {
+    return `${formatDuration(progress.elapsed_s + sinceS)} so far`;
+  }
+  return "";
+}
+
+/** What the whole video becomes, said on each segment's preview. */
+export function outputSizeLine(scale: number): string {
+  if (scale === 1) return "The whole video keeps its size; these previews show the clean-up.";
+  if (scale > 2) {
+    return `The whole video is upscaled ${scale}×; previews are 2×, which shows the same restoration at a size any GPU fits.`;
+  }
+  return `The whole video is upscaled ${scale}×.`;
+}
+
+/** Gemini's output scale and its reason, as one line. */
+export function scaleChoiceText(scale: number | null | undefined, reason?: string): string {
+  if (typeof scale !== "number") return "";
+  const what = scale === 1 ? "keep the size (no upscaling)" : `upscale ${scale}×`;
+  return `Gemini chose to ${what}${reason ? `: ${reason}` : "."}`;
+}
+
+/** Say so when a small source could go to 4× on a larger GPU. */
+export function vramNote(looks: Looks): string {
+  const vram = looks.gpu_vram_gb;
+  if (looks.scales?.includes(4) || !looks.small_source || typeof vram !== "number") return "";
+  const have = vram ? `this one has ${vram} GB` : "none was found";
+  return `4× needs an NVIDIA GPU with at least 24 GB of memory; ${have}.`;
+}
 
 export type ShotLook = Record<
   "deblock" | "denoise" | "contrast" | "brightness" | "saturation" | "gamma" | "grain",
@@ -80,6 +139,10 @@ export type Looks = {
   // On the ready screen: 1 is "do not upscale".
   scales?: number[];
   source_size?: [number, number];
+  // Gemini's reason while its scale stands, and what keeps 4× off the list.
+  scale_reason?: string;
+  gpu_vram_gb?: number;
+  small_source?: boolean;
 };
 
 export type Navigation = { setup: boolean; file: boolean; segments: boolean };

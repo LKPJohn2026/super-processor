@@ -399,6 +399,54 @@ def resolve_flashvsr_plus(home: Path | None = None) -> Path:
     return root
 
 
+# Total GPU memory override, in GB, for when detection is wrong or for tests.
+GPU_VRAM_ENV = "SUPER_PROCESSOR_GPU_VRAM_GB"
+_detected_vram: list[int] = []
+
+
+def gpu_vram_bytes() -> int:
+    """Total memory of the first NVIDIA GPU in bytes; 0 when there is none.
+
+    ``SUPER_PROCESSOR_GPU_VRAM_GB`` wins. Otherwise ``nvidia-smi`` is asked
+    once per process (no CUDA context is created), then PyTorch if it is
+    already loaded. A setting that is not a number (``24GB``) is ignored
+    rather than failing the job: the GPU is then asked instead.
+    """
+    raw = os.environ.get(GPU_VRAM_ENV, "").strip()
+    if raw:
+        with contextlib.suppress(ValueError, OverflowError):
+            return max(0, round(float(raw) * 1000**3))
+    if not _detected_vram:
+        _detected_vram.append(_detect_vram())
+    return _detected_vram[0]
+
+
+def _detect_vram() -> int:
+    try:
+        done = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        first = done.stdout.strip().splitlines()[0]
+        return int(float(first) * 1024 * 1024)  # MiB
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        pass
+    torch = sys.modules.get("torch")
+    try:
+        if torch is not None and torch.cuda.is_available():
+            return int(torch.cuda.get_device_properties(0).total_memory)
+    except Exception:  # noqa: BLE001 - any failure means "unknown"
+        pass
+    return 0
+
+
 def cuda_available() -> bool:
     """True when PyTorch can see an NVIDIA GPU."""
     try:
@@ -2175,6 +2223,22 @@ def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
 _CUT_MARGIN_FRAMES = 0.25
 
 
+# What a source frame costs to render without FlashVSR (a lanczos resize and
+# the delivery encode), against 1 for a frame FlashVSR restores.
+PLAIN_FRAME_COST = 0.05
+# The share of a FlashVSR part spent restoring; the rest is its delivery
+# encode.
+RESTORE_SHARE = 0.92
+
+
+def _flash(span: UpscaleSpan) -> bool:
+    return span.use_upscale and span.scale > 1
+
+
+def _frame_cost(span: UpscaleSpan) -> float:
+    return 1.0 if _flash(span) else PLAIN_FRAME_COST
+
+
 def render_shot_parts(
     spans: tuple[UpscaleSpan, ...], duration_s: float, total: int, fps: float
 ) -> list[tuple[UpscaleSpan, int, int]]:
@@ -2229,10 +2293,17 @@ def render_shots(
     want, rate = video_stream_facts(source, ffprobe_bin=ffprobe_bin)
     fps = float(Fraction(rate))
     timeline = render_shot_parts(spans, duration_s, want, fps)
+    # Each part's share of the work is its frames times what a frame costs,
+    # so a part FlashVSR skips does not make the time left jump.
+    costs = [(stop - first) * _frame_cost(span) for span, first, stop in timeline]
+    total_cost = sum(costs) or 1.0
     parts: list[Path] = []
+    done_cost = 0.0
     for index, (span, first, stop) in enumerate(timeline):
-        # Each part's share of the work is its share of the source frames.
-        part = _part_of(on_progress, first / want, (stop - first) / want)
+        whole = _part_of(on_progress, done_cost / total_cost, costs[index] / total_cost)
+        done_cost += costs[index]
+        # The restore is most of a FlashVSR part; its delivery encode the rest.
+        part = _part_of(whole, 0.0, RESTORE_SHARE if _flash(span) else 0.5)
         clip = trim_source(
             source,
             work / f"shot_{index}.mp4",
@@ -2266,8 +2337,8 @@ def render_shots(
                 regions=span.regions,
             )
         )
-        if part is not None:
-            part(1.0)
+        if whole is not None:
+            whole(1.0)
     silent = work / "shots.mp4"
     _concat(parts, silent, ffmpeg_bin=ffmpeg_bin)
     have, _rate = video_stream_facts(silent, ffprobe_bin=ffprobe_bin)

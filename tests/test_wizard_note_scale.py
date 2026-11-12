@@ -24,6 +24,9 @@ from super_processor.upscale import (
 )
 from super_processor.wizard import WizardController, WizardStep, strength_summary
 
+# A 32 GB GPU, which allows 4x for a small source.
+GB_32 = 32 * 1000**3
+
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg required"
 )
@@ -204,10 +207,49 @@ def test_scale_one_spans_report_flashvsr_off() -> None:
     )
 
 
+def test_4x_needs_a_gpu_with_24_gb() -> None:
+    # Sold as 24 GB, an RTX 4090 reports 24564 MiB: still enough.
+    for enough in (24 * 1000**3, 24564 * 1024**2, GB_32):
+        assert allowed_scales(854, 480, vram_bytes=enough) == (2, 4)
+    for short in (0, 16 * 1024**3, 23 * 1000**3):
+        assert allowed_scales(854, 480, vram_bytes=short) == (2,)
+
+
+def test_the_gpu_size_comes_from_the_setting_or_nvidia_smi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from super_processor import upscale
+
+    monkeypatch.setenv("SUPER_PROCESSOR_GPU_VRAM_GB", "12")
+    assert upscale.gpu_vram_bytes() == 12 * 1000**3
+    monkeypatch.delenv("SUPER_PROCESSOR_GPU_VRAM_GB")
+    monkeypatch.setattr(upscale, "_detected_vram", [])
+
+    def smi(command: list[str], **_kwargs: object) -> object:
+        assert command[0] == "nvidia-smi"
+        return type("Done", (), {"stdout": "32607\n"})()
+
+    monkeypatch.setattr("super_processor.upscale.subprocess.run", smi)
+    assert upscale.gpu_vram_bytes() == 32607 * 1024**2
+    # A setting that is not a number is ignored, not a failed job.
+    for typo in ("24GB", "lots", "inf"):
+        monkeypatch.setenv("SUPER_PROCESSOR_GPU_VRAM_GB", typo)
+        assert upscale.gpu_vram_bytes() == 32607 * 1024**2
+    monkeypatch.delenv("SUPER_PROCESSOR_GPU_VRAM_GB")
+    monkeypatch.setattr(upscale, "_detected_vram", [])
+
+    def missing(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr("super_processor.upscale.subprocess.run", missing)
+    monkeypatch.delitem(__import__("sys").modules, "torch", raising=False)
+    assert upscale.gpu_vram_bytes() == 0
+
+
 def test_unknown_size_does_not_unlock_4x() -> None:
-    assert allowed_scales(0, 0) == (2,)
-    assert allowed_scales(854, 480) == (2, 4)
-    assert allowed_scales(1920, 1080) == (2,)
+    assert allowed_scales(0, 0, vram_bytes=GB_32) == (2,)
+    assert allowed_scales(854, 480, vram_bytes=GB_32) == (2, 4)
+    assert allowed_scales(1920, 1080, vram_bytes=GB_32) == (2,)
 
 
 @needs_ffmpeg

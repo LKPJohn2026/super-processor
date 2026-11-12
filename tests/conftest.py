@@ -24,6 +24,9 @@ def _own_config_dir(
     # An exported FlashVSR+ choice would send the v1.1 tests to the real model.
     for name in ("SUPER_PROCESSOR_FLASHVSR", "FLASHVSR_PLUS_HOME"):
         monkeypatch.delenv(name, raising=False)
+    # Every test sees the same GPU size, whatever this machine has: 32 GB,
+    # which allows 4x for a small source. Tests of the gate set their own.
+    monkeypatch.setenv("SUPER_PROCESSOR_GPU_VRAM_GB", "32")
     empty = types.SimpleNamespace(
         get_password=lambda service, name: None,
         set_password=lambda service, name, value: None,

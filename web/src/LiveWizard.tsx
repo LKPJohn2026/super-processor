@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import {
   loadState,
+  outputSizeLine,
   outputSrc,
   postAction,
+  progressTiming,
+  scaleChoiceText,
+  vramNote,
   runAnalyze,
   runRender,
   runSegmenting,
@@ -288,9 +292,10 @@ function WizardStepView({
         progress={view.progress ?? null}
         message={message}
       >
-        FFmpeg saves a small still about every second, on this computer.
-        Gemini looks at them and splits the video where the light, place, or
-        picture quality changes.
+        A small copy of the video, without its sound, is uploaded to Gemini,
+        which watches it at one frame a second and splits it where the light,
+        place, or picture quality changes. If the upload fails, Gemini works
+        from stills FFmpeg saves on this computer.
       </Busy>
     );
   }
@@ -416,18 +421,46 @@ function Busy({
   children: ReactNode;
 }) {
   const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
+  const overall =
+    typeof progress?.overall === "number" ? Math.max(0, Math.min(100, Math.round(progress.overall))) : null;
+  // The view arrives every two seconds; count the clock down between them.
+  // The tick names the view it was counted from, so a new view starts at
+  // zero on its first paint instead of with the old view's seconds.
+  const [tick, setTick] = useState<{ of: Progress | null; since: number }>({ of: null, since: 0 });
+  useEffect(() => {
+    if (!progress) return undefined;
+    const arrived = Date.now();
+    const timer = window.setInterval(
+      () => setTick({ of: progress, since: (Date.now() - arrived) / 1000 }),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [progress]);
+  const since = tick.of === progress ? tick.since : 0;
+  const timing = progress ? progressTiming(progress, since) : "";
+  const step = progress ? `${pct}% · ${progress.message}${timing ? ` · ${timing}` : ""}` : "";
   return (
     <>
       <h1>{title}</h1>
       <p className="lede" role="status">
         {children}
       </p>
-      {pct !== null ? (
+      {overall !== null ? (
+        <>
+          <p className="progress">
+            <progress max={100} value={overall} aria-label={`Whole job: ${overall}%`}>
+              {overall}%
+            </progress>{" "}
+            <strong>{overall}% of the job</strong>
+          </p>
+          <p className="progress muted">This step: {step}</p>
+        </>
+      ) : pct !== null ? (
         <p className="progress">
           <progress max={100} value={pct} aria-label={`${title}: ${pct}%`}>
             {pct}%
           </progress>{" "}
-          {pct}% · {progress?.message}
+          {step}
         </p>
       ) : null}
       {message ? <Alert text={message} /> : null}
@@ -822,7 +855,16 @@ function SegmentsStep({
           : "Gemini split the video where the picture needs different settings. Approve the segments, or say where the cuts should go and Gemini will try again."}
       </p>
       {message ? <Alert text={message} /> : null}
-      <Notice text={list.error} />
+      <Notice
+        text={
+          [list.error, list.video_problem ? `Gemini saw stills instead of the video: ${list.video_problem}.` : ""]
+            .filter(Boolean)
+            .join(" ") || null
+        }
+      />
+      {scaleChoiceText(list.scale, list.scale_reason) ? (
+        <p className="muted">{scaleChoiceText(list.scale, list.scale_reason)}</p>
+      ) : null}
       <Timeline segments={list.segments} />
       <p className="muted">
         {count} {noun}
@@ -1074,7 +1116,7 @@ function PreviewStep({
         what to change.
       </p>
       {preview.scale ? (
-        <p className="muted">The whole video is upscaled {preview.scale}×.</p>
+        <p className="muted">{outputSizeLine(preview.scale)}</p>
       ) : null}
       {message ? <Alert text={message} /> : null}
       <Notice text={preview.error} />
@@ -1188,6 +1230,7 @@ function ReadyStep({
           );
         })}
       </ul>
+      {looks.scale_reason ? <p className="muted">{scaleChoiceText(looks.scale, looks.scale_reason)}</p> : null}
       {scales.length ? (
         <fieldset className="options">
           <legend>Upscale</legend>
@@ -1220,6 +1263,7 @@ function ReadyStep({
           })}
         </fieldset>
       ) : null}
+      {vramNote(looks) ? <p className="muted">{vramNote(looks)}</p> : null}
       <div className="actions">
         <button
           type="button"

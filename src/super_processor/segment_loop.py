@@ -1,9 +1,12 @@
-"""Segment loop: dense stills for Gemini to cut the video into segments.
+"""Segment loop: Gemini cuts the video into segments the editor approves.
 
-No video leaves the machine. FFmpeg saves a grid of small stills, about one
-a second and never more than :data:`MAX_STILLS`, always including the first
-and the last frame. Gemini proposes segment boundaries from those stills and
-their times; the editor approves them before anything is planned.
+Gemini watches an audio-free copy of the video (at most 960 pixels on its
+long edge) uploaded through its File API and sampled at 1 fps; see
+:func:`make_gemini_copy`. FFmpeg also saves a grid of small stills, about
+one a second and never more than :data:`MAX_STILLS`, always including the
+first and the last frame: the Segments screen shows them, and Gemini cuts
+from them when the upload cannot be used. The editor approves the segments
+before anything is planned.
 """
 
 from __future__ import annotations
@@ -11,6 +14,9 @@ from __future__ import annotations
 import json
 import math
 import re
+import subprocess
+import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,6 +41,11 @@ END_MARGIN_S = 0.1
 # schema 1 without a kind. Each side refuses the other's file.
 SEGMENT_LIST_SCHEMA_VERSION = 2
 SEGMENT_LIST_KIND = WIZARD_SEGMENTS_KIND
+# The copy Gemini watches: no audio, at most this long edge. Gemini samples
+# 1 frame a second and reads each at about 768 pixels, so a larger copy only
+# makes the upload slower.
+GEMINI_COPY_NAME = "gemini_upload.mp4"
+GEMINI_COPY_LONG_EDGE = 960
 
 
 def sample_times(
@@ -103,11 +114,13 @@ def extract_segment_stills(
     times: list[float],
     *,
     ffmpeg_bin: str = "ffmpeg",
+    on_progress: Callable[[float], None] | None = None,
 ) -> list[SegmentStill]:
     """Save one still per time under ``job_dir`` and return them in order.
 
     Stills from an earlier sampling are removed first. Stills from the older
     segment review (``seg_NN.ppm``) share the folder and are left alone.
+    ``on_progress`` gets the share of stills saved, 0 to 1.
     """
     folder = job_dir / STILLS_DIR_NAME
     if folder.is_symlink():
@@ -125,7 +138,90 @@ def extract_segment_stills(
         except ShotError as exc:
             raise SegmentLoopError(f"could not sample the video: {exc}") from exc
         stills.append(SegmentStill(t_s=t_s, path=relative))
+        if on_progress is not None:
+            on_progress(len(stills) / len(times))
     return stills
+
+
+def make_gemini_copy(
+    source: Path,
+    job_dir: Path,
+    duration_s: float,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    on_progress: Callable[[float], None] | None = None,
+) -> Path:
+    """Write the audio-free, small copy of ``source`` that Gemini watches.
+
+    The frame rate is kept: Gemini picks its own frames at 1 fps.
+    ``on_progress`` gets the share of the video encoded, 0 to 1.
+    """
+    out = job_dir / GEMINI_COPY_NAME
+    tmp = out.with_suffix(".part.mp4")
+    edge = GEMINI_COPY_LONG_EDGE
+    # Shrink only, keep the aspect ratio, and keep even dimensions.
+    even = f"trunc(min({edge},%s)/2)*2"
+    fit = f"scale='if(gte(iw,ih),{even % 'iw'},-2)':'if(gte(iw,ih),-2,{even % 'ih'})'"
+    command = [
+        ffmpeg_bin,
+        "-nostdin",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        f"{fit},format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "28",
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:1",
+        str(tmp),
+    ]
+    # Errors go to a file, not a pipe: a damaged source can print more than
+    # a pipe holds, and ffmpeg would then stall while we read its progress.
+    try:
+        with (
+            tempfile.TemporaryFile(mode="w+") as err,
+            subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=err,
+                text=True,
+            ) as proc,
+        ):
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                if key == "out_time_us" and on_progress and duration_s > 0:
+                    try:
+                        done = int(value) / 1e6 / duration_s
+                    except ValueError:
+                        continue
+                    on_progress(min(1.0, max(0.0, done)))
+            proc.wait()
+            err.seek(0)
+            errors = err.read()
+    except OSError as exc:
+        raise SegmentLoopError(f"could not make the copy for Gemini: {exc}") from exc
+    if proc.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        last = errors.strip().splitlines()[-1:] or ["ffmpeg failed"]
+        raise SegmentLoopError(f"could not make the copy for Gemini: {last[0]}")
+    tmp.replace(out)
+    return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +278,10 @@ class SegmentList:
     error: str | None = None
     # The editor's reason for sending the last proposal back.
     note: str = ""
+    # The output scale Gemini chose while watching the whole video, and why;
+    # None when it gave none (the plan then starts at 2x).
+    scale: int | None = None
+    scale_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -190,6 +290,8 @@ class SegmentList:
             "approved": self.approved,
             "error": self.error,
             "note": self.note,
+            "scale": self.scale,
+            "scale_reason": self.scale_reason,
             "segments": [segment.to_dict() for segment in self.segments],
         }
 
@@ -204,11 +306,18 @@ class SegmentList:
         if not isinstance(raw, list):
             raise SegmentLoopError("the segment list is missing")
         error = data.get("error")
+        scale = data.get("scale")
         return cls(
             segments=[LoopSegment.from_dict(item) for item in raw],
             approved=bool(data.get("approved", False)),
             error=error if isinstance(error, str) else None,
             note=str(data.get("note", "")),
+            scale=scale
+            if isinstance(scale, int)
+            and not isinstance(scale, bool)
+            and scale in (1, 2, 4)
+            else None,
+            scale_reason=str(data.get("scale_reason") or ""),
         )
 
 
