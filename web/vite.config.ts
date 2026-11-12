@@ -8,8 +8,10 @@ const proxy = Object.fromEntries(
   ),
 );
 
-export default defineConfig(({ command }) => ({
-  base: command === "serve" ? "/" : "/super-processor/",
+export default defineConfig(({ command, isPreview }) => ({
+  // `vite preview` also reports command "serve", but it serves the production
+  // build, whose asset URLs carry the Pages base.
+  base: command === "serve" && !isPreview ? "/" : "/super-processor/",
   plugins: [react()],
   server: { proxy },
   preview: { proxy },

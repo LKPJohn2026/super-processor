@@ -4,7 +4,7 @@ import { createServer as httpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createServer, preview } from "vite";
+import { build, createServer, preview } from "vite";
 
 // Exercise the real config and actual HTTP forwarding, including range headers.
 test("dev and preview proxy API, output, stills and previews to VITE_PROXY_TARGET", async (t) => {
@@ -54,5 +54,36 @@ test("dev and preview proxy API, output, stills and previews to VITE_PROXY_TARGE
     } finally {
       await vite.close();
     }
+  }
+});
+
+// A blank page: the built HTML names assets under the base, so preview must too.
+test("preview serves the production build's page and bundle at its base", async (t) => {
+  const outDir = await mkdtemp(join(tmpdir(), "super-processor-preview-"));
+  t.after(() => rm(outDir, { recursive: true, force: true }));
+  await build({ configFile: "vite.config.ts", logLevel: "silent", build: { outDir, emptyOutDir: true } });
+  const vite = await preview({
+    configFile: "vite.config.ts",
+    logLevel: "silent",
+    preview: { host: "127.0.0.1", port: 0, open: false },
+    build: { outDir },
+  });
+  try {
+    const origin = `http://127.0.0.1:${vite.httpServer.address().port}`;
+    const page = await fetch(`${origin}/super-processor/`);
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    const script = html.match(/<script[^>]+src="([^"]+)"/)?.[1];
+    const style = html.match(/<link[^>]+href="([^"]+\.css)"/)?.[1];
+    assert.ok(script?.startsWith("/super-processor/assets/"), `script: ${script}`);
+    assert.ok(style?.startsWith("/super-processor/assets/"), `style: ${style}`);
+    const js = await fetch(`${origin}${script}`, { headers: { Accept: "*/*" } });
+    assert.equal(js.status, 200);
+    assert.match(js.headers.get("Content-Type"), /javascript/);
+    const css = await fetch(`${origin}${style}`, { headers: { Accept: "text/css" } });
+    assert.equal(css.status, 200);
+    assert.match(css.headers.get("Content-Type"), /text\/css/);
+  } finally {
+    await vite.close();
   }
 });
