@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -492,6 +493,7 @@ def test_odd_sizes_give_an_even_copy(tmp_path: Path) -> None:
     assert _streams(tall) == ["video,540,960"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a shell script as ffmpeg")
 def test_a_flood_of_ffmpeg_errors_does_not_stall_the_copy(tmp_path: Path) -> None:
     fake = tmp_path / "ffmpeg"
     fake.write_text(
