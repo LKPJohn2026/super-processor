@@ -20,6 +20,7 @@ from loop_driver import (
     preview,
     segments,
 )
+from test_upscale import _V11_FAKE_BASE
 
 from super_processor.gemini import GeminiClient, GeminiError
 from super_processor.look import LOOK_BOUNDS, ShotLook
@@ -486,20 +487,11 @@ def test_preview_post_needs_the_preview_step(tmp_path: Path) -> None:
         controller.handle_post("/looks", {"action": ["approve"]})
 
 
-_COUNTING_INFER = """
-import os
-import subprocess
-from pathlib import Path
+_COUNTING_INFER = (
+    _V11_FAKE_BASE
+    + """
 
 LOADS = Path(os.environ["FAKE_LOADS"])
-
-
-class _Torch:
-    bfloat16 = "bf16"
-
-
-torch = _Torch()
-_SOURCE = {}
 
 
 def init_pipeline():
@@ -508,25 +500,14 @@ def init_pipeline():
 
 
 def prepare_input_tensor(path, scale, dtype, device):
-    _SOURCE["path"] = path
-    _SOURCE["scale"] = int(scale)
-    return ("lq", 8, 8, 1, 10)
+    return ({"path": path, "scale": int(scale)}, 8, 8, 1, 10)
 
 
 def tensor2video(video):
-    return [video]
-
-
-def save_video(pictures, save_path, fps, quality):
-    scale = _SOURCE["scale"]
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-i", _SOURCE["path"], "-vf", f"scale=iw*{scale}:ih*{scale}",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", save_path],
-        check=True,
-    )
+    scale = video["scale"]
+    return _frames(video["path"], f"scale=iw*{scale}:ih*{scale}", _count(video["path"]))
 """
+)
 
 
 @needs_ffmpeg

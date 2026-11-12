@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Segment previews still render at no more than 2x now that a plan can start
   at 4x, so they stay out of the system-RAM fallback, and a 1x plan runs no
   FlashVSR for its previews.
+- FlashVSR v1.1 chunks no longer pass through a lossy CRF 20 file: the
+  restored frames go straight to the lossless chunk, as FlashVSR+ already
+  did. While the GPU restores a chunk, a reader thread cuts and loads the
+  next one and a writer thread encodes the last. On a 60 s 640x480 clip
+  at 2x this took 214 s instead of 250 s, and the chunks gained 43-45 dB
+  of PSNR over the old CRF 20 copies.
 
 ### Fixed
 

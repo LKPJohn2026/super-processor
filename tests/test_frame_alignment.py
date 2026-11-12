@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from test_upscale import _V11_FAKE_BASE
 
 from super_processor.upscale import (
     FLASHVSR_MIN_CHUNK_FRAMES,
@@ -138,63 +139,25 @@ def test_every_segment_lines_up_with_the_source(tmp_path: Path) -> None:
 
 # Like FlashVSR's loader: return only the largest 8n + 1 of (frames + 4),
 # less four, at twice the size.
-_EIGHT_N_INFER = """
-import subprocess
-from pathlib import Path
-
-
-class _Cuda:
-    @staticmethod
-    def empty_cache():
-        return None
-
-
-class _Torch:
-    bfloat16 = "bf16"
-    cuda = _Cuda()
-
-
-torch = _Torch()
-_SOURCE = {}
-
-
-def init_pipeline():
-    def pipe(**kwargs):
-        return kwargs["LQ_video"]
-    return pipe
-
+_EIGHT_N_INFER = (
+    _V11_FAKE_BASE
+    + """
 
 def prepare_input_tensor(path, scale, dtype, device):
-    import os
-
-    count = int(subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
-         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip())
+    count = _count(path)
     limit = int(os.environ.get("FAKE_MAX_FRAMES", "100000"))
     if count > limit:
         # What PyTorch raises when the working memory does not fit.
         raise RuntimeError(f"CUDA out of memory. Tried to allocate 2 GiB ({count})")
-    _SOURCE.update(path=path, scale=int(scale), keep=((count + 3) // 8) * 8 + 1 - 4)
-    return ("lq", 8, 8, 1, 24)
+    keep = ((count + 3) // 8) * 8 + 1 - 4
+    return ({"path": path, "scale": int(scale), "keep": keep}, 8, 8, 1, 24)
 
 
 def tensor2video(video):
-    return [video]
-
-
-def save_video(pictures, save_path, fps, quality):
-    scale = _SOURCE["scale"]
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-i", _SOURCE["path"], "-vf", f"scale=iw*{scale}:ih*{scale}",
-         "-frames:v", str(_SOURCE["keep"]),
-         "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", save_path],
-        check=True,
-    )
+    scale = video["scale"]
+    return _frames(video["path"], f"scale=iw*{scale}:ih*{scale}", video["keep"])
 """
+)
 
 
 @needs_ffmpeg

@@ -8,6 +8,7 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -290,14 +291,18 @@ class _PlainV11:
         with self.log.open("a") as handle:
             handle.write("v1.1 load\n")
 
-        def run(
-            _module: object, _pipe: object, source: Path, output: Path, *, scale: int
-        ) -> None:
-            with self.log.open("a") as handle:
-                handle.write(f"v1.1 {source.name} {scale}\n")
-            upscale.plain_upscale(UpscaleRequest(source, output, scale=scale))
+        log = self.log
 
-        return upscale._Loaded(None, None, run, lambda: None)
+        class _Plain(upscale._Loaded):
+            def run(self, source: Path, output: Path, *, scale: int) -> None:
+                with log.open("a") as handle:
+                    handle.write(f"v1.1 {source.name} {scale}\n")
+                upscale.plain_upscale(UpscaleRequest(source, output, scale=scale))
+
+        def unused(*_args: object) -> Any:
+            raise AssertionError("short clips run whole")
+
+        return _Plain(None, None, unused, unused, lambda: None)
 
 
 @needs_ffmpeg

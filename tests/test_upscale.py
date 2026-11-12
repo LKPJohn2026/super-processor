@@ -227,7 +227,7 @@ def _flashvsr_tree(tmp_path: Path, script: str) -> tuple[Path, Path]:
     return home, infer
 
 
-_FAKE_INFER = """
+_V11_FAKE_BASE = """
 import os
 import subprocess
 from pathlib import Path
@@ -245,47 +245,76 @@ class _Torch:
 
 
 torch = _Torch()
-_SOURCE = {}
+
+
+class _Frame:
+    # What tensor2video gives: a picture with a size and its packed RGB.
+    def __init__(self, data, size):
+        self._data = data
+        self.size = size
+
+    def tobytes(self):
+        return self._data
+
+
+def _count(path):
+    return int(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip())
+
+
+def _frames(path, vf, limit):
+    # Decode the model's input through vf: at most limit RGB frames.
+    tmp = Path(path).with_suffix(".fake.mkv")
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", path, "-vf", vf,
+         "-frames:v", str(limit), "-c:v", "ffv1", str(tmp)],
+        check=True,
+    )
+    size = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height", "-of", "csv=p=0:s=x", str(tmp)],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    width, height = (int(v) for v in size.split("x"))
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(tmp), "-f", "rawvideo",
+         "-pix_fmt", "rgb24", "-"],
+        check=True, capture_output=True,
+    ).stdout
+    tmp.unlink()
+    step = width * height * 3
+    return [_Frame(raw[i:i + step], (width, height))
+            for i in range(0, len(raw), step)]
 
 
 def init_pipeline():
     def pipe(**kwargs):
         return kwargs["LQ_video"]
     return pipe
+"""
 
+_FAKE_INFER = (
+    _V11_FAKE_BASE
+    + """
 
 def prepare_input_tensor(path, scale, dtype, device):
-    _SOURCE["path"] = path
-    _SOURCE["scale"] = int(scale)
-    return ("lq", 8, 8, 1, 10)
+    # The input travels with the "tensor", as a real one would: the next
+    # piece is read in while this one is restored.
+    return ({"path": path, "scale": int(scale)}, 8, 8, 1, 10)
 
 
 def tensor2video(video):
-    return [video]
-
-
-def save_video(pictures, save_path, fps, quality):
-    # Upscale the real input, then drop FAKE_DROP trailing frames and write
-    # at FAKE_RATE, the way a block-padded model or a rounded fps would.
+    # Upscale the real input, then drop FAKE_DROP trailing frames, the way
+    # a block-padded model would.
     drop = int(os.environ.get("FAKE_DROP", "0"))
-    rate = os.environ.get("FAKE_RATE", "10")
-    count = int(subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
-         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0",
-         _SOURCE["path"]],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip())
-    scale = _SOURCE["scale"]
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-i", _SOURCE["path"],
-         "-vf", f"scale=iw*{scale}:ih*{scale},setpts=N/({rate})/TB",
-         "-r", rate, "-frames:v", str(max(1, count - drop)),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", save_path],
-        check=True,
-    )
+    scale = video["scale"]
+    count = _count(video["path"])
+    return _frames(video["path"], f"scale=iw*{scale}:ih*{scale}", max(1, count - drop))
 """
+)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
@@ -780,9 +809,8 @@ def test_chunked_flashvsr_reports_each_chunk(
 
 # Like the real loader: upscale, then centre-crop to whole 128-pixel blocks.
 _CROPPING_INFER = _FAKE_INFER.replace(
-    '"-vf", f"scale=iw*{scale}:ih*{scale},setpts=N/({rate})/TB",',
-    '"-vf", f"scale=iw*{scale}:ih*{scale},crop=trunc(iw/128)*128:'
-    'trunc(ih/128)*128,setpts=N/({rate})/TB",',
+    'f"scale=iw*{scale}:ih*{scale}"',
+    'f"scale=iw*{scale}:ih*{scale},crop=trunc(iw/128)*128:trunc(ih/128)*128"',
 )
 
 
