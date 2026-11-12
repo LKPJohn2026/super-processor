@@ -273,7 +273,7 @@ def test_json_api_drives_upscale_flow(
         assert result["step"] == "result"
         assert result["busy"] is False
         assert result["output_ready"] is True
-        assert result["output_url"] == "/output.mp4"
+        assert result["output_url"].startswith("/output.mp4?v=")
         assert result["scale"] == 2
         assert result["strength"] == 0.5
         assert result["strength_summary"] == "strength 0.50"

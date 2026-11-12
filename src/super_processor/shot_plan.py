@@ -254,9 +254,57 @@ def look_from_model(raw: Any) -> ShotLook:
     return ShotLook(**values)
 
 
+# A result note changes the output size only by naming a multiple as a request:
+# "make it 4x", "go back to 2x", or "4x" on its own. Everything else keeps the
+# size, including "the sign reads 4x", "16x9", "1.5x", and "don't make it 4x".
+_NOTE_CLAUSE = re.compile(r"[,;!?\n]|[.:](?!\d)|\b(?:and|but)\b")
+_NOTE_NEGATION = re.compile(r"\b(?:not|no|never|without|don't|dont)\b")
+_MULTIPLE = r"(?<![\w.])(\d+)\s?[x×](?![\w.]|\s*\d)"
+_NOTE_SIZE_REQUEST = re.compile(
+    r"\b(?:make|render|export|output|upscale|scale|try|use|want|need|go|back"
+    rf"|switch|change|set)\b.*?\s{_MULTIPLE}"
+    rf"|^(?:(?:at|to)\s+)?{_MULTIPLE}(?:\s+please)?$"
+)
+
+
 def allowed_scales(width: int, height: int) -> tuple[int, ...]:
-    """4x only when the long edge is small enough for it to recover detail."""
-    return (2, 4) if max(width, height) <= MAX_4X_LONG_EDGE else (2,)
+    """4x only when the long edge is small enough for it to recover detail.
+
+    An unknown size (0) does not qualify: it must not unlock 4x.
+    """
+    long_edge = max(width, height)
+    return (2, 4) if 0 < long_edge <= MAX_4X_LONG_EDGE else (2,)
+
+
+def note_scale(note: str, current: int, allowed: tuple[int, ...]) -> int:
+    """The scale a result note names, or ``current`` when it names none.
+
+    The note's own words decide, never the model's reply. Raises
+    ``ValueError`` for a size this source does not have, before any work.
+    """
+    for clause in _NOTE_CLAUSE.split(note.lower().replace("’", "'")):
+        clause = clause.strip()
+        match = _NOTE_SIZE_REQUEST.search(clause)
+        if match is None or _NOTE_NEGATION.search(clause) is not None:
+            continue
+        wanted = int(match.group(1) or match.group(2))
+        if wanted not in allowed:
+            choices = ", ".join(f"{scale}x" for scale in allowed)
+            raise ValueError(
+                f"kept {current}x and rendered nothing: this video can be "
+                f"{choices}. Send the note again with one of those, or without "
+                "the size."
+            )
+        return wanted
+    return current
+
+
+def reply_scale(raw: Any) -> int | None:
+    """The scale a model reply names, if it names a real one."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    # ``in`` also turns away fractions, infinity and NaN, without calling int().
+    return int(raw) if raw in (1, 2, 4) else None
 
 
 def cap_strength(strength: float, shot: Shot) -> float:

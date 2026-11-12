@@ -1258,17 +1258,21 @@ class GeminiClient:
         prior_start_s: float,
         prior_end_s: float,
         duration_s: float,
+        allowed_scales: tuple[int, ...] = (2, 4),
         job_dir: Path | None = None,
     ) -> dict[str, Any]:
         """Turn a result note into a bounded scale, strength, and time range."""
+        scales = ", ".join(str(scale) for scale in allowed_scales)
         prompt = (
             "We already restored and upscaled a video locally. "
             f"Duration is {duration_s:.1f} seconds. Previous params: "
             f"scale={prior_scale}, strength={prior_strength:.2f}, "
             f"applied from {prior_start_s:.1f}s to {prior_end_s:.1f}s. "
             f"The user said: {note.strip()}. "
-            "Return start_s, end_s, scale (only 2 or 4), and strength from "
-            "0 to 1. Lower strength means less invented texture. If they "
+            f"Return start_s, end_s, scale (only one of: {scales}; 1 means "
+            "the video keeps its size), and strength from 0 to 1. Keep "
+            f"scale={prior_scale} unless they explicitly ask for a different "
+            "output size. Lower strength means less invented texture. If they "
             "name a time range, set start_s and end_s to that range. "
             "Do not invent shell commands or a new model."
         )

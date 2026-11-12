@@ -63,9 +63,11 @@ from .shot_plan import (
     locate_targets,
     measure_shimmer,
     new_plan,
+    note_scale,
     plan_path,
     random_preview_start,
     render_previews,
+    reply_scale,
     request_redo,
     save_plan,
     set_upscale,
@@ -81,6 +83,7 @@ from .shots import (
 )
 from .stability import StabilityError, find_seams, seam_candidates
 from .upscale import (
+    UPSCALE_PLAN_FILE,
     FlashVsrEngine,
     UpscaleEngine,
     UpscaleError,
@@ -183,6 +186,8 @@ class WizardState:
     segment_index: int = 0
     # While a worker runs: {"phase", "pct" (0 to 100), "message"}.
     progress: dict[str, Any] | None = None
+    # Shown as the error once the render in progress succeeds.
+    notice: str | None = None
     schema_version: int = WIZARD_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -193,6 +198,7 @@ class WizardState:
             "error": self.error,
             "segment_index": self.segment_index,
             "progress": self.progress,
+            "notice": self.notice,
         }
 
     @classmethod
@@ -212,6 +218,7 @@ class WizardState:
             error=data.get("error"),
             segment_index=index if isinstance(index, int) and index >= 0 else 0,
             progress=progress if isinstance(progress, dict) else None,
+            notice=data.get("notice"),
         )
 
 
@@ -370,6 +377,28 @@ def load_render_report(job_dir: Path) -> dict[str, Any]:
     return {"seams": seams, "error": str(error) if error else None}
 
 
+# The plan a result note replaced, until its render shows the output holds it.
+_PLAN_BEFORE_NOTE = "upscale_plan_before_note.json"
+_SOURCE_SIZE_NOTE = (
+    "this render keeps the source size with FlashVSR off, so a note cannot "
+    'change the picture. Say "make it 2x" to upscale it, or start over.'
+)
+
+
+def _output_url(job_dir: Path) -> str | None:
+    """The result's URL, or ``None`` before there is one.
+
+    A revise replaces ``output.mp4``, and a browser's media layer can reuse what
+    it buffered for an unchanged URL even with ``no-store``, so the URL changes
+    with the file.
+    """
+    try:
+        version = (job_dir / "output.mp4").stat().st_mtime_ns
+    except OSError:
+        return None
+    return f"/output.mp4?v={version}"
+
+
 def _active_knobs(job_dir: Path) -> tuple[int | None, float | None, str | None]:
     """Scale, the latest span's strength (the JSON API's ``strength``), and a
     summary of every span for the Result line."""
@@ -387,8 +416,10 @@ def strength_summary(spans: tuple[UpscaleSpan, ...]) -> str:
 
     Each segment has its own recipe, so one span's strength misdescribes the
     rest. Spans with ``use_upscale`` False skip FlashVSR, so their strength
-    does not apply to the picture.
+    does not apply to the picture, and neither does it at scale 1.
     """
+    if all(span.scale == 1 for span in spans):
+        return "FlashVSR off"
     restored = sorted({round(span.strength, 2) for span in spans if span.use_upscale})
     if not restored:
         return "FlashVSR off"
@@ -639,7 +670,7 @@ class WizardController:
             scale, _strength, summary = _active_knobs(job_dir)
             report = load_render_report(job_dir)
             return render_result(
-                output_url="/output.mp4",
+                output_url=_output_url(job_dir) or "/output.mp4",
                 error=state.error,
                 scale=scale,
                 strength=summary,
@@ -662,9 +693,8 @@ class WizardController:
         seam_error: str | None = None
         if state.job_id and state.step in {WizardStep.RESULT, WizardStep.DONE}:
             job_dir = self.store.job_dir(state.job_id)
-            if (job_dir / "output.mp4").is_file():
-                output_ready = True
-                output_url = "/output.mp4"
+            output_url = _output_url(job_dir)
+            output_ready = output_url is not None
             if state.step is WizardStep.RESULT:
                 scale, strength, summary = _active_knobs(job_dir)
                 report = load_render_report(job_dir)
@@ -788,7 +818,12 @@ class WizardController:
         assert state.job_id
         job_id = state.job_id
         job_dir = self.store.job_dir(job_id)
+        state.notice = None
         if (job_dir / "output.mp4").is_file():
+            # The plan goes back to what the file on disk holds. A failed
+            # rescale would otherwise pin later notes to a size it never reached.
+            with contextlib.suppress(OSError):
+                (job_dir / _PLAN_BEFORE_NOTE).replace(job_dir / UPSCALE_PLAN_FILE)
             state.error = detail
             state.step = WizardStep.RESULT
             self._save(state)
@@ -1441,21 +1476,50 @@ class WizardController:
                 spans=(default_span(duration),)
             )
             prior = plan.latest_revision or plan.spans[-1]
+            current = prior.scale
+            video = facts.primary_video()
+            allowed = (
+                1,
+                *allowed_scales(
+                    (video.width or 0) if video else 0,
+                    (video.height or 0) if video else 0,
+                ),
+            )
+            scale = note_scale(note, current, allowed)
+            if scale == 1 and current == 1:
+                raise ValueError(_SOURCE_SIZE_NOTE)
             raw = self.gemini().revise_upscale_params(
                 note=note,
-                prior_scale=prior.scale,
+                prior_scale=current,
                 prior_strength=prior.strength,
                 prior_start_s=prior.start_s,
                 prior_end_s=prior.end_s,
                 duration_s=duration,
+                allowed_scales=allowed,
                 job_dir=job_dir,
             )
+            ignored = reply_scale(raw.get("scale"))
+            raw["scale"] = scale
             patch = UpscaleSpan.from_dict(raw)
             updated = replace_overlapping(
                 plan, patch, duration, preserve_shot_settings=True
             )
+            (job_dir / _PLAN_BEFORE_NOTE).write_text(
+                json.dumps(plan.to_dict(), indent=2) + "\n", encoding="utf-8"
+            )
             save_upscale_plan(job_dir, updated)
             state.error = None
+            state.notice = None
+            if scale == current and ignored not in (None, current):
+                example = (
+                    ignored
+                    if ignored in allowed
+                    else max(option for option in allowed if option != current)
+                )
+                state.notice = (
+                    f"Kept {current}x: Gemini answered {ignored}x, but this note "
+                    f'did not name a size. To change it, say "make it {example}x".'
+                )
             state.step = WizardStep.RENDERING
         except (UpscaleError, GeminiError, ProbeError, OSError, ValueError) as exc:
             state.error = str(exc)
@@ -1477,7 +1541,9 @@ class WizardController:
             ),
         )
         restart_from_segmentation(job_dir)
+        (job_dir / _PLAN_BEFORE_NOTE).unlink(missing_ok=True)
         state.error = None
+        state.notice = None
         state.segment_index = 0
         state.progress = None
         state.step = WizardStep.SAMPLING
@@ -1520,6 +1586,8 @@ class WizardController:
                 on_progress=self._render_progress(state),
                 on_revise_range=lambda start, end: revised_ranges.append((start, end)),
             )
+            # The output now holds this plan, so a later failure must keep it.
+            (job_dir / _PLAN_BEFORE_NOTE).unlink(missing_ok=True)
             # The renderer probes the old output's keyframes (after legacy
             # delivery conversion, if needed). Keep its actual splice edges,
             # not the requested range or the new output's different keyframes.
@@ -1537,7 +1605,8 @@ class WizardController:
             save_upscale_plan(job_dir, plan)
             self._progress(state, "rendering", 90, "Checking for seams")
             self._check_seams(job_dir, output, source, candidates)
-            state.error = None
+            state.error = state.notice
+            state.notice = None
             state.step = WizardStep.RESULT
         except (UpscaleError, ProbeError, OSError, ValueError) as exc:
             self._render_failed(state, str(exc))

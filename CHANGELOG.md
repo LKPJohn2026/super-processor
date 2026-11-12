@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A result note changes the output size only by naming a multiple, such as
+  "make it 4x", and only one the Ready screen offers for the source. A note on a
+  "Don't upscale" render used to re-render the whole clip at 2x with FlashVSR,
+  and a 1080p source could reach 4x. When Gemini answers a different scale, the
+  Result screen says so and how to ask.
+- A note on a "Don't upscale" render that names no size is refused with a
+  message, since strength cannot change the picture without FlashVSR, and the
+  Result line says "FlashVSR off" for that render.
+- After a scale change fails to render, the plan goes back to what `output.mp4`
+  holds, so later notes no longer fail on a size mismatch.
+- The Result player shows the revised video after a revise. The URL stayed
+  `/output.mp4`, so a browser could keep playing what it had buffered from the
+  previous render, even though the file on disk was correct.
+- `npm run preview` serves the production build at `/super-processor/` again;
+  the page was blank because the preview server used base `/`.
 - A refused host-memory allocation (torch's "can't allocate memory", or a
   `MemoryError` subclass) now counts as out of memory, so the clip is retried
   in shorter pieces instead of failing outright.

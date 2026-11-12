@@ -81,7 +81,7 @@ The wizard picture path is a local GPU restoration upscale (FlashVSR). FFmpeg
 probes, trims a cited time range, splices that range back, and copies audio.
 Before the first render, the segment loop (below) cuts the clip into
 segments and gets each one's settings approved on a short preview. Gemini
-turns a result note into `start_s`, `end_s`, `scale` (2 or 4), and
+turns a result note into `start_s`, `end_s`, `scale`, and
 `strength` (0–1). Re-runs read the original source for that range so detail
 does not stack.
 
@@ -224,7 +224,7 @@ Gemini emits parseable JSON through
 Each wizard call has its own schema: segments (times, label, contents), a
 recipe per segment (strength, `use_upscale`, look, and once the scale),
 protection boxes, a preview check, and a result note's range (`start_s`,
-`end_s`, `scale` 2 or 4, `strength` 0–1). Values are validated, clamped, and
+`end_s`, a `scale` the source allows, `strength` 0–1). Values are validated, clamped, and
 unknown names dropped before anything runs. The model has no shell tool, and FFmpeg argument lists
 are built by engineering-owned code.
 

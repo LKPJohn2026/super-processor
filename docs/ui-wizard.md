@@ -207,7 +207,10 @@ chunks do not repeatedly decode the whole original file for this guard.
 single-range support (`206 Partial Content`, `416` for an unsatisfiable
 range, `HEAD`), so players can seek without the server loading the file into
 memory. Responses carry `Cache-Control: no-store` because a revise rewrites
-`output.mp4` in place. The final mux uses `-movflags +faststart`.
+`output.mp4` in place. `no-store` alone is not enough: a browser's media layer
+can reuse what it buffered for an unchanged URL, so both shells get the result as
+`/output.mp4?v=<modification time>`, and a revise changes the URL. The final mux
+uses `-movflags +faststart`.
 
 ## Frame alignment
 
@@ -454,7 +457,16 @@ A result note becomes a range and knobs.
 {"start_s": 2.0, "end_s": 5.0, "scale": 2, "strength": 0.3}
 ```
 
-`scale` must be 2 or 4 and `strength` 0–1; the range is clamped to the file.
+`scale` must be one the Ready screen offers for this source (1, 2, and 4 when
+its long edge is 960 or less) and `strength` 0–1; the range is clamped to the
+file. The size changes only when the note names a multiple as a request ("make
+it 4x", "go back to 2x", or "4x" alone). Code holds that whatever Gemini replies:
+any other note keeps the current scale, even "make it bigger", and if Gemini
+answered a different scale the Result screen says so and how to ask. A named size
+the source does not offer is refused before anything runs. A note on a "Don't
+upscale" render that names no size is refused too, since strength does not apply
+without FlashVSR. If a scale change fails to render, the plan goes back to what
+`output.mp4` holds.
 A scale change re-renders the whole clip (see Range revise above).
 
 ## Multi-turn chat
@@ -491,6 +503,7 @@ name in the URL.
 | `shot_plan.json` | Per-segment recipe, `use_upscale`, preview window, reason, check result, preview revision, pending editor note |
 | `previews/` | `shot_NNN_rN_before/after.mp4` and check stills, served at `/previews/<name>` |
 | `upscale_plan.json` | Spans (one per approved segment) with scale, strength, look, and `use_upscale`, plus the pending revise |
+| `upscale_plan_before_note.json` | The plan a result note replaced, kept until its render succeeds and restored if it fails |
 | `output.mp4` | Current result |
 | `render_report.json` | Seam check of the latest render: times checked and seams found |
 | `output.mp4.delivery.json` | Encode settings marker for keyframe splices |

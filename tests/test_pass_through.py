@@ -200,7 +200,8 @@ def test_result_note_preserves_each_shots_settings(
     assert controller.current_state().step is WizardStep.RESULT
     assert engine.calls == 1
 
-    controller.handle_post("/result", {"note": ["less invented detail"]})
+    note = "less invented detail" if scale == 2 else "less detail, make it 4x"
+    controller.handle_post("/result", {"note": [note]})
     state = controller.current_state()
     assert state.step is WizardStep.RENDERING and state.error is None
     assert transport.calls == 1

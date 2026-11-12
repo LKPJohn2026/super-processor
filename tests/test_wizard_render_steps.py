@@ -92,6 +92,7 @@ def test_retired_steps_go_back_to_pick(tmp_path: Path) -> None:
         "error": loaded.error,
         "segment_index": 0,
         "progress": None,
+        "notice": None,
     }
 
 
