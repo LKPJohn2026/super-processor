@@ -126,10 +126,94 @@ def test_blend_filter_swaps_in_the_source_structure() -> None:
     assert "gblur" not in plain
     graph = blend_filter(320, 180, 0.5, regions=(FACE,), sigma=3.0)
     assert graph.count("gblur=sigma=3.000") == 2
-    assert "A-B+128" in graph and "B+A-128" in graph
-    assert "clip(" in graph
-    # Every blend keeps the restored branch as its main input.
+    assert "x-y+128" in graph and "y+x-128" in graph
+    # Per-pixel work is a lookup table or a mask drawn once, never an
+    # expression evaluated for every pixel of every frame.
+    assert "blend=" not in graph and "all_expr" not in graph
+    # The boxes are drawn into one-frame masks, in each plane's own scale.
+    assert graph.count("r=1:d=1") == 3 and "X/(W*SW)" in graph
+    # Each lookup keeps the restored branch as its main input, and each
+    # picture leads its own merge so it keeps its timestamps.
     assert graph.count("eof_action=pass") == 3
+    assert "[rebuilt][zeror][keepr]maskedmerge" in graph
+    assert "[basemix][zerob][keepb]maskedmerge" in graph
+    # Without boxes the mix is one lookup table.
+    assert "maskedmerge" not in blend_filter(320, 180, 0.5, sigma=3.0)
+
+
+def _mixed_frames(graph: str, restored: str, base: str, frames: int) -> list[bytes]:
+    """Run ``graph`` on two lavfi sources; the luma plane of each output frame."""
+    out = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            restored,
+            "-f",
+            "lavfi",
+            "-i",
+            base,
+            "-filter_complex",
+            graph,
+            "-map",
+            "[v]",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    size = 64 * 48
+    step = size * 3 // 2
+    assert len(out) == frames * step
+    return [out[i * step : i * step + size] for i in range(frames)]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(("restored", "base"), [(36, 12), (12, 36)])
+def test_boxes_mix_each_frame_with_its_own_base(restored: int, base: int) -> None:
+    box = (Region("faces", 0.25, 0.25, 0.75, 0.75),)
+    graph = blend_filter(64, 48, 0.8, regions=box)
+    # Flat pictures: the restored one at 200, the base at 50.
+    flat = _mixed_frames(
+        graph,
+        f"color=c=0xC8C8C8:s=64x48:r=30000/1001,trim=end_frame={restored}",
+        f"color=c=0x323232:s=32x24:r=30000/1001,trim=end_frame={base}",
+        restored,
+    )
+    # The restored picture sets the length, whichever input is longer.
+    assert len(flat) == restored
+    row = flat[0][24 * 64 : 25 * 64]
+
+    def luma(level: int) -> float:
+        return 16 + level * 219 / 255
+
+    share = REGION_STRENGTH["faces"]
+    assert abs(row[32] - (luma(50) + (luma(200) - luma(50)) * share)) <= 2
+    assert abs(row[2] - (luma(50) + (luma(200) - luma(50)) * 0.8)) <= 2
+    # Moving pictures: every frame matches the same mix done per pixel by
+    # an expression, so no frame is paired with a neighbour's base.
+    moving = (
+        f"testsrc2=s=64x48:r=30000/1001,trim=end_frame={restored}",
+        f"testsrc=s=32x24:r=30000/1001,trim=end_frame={base}",
+    )
+    fast = _mixed_frames(graph, *moving, restored)
+    share_expr = strength_expr(0.8, box)
+    slow_graph = (
+        "[0:v]format=yuv420p[a];"
+        "[1:v]scale=64:48:flags=lanczos,format=yuv420p,"
+        "tpad=stop_mode=clone:stop_duration=1[b];"
+        f"[a][b]blend=all_expr='B+(A-B)*({share_expr})':eof_action=pass[v]"
+    )
+    slow = _mixed_frames(slow_graph, *moving, restored)
+    for got, want in zip(fast, slow, strict=True):
+        assert max(abs(g - w) for g, w in zip(got, want, strict=True)) <= 2
 
 
 def test_caps_targets_and_regions_from_gemini() -> None:

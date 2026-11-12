@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from super_processor.upscale import (
+    RESTORE_SHARE,
     FakeUpscaleEngine,
     FlashVsrEngine,
     UpscaleError,
@@ -764,7 +765,17 @@ def test_chunked_flashvsr_reports_each_chunk(
     )
     count = len(planned_chunks(12.0, scale=2, strength=0.5))
     assert count > 1
-    assert seen == pytest.approx([(i + 1) / count for i in range(count)])
+    # The chunks fill the restore share; the blend and encode after them
+    # count their frames up to the end.
+    chunks = seen[:count]
+    assert chunks == pytest.approx(
+        [(i + 1) / count * RESTORE_SHARE for i in range(count)]
+    )
+    encoding = seen[count:]
+    assert (
+        encoding and encoding == sorted(encoding) and encoding[-1] == pytest.approx(1.0)
+    )
+    assert all(value >= RESTORE_SHARE for value in encoding)
 
 
 # Like the real loader: upscale, then centre-crop to whole 128-pixel blocks.

@@ -66,7 +66,7 @@ def test_look_filters_follow_the_fixed_order() -> None:
     # Clean on the plain-upscale base before scaling, finish after the mix.
     base = graph.split("[1:v]", 1)[1]
     assert base.index("deblock=") < base.index("scale=320:180")
-    assert graph.index("blend=") < graph.index("eq=")
+    assert graph.index("lut2=") < graph.index("eq=")
     assert graph.endswith("[v]")
     assert "[mix]" not in blend_filter(320, 180, 0.5)
 

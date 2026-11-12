@@ -26,6 +26,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -1551,6 +1552,9 @@ def _run_flashvsr_chunked(
     pieces: list[Path] = []
     failed: UpscaleError | None = None
     covered = 0
+    # The chunks are most of the work; the blend and delivery encode after
+    # them report the rest, so the bar does not wait at 100%.
+    restored = _part_of(request.on_progress, 0.0, RESTORE_SHARE)
     try:
         for index, (first, stop) in enumerate(chunks):
             clip = trim_source(
@@ -1570,8 +1574,8 @@ def _run_flashvsr_chunked(
             trim_source(raw, kept, _cut_time(skip, fps), _cut_time(stop - first, fps))
             covered = stop
             pieces.append(kept)
-            if request.on_progress is not None:
-                request.on_progress((index + 1) / len(chunks))
+            if restored is not None:
+                restored((index + 1) / len(chunks))
     except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
         failed = _flashvsr_failure(exc)
         del exc
@@ -1593,6 +1597,7 @@ def _run_flashvsr_chunked(
         strength=request.strength,
         look=request.look,
         regions=request.regions,
+        on_progress=_part_of(request.on_progress, RESTORE_SHARE, 1.0 - RESTORE_SHARE),
     )
     if not request.output.is_file():
         raise UpscaleError("FlashVSR produced no output")
@@ -1720,15 +1725,16 @@ def blend_filter(
     the base's shapes and colour with FlashVSR's fine detail. The strength
     ``s`` is per pixel: lower inside protected ``regions``.
 
-    Every blend takes the restored picture's branch as its first (main) input
-    with ``eof_action=pass``, so the frame count the keyframe splice relies
-    on never changes. The base is padded by a second of its last frame so a
+    Every two-input step takes the restored picture's branch as its first
+    (main) input with ``eof_action=pass``, so the frame count the keyframe
+    splice relies on never changes. The steps are lookup tables and a mask
+    drawn once, not an expression per pixel, which ran at about 5 frames a
+    second at 1280x960. The base is padded by a second of its last frame so a
     few missing frames do not leave the tail unmixed. The base gets the look's
     clean step, as the engine input did, and the mix gets its finish step.
     """
     _require_strength(strength)
     look = look or ShotLook()
-    share = strength_expr(strength, regions)
     base = _join_filters(
         "setpts=PTS-STARTPTS",
         look.clean_filter(),
@@ -1737,25 +1743,58 @@ def blend_filter(
     )
     finish = look.finish_filter()
     mixed = "[mix];[mix]" + finish + "[v]" if finish else "[v]"
-    mix = f"blend=all_expr='B+(A-B)*({share})':eof_action=pass{mixed}"
     if sigma <= 0:
-        return (
-            "[0:v]setpts=PTS-STARTPTS,format=yuv420p[up];"
-            f"[1:v]{base}[base];"
-            f"[up][base]{mix}"
+        graph = (
+            f"[0:v]setpts=PTS-STARTPTS,format=yuv420p[rebuilt];[1:v]{base}[basemix];"
         )
-    blur = f"gblur=sigma={sigma:.3f}"
-    return (
-        "[0:v]setpts=PTS-STARTPTS,format=yuv420p,split[up][upc];"
-        f"[upc]{blur}[uplow];"
-        f"[1:v]{base},split[basec][basemix];"
-        f"[basec]{blur}[baselow];"
-        # Restored detail, offset to mid grey so negative values survive.
-        "[up][uplow]blend=all_expr='A-B+128':eof_action=pass[detail];"
-        # The base's coarse layer with the restored detail on top.
-        "[detail][baselow]blend=all_expr='B+A-128':eof_action=pass[rebuilt];"
-        f"[rebuilt][basemix]{mix}"
+    else:
+        blur = f"gblur=sigma={sigma:.3f}"
+        graph = (
+            "[0:v]setpts=PTS-STARTPTS,format=yuv420p,split[up][upc];"
+            f"[upc]{blur}[uplow];"
+            f"[1:v]{base},split[basec][basemix];"
+            f"[basec]{blur}[baselow];"
+            # Restored detail, offset to mid grey so negative values survive.
+            f"[up][uplow]{_lut2('x-y+128')}[detail];"
+            # The base's coarse layer with the restored detail on top.
+            f"[detail][baselow]{_lut2('y+x-128')}[rebuilt];"
+        )
+    share = strength_expr(strength, regions)
+    if share == f"{strength:.4f}":
+        # One share for every pixel: a lookup table, the same sum the
+        # expression gave, at the speed of a table read.
+        return graph + f"[rebuilt][basemix]{_lut2(f'y+(x-y)*{share}')}{mixed}"
+    # A share that changes across the frame cannot be a table. It is drawn
+    # once into two masks, the share and what is left of it. Each picture
+    # is weighted by its mask against black, with that picture as the first
+    # input so its frames keep their own timestamps and length; the sum then
+    # takes the restored picture's frame count. In geq, W and H are the luma
+    # size on every plane, so box corners are scaled by its subsampling.
+    plane = share.replace("X/W", "X/(W*SW)").replace("Y/H", "Y/(H*SH)")
+    # One frame (r=1, d=1): framesync repeats it for the whole picture.
+    still = f"color=c=black:s={width}x{height}:r=1:d=1,format=yuv420p"
+
+    def mask(level: str) -> str:
+        return f"{still},geq=lum={level}:cb={level}:cr={level}"
+
+    restored_mask = mask(f"'255*(1-({plane}))'")
+    base_mask = mask(f"'255*({plane})'")
+    return graph + (
+        # maskedmerge gives first + (second - first) * mask: against black,
+        # a mask of (1 - weight) leaves first * weight.
+        f"{restored_mask}[keepr];"
+        f"{base_mask}[keepb];"
+        f"{mask('0')},split[zeror][zerob];"
+        "[rebuilt][zeror][keepr]maskedmerge[rpart];"
+        "[basemix][zerob][keepb]maskedmerge[bpart];"
+        f"[rpart][bpart]{_lut2('x+y')}{mixed}"
     )
+
+
+def _lut2(expr: str) -> str:
+    """A two-input ``lut2`` on every plane; the first input sets the length."""
+    planes = ":".join(f"c{index}='{expr}'" for index in range(3))
+    return f"lut2={planes}:eof_action=pass"
 
 
 def _join_filters(*parts: str) -> str:
@@ -1772,6 +1811,7 @@ def encode_delivery(
     strength: float = 1.0,
     look: ShotLook | None = None,
     regions: tuple[Region, ...] = (),
+    on_progress: ProgressFn | None = None,
 ) -> Path:
     """Encode a picture once into the settings every splice part shares.
 
@@ -1780,7 +1820,8 @@ def encode_delivery(
     ``source`` as a concat-demuxer listing. With ``blend_with``, the picture
     is mixed with a lanczos upscale of ``blend_with`` in the same encode,
     taking its coarse layer from that base (see :func:`blend_filter`). The
-    look's finish step runs in this encode too.
+    look's finish step runs in this encode too. ``on_progress`` gets the
+    share of frames encoded, 0 to 1, when the frame count can be read.
     """
     look = look or ShotLook()
     record = _blend_record(strength, regions) if blend_with is not None else None
@@ -1852,7 +1893,14 @@ def encode_delivery(
             "0",
             "-an",
             str(tmp),
-        ]
+        ],
+        on_progress=on_progress,
+        total_frames=_count_frames(
+            blend_with if blend_with is not None else None if concat else source,
+            ffmpeg_bin,
+        )
+        if on_progress is not None
+        else 0,
     )
     tmp.replace(dest)
     _write_marker(dest, blend=record, look=None if look.is_neutral() else look)
@@ -1984,6 +2032,7 @@ def _upscale_full(
     ffmpeg_bin: str,
     on_progress: ProgressFn | None = None,
 ) -> Path:
+    restore, deliver = _restore_then_deliver(on_progress, span)
     raw, strength = restore_clip(
         engine,
         UpscaleRequest(
@@ -1993,7 +2042,7 @@ def _upscale_full(
             strength=span.strength,
             look=span.look,
             regions=span.regions,
-            on_progress=on_progress,
+            on_progress=restore,
         ),
         use_upscale=span.use_upscale,
         ffmpeg_bin=ffmpeg_bin,
@@ -2006,6 +2055,7 @@ def _upscale_full(
         strength=strength,
         look=span.look,
         regions=span.regions,
+        on_progress=deliver,
     )
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
@@ -2226,8 +2276,9 @@ _CUT_MARGIN_FRAMES = 0.25
 # What a source frame costs to render without FlashVSR (a lanczos resize and
 # the delivery encode), against 1 for a frame FlashVSR restores.
 PLAIN_FRAME_COST = 0.05
-# The share of a FlashVSR part spent restoring; the rest is its delivery
-# encode.
+# The share of a FlashVSR part spent restoring; the rest is its blend and
+# delivery encode. Measured on a 640x480 film at 2x: FlashVSR at about 9.5
+# frames a second, the blend and encode at about 155.
 RESTORE_SHARE = 0.92
 
 
@@ -2237,6 +2288,20 @@ def _flash(span: UpscaleSpan) -> bool:
 
 def _frame_cost(span: UpscaleSpan) -> float:
     return 1.0 if _flash(span) else PLAIN_FRAME_COST
+
+
+def _restore_then_deliver(
+    on_progress: ProgressFn | None, span: UpscaleSpan
+) -> tuple[ProgressFn | None, ProgressFn | None]:
+    """Progress for a part's restore and for its delivery encode after it.
+
+    FlashVSR blends and encodes into the delivery settings itself and
+    reports both, so it gets the whole part and the encode after it finds
+    nothing to do. A plain resize and its encode get half each.
+    """
+    if _flash(span):
+        return on_progress, None
+    return _part_of(on_progress, 0.0, 0.5), _part_of(on_progress, 0.5, 0.5)
 
 
 def render_shot_parts(
@@ -2302,8 +2367,7 @@ def render_shots(
     for index, (span, first, stop) in enumerate(timeline):
         whole = _part_of(on_progress, done_cost / total_cost, costs[index] / total_cost)
         done_cost += costs[index]
-        # The restore is most of a FlashVSR part; its delivery encode the rest.
-        part = _part_of(whole, 0.0, RESTORE_SHARE if _flash(span) else 0.5)
+        restore, deliver = _restore_then_deliver(whole, span)
         clip = trim_source(
             source,
             work / f"shot_{index}.mp4",
@@ -2321,7 +2385,7 @@ def render_shots(
                 strength=span.strength,
                 look=span.look,
                 regions=span.regions,
-                on_progress=part,
+                on_progress=restore,
             ),
             use_upscale=span.use_upscale,
             ffmpeg_bin=ffmpeg_bin,
@@ -2335,6 +2399,7 @@ def render_shots(
                 strength=strength,
                 look=span.look,
                 regions=span.regions,
+                on_progress=deliver,
             )
         )
         if whole is not None:
@@ -2422,14 +2487,55 @@ def _concat(parts: list[Path], dest: Path, *, ffmpeg_bin: str) -> None:
     _run_ffmpeg(build_concat_argv(listing, dest, ffmpeg_bin=ffmpeg_bin))
 
 
-def _run_ffmpeg(command: list[str]) -> None:
+def _run_ffmpeg(
+    command: list[str],
+    *,
+    on_progress: ProgressFn | None = None,
+    total_frames: int = 0,
+) -> None:
+    """Run ``command``; with ``on_progress``, report frames out of ``total_frames``."""
+    if on_progress is None or total_frames <= 0:
+        try:
+            completed = subprocess.run(command, check=False, capture_output=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or b"").decode("utf-8", errors="replace")
+            raise UpscaleError(detail.strip() or "ffmpeg failed")
+        return
+    watched = [command[0], "-progress", "pipe:1", "-nostats", *command[1:]]
+    # Errors go to a file: read from a pipe only after the progress, a long
+    # error output would fill it and stall ffmpeg.
     try:
-        completed = subprocess.run(command, check=False, capture_output=True)
+        with (
+            tempfile.TemporaryFile() as errors,
+            subprocess.Popen(
+                watched, stdout=subprocess.PIPE, stderr=errors, text=True
+            ) as proc,
+        ):
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                if key == "frame" and value.isdigit():
+                    on_progress(min(1.0, int(value) / total_frames))
+            proc.wait()
+            errors.seek(0)
+            detail = errors.read().decode("utf-8", errors="replace")
     except (OSError, subprocess.SubprocessError) as exc:
         raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
-    if completed.returncode != 0:
-        detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise UpscaleError(detail or "ffmpeg failed")
+    if proc.returncode != 0:
+        raise UpscaleError(detail.strip() or "ffmpeg failed")
+
+
+def _count_frames(video: Path | None, ffmpeg_bin: str) -> int:
+    """Frames in ``video`` for a progress report; 0 when unknown."""
+    if video is None:
+        return 0
+    try:
+        frames, _rate = video_stream_facts(video, ffprobe_bin=_ffprobe_for(ffmpeg_bin))
+    except UpscaleError:
+        return 0
+    return frames
 
 
 def _require_scale(value: Any) -> int:

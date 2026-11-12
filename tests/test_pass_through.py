@@ -17,7 +17,6 @@ from super_processor.shot_plan import new_plan, render_previews
 from super_processor.shots import Shot, ShotList
 from super_processor.upscale import (
     PLAIN_FRAME_COST,
-    RESTORE_SHARE,
     FakeUpscaleEngine,
     UpscalePlan,
     UpscaleRequest,
@@ -382,21 +381,17 @@ def test_render_reports_progress_by_the_work_left(tmp_path: Path) -> None:
         on_progress=seen.append,
     )
     # Frames weigh by what they cost: a pass-through frame is a small share
-    # of a FlashVSR one, and a FlashVSR part's restore comes before its
-    # encode. Part one: halfway, then done; the pass-through part only
-    # reports done.
+    # of a FlashVSR one. FlashVSR reports its own restore and encode (this
+    # fake stops halfway); a pass-through part's resize is its first half and
+    # its delivery encode, which counts frames, the second.
     costs = [3.0, 1.5 * PLAIN_FRAME_COST, 1.5]
     total = sum(costs)
     one, two = costs[0] / total, (costs[0] + costs[1]) / total
-    assert seen == pytest.approx(
-        [
-            0.5 * RESTORE_SHARE * one,
-            one,
-            two,
-            two + 0.5 * RESTORE_SHARE * costs[2] / total,
-            1.0,
-        ]
-    )
+    assert seen[:2] == pytest.approx([0.5 * one, one])
+    assert seen[-3:] == pytest.approx([two, two + 0.5 * costs[2] / total, 1.0])
+    encoding = seen[2:-3]
+    assert encoding and encoding == sorted(encoding)
+    assert all(one + (two - one) / 2 <= value <= two + 1e-9 for value in encoding)
     single: list[float] = []
     render_shots(
         source,
