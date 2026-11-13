@@ -49,8 +49,8 @@ from .segment_loop import (
 from .segments import MAX_DURATION_S
 from .shot_plan import (
     CHECK_PROBLEMS,
-    DEFAULT_SCALE,
     MAX_4X_LONG_EDGE,
+    MAX_UPSCALE_LONG_EDGE,
     PROTECTED_STRENGTH,
     ShotPlan,
     ShotPlanError,
@@ -59,6 +59,7 @@ from .shot_plan import (
     apply_proposals,
     apply_regions,
     check_stills,
+    default_scale,
     fallback_recipe,
     finish,
     guard_shimmer,
@@ -387,6 +388,11 @@ _PLAN_BEFORE_NOTE = "upscale_plan_before_note.json"
 _SOURCE_SIZE_NOTE = (
     "this render keeps the source size with FlashVSR off, so a note cannot "
     'change the picture. Say "make it 2x" to upscale it, or start over.'
+)
+_LARGE_SOURCE_NOTE = (
+    "this render keeps the source size with FlashVSR off, so a note cannot "
+    f"change the picture, and a video over {MAX_UPSCALE_LONG_EDGE} px on its "
+    "long edge cannot be upscaled. Start over to change the segment settings."
 )
 
 
@@ -1330,7 +1336,8 @@ class WizardController:
             "max_segments": MAX_LOOP_SEGMENTS,
             "min_segment_s": MIN_LOOP_SEGMENT_S,
             "job_dir": job_dir,
-            "scales": scales,
+            # Only a real choice is asked: a large source keeps its size.
+            "scales": scales if len(scales) > 1 else (),
             "source_size": self._source_size(state.job_id),
         }
         stills_ask: dict[str, Any] = {
@@ -1592,13 +1599,11 @@ class WizardController:
                 self._analyze_failed(state, str(exc))
                 return
             save_shots(job_dir, shots)
-            scale = (
-                found.scale
-                if found.scale in self._scale_options(state.job_id)
-                else DEFAULT_SCALE
-            )
+            options = self._scale_options(state.job_id)
+            scale = found.scale if found.scale in options else default_scale(options)
             plan = new_plan(shots, scale)
             save_plan(job_dir, plan)
+        self._fit_plan_scale(state.job_id, job_dir, plan)
         index = state.segment_index
         if index >= len(plan.recipes):
             state.step = WizardStep.READY_TO_RENDER
@@ -1702,6 +1707,7 @@ class WizardController:
                 return
             plan.scale = int(raw)
             save_plan(job_dir, plan)
+        self._fit_plan_scale(state.job_id, job_dir, plan)
         try:
             save_upscale_plan(job_dir, plan.to_upscale_plan(shots))
             state.step = WizardStep.RENDERING
@@ -1716,6 +1722,18 @@ class WizardController:
         except ProbeError:
             return 0, 0
         return ((video.width or 0), (video.height or 0)) if video else (0, 0)
+
+    def _fit_plan_scale(self, job_id: str, job_dir: Path, plan: ShotPlan) -> None:
+        """Bring a saved plan back inside this source's options.
+
+        A plan saved before a limit changed, such as 2x for a source now over
+        ``MAX_UPSCALE_LONG_EDGE``, must not reach FlashVSR in previews or the
+        render.
+        """
+        options = self._scale_options(job_id)
+        if plan.scale not in options:
+            plan.scale = default_scale(options)
+            save_plan(job_dir, plan)
 
     def _scale_options(self, job_id: str) -> tuple[int, ...]:
         """1 (do not upscale) and the scales this source allows."""
@@ -1733,10 +1751,16 @@ class WizardController:
             found = load_segment_list(job_dir)
         except SegmentLoopError:
             found = None
-        chose = found is not None and found.scale == view.get("scale")
+        chose = (
+            found is not None
+            and found.scale == view.get("scale")
+            and found.scale in view["scales"]
+        )
         view["scale_reason"] = found.scale_reason if found and chose else ""
         view["gpu_vram_gb"] = round(gpu_vram_bytes() / 1000**3, 1)
         view["small_source"] = 0 < max(width, height) <= MAX_4X_LONG_EDGE
+        view["large_source"] = max(width, height) > MAX_UPSCALE_LONG_EDGE
+        view["max_upscale_long_edge"] = MAX_UPSCALE_LONG_EDGE
         return view
 
     def _result_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
@@ -1780,8 +1804,13 @@ class WizardController:
                 ),
             )
             scale = note_scale(note, current, allowed)
+            if scale not in allowed and allowed == (1,):
+                # A render from before the size limit: no more FlashVSR on it.
+                raise ValueError(_LARGE_SOURCE_NOTE)
             if scale == 1 and current == 1:
-                raise ValueError(_SOURCE_SIZE_NOTE)
+                raise ValueError(
+                    _LARGE_SOURCE_NOTE if allowed == (1,) else _SOURCE_SIZE_NOTE
+                )
             raw = self.gemini().revise_upscale_params(
                 note=note,
                 prior_scale=current,

@@ -14,7 +14,12 @@ import pytest
 from super_processor.gemini import GeminiClient
 from super_processor.probe import probe_file
 from super_processor.review import WizardServer
-from super_processor.shot_plan import allowed_scales, note_scale, reply_scale
+from super_processor.shot_plan import (
+    allowed_scales,
+    default_scale,
+    note_scale,
+    reply_scale,
+)
 from super_processor.upscale import (
     FakeUpscaleEngine,
     UpscaleError,
@@ -249,7 +254,17 @@ def test_the_gpu_size_comes_from_the_setting_or_nvidia_smi(
 def test_unknown_size_does_not_unlock_4x() -> None:
     assert allowed_scales(0, 0, vram_bytes=GB_32) == (2,)
     assert allowed_scales(854, 480, vram_bytes=GB_32) == (2, 4)
-    assert allowed_scales(1920, 1080, vram_bytes=GB_32) == (2,)
+    assert allowed_scales(1280, 960, vram_bytes=GB_32) == (2,)
+
+
+def test_a_large_source_is_not_offered_flashvsr() -> None:
+    # 2x of 1440x1080 is 2880x2160: past the GPU, many hours in system RAM.
+    for width, height in ((1440, 1080), (1920, 800), (1080, 1920), (1281, 720)):
+        assert allowed_scales(width, height, vram_bytes=GB_32) == ()
+    assert allowed_scales(1280, 720, vram_bytes=GB_32) == (2,)
+    assert default_scale((1, 2, 4)) == 2 and default_scale((1,)) == 1
+    with pytest.raises(ValueError, match="larger than 1280 px"):
+        note_scale("make it 2x", 1, (1,))
 
 
 @needs_ffmpeg
@@ -277,6 +292,31 @@ def test_note_on_dont_upscale_render_cannot_change_the_picture(
     plan = load_upscale_plan(job_dir)
     assert plan is not None and plan.pending is None
     assert {span.scale for span in plan.spans} == {1}
+
+
+@needs_ffmpeg
+def test_note_on_a_2x_render_of_a_source_now_over_the_limit_renders_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, transport, job_dir = _render(
+        tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=2
+    )
+    before = (job_dir / "output.mp4").read_bytes()
+    monkeypatch.setattr("super_processor.shot_plan.MAX_UPSCALE_LONG_EDGE", 100)
+    controller.handle_post("/result", {"note": ["warmer from 1s to 2s"]})
+    state = controller.current_state()
+    assert state.step is WizardStep.RESULT
+    assert state.error is not None and "cannot be upscaled" in state.error
+    assert transport.revise_prompts == []
+    assert (job_dir / "output.mp4").read_bytes() == before
+    # Asking for the size it can have still works: back to the source size.
+    controller.handle_post("/result", {"note": ["make it 1x"]})
+    plan = load_upscale_plan(job_dir)
+    assert plan is not None and {span.scale for span in plan.spans} == {1}
+    controller.run_render()
+    state = controller.current_state()
+    assert state.step is WizardStep.RESULT, state.error
+    assert _size(job_dir / "output.mp4") == (160, 90)
 
 
 @needs_ffmpeg

@@ -174,7 +174,10 @@ preview_segment) per segment → ready_to_render → rendering → result`.
   change in what the restoration needs.
 - **Gemini picks the scale.** With the segments, Gemini returns `scale` (1 =
   don't upscale, 2, or 4) and `scale_reason` for the whole video, from the
-  options code offers; 2 is the default when it gives none. 4x is offered
+  options code offers; 2 is the default when it gives none. A source whose
+  long edge is over 1280 px (`MAX_UPSCALE_LONG_EDGE`) is offered no FlashVSR
+  scale: Gemini is not asked and the plan starts at 1, since its 2x output
+  would not fit the GPU and the system-RAM fallback takes hours. 4x is offered
   only when the source's long edge is 960 px or less and the GPU has at
   least 24 GB (decimal, `MIN_4X_VRAM_BYTES`). GPU memory comes from
   `SUPER_PROCESSOR_GPU_VRAM_GB`, else `nvidia-smi`, else PyTorch if loaded,

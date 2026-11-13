@@ -128,15 +128,19 @@ that is there but missing files is reported, not skipped.
 
 While it proposes segments, Gemini also picks the output size for the whole
 video and says why: 1x (keep the size, no FlashVSR), 2x (the default), or 4x.
-It can only pick from what the code offers. 4x is offered when the source's
-long edge is 960 px or less and the GPU has at least 24 GB (decimal, so a
+It can only pick from what the code offers. A source whose long edge is over
+1280 px keeps its size: FlashVSR is not offered, and Gemini is not asked,
+because 2x of 1440x1080 (2880x2160) does not fit a 32 GB GPU and the
+system-RAM fallback took about 16 hours for a 20-minute film. 4x is offered
+when the source's long edge is 960 px or less and the GPU has at least 24 GB (decimal, so a
 24564 MiB card counts). GPU memory comes from `nvidia-smi`, or from PyTorch if
 it is already loaded; `SUPER_PROCESSOR_GPU_VRAM_GB=24` overrides both (a value
 that is not a number is ignored). With no GPU found, 4x is not offered.
 
 The Segments screen shows Gemini's choice and reason. The Ready screen shows
 the reason while that choice stands and, on a small source, says when the GPU
-is too small for 4x. You can still change the size
+is too small for 4x; on a source over 1280 px it says why the video keeps its
+size. You can still change the size
 there. Segment previews are rendered at no more than 2x, so a 4x job previews
 at 2x, and a 1x job never runs FlashVSR for its previews.
 

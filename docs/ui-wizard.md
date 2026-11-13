@@ -242,7 +242,7 @@ frame count is refused and the previous `output.mp4` is kept.
 | Segments | `POST /segments` (`/api/segments`) | `action=approve`, or `action=note` with `note` to propose again |
 | Analyzing | `GET /analyze?run=1` (`/api/analyze?run=1`) | The current segment only: Gemini proposes its settings, a short preview renders, Gemini checks it |
 | Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one; `action=upscale` with `on=0` or `on=1` overrides Gemini's FlashVSR choice for this segment, which later proposals keep |
-| Ready to render | `POST /ready` (`/api/ready`) | Starts at Gemini's scale and shows its reason. Choose the upscale: `scale=2`, `4` (when the source's long edge is 960 or less and the GPU has at least 24 GB), or `1` ("Don't upscale": same size, clean-up and finishing only, no FlashVSR). `action=render` starts the full render from every approved segment |
+| Ready to render | `POST /ready` (`/api/ready`) | Starts at Gemini's scale and shows its reason; a source over 1280 px on the long edge starts at 1 and says why. Choose the upscale: `scale=2` (when the source's long edge is 1280 or less), `4` (when the source's long edge is 960 or less and the GPU has at least 24 GB), or `1` ("Don't upscale": same size, clean-up and finishing only, no FlashVSR). `action=render` starts the full render from every approved segment |
 | Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, a note that retunes a time range, or a note with `restart=1` that starts over from the segments |
 | Done | `GET /` (state `done`) | Confirmation |
@@ -400,7 +400,11 @@ would invent over); that segment is then resized with lanczos and keeps its
 look. The whole video shares one scale, which Gemini chooses while it
 proposes segments: `scale` 1 ("Don't upscale"), 2, or 4, with a
 `scale_reason`, from the options code offers. Without a valid choice the plan
-starts at 2×. 4× is offered only when the source's long edge is 960 pixels or
+starts at 2×. A source whose long edge is over 1280 pixels
+(`MAX_UPSCALE_LONG_EDGE`) is offered no upscaling: Gemini is not asked, the
+plan starts at 1×, and the Ready screen says why. Its 2× output would not fit
+the GPU, and the system-RAM fallback took about 16 hours for a 20-minute
+1440×1080 film. 4× is offered only when the source's long edge is 960 pixels or
 less and the GPU has at least 24 GB (decimal: `MIN_4X_VRAM_BYTES` is
 24 × 1000³, so a 24564 MiB card counts). GPU memory comes from
 `SUPER_PROCESSOR_GPU_VRAM_GB` (GB; a value that is not a number is ignored),
@@ -515,8 +519,9 @@ A result note becomes a range and knobs.
 {"start_s": 2.0, "end_s": 5.0, "scale": 2, "strength": 0.3}
 ```
 
-`scale` must be one the Ready screen offers for this source (1, 2, and 4 when
-its long edge is 960 or less and the GPU has at least 24 GB) and `strength`
+`scale` must be one the Ready screen offers for this source (1; 2 when its
+long edge is 1280 or less; and 4 when it is 960 or less and the GPU has at
+least 24 GB) and `strength`
 0–1; the range is clamped to the file. The size changes only when the note
 names a multiple as a request ("make it 4x", "go back to 2x", or "4x" alone).
 Code holds that whatever Gemini replies: any other note keeps the current

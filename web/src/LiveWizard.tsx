@@ -6,6 +6,7 @@ import {
   postAction,
   progressTiming,
   scaleChoiceText,
+  sizeNote,
   vramNote,
   runAnalyze,
   runRender,
@@ -625,7 +626,8 @@ function PickStep({
       <p className="lede">
         Choose a video on this computer. Gemini splits it into segments, you
         approve a short before/after preview of each, and then you choose
-        whether to upscale the whole video on your GPU.
+        whether to upscale the whole video on your GPU (videos up to 1280 px
+        on the long edge).
       </p>
       <p className="muted">Up to 1080p and 30 minutes.</p>
       {message ? <Alert text={message} /> : null}
@@ -1156,7 +1158,7 @@ function PreviewStep({
           </button>
         </div>
       </form>
-      {preview.shot ? (
+      {preview.shot && preview.scale !== 1 ? (
         <UpscaleToggle shot={preview.shot} busy={busy} onSend={onSend} />
       ) : null}
       <Back view={view} to={["segments"]} busy={busy} onSend={onSend} />
@@ -1214,7 +1216,7 @@ function ReadyStep({
     <>
       <h1>Ready to render</h1>
       <p className="lede">
-        Every segment is approved. Choose whether to upscale, then render the
+        Every segment is approved. Check the output size, then render the
         whole video with these settings.
       </p>
       {message ? <Alert text={message} /> : null}
@@ -1263,6 +1265,7 @@ function ReadyStep({
           })}
         </fieldset>
       ) : null}
+      {sizeNote(looks) ? <p className="muted">{sizeNote(looks)}</p> : null}
       {vramNote(looks) ? <p className="muted">{vramNote(looks)}</p> : null}
       <div className="actions">
         <button

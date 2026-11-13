@@ -48,6 +48,10 @@ PREVIEW_S = 3.0
 CHECK_STILL_WIDTH = 960
 # 4x only for small sources; on larger ones it is mostly invented detail.
 MAX_4X_LONG_EDGE = 960
+# FlashVSR at all only up to this long edge. 2x of 1440x1080 is 2880x2160,
+# which v1.1 cannot restore in 32 GB; the system-RAM fallback then took about
+# 16 h for a 20-minute film. FlashVSR is built and measured on small sources.
+MAX_UPSCALE_LONG_EDGE = 1280
 # ... and only on a GPU with at least this much memory. Decimal GB, so a card
 # sold as 24 GB (24564 MiB on an RTX 4090) qualifies.
 MIN_4X_VRAM_BYTES = 24 * 1000**3
@@ -274,16 +278,26 @@ _NOTE_SIZE_REQUEST = re.compile(
 
 
 def allowed_scales(width: int, height: int, *, vram_bytes: int) -> tuple[int, ...]:
-    """4x only for a small source on a GPU with at least 24 GB.
+    """The FlashVSR scales for a source: none when it is large, 4x only when
+    it is small and the GPU has at least 24 GB.
 
+    Above ``MAX_UPSCALE_LONG_EDGE`` the output would not fit the GPU, and the
+    system-RAM fallback takes many hours, so the source only keeps its size.
     The long edge must be small enough for 4x to recover detail rather than
     invent it, and the GPU large enough to restore it without spilling into
     system RAM for most of the run. An unknown size or GPU (0) does not
-    qualify: it must not unlock 4x.
+    qualify for 4x; an unknown size still allows 2x.
     """
     long_edge = max(width, height)
+    if long_edge > MAX_UPSCALE_LONG_EDGE:
+        return ()
     small = 0 < long_edge <= MAX_4X_LONG_EDGE
     return (2, 4) if small and vram_bytes >= MIN_4X_VRAM_BYTES else (2,)
+
+
+def default_scale(options: tuple[int, ...]) -> int:
+    """The scale a plan starts at when Gemini gives none it may use."""
+    return DEFAULT_SCALE if DEFAULT_SCALE in options else 1
 
 
 def preview_scale(scale: int) -> int:
@@ -308,6 +322,12 @@ def note_scale(note: str, current: int, allowed: tuple[int, ...]) -> int:
         if match is None or _NOTE_NEGATION.search(clause) is not None:
             continue
         wanted = int(match.group(1) or match.group(2))
+        if wanted not in allowed and allowed == (1,):
+            raise ValueError(
+                f"kept {current}x and rendered nothing: this video is larger "
+                f"than {MAX_UPSCALE_LONG_EDGE} px on its long edge, so it keeps "
+                "its size. Send the note again without the size."
+            )
         if wanted not in allowed:
             choices = ", ".join(f"{scale}x" for scale in allowed)
             raise ValueError(

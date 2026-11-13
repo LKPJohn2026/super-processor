@@ -578,7 +578,8 @@ def render_pick(*, error: str | None = None) -> str:
 <h1>Pick a video file</h1>
 <p class="lede">Choose a video on this computer. Gemini splits it into
 segments, you approve a short before/after preview of each, and then you choose
-whether to upscale the whole video on your GPU.</p>
+whether to upscale the whole video on your GPU (videos up to 1280 px on the
+long edge).</p>
 <p class="muted">Up to 1080p and 30 minutes.</p>
 {err}
 <form method="post" action="/browse">
@@ -933,7 +934,7 @@ or tell me what to change.</p>
 <input type="hidden" name="action" value="approve">
 <button type="submit" class="full">{approve}</button>
 </form>
-{_upscale_toggle(shot)}
+{_upscale_toggle(shot) if scale != 1 else ""}
 <div class="back"><!--back:segments--></div>
 """
     return _page("Segment preview", body, phase="previews")
@@ -975,7 +976,7 @@ def render_ready(view: dict[str, object], *, error: str | None = None) -> str:
         )
     body = f"""
 <h1>Ready to render</h1>
-<p class="lede">Every segment is approved. Choose whether to upscale, then
+<p class="lede">Every segment is approved. Check the output size, then
 render the whole video with these settings.</p>
 {err}
 <ul class="summary">{"".join(rows)}</ul>
@@ -988,6 +989,7 @@ render the whole video with these settings.</p>
 <form method="post" action="/ready">
 <input type="hidden" name="action" value="render">
 {_scale_options(view)}
+{_size_note(view)}
 {_vram_note(view)}
 <button type="submit" class="full">Render the whole video</button>
 </form>
@@ -1015,6 +1017,18 @@ def _scale_choice(scale: object, reason: object) -> str:
     what = "keep the size (no upscaling)" if scale == 1 else f"upscale {scale}×"
     why = f": {escape(str(reason))}" if reason else "."
     return f'<p class="muted">Gemini chose to {what}{why}</p>'
+
+
+def _size_note(view: dict[str, object]) -> str:
+    """Say why a large source is not offered FlashVSR."""
+    limit = _number(view.get("max_upscale_long_edge"))
+    if not view.get("large_source") or not limit:
+        return ""
+    return (
+        '<p class="muted">Upscaling is offered only for videos up to '
+        f"{limit:g} px on the long edge; larger ones would not fit the GPU "
+        "and take many hours. This one keeps its size.</p>"
+    )
 
 
 def _vram_note(view: dict[str, object]) -> str:

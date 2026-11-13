@@ -344,6 +344,59 @@ def test_editor_can_turn_flashvsr_off_for_a_segment(tmp_path: Path) -> None:
 
 
 @needs_ffmpeg
+def test_a_large_source_keeps_its_size_without_asking_gemini(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The 320x180 clip stands in for a source over the long-edge limit.
+    monkeypatch.setattr("super_processor.shot_plan.MAX_UPSCALE_LONG_EDGE", 300)
+    monkeypatch.setattr("super_processor.wizard.MAX_UPSCALE_LONG_EDGE", 300)
+    asked: list[Any] = []
+
+    class _Asking(_Gemini):
+        def propose_segments(self, **kwargs: Any) -> Any:
+            asked.append(kwargs.get("scales"))
+            # What happened on the 1440x1080 film: Gemini answered 2x anyway.
+            segments = super().propose_segments(**kwargs)
+            return {"segments": segments, "scale": 2, "scale_reason": "SD"}
+
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Asking(),  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
+    assert asked == [()]
+    plan = load_plan(job_dir)
+    assert plan is not None and plan.scale == 1
+    view = controller.api_view()["looks"]
+    assert view["scales"] == [1] and view["large_source"] is True
+    page = controller.render()
+    assert "up to 300 px on the long edge" in page
+    assert "Upscale 2×" not in page
+    controller.handle_post("/ready", {"action": ["render"], "scale": ["2"]})
+    assert "pick one of the upscale options" in (controller.current_state().error or "")
+
+
+@needs_ffmpeg
+def test_a_plan_saved_at_2x_before_the_limit_is_brought_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
+    plan = load_plan(job_dir)
+    assert plan is not None and plan.scale == 2
+    # The limit arrives with the job already planned at 2x.
+    monkeypatch.setattr("super_processor.shot_plan.MAX_UPSCALE_LONG_EDGE", 300)
+    monkeypatch.setattr("super_processor.wizard.MAX_UPSCALE_LONG_EDGE", 300)
+    view = controller.api_view()["looks"]
+    assert view["scales"] == [1] and view["scale_reason"] == ""
+    controller.handle_post("/ready", {"action": ["render"]})
+    assert controller.current_state().step is WizardStep.RENDERING
+    upscale = load_upscale_plan(job_dir)
+    assert upscale is not None and {span.scale for span in upscale.spans} == {1}
+
+
+@needs_ffmpeg
 def test_ready_screen_offers_the_upscale_choice(tmp_path: Path) -> None:
     engine = _CountingEngine()
     controller = _controller(tmp_path, engine)
@@ -351,6 +404,7 @@ def test_ready_screen_offers_the_upscale_choice(tmp_path: Path) -> None:
     job_dir = to_ready(controller, clip)
     view = controller.api_view()["looks"]
     assert view["scales"] == [1, 2, 4] and view["source_size"] == [320, 180]
+    assert view["large_source"] is False
     page = controller.render()
     assert "Don't upscale" in page and "Upscale 4×" in page and "1280×720" in page
     assert 'name="scale" value="2" checked' in page

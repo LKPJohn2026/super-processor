@@ -86,6 +86,16 @@ export function scaleChoiceText(scale: number | null | undefined, reason?: strin
   return `Gemini chose to ${what}${reason ? `: ${reason}` : "."}`;
 }
 
+/** Say why a large source is not offered FlashVSR. */
+export function sizeNote(looks: Looks): string {
+  const limit = looks.max_upscale_long_edge;
+  if (!looks.large_source || !limit) return "";
+  return (
+    `Upscaling is offered only for videos up to ${limit} px on the long edge; ` +
+    "larger ones would not fit the GPU and take many hours. This one keeps its size."
+  );
+}
+
 /** Say so when a small source could go to 4× on a larger GPU. */
 export function vramNote(looks: Looks): string {
   const vram = looks.gpu_vram_gb;
@@ -143,6 +153,8 @@ export type Looks = {
   scale_reason?: string;
   gpu_vram_gb?: number;
   small_source?: boolean;
+  large_source?: boolean;
+  max_upscale_long_edge?: number;
 };
 
 export type Navigation = { setup: boolean; file: boolean; segments: boolean };

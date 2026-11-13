@@ -297,4 +297,9 @@ test("scale lines say what Gemini chose and what the GPU allows", async (t) => {
   assert.equal(api.vramNote({ ...looks, gpu_vram_gb: 0 }), "4× needs an NVIDIA GPU with at least 24 GB of memory; none was found.");
   assert.equal(api.vramNote({ ...looks, scales: [1, 2, 4] }), "");
   assert.equal(api.vramNote({ ...looks, small_source: false }), "");
+  assert.equal(api.sizeNote(looks), "");
+  assert.match(
+    api.sizeNote({ ...looks, scales: [1], large_source: true, max_upscale_long_edge: 1280 }),
+    /^Upscaling is offered only for videos up to 1280 px on the long edge; .* This one keeps its size\.$/,
+  );
 });

@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A source whose long edge is over 1280 px is no longer offered FlashVSR.
+  Gemini chose 2x for a 1440x1080 film; its 2880x2160 output did not fit a
+  32 GB GPU, and the system-RAM fallback put the 20-minute render at about
+  16 hours. Such a source now keeps its size (clean-up and finishing only),
+  Gemini is not asked for a scale, and the Ready screen says why. A plan
+  without Gemini's choice starts at 1x there instead of 2x.
 - A result note changes the output size only by naming a multiple, such as
   "make it 4x", and only one the Ready screen offers for the source. A note on a
   "Don't upscale" render used to re-render the whole clip at 2x with FlashVSR,
