@@ -2,14 +2,14 @@
 
 [![CI](https://github.com/LKPJohn2026/super-processor/actions/workflows/ci.yml/badge.svg)](https://github.com/LKPJohn2026/super-processor/actions/workflows/ci.yml)
 
-Local-first AI video restoration: FlashVSR upscaling, with a strength
+Local-first AI video restoration: SPAN 2x upscaling, with a strength
 control for how much new detail it adds.
 
 Super Processor enhances existing footage. A localhost wizard has Gemini watch
 a small, silent copy of the video, split it into segments, and choose the
 output size, then plans each segment in turn with bounded settings and a short
 before/after preview you approve or send back with a note. It runs a local
-FlashVSR restoration upscale (or a plain resize where FlashVSR would only
+SPAN restoration upscale (or a plain resize where the upscaler would only
 harm), then lets you revise a time range with a note. Gemini structured output
 only labels, picks numbers inside fixed bounds, and checks previews. FFmpeg
 detects, measures, trims, splices, and encodes from engineering-owned argument
@@ -26,8 +26,8 @@ lists. Models never write shell commands.
   `hqdn3d`, and `psnr`. `scdet` is used by legacy shot detection, not wizard
   segmentation. `libvmaf` is optional for offline regression.
 - A Gemini API key from [Google AI Studio](https://aistudio.google.com/) for the wizard
-- For the upscale itself: an NVIDIA GPU with CUDA, PyTorch, and a FlashVSR
-  v1.1 checkout with its weights (see [GPU setup](#gpu-setup))
+- For the upscale itself: an NVIDIA GPU with CUDA, PyTorch, spandrel, and the
+  SPAN weights file (see [GPU setup](#gpu-setup))
 
 ## Quick start
 
@@ -42,7 +42,7 @@ super-processor review
 ```
 
 The wizard walks through Gemini setup, file pick (up to 1080p and 30 minutes),
-segment review, a before/after preview of each segment in turn, a FlashVSR
+segment review, a before/after preview of each segment in turn, a SPAN
 upscale on an NVIDIA GPU, and a result screen where a note re-runs one time
 range.
 
@@ -55,94 +55,83 @@ normalization: external CFR conversion may change frames/timing. This is an
 interim safety limit, not VFR support.
 
 Without a GPU, the wizard works up to the Segments screen (the still grid and
-Gemini's segments), and 4x is never offered. The segment previews and the
-upscale need FlashVSR on CUDA.
+Gemini's segments). The segment previews and the upscale need SPAN on CUDA.
 
 ## GPU setup
 
-Install the GPU extra:
+Install the GPU extra (PyTorch and spandrel, which loads the SPAN network):
 
 ```bash
 python -m pip install -e ".[dev,gpu]"
 ```
 
-Clone FlashVSR where the wizard looks for it (`.dogfood/models/FlashVSR`
-under the folder you run from, or set `FLASHVSR_HOME` to another checkout;
-`SUPER_PROCESSOR_MODELS` moves the whole models folder):
+Download the weights, `2xLiveActionV1_SPAN_490000.pth` (about 9 MB), to where
+the wizard looks for them, `.dogfood/models/SPAN/` under the folder you run
+from. The link is pinned to the commit that relicensed them as Apache-2.0
+(see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)):
 
 ```bash
-git clone https://github.com/OpenImagingLab/FlashVSR .dogfood/models/FlashVSR
+mkdir -p .dogfood/models/SPAN
+curl -L -o .dogfood/models/SPAN/2xLiveActionV1_SPAN_490000.pth \
+  https://github.com/jcj83429/upscaling/raw/5d8cdd2e17750b64be39ccab3a8763d91128fe15/2xLiveActionV1_SPAN/2xLiveActionV1_SPAN_490000.pth
+sha256sum .dogfood/models/SPAN/2xLiveActionV1_SPAN_490000.pth
+# 8b166c75831ea7f694d9058ee9c8df8148af8cc1d2b57e69e6581b15cab572f7
 ```
 
-Download the `JunhaoZhuang/FlashVSR-v1.1` weights into
-`.dogfood/models/FlashVSR/examples/WanVSR/FlashVSR-v1.1/`. The wizard needs
-these three files there:
-
-- `diffusion_pytorch_model_streaming_dmd.safetensors`
-- `LQ_proj_in.ckpt`
-- `TCDecoder.ckpt`
-
-Install FlashVSR's own dependencies as its README describes. Then check each
-piece:
+`SUPER_PROCESSOR_SPAN_WEIGHTS=/path/to/file.pth` reads the weights from
+another place; `SUPER_PROCESSOR_MODELS` moves the whole models folder (the
+file is then expected in its `SPAN/` folder). The wizard checks the file's
+sha256 before it loads it and names the expected one if it differs. Then
+check each piece:
 
 ```bash
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"
-python -c "from super_processor.upscale import resolve_flashvsr_weights as r; print(r())"
+python -c "from super_processor.span_sr import resolve_span_weights as r; from super_processor.upscale import models_dir as m; print(r(m()))"
 super-processor doctor
 ffmpeg -hide_banner -filters | grep -E ' (blockdetect|blurdetect|signalstats|hqdn3d|psnr) '
 ```
 
-The first should print `CUDA: True`, the second the weights folder (it raises
-with the missing file names otherwise). Doctor should report required tools
+The first should print `CUDA: True`, the second the weights file (it raises
+with the expected path or hash otherwise). Doctor should report required tools
 ready, and the final command should show all five wizard measurement filters.
 Legacy shot detection additionally needs `scdet`.
 
-### FlashVSR+ (optional)
+SPAN sees one frame at a time and the frames go to the GPU in small batches,
+so GPU memory follows the batch, not the clip: about 4-9 GB for 1440x1080 to
+2880x2160. Each clip streams in one pass: FFmpeg decodes and cleans the
+source, SPAN upscales it on the GPU, and the upscaled frames go straight into
+the delivery encoder through a pipe, so nothing is written to scratch disk.
+On an RTX 5090 a 1440x1080 to 2880x2160 render runs at about 22 frames a
+second end to end, blend and delivery encode included: about 23 minutes for
+a 20-minute 1080p film, and about 8 minutes or less for a 20-minute SD film.
+It uses 0.43 CPU-seconds per 1080p frame, about a third of a 32-thread CPU on
+average (an earlier chunked pipeline used 1.21, ran a 16-core CPU at its
+95 C limit, and wrote about 63 GB of lossless 4K work files for a full-length
+1080p film). If the GPU runs out of memory, the upscale retries with smaller
+batches, down to one frame, and then stops with advice to close other GPU
+programs.
 
-`SUPER_PROCESSOR_FLASHVSR=plus` restores with
-[FlashVSR+](https://github.com/OpenImagingLab/FlashVSR_Plus) turbo instead
-of v1.1 (the default). It uses about 60% less GPU memory: 4x of 854x480 fits
-in 32 GB, where v1.1 needs the system-RAM fallback (about 90 s against 274 s
-for a 4 s clip on an RTX 5090). At 2x it is slower, about 31 s against 17 s
-per 4 s clip. Against their sources, its pictures were closer and flickered
-less on all four test clips, with colour correction on, as it is here.
+### Why SPAN and not FlashVSR
 
-Clone it to `.dogfood/models/FlashVSR_Plus` (or set `FLASHVSR_PLUS_HOME`),
-install its requirements, and download `turbo/` and `TCDecoder.ckpt` from
-`ruchangyao/FlashVSR_plus` into its `ckpts` folder:
-
-```bash
-git clone https://github.com/OpenImagingLab/FlashVSR_Plus .dogfood/models/FlashVSR_Plus
-python -c "from super_processor.upscale import resolve_flashvsr_plus as r; print(r())"
-```
-
-The check names any missing file. Unset the variable to go back to v1.1.
-
-`SUPER_PROCESSOR_FLASHVSR=auto` picks per clip: FlashVSR+ at 4x, where it
-avoids the system-RAM fallback, and v1.1 at 2x, where the wizard's blended
-strengths left the two pictures the same and v1.1 rendered a trailer in 257 s
-against 403 s. With only one checkout folder present, `auto` uses that one; a checkout
-that is there but missing files is reported, not skipped.
+Up to 3.7.0 the upscaler was FlashVSR v1.1 (or FlashVSR+). A bake-off on an
+RTX 5090 found that FlashVSR's output, blended at strength 0.5 as the wizard
+uses it, was almost the same as plain SPAN 2x on SD footage (consistency 41.9
+against 41.5 dB, detail 32.1 against 32.6, added shimmer +0.04 against +0.07),
+but it took 97 minutes against 3 minutes for a 20-minute film and 26 GB
+against 2 GB of GPU memory. On 1440x1080, FlashVSR did not fit a 32 GB GPU at
+all, which is why it was limited to sources up to 1280 px. Recent jobs used
+strength 0.5 or less for 85% of segments, never above 0.7, and never 4x. SPAN
+replaced it outright, with 4x and the system-RAM fallback.
 
 ### Output size
 
 While it proposes segments, Gemini also picks the output size for the whole
-video and says why: 1x (keep the size, no FlashVSR), 2x (the default), or 4x.
-It can only pick from what the code offers. A source whose long edge is over
-1280 px keeps its size: FlashVSR is not offered, and Gemini is not asked,
-because 2x of 1440x1080 (2880x2160) does not fit a 32 GB GPU and the
-system-RAM fallback took about 16 hours for a 20-minute film. 4x is offered
-when the source's long edge is 960 px or less and the GPU has at least 24 GB (decimal, so a
-24564 MiB card counts). GPU memory comes from `nvidia-smi`, or from PyTorch if
-it is already loaded; `SUPER_PROCESSOR_GPU_VRAM_GB=24` overrides both (a value
-that is not a number is ignored). With no GPU found, 4x is not offered.
-
-The Segments screen shows Gemini's choice and reason. The Ready screen shows
-the reason while that choice stands and, on a small source, says when the GPU
-is too small for 4x; on a source over 1280 px it says why the video keeps its
-size. You can still change the size
-there. Segment previews are rendered at no more than 2x, so a 4x job previews
-at 2x, and a 1x job never runs FlashVSR for its previews.
+video and says why: 1x (keep the size, no upscaling) or 2x (the default). Both
+are offered for every source the wizard accepts (up to 1080p). The Segments
+screen shows Gemini's choice and reason, and the Ready screen shows the reason
+while that choice stands; you can still change the size there. Segment
+previews render at the plan's scale, and a 1x job never runs SPAN for its
+previews.
 
 ### Progress and time left
 
@@ -151,9 +140,9 @@ the running step: its percentage, what it is doing, and "about X left", or
 "X so far" while Gemini is thinking. Segmenting is the first 8% of the job,
 the previews the next 30% (split evenly per segment), and the render the
 rest; a render from a result note counts 0–100% on its own. The time left
-ignores time before the step's first report, such as loading FlashVSR, and
+ignores time before the step's first report, such as loading SPAN, and
 follows both the step's average speed and its recent speed. In the render,
-a FlashVSR frame counts far more than a frame that is only resized.
+an upscaled frame counts more than a frame that is only resized.
 
 ## Testing on your own footage
 

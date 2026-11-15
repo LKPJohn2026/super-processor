@@ -58,7 +58,7 @@ class StepClock:
     """Estimate one worker step's time left from its fractions over time.
 
     The first report is only a starting point: the time before it (loading
-    FlashVSR, uploading) says nothing about how fast frames go. After that,
+    SPAN, uploading) says nothing about how fast frames go. After that,
     the rate is a blend of the step's average rate and a recent one that
     follows changes (a heavier segment, the GPU throttling), so the estimate
     neither jumps on one slow chunk nor ignores a lasting change.

@@ -26,6 +26,7 @@ from .gemini import (
     resolve_gemini_api_key,
     store_gemini_api_key,
 )
+from .gpu_heat import GpuHeat, SlowdownWatch, read_gpu_heat
 from .jobs import JobError, JobState, JobStore
 from .look import LOOK_BOUNDS
 from .probe import MediaFacts, ProbeError, probe_file
@@ -49,12 +50,10 @@ from .segment_loop import (
 from .segments import MAX_DURATION_S
 from .shot_plan import (
     CHECK_PROBLEMS,
-    MAX_4X_LONG_EDGE,
-    MAX_UPSCALE_LONG_EDGE,
     PROTECTED_STRENGTH,
+    UPSCALE_SCALES,
     ShotPlan,
     ShotPlanError,
-    allowed_scales,
     apply_checks,
     apply_proposals,
     apply_regions,
@@ -90,16 +89,16 @@ from .shots import (
 from .stability import StabilityError, find_seams, seam_candidates
 from .upscale import (
     UPSCALE_PLAN_FILE,
-    FlashVsrEngine,
+    SpanEngine,
     UpscaleEngine,
     UpscaleError,
     UpscalePlan,
     UpscaleSpan,
     _ffprobe_for,
     default_span,
-    gpu_vram_bytes,
     load_upscale_plan,
     render_plan,
+    rendered_scale,
     replace_overlapping,
     require_supported_timing,
     save_upscale_plan,
@@ -124,7 +123,7 @@ from .wizard_pages import (
 
 WIZARD_STATE_FILE = "wizard_state.json"
 WIZARD_SCHEMA_VERSION = 3
-# Inputs are limited to 1080p (either orientation) and 30 minutes. FlashVSR
+# Inputs are limited to 1080p (either orientation) and 30 minutes. SPAN
 # at 2x already makes 4K from 1080p; larger inputs exceed what one GPU pass
 # and the job directory are sized for.
 MAX_INPUT_LONG_EDGE = 1920
@@ -134,6 +133,8 @@ GEMINI_VIDEO_FILE = "gemini_video.json"
 # A render's time left is saved at least this often, so the page's estimate
 # stays fresh between whole-percent steps.
 _PROGRESS_SAVE_S = 5.0
+# How often a render reads the GPU's heat (see super_processor.gpu_heat).
+HEAT_SAMPLE_S = 10.0
 
 
 class WizardError(RuntimeError):
@@ -386,14 +387,12 @@ def load_render_report(job_dir: Path) -> dict[str, Any]:
 # The plan a result note replaced, until its render shows the output holds it.
 _PLAN_BEFORE_NOTE = "upscale_plan_before_note.json"
 _SOURCE_SIZE_NOTE = (
-    "this render keeps the source size with FlashVSR off, so a note cannot "
+    "this render keeps the source size with upscaling off, so a note cannot "
     'change the picture. Say "make it 2x" to upscale it, or start over.'
 )
-_LARGE_SOURCE_NOTE = (
-    "this render keeps the source size with FlashVSR off, so a note cannot "
-    f"change the picture, and a video over {MAX_UPSCALE_LONG_EDGE} px on its "
-    "long edge cannot be upscaled. Start over to change the segment settings."
-)
+# 1 (do not upscale) and the upscale multiples. Every source the wizard takes
+# may use them all, so the size of the source no longer matters here.
+SCALE_OPTIONS = (1, *UPSCALE_SCALES)
 
 
 def _output_url(job_dir: Path) -> str | None:
@@ -410,37 +409,43 @@ def _output_url(job_dir: Path) -> str | None:
     return f"/output.mp4?v={version}"
 
 
-def _active_knobs(job_dir: Path) -> tuple[int | None, float | None, str | None]:
+def _active_knobs(
+    job_dir: Path, source: Path
+) -> tuple[int | None, float | None, str | None]:
     """Scale, the latest span's strength (the JSON API's ``strength``), and a
     summary of every span for the Result line."""
     plan = load_upscale_plan(job_dir)
     if plan is None or not plan.spans:
         return None, None, None
     span = plan.pending or plan.spans[-1]
+    # The scale output.mp4 has: a job rendered at 4x before 4x was retired
+    # loads its plan at 2x, but the file is still 4x until it renders again.
+    output = job_dir / "output.mp4"
+    shown = rendered_scale(source, output) if output.is_file() else None
     # The summary reads the spans alone: they are what the output holds, and a
     # pending span never reached it.
-    return span.scale, span.strength, strength_summary(plan.spans)
+    return shown or span.scale, span.strength, strength_summary(plan.spans)
 
 
 def strength_summary(spans: tuple[UpscaleSpan, ...]) -> str:
     """Describe the strength of a whole render for the Result line.
 
     Each segment has its own recipe, so one span's strength misdescribes the
-    rest. Spans with ``use_upscale`` False skip FlashVSR, so their strength
+    rest. Spans with ``use_upscale`` False skip SPAN, so their strength
     does not apply to the picture, and neither does it at scale 1.
     """
     if all(span.scale == 1 for span in spans):
-        return "FlashVSR off"
+        return "upscaling off"
     restored = sorted({round(span.strength, 2) for span in spans if span.use_upscale})
     if not restored:
-        return "FlashVSR off"
+        return "upscaling off"
     low, high = restored[0], restored[-1]
     summary = f"strength {low:.2f}" if low == high else f"strength {low:.2f}–{high:.2f}"
     # Seconds, not a count: a range revision splits spans, so spans are not
     # segments.
     skipped = sum(span.end_s - span.start_s for span in spans if not span.use_upscale)
     if skipped:
-        summary += f" · FlashVSR off for {skipped:.1f} s"
+        summary += f" · upscaling off for {skipped:.1f} s"
     return summary
 
 
@@ -500,6 +505,10 @@ class WizardController:
         self._clock_task = ""
         self._step_started = 0.0
         self._revising = False
+        # Shown under the render's progress once the render slows down while
+        # the GPU runs hot; tests replace the reader.
+        self._heat_note: str | None = None
+        self.read_gpu_heat: Callable[[], GpuHeat | None] = read_gpu_heat
 
     def gemini(self) -> GeminiClient:
         if self._gemini is None:
@@ -508,7 +517,7 @@ class WizardController:
 
     def upscale_engine(self) -> UpscaleEngine:
         if self._upscale is None:
-            self._upscale = FlashVsrEngine()
+            self._upscale = SpanEngine()
         return self._upscale
 
     def current_state(self) -> WizardState:
@@ -638,6 +647,8 @@ class WizardController:
             "elapsed_s": round(max(0.0, now - self._step_started), 1),
             "updated_at": round(now, 3),
         }
+        if self._heat_note:
+            state.progress["note"] = self._heat_note
         self._save(state)
 
     def _segment_count(self, state: WizardState) -> int:
@@ -775,7 +786,9 @@ class WizardController:
         if state.step is WizardStep.RESULT:
             assert state.job_id
             job_dir = self.store.job_dir(state.job_id)
-            scale, _strength, summary = _active_knobs(job_dir)
+            scale, _strength, summary = _active_knobs(
+                job_dir, Path(self.store.load(state.job_id).source_path)
+            )
             report = load_render_report(job_dir)
             return render_result(
                 output_url=_output_url(job_dir) or "/output.mp4",
@@ -804,7 +817,9 @@ class WizardController:
             output_url = _output_url(job_dir)
             output_ready = output_url is not None
             if state.step is WizardStep.RESULT:
-                scale, strength, summary = _active_knobs(job_dir)
+                scale, strength, summary = _active_knobs(
+                    job_dir, Path(self.store.load(state.job_id).source_path)
+                )
                 report = load_render_report(job_dir)
                 seams, seam_error = report["seams"], report["error"]
         looks: dict[str, Any] | None = None
@@ -1110,7 +1125,7 @@ class WizardController:
     def _locate(
         self, shots: ShotList, source: Path, job_dir: Path, warnings: list[str]
     ) -> ShotList:
-        """Box faces, hands, and text so the blend can hold FlashVSR down there."""
+        """Box faces, hands, and text so the blend can hold SPAN down there."""
         targets = locate_targets(shots)
         if not targets:
             return shots
@@ -1317,7 +1332,6 @@ class WizardController:
             return
         assert state.job_id
         video = self._gemini_video(state, job_dir, source, "proposing", 25, 75)
-        scales = self._scale_options(state.job_id)
         self._progress(
             state,
             "proposing",
@@ -1336,8 +1350,7 @@ class WizardController:
             "max_segments": MAX_LOOP_SEGMENTS,
             "min_segment_s": MIN_LOOP_SEGMENT_S,
             "job_dir": job_dir,
-            # Only a real choice is asked: a large source keeps its size.
-            "scales": scales if len(scales) > 1 else (),
+            "scales": SCALE_OPTIONS,
             "source_size": self._source_size(state.job_id),
         }
         stills_ask: dict[str, Any] = {
@@ -1365,7 +1378,7 @@ class WizardController:
             # Test doubles may still answer with the bare segment list.
             found = raw if isinstance(raw, list) else raw.get("segments", [])
             if isinstance(raw, dict):
-                scale = raw.get("scale") if raw.get("scale") in scales else None
+                scale = raw.get("scale") if raw.get("scale") in SCALE_OPTIONS else None
                 reason = str(raw.get("scale_reason") or "") if scale else ""
             segments = repair_coverage(found, duration)
         except (GeminiError, SegmentLoopError) as exc:
@@ -1599,11 +1612,11 @@ class WizardController:
                 self._analyze_failed(state, str(exc))
                 return
             save_shots(job_dir, shots)
-            options = self._scale_options(state.job_id)
+            options = SCALE_OPTIONS
             scale = found.scale if found.scale in options else default_scale(options)
             plan = new_plan(shots, scale)
             save_plan(job_dir, plan)
-        self._fit_plan_scale(state.job_id, job_dir, plan)
+        self._fit_plan_scale(job_dir, plan)
         index = state.segment_index
         if index >= len(plan.recipes):
             state.step = WizardStep.READY_TO_RENDER
@@ -1701,13 +1714,13 @@ class WizardController:
             return
         raw = fields.get("scale", [""])[0]
         if raw:
-            if not raw.isdigit() or int(raw) not in self._scale_options(state.job_id):
+            if not raw.isdigit() or int(raw) not in SCALE_OPTIONS:
                 state.error = "pick one of the upscale options shown"
                 self._save(state)
                 return
             plan.scale = int(raw)
             save_plan(job_dir, plan)
-        self._fit_plan_scale(state.job_id, job_dir, plan)
+        self._fit_plan_scale(job_dir, plan)
         try:
             save_upscale_plan(job_dir, plan.to_upscale_plan(shots))
             state.step = WizardStep.RENDERING
@@ -1723,30 +1736,21 @@ class WizardController:
             return 0, 0
         return ((video.width or 0), (video.height or 0)) if video else (0, 0)
 
-    def _fit_plan_scale(self, job_id: str, job_dir: Path, plan: ShotPlan) -> None:
-        """Bring a saved plan back inside this source's options.
+    def _fit_plan_scale(self, job_dir: Path, plan: ShotPlan) -> None:
+        """Bring a saved plan back inside the scale options.
 
-        A plan saved before a limit changed, such as 2x for a source now over
-        ``MAX_UPSCALE_LONG_EDGE``, must not reach FlashVSR in previews or the
-        render.
+        A plan saved at 4x, before 4x was removed, renders at 2x.
         """
-        options = self._scale_options(job_id)
-        if plan.scale not in options:
-            plan.scale = default_scale(options)
+        if plan.scale not in SCALE_OPTIONS:
+            plan.scale = default_scale(SCALE_OPTIONS)
             save_plan(job_dir, plan)
-
-    def _scale_options(self, job_id: str) -> tuple[int, ...]:
-        """1 (do not upscale) and the scales this source allows."""
-        width, height = self._source_size(job_id)
-        return (1, *allowed_scales(width, height, vram_bytes=gpu_vram_bytes()))
 
     def _ready_view(self, job_dir: Path, job_id: str) -> dict[str, Any]:
         view = self._looks_view(job_dir)
         width, height = self._source_size(job_id)
         view["source_size"] = [width, height]
-        view["scales"] = list(self._scale_options(job_id))
-        # Why the scale is what it is: Gemini's reason while its choice
-        # stands, and whether the GPU is what keeps 4x off the list.
+        view["scales"] = list(SCALE_OPTIONS)
+        # Why the scale is what it is: Gemini's reason while its choice stands.
         try:
             found = load_segment_list(job_dir)
         except SegmentLoopError:
@@ -1757,10 +1761,6 @@ class WizardController:
             and found.scale in view["scales"]
         )
         view["scale_reason"] = found.scale_reason if found and chose else ""
-        view["gpu_vram_gb"] = round(gpu_vram_bytes() / 1000**3, 1)
-        view["small_source"] = 0 < max(width, height) <= MAX_4X_LONG_EDGE
-        view["large_source"] = max(width, height) > MAX_UPSCALE_LONG_EDGE
-        view["max_upscale_long_edge"] = MAX_UPSCALE_LONG_EDGE
         return view
 
     def _result_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
@@ -1794,23 +1794,10 @@ class WizardController:
             )
             prior = plan.latest_revision or plan.spans[-1]
             current = prior.scale
-            video = facts.primary_video()
-            allowed = (
-                1,
-                *allowed_scales(
-                    (video.width or 0) if video else 0,
-                    (video.height or 0) if video else 0,
-                    vram_bytes=gpu_vram_bytes(),
-                ),
-            )
+            allowed = SCALE_OPTIONS
             scale = note_scale(note, current, allowed)
-            if scale not in allowed and allowed == (1,):
-                # A render from before the size limit: no more FlashVSR on it.
-                raise ValueError(_LARGE_SOURCE_NOTE)
             if scale == 1 and current == 1:
-                raise ValueError(
-                    _LARGE_SOURCE_NOTE if allowed == (1,) else _SOURCE_SIZE_NOTE
-                )
+                raise ValueError(_SOURCE_SIZE_NOTE)
             raw = self.gemini().revise_upscale_params(
                 note=note,
                 prior_scale=current,
@@ -1896,6 +1883,16 @@ class WizardController:
         # job re-planned from the segments renders as part of the whole job.
         self._revising = (job_dir / _PLAN_BEFORE_NOTE).is_file()
         self._progress(state, "rendering", 5, "Upscaling on the GPU")
+        self._heat_note = None
+        watch = SlowdownWatch()
+        sampled = threading.Event()
+        sampler = threading.Thread(
+            target=self._sample_heat,
+            args=(watch, sampled),
+            name="gpu-heat",
+            daemon=True,
+        )
+        sampler.start()
         try:
             facts = probe_file(source)
             duration = float(facts.duration_s or 0.0)
@@ -1911,7 +1908,7 @@ class WizardController:
                 engine=self.upscale_engine(),
                 ffmpeg_bin=self.ffmpeg_bin,
                 duration_s=duration,
-                on_progress=self._render_progress(state),
+                on_progress=self._watched(watch, self._render_progress(state)),
                 on_revise_range=lambda start, end: revised_ranges.append((start, end)),
             )
             # The output now holds this plan, so a later failure must keep it.
@@ -1939,4 +1936,28 @@ class WizardController:
         except (UpscaleError, ProbeError, OSError, ValueError) as exc:
             self._render_failed(state, str(exc))
             return
+        finally:
+            sampled.set()
+            sampler.join()
+            self._heat_note = None
         self._save(state)
+
+    def _sample_heat(self, watch: SlowdownWatch, stop: threading.Event) -> None:
+        """Read the GPU's heat into ``watch`` until the render ends."""
+        while not stop.wait(HEAT_SAMPLE_S):
+            watch.heat(self.read_gpu_heat())
+
+    def _watched(
+        self, watch: SlowdownWatch, report: Callable[[float], None]
+    ) -> Callable[[float], None]:
+        """``report``, also feeding the render's speed to ``watch`` and
+        showing its note when it has one."""
+
+        def tracked(done: float) -> None:
+            watch.progress(time.time(), done)
+            note = watch.note()
+            if note is not None:
+                self._heat_note = note
+            report(done)
+
+        return tracked

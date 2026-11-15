@@ -307,17 +307,18 @@ class SegmentList:
             raise SegmentLoopError("the segment list is missing")
         error = data.get("error")
         scale = data.get("scale")
+        # Lists saved while 4x existed may name it, with Gemini's reason for
+        # 4x; both are dropped, so the plan's default 2x applies.
+        chosen = (
+            isinstance(scale, int) and not isinstance(scale, bool) and scale in (1, 2)
+        )
         return cls(
             segments=[LoopSegment.from_dict(item) for item in raw],
             approved=bool(data.get("approved", False)),
             error=error if isinstance(error, str) else None,
             note=str(data.get("note", "")),
-            scale=scale
-            if isinstance(scale, int)
-            and not isinstance(scale, bool)
-            and scale in (1, 2, 4)
-            else None,
-            scale_reason=str(data.get("scale_reason") or ""),
+            scale=scale if chosen else None,
+            scale_reason=str(data.get("scale_reason") or "") if chosen else "",
         )
 
 

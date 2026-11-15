@@ -104,8 +104,8 @@ def test_revise_keeps_each_shots_look() -> None:
         (10.0, 20.0, CLEANED),
         (4.0, 6.0, BRIGHT),
     ]
-    rescaled = replace_overlapping(plan, UpscaleSpan(4, 6, scale=4), 20)
-    assert {s.scale for s in rescaled.spans} == {4}
+    rescaled = replace_overlapping(plan, UpscaleSpan(4, 6, scale=1), 20)
+    assert {s.scale for s in rescaled.spans} == {1}
     assert look_at(rescaled, 15) == CLEANED
 
 
@@ -117,7 +117,7 @@ def test_shot_timeline_checks_coverage() -> None:
     with pytest.raises(UpscaleError, match="before the end"):
         shot_timeline((UpscaleSpan(0, 4),), 10)
     with pytest.raises(UpscaleError, match="same scale"):
-        shot_timeline((UpscaleSpan(0, 5), UpscaleSpan(5, 10, scale=4)), 10)
+        shot_timeline((UpscaleSpan(0, 5), UpscaleSpan(5, 10, scale=1)), 10)
     with pytest.raises(UpscaleError, match="no shots"):
         shot_timeline((), 10)
 
@@ -236,12 +236,12 @@ def test_render_plan_splices_a_range_and_rerenders_on_a_new_scale(
     assert len(lumas) == 40
     assert lumas[15] - lumas[0] >= 15
     assert abs(lumas[35] - lumas[0]) <= 3
-    plan = replace_overlapping(plan, UpscaleSpan(3, 4, scale=4), 4)
+    plan = replace_overlapping(plan, UpscaleSpan(3, 4, scale=1), 4)
     assert plan.pending is not None and plan.pending.start_s == 0.0
     render_plan(source, output, plan, engine=engine, duration_s=4)
     lumas = _frame_lumas(output)
     assert len(lumas) == 40
-    # The whole clip re-rendered at 4x, and the bright shot kept its look.
+    # The whole clip re-rendered at 1x, and the bright shot kept its look.
     assert lumas[15] - lumas[0] >= 15
 
 

@@ -1,14 +1,14 @@
-"""Local FlashVSR restoration upscale.
+"""Local SPAN upscale.
 
 FFmpeg probes, trims, concatenates, and copies audio. Each span (a shot) also
 carries a :class:`~super_processor.look.ShotLook`: bounded FFmpeg clean-up
-before FlashVSR and finishing after it, always in that order. Gemini may only
+before SPAN and finishing after it, always in that order. Gemini may only
 return a time range plus ``scale`` and ``strength``.
 Shapes, colour, and layout always come from a plain lanczos upscale of the
-same (cleaned) frames; ``strength`` is how much of FlashVSR's fine detail is
-added on top, so 0.0 invents nothing and 1.0 adds all of it. Inside protected
-regions (faces, hands, text) the share is lower. FlashVSR itself always runs
-at its upstream settings.
+same (cleaned) frames; ``strength`` is how much of SPAN's fine detail is
+added on top, so 0.0 adds nothing and 1.0 adds all of it. Inside protected
+regions (faces, hands, text) the share is lower. SPAN itself has no settings
+(see :mod:`super_processor.span_sr`).
 The real engine refuses to run without CUDA; tests use :class:`FakeUpscaleEngine`.
 
 Work clips handed to the engine are encoded losslessly. The engine output is
@@ -21,19 +21,18 @@ from __future__ import annotations
 
 import contextlib
 import importlib
-import importlib.util
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
 import threading
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Protocol
+from typing import IO, Any, Protocol
 
 from .look import LookError, ShotLook
 from .regions import Region, regions_from_dicts, strength_expr
@@ -41,55 +40,41 @@ from .regions import Region, regions_from_dicts, strength_expr
 UPSCALE_PLAN_FILE = "upscale_plan.json"
 CHUNK_SECONDS = 8.0
 CHUNK_OVERLAP_S = 0.5
-DELIVERY_VERSION = 1
+# 2: the "faster" x264 preset. Outputs from version 1 ("medium") are not
+# spliced into: a revise renders them again whole (see apply_range_revise).
+DELIVERY_VERSION = 2
+# On a 1440x1080 -> 2880x2160 clip, "faster" was within 0.15 dB PSNR and
+# 0.0001 SSIM of "medium" against the lossless upscale (44.29 against 44.44
+# dB, 1% smaller) for 57% less encoder CPU (51 against 118 CPU-seconds for
+# 200 frames). The encode was half the CPU of a SPAN render, which ran a
+# 16-core CPU at its 95 C limit.
+DELIVERY_PRESET = "faster"
 DELIVERY_CRF = 16
 KEYFRAME_INTERVAL_S = 1.0
 _KEY_EPSILON_S = 0.02
-# FlashVSR works in fixed-size frame blocks and may pad or drop a few frames
-# at the end of a clip. Up to this many (or 2% of the clip) are conformed back
-# to the source count; more than that means the clip is misaligned.
+# An engine may return a frame or two more or fewer than it was given (a
+# decoder that drops a damaged frame, a stand-in engine). Up to this many (or
+# 2% of the clip) are conformed back to the source count (the last frame
+# repeated, or the surplus dropped); more than that, either way, means the
+# clip is misaligned and is refused.
 FRAME_SLACK = 8
 # Shapes, colour, and layout come from the plain upscale of the source; only
 # detail finer than this (a Gaussian sigma, in source pixels) comes from
-# FlashVSR. FlashVSR can sharpen what is there but cannot move, reshape, or
+# SPAN. SPAN can sharpen what is there but cannot move, reshape, or
 # recolour it.
 STRUCTURE_SIGMA = 1.5
 # 1 is "do not upscale": the clip keeps its size, goes through clean-up and
-# finishing, and never reaches FlashVSR (see :func:`restore_clip`).
-_SCALES = frozenset({1, 2, 4})
-# The upstream script is imported with a chdir into its folder, which is
-# process-wide. Only one FlashVSR load or inference may run at a time.
-_FLASHVSR_LOCK = threading.Lock()
-_WEIGHT_FILES = (
-    "diffusion_pytorch_model_streaming_dmd.safetensors",
-    "LQ_proj_in.ckpt",
-    "TCDecoder.ckpt",
+# finishing, and never reaches SPAN (see :func:`restore_clip`). SPAN only
+# does 2x.
+_SCALES = frozenset({1, 2})
+# Plans saved while 4x existed still name it; they render at 2x.
+_RETIRED_SCALES = {4: 2}
+# One model load or upscale at a time: two wizard threads (a preview and a
+# render) would otherwise share the GPU's memory between two copies.
+_GPU_LOCK = threading.Lock()
+_GPU_ADVICE = (
+    "Close other programs that use the GPU (games, other AI tools) and try again."
 )
-# Which FlashVSR restores: "v1.1" (the default, the tiny script), "plus"
-# (FlashVSR+ turbo: about 60% less GPU memory, and 4x of 854x480 fits in
-# 32 GB without the system-RAM fallback), or "auto" (each clip by its scale).
-FLASHVSR_MODEL_ENV = "SUPER_PROCESSOR_FLASHVSR"
-FLASHVSR_MODELS = ("v1.1", "plus", "auto")
-# "auto" restores this scale and up with FlashVSR+. At 2x, replaying a
-# trailer plan gave the same picture (47.8 dB between the two) in 1.57x the
-# time; at 4x v1.1 needed system RAM (274 s against 90 s per 4 s clip).
-AUTO_PLUS_FROM_SCALE = 4
-# FlashVSR+ preset and the files it reads under its checkout.
-PLUS_MODE = "turbo"
-# Its wavelet colour correction, like v1.1's color_fix. Off, a face clip
-# fell from 41.4 to 35.1 dB against its source and flickered 14x as much,
-# for 12 s saved per 4 s clip at 2x.
-PLUS_COLOR_CORRECTION = True
-_PLUS_FILES = (
-    "flashvsr_plus/__init__.py",
-    "inference/presets.py",
-    "prompt_tensor/posi_prompt.pth",
-    "ckpts/TCDecoder.ckpt",
-    f"ckpts/{PLUS_MODE}/dit.safetensors",
-    f"ckpts/{PLUS_MODE}/lq_proj_in.safetensors",
-)
-# FlashVSR+ imports these generic top-level packages from its checkout.
-_PLUS_PACKAGES = ("flashvsr_plus", "inference", "models", "model_io")
 
 
 ProgressFn = Callable[[float], None]
@@ -124,42 +109,47 @@ def require_supported_timing(source: Path, *, ffmpeg_bin: str = "ffmpeg") -> Non
 
 
 class GpuOutOfMemory(UpscaleError):
-    """FlashVSR ran out of GPU memory; a shorter piece may still fit."""
+    """SPAN ran out of GPU memory, even one frame at a time."""
 
 
-# FlashVSR's working memory grows with the frames in one call: at 2x of
-# 854x480, 16 frames peak at 15.5 GiB and 24 at 16.9 GiB, against 3.4 GiB of
-# weights. When a clip does not fit (another program holds GPU memory), it is
-# retried in pieces of half the length, down to this many frames; finished
-# pieces go to disk, so memory follows the piece, not the clip.
-FLASHVSR_MIN_CHUNK_FRAMES = 17
+def _gpu_out_of_memory(exc: BaseException) -> bool:
+    """True for PyTorch's CUDA out-of-memory error, by name or by text."""
+    return (
+        type(exc).__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower()
+    )
 
 
-def _flashvsr_failure(exc: BaseException) -> UpscaleError:
-    """The error to raise for a failed FlashVSR call, holding no GPU memory.
+def _forget_frames(exc: BaseException) -> None:
+    """Drop the locals ``exc``'s traceback keeps alive (tensors, the model).
 
-    The traceback keeps every frame's locals alive, and with them the input
-    and output tensors and the pipeline. Releasing the GPU while it exists
-    frees nothing, and an error raised ``from`` it keeps it after that: a
-    failed preview held 13 GiB until the server restarted. So the frames are
-    cleared and the new error does not chain to it.
+    Releasing the GPU while they exist frees nothing: a failed preview once
+    held 13 GiB until the server restarted.
     """
     import traceback
 
-    # The system-RAM allocator refuses past its limit with std::bad_alloc.
-    # FlashVSR+ keeps whole clips in host memory, and torch's CPU allocator
-    # refuses with "can't allocate memory ... (Cannot allocate memory)".
-    signs = ("out of memory", "bad_alloc", "can't allocate memory")
-    out_of_memory = isinstance(exc, MemoryError) or (
-        type(exc).__name__ == "OutOfMemoryError"
-        or any(sign in str(exc).lower() for sign in signs)
-    )
-    text = str(exc).splitlines()[0] if str(exc) else repr(exc)
-    message = str(exc) if isinstance(exc, UpscaleError) else f"FlashVSR failed: {text}"
     traceback.clear_frames(exc.__traceback__)
     exc.__traceback__ = None
-    if out_of_memory and not isinstance(exc, GpuOutOfMemory):
-        return GpuOutOfMemory(message)
+
+
+def _upscale_failure(exc: BaseException) -> UpscaleError:
+    """The error to raise for a failed upscale call, holding no GPU memory.
+
+    The traceback's frames are cleared (see :func:`_forget_frames`), and the
+    new error does not chain to the old one, which would keep them.
+    """
+    text = str(exc).splitlines()[0] if str(exc) else repr(exc)
+    if isinstance(exc, UpscaleError):
+        message = str(exc)
+    elif isinstance(exc, MemoryError) or "can't allocate memory" in text.lower():
+        # torch's CPU allocator says "can't allocate memory": the chunk's
+        # frames did not fit in system RAM, which a smaller batch cannot fix.
+        message = f"the upscale ran out of system memory: {text}"
+    else:
+        message = f"SPAN failed: {text}"
+    gpu = _gpu_out_of_memory(exc)
+    _forget_frames(exc)
+    if gpu and not isinstance(exc, GpuOutOfMemory):
+        return GpuOutOfMemory(f"{message}. {_GPU_ADVICE}")
     return exc if isinstance(exc, UpscaleError) else UpscaleError(message)
 
 
@@ -174,7 +164,7 @@ class UpscaleSpan:
     source: str = "original"
     look: ShotLook = field(default_factory=ShotLook)
     regions: tuple[Region, ...] = ()
-    # False: skip FlashVSR and only resize this span (see :func:`restore_clip`).
+    # False: skip SPAN and only resize this span (see :func:`restore_clip`).
     use_upscale: bool = True
 
     def __post_init__(self) -> None:
@@ -212,10 +202,11 @@ class UpscaleSpan:
         except LookError as exc:
             raise UpscaleError(f"invalid shot look: {exc}") from exc
         try:
+            scale = int(data.get("scale", 2))
             return cls(
                 start_s=float(data["start_s"]),
                 end_s=float(data["end_s"]),
-                scale=int(data.get("scale", 2)),
+                scale=_RETIRED_SCALES.get(scale, scale),
                 strength=float(data.get("strength", 0.5)),
                 source=str(data.get("source", "original")),
                 look=look,
@@ -228,7 +219,7 @@ class UpscaleSpan:
 
 @dataclass(frozen=True, slots=True)
 class UpscalePlan:
-    """Ordered spans covering a job. Long clips run as overlapping chunks."""
+    """Ordered spans covering a job."""
 
     spans: tuple[UpscaleSpan, ...]
     pending: UpscaleSpan | None = None
@@ -238,8 +229,6 @@ class UpscalePlan:
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "spans": [span.to_dict() for span in self.spans],
-            "chunk_seconds": CHUNK_SECONDS,
-            "chunk_overlap_s": CHUNK_OVERLAP_S,
         }
         if self.pending is not None:
             payload["pending"] = self.pending.to_dict()
@@ -278,7 +267,7 @@ class UpscaleRequest:
     look: ShotLook = field(default_factory=ShotLook)
     regions: tuple[Region, ...] = ()
     # Called with the share of this clip done (0 to 1) as an engine works
-    # through it; FlashVSR reports once per chunk.
+    # through it; SPAN reports once per block of frames.
     on_progress: ProgressFn | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -324,129 +313,12 @@ def planned_chunks(
     return spans
 
 
-# Upstream FlashVSR v1.1 tiny defaults. These trade attention cost against
-# quality; they are not a restoration strength, so they stay fixed.
-FLASHVSR_SPARSE_RATIO = 2.0
-FLASHVSR_LOCAL_RANGE = 11
-
-
 def models_dir() -> Path:
     """Gitignored weights root. Override with ``SUPER_PROCESSOR_MODELS``."""
     raw = os.environ.get("SUPER_PROCESSOR_MODELS", "").strip()
     if raw:
         return Path(raw).expanduser()
     return Path.cwd() / ".dogfood" / "models"
-
-
-def flashvsr_home() -> Path:
-    """FlashVSR checkout. Override with ``FLASHVSR_HOME``."""
-    raw = os.environ.get("FLASHVSR_HOME", "").strip()
-    if raw:
-        return Path(raw).expanduser()
-    return models_dir() / "FlashVSR"
-
-
-def flashvsr_weights_dir(home: Path | None = None) -> Path:
-    root = home or flashvsr_home()
-    return root / "examples" / "WanVSR" / "FlashVSR-v1.1"
-
-
-def resolve_flashvsr_weights(home: Path | None = None) -> Path:
-    """Require the v1.1 tiny weight trio or raise a wizard-facing error."""
-    folder = flashvsr_weights_dir(home)
-    missing = [name for name in _WEIGHT_FILES if not (folder / name).is_file()]
-    if missing:
-        listed = ", ".join(missing)
-        raise UpscaleError(
-            "FlashVSR v1.1 weights were not found "
-            f"({listed}) under {folder}. Clone "
-            "https://github.com/OpenImagingLab/FlashVSR into "
-            f"{flashvsr_home()} and download JunhaoZhuang/FlashVSR-v1.1 into "
-            "examples/WanVSR/FlashVSR-v1.1. CUDA is required; there is no "
-            "FFmpeg grade fallback."
-        )
-    return folder
-
-
-def flashvsr_model() -> str:
-    """The FlashVSR to run, from ``SUPER_PROCESSOR_FLASHVSR`` (default v1.1)."""
-    raw = os.environ.get(FLASHVSR_MODEL_ENV, "").strip().lower() or "v1.1"
-    if raw not in FLASHVSR_MODELS:
-        raise UpscaleError(
-            f"{FLASHVSR_MODEL_ENV} must be one of {', '.join(FLASHVSR_MODELS)}, "
-            f"not {raw!r}"
-        )
-    return raw
-
-
-def flashvsr_plus_home() -> Path:
-    """FlashVSR+ checkout. Override with ``FLASHVSR_PLUS_HOME``."""
-    raw = os.environ.get("FLASHVSR_PLUS_HOME", "").strip()
-    if raw:
-        return Path(raw).expanduser()
-    return models_dir() / "FlashVSR_Plus"
-
-
-def resolve_flashvsr_plus(home: Path | None = None) -> Path:
-    """Require the FlashVSR+ code and turbo weights or raise a wizard-facing error."""
-    root = home or flashvsr_plus_home()
-    missing = [name for name in _PLUS_FILES if not (root / name).is_file()]
-    if missing:
-        raise UpscaleError(
-            f"FlashVSR+ files were not found ({', '.join(missing)}) under {root}. "
-            "Clone https://github.com/OpenImagingLab/FlashVSR_Plus there and "
-            f"download {PLUS_MODE}/ and TCDecoder.ckpt from ruchangyao/FlashVSR_plus "
-            f"into its ckpts folder, or unset {FLASHVSR_MODEL_ENV} to use v1.1."
-        )
-    return root
-
-
-# Total GPU memory override, in GB, for when detection is wrong or for tests.
-GPU_VRAM_ENV = "SUPER_PROCESSOR_GPU_VRAM_GB"
-_detected_vram: list[int] = []
-
-
-def gpu_vram_bytes() -> int:
-    """Total memory of the first NVIDIA GPU in bytes; 0 when there is none.
-
-    ``SUPER_PROCESSOR_GPU_VRAM_GB`` wins. Otherwise ``nvidia-smi`` is asked
-    once per process (no CUDA context is created), then PyTorch if it is
-    already loaded. A setting that is not a number (``24GB``) is ignored
-    rather than failing the job: the GPU is then asked instead.
-    """
-    raw = os.environ.get(GPU_VRAM_ENV, "").strip()
-    if raw:
-        with contextlib.suppress(ValueError, OverflowError):
-            return max(0, round(float(raw) * 1000**3))
-    if not _detected_vram:
-        _detected_vram.append(_detect_vram())
-    return _detected_vram[0]
-
-
-def _detect_vram() -> int:
-    try:
-        done = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        )
-        first = done.stdout.strip().splitlines()[0]
-        return int(float(first) * 1024 * 1024)  # MiB
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-        pass
-    torch = sys.modules.get("torch")
-    try:
-        if torch is not None and torch.cuda.is_available():
-            return int(torch.cuda.get_device_properties(0).total_memory)
-    except Exception:  # noqa: BLE001 - any failure means "unknown"
-        pass
-    return 0
 
 
 def cuda_available() -> bool:
@@ -592,123 +464,48 @@ class FakeUpscaleEngine:
         return request.output
 
 
-class _Loaded:
-    """One loaded FlashVSR pipeline and how to run and unload it.
+@dataclass(frozen=True)
+class _Span:
+    """The SPAN weights to load, already checked."""
 
-    ``prepare`` does a clip's CPU work (padding, reading frames) and may run
-    on another thread while ``restore`` has the GPU. Callers drop ``module``
-    and ``pipe`` themselves (see :func:`_release_gpu`) before ``close``
-    undoes the import's changes to the process.
+    weights: Path
+
+    def load(self) -> _Loaded:
+        from .span_sr import load_span
+
+        return _Loaded(load_span(self.weights))
+
+
+class _Loaded:
+    """The SPAN network on the GPU, and the batch it runs at.
+
+    ``batch`` is 0 (by frame size, see
+    :func:`super_processor.span_sr.batch_size`) until a batch runs out of
+    memory; the smaller one that fits is then kept for the rest of the load.
     """
 
-    def __init__(
-        self,
-        module: Any,
-        pipe: Any,
-        prepare: Callable[[Any, Path, int], _Prepared],
-        restore: Callable[[Any, Any, _Prepared, int], _Restored],
-        close: Callable[[], None],
-    ) -> None:
-        self.module = module
-        self.pipe = pipe
-        self._prepare = prepare
-        self._restore = restore
-        self.close = close
-
-    def prepare(self, source: Path, *, scale: int) -> _Prepared:
-        return self._prepare(self.module, source, scale)
-
-    def restore(self, prepared: _Prepared, *, scale: int) -> _Restored:
-        return self._restore(self.module, self.pipe, prepared, scale)
-
-    def run(self, source: Path, output: Path, *, scale: int) -> None:
-        prepared = self.prepare(source, scale=scale)
-        restored = self.restore(prepared, scale=scale)
-        _write_restored(restored, prepared, output, scale=scale)
+    def __init__(self, model: Any) -> None:
+        self.model = model
+        self.batch = 0
 
 
-@dataclass(frozen=True)
-class _V11:
-    """FlashVSR v1.1 through its tiny example script."""
+def _span_ready(scale: int) -> _Span:
+    """SPAN, checked for this scale, the GPU, and its weights, or a
+    wizard-facing error."""
+    from .span_sr import SPAN_SCALE, resolve_span_weights
 
-    home: Path
-    infer: Path
-
-    def load(self) -> _Loaded:
-        module, pipe, previous, path_added = _load_flashvsr(self.home, self.infer)
-        return _Loaded(
-            module,
-            pipe,
-            _prepare_v11,
-            _restore_v11,
-            lambda: _unload_flashvsr(previous, path_added),
-        )
-
-
-@dataclass(frozen=True)
-class _Plus:
-    """FlashVSR+ (turbo, colour-corrected) through its Python API."""
-
-    home: Path
-
-    def load(self) -> _Loaded:
-        module, pipe, path_added = _load_flashvsr_plus(self.home)
-        return _Loaded(
-            module,
-            pipe,
-            _prepare_plus,
-            _restore_plus,
-            lambda: _unload_flashvsr_plus(self.home, path_added),
-        )
-
-
-def _flashvsr_ready(scale: int) -> _V11 | _Plus:
-    """The FlashVSR to run at ``scale``, checked, or a wizard-facing error."""
-    model = flashvsr_model()
+    if scale != SPAN_SCALE:
+        raise UpscaleError(f"SPAN only upscales {SPAN_SCALE}x, not {scale}x")
     if not cuda_available():
         raise UpscaleError(
-            "FlashVSR needs an NVIDIA GPU with CUDA. Refusing to fall "
-            "back to an FFmpeg grade. Install the gpu extra and a driver."
+            "SPAN needs an NVIDIA GPU with CUDA. Refusing to fall back to an "
+            "FFmpeg grade. Install the gpu extra and a driver."
         )
-    if model == "plus":
-        return _plus_ready()
-    if model == "v1.1":
-        return _v11_ready()
-    # auto: the model suited to the scale, or the other when only its
-    # checkout is there. A checkout that is there but incomplete names its
-    # missing files rather than being passed over.
-    plus = (flashvsr_plus_home(), _plus_ready)
-    v11 = (flashvsr_home(), _v11_ready)
-    choices = (plus, v11) if scale >= AUTO_PLUS_FROM_SCALE else (v11, plus)
-    for home, ready in choices:
-        if home.is_dir():
-            return ready()
-    raise UpscaleError(
-        f"{FLASHVSR_MODEL_ENV}=auto found no FlashVSR checkout at {v11[0]} "
-        f"or {plus[0]}. Clone OpenImagingLab/FlashVSR (v1.1) or "
-        "OpenImagingLab/FlashVSR_Plus there with their weights; FlashVSR+ "
-        "suits 4x, v1.1 2x."
-    )
-
-
-def _plus_ready() -> _Plus:
-    return _Plus(resolve_flashvsr_plus())
-
-
-def _v11_ready() -> _V11:
-    home = flashvsr_home()
-    infer = home / "examples" / "WanVSR" / "infer_flashvsr_v1.1_tiny.py"
-    if not infer.is_file():
-        raise UpscaleError(
-            "FlashVSR checkout is missing "
-            f"{infer}. Clone OpenImagingLab/FlashVSR into {home}."
-        )
-    resolve_flashvsr_weights(home)
-    return _V11(home, infer)
+    return _Span(resolve_span_weights(models_dir()))
 
 
 def plain_upscale(request: UpscaleRequest, *, ffmpeg_bin: str = "ffmpeg") -> Path:
-    """Resize ``request.source`` by its scale with lanczos, without FlashVSR."""
+    """Resize ``request.source`` by its scale with lanczos, without SPAN."""
     require_supported_timing(request.source, ffmpeg_bin=ffmpeg_bin)
     request.output.parent.mkdir(parents=True, exist_ok=True)
     _run_ffmpeg(
@@ -746,7 +543,7 @@ def restore_clip(
 ) -> tuple[Path, float]:
     """The restored clip and the strength to blend it at.
 
-    Without FlashVSR (``use_upscale`` off, or scale 1) the clip is only
+    Without SPAN (``use_upscale`` off, or scale 1) the clip is only
     resized, or at scale 1 only re-encoded. Blended at strength 0 the
     delivery encode keeps just its lanczos base with the look applied, so a
     pass-through span matches its neighbours' size and frame timing.
@@ -774,13 +571,17 @@ def upscale_all(
     return [engine.upscale(request) for request in requests]
 
 
-class FlashVsrEngine:
-    """Temporal restoration via the FlashVSR v1.1 tiny pipeline."""
+class SpanEngine:
+    """2x upscale with SPAN (see :mod:`super_processor.span_sr`), on the GPU.
 
-    def __init__(self, *, chunk_s: float = CHUNK_SECONDS) -> None:
-        # Longest piece to try first; the system-RAM child starts at the
-        # shortest, since its memory has no GPU-sized ceiling of its own.
-        self._chunk_s = chunk_s
+    A clip streams through three processes at once: an FFmpeg decoder reads
+    the source (through the look's clean step) as packed RGB, SPAN upscales
+    it a block of frames at a time, and the delivery encoder blends each
+    upscaled frame with a lanczos upscale of the source as it arrives (see
+    :func:`encode_delivery`). Nothing is written in between, so a 20-minute
+    1080p film needs no scratch space beyond its output, and host memory
+    holds a few blocks of frames, never the clip.
+    """
 
     def upscale_many(self, requests: list[UpscaleRequest]) -> list[Path]:
         """Restore several short clips (previews) with one model load."""
@@ -788,368 +589,309 @@ class FlashVsrEngine:
             return []
         for request in requests:
             require_supported_timing(request.source)
-        # With "auto" a batch can mix models; each loads once for its clips.
-        batches: dict[_V11 | _Plus, list[int]] = {}
-        for index, request in enumerate(requests):
-            batches.setdefault(_flashvsr_ready(request.scale), []).append(index)
-        restored: list[Path] = [Path()] * len(requests)
-        for backend, indexes in batches.items():
-            outputs = self._upscale_batch([requests[i] for i in indexes], backend)
-            for index, output in zip(indexes, outputs, strict=True):
-                restored[index] = output
-        return restored
-
-    def _upscale_batch(
-        self, requests: list[UpscaleRequest], backend: _V11 | _Plus
-    ) -> list[Path]:
-        from .probe import ProbeError, probe_file
-
-        ready: list[UpscaleRequest] = []
-        for request in requests:
-            request = replace(
-                request,
-                source=request.source.resolve(),
-                output=request.output.resolve(),
-            )
-            try:
-                duration = float(probe_file(request.source).duration_s or 0.0)
-            except ProbeError:
-                duration = 0.0
-            if duration > CHUNK_SECONDS + 0.05:
-                raise UpscaleError(
-                    f"{request.source.name} is {duration:.1f}s; batched clips "
-                    f"must be at most {CHUNK_SECONDS:g}s"
-                )
-            clean = request.look.clean_filter()
-            if clean:
-                cleaned = trim_source(
-                    request.source,
-                    request.output.with_name(request.output.stem + ".clean.mp4"),
-                    0.0,
-                    duration,
-                    video_filter=clean,
-                )
-                request = replace(request, source=cleaned)
-            ready.append(request)
-        failed: UpscaleError | None = None
-        with _FLASHVSR_LOCK:
-            try:
-                loaded = backend.load()
-            except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
-                failure = _flashvsr_failure(exc)
-                del exc
-                _release_gpu()
-                raise failure from None
-            try:
-                for request in ready:
-                    loaded.run(request.source, request.output, scale=request.scale)
-            except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
-                failed = _flashvsr_failure(exc)
-                del exc
-            finally:
-                _release_gpu(loaded.pipe)
-                loaded.module = loaded.pipe = None
-                _release_gpu()
-                loaded.close()
-        if isinstance(failed, GpuOutOfMemory):
-            # One at a time, each in pieces as short as it needs.
-            return [self.upscale(request) for request in requests]
-        if failed is not None:
-            raise failed from None
-        missing = [r.output.name for r in ready if not r.output.is_file()]
-        if missing:
-            raise UpscaleError(f"FlashVSR produced no output for {missing[0]}")
-        return [request.output for request in ready]
+        backend = _span_ready(requests[0].scale)
+        for request in requests[1:]:
+            _span_ready(request.scale)
+        return self._run(backend, requests)
 
     def upscale(self, request: UpscaleRequest) -> Path:
         require_supported_timing(request.source)
-        backend = _flashvsr_ready(request.scale)
-        from .probe import ProbeError, probe_file
+        return self._run(_span_ready(request.scale), [request])[0]
 
-        # The loader chdirs into the FlashVSR checkout; relative job paths
-        # would then point inside it.
-        request = replace(
-            request,
-            source=request.source.resolve(),
-            output=request.output.resolve(),
-        )
+    def _run(self, backend: _Span, requests: list[UpscaleRequest]) -> list[Path]:
+        failed: UpscaleError | None = None
+        with _GPU_LOCK:
+            loaded = _load(backend)
+            try:
+                for request in requests:
+                    _stream_span(loaded, request)
+            except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
+                failed = _upscale_failure(exc)
+                del exc
+            finally:
+                _unload(loaded)
+        if failed is not None:
+            raise failed from None
+        missing = [r.output.name for r in requests if not r.output.is_file()]
+        if missing:
+            raise UpscaleError(f"SPAN produced no output for {missing[0]}")
+        return [request.output for request in requests]
+
+
+def _load(backend: _Span) -> _Loaded:
+    """Load SPAN, or raise a wizard-facing error that holds no GPU memory."""
+    try:
+        return backend.load()
+    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
+        failure = _upscale_failure(exc)
+        del exc
+        _release_gpu()
+        raise failure from None
+
+
+def _unload(loaded: _Loaded) -> None:
+    _release_gpu(loaded.model)
+    loaded.model = None
+    _release_gpu()
+
+
+# Source bytes decoded per hand-off to the GPU. Each block's 2x output is
+# four times as large, and at most two input blocks (queued) and two output
+# blocks (one upscaling, one being encoded) exist at once: about 2.5 GB of
+# host memory at any source size (57 frames of 1440x1080, 291 of 640x480).
+STREAM_BLOCK_BYTES = 256 * 1024 * 1024
+
+
+def block_frames(width: int, height: int) -> int:
+    """Frames per GPU hand-off for a ``width`` x ``height`` source."""
+    return max(1, STREAM_BLOCK_BYTES // max(1, width * height * 3))
+
+
+def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
+    """Decode, upscale, blend, and encode ``request`` in one pass.
+
+    Writes ``request.output`` as a delivery file (with its marker), so the
+    caller's :func:`encode_delivery` of it only renames it. The output holds
+    exactly the source's frames: a decoder a few frames short repeats the
+    last one, a few too many are dropped, and more than that either way is
+    an error. A failed decode is an error too, raised before the output is
+    published.
+    """
+    from .span_sr import SPAN_SCALE
+
+    source = request.source
+    size = _frame_size(source)
+    if size is None:
+        raise UpscaleError(f"could not read the frame size of {source.name}")
+    want, rate = video_stream_facts(source)
+    width, height = size
+    frame_in = width * height * 3
+    per_block = block_frames(width, height)
+    slack = max(FRAME_SLACK, int(want * 0.02))
+    clean = request.look.clean_filter()
+    decode = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        str(source),
+        *(["-vf", clean] if clean else []),
+        "-an",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]
+    report = request.on_progress
+    blocks: queue.Queue[bytearray | None] = queue.Queue(maxsize=2)
+    upscaled: queue.Queue[_Restored | None] = queue.Queue(maxsize=1)
+    failures: list[BaseException] = []
+    stop = threading.Event()
+    # Set when the decoder's output ended (not when reading was stopped).
+    decoded = threading.Event()
+
+    with tempfile.TemporaryFile() as decode_errors:
         try:
-            duration = float(probe_file(request.source).duration_s or 0.0)
-        except ProbeError:
-            duration = 0.0
-        chunk_s = self._chunk_s
-        with _FLASHVSR_LOCK:
-            while True:
-                try:
-                    return self._upscale_once(
-                        request,
-                        backend=backend,
-                        duration=duration,
-                        chunk_s=chunk_s,
+            decoder = subprocess.Popen(
+                decode, stdout=subprocess.PIPE, stderr=decode_errors
+            )
+        except OSError as exc:
+            raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
+
+        def read() -> None:
+            assert decoder.stdout is not None
+            try:
+                while not stop.is_set():
+                    block = bytearray(frame_in * per_block)
+                    got = _read_into(decoder.stdout, block)
+                    whole = got - got % frame_in
+                    if whole:
+                        del block[whole:]
+                        blocks.put(block)
+                    if got < len(block) or not whole:
+                        decoded.set()
+                        break
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                failures.append(exc)
+            finally:
+                blocks.put(None)
+
+        def write(encoder: IO[bytes]) -> None:
+            written = received = 0
+            last: Any = None
+            ended = False
+            try:
+                while (restored := upscaled.get()) is not None:
+                    received += restored.count
+                    if received > want + slack:
+                        # Stop at once: the rest would only keep the GPU busy.
+                        raise UpscaleError(
+                            f"SPAN read over {want + slack} frames of a "
+                            f"{want}-frame clip ({source.name}); refusing to "
+                            "splice a misaligned picture"
+                        )
+                    for index in range(min(restored.count, want - written)):
+                        last = restored.frame(index)
+                        encoder.write(last)
+                        written += 1
+                    if report is not None and want:
+                        report(min(1.0, written / want))
+                    del restored
+                ended = True
+                if written < want - slack or written == 0:
+                    raise UpscaleError(
+                        f"SPAN read {written} frames of a {want}-frame clip "
+                        f"({source.name}); refusing to splice a misaligned picture"
                     )
-                except GpuOutOfMemory as exc:
-                    fps = _frame_rate(request.source)
-                    shortest = FLASHVSR_MIN_CHUNK_FRAMES / fps
-                    if min(chunk_s, duration) > shortest + 0.5 / fps:
-                        chunk_s = max(shortest, min(chunk_s, duration) / 2)
-                        continue
-                    reason = str(exc)
-                    del exc
-                    return _last_resort(request, reason, shortest)
+                while written < want:
+                    encoder.write(last)
+                    written += 1
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                failures.append(exc)
+                stop.set()
+                # Keep taking pictures so the GPU loop never blocks on us,
+                # up to its end mark (unless the loop above already took it).
+                while not ended and upscaled.get() is not None:
+                    pass
 
-    def _upscale_once(
-        self,
-        request: UpscaleRequest,
-        *,
-        backend: _V11 | _Plus,
-        duration: float,
-        chunk_s: float,
-    ) -> Path:
-        if duration > chunk_s + 0.05:
-            return _run_flashvsr_chunked(request, backend=backend, chunk_s=chunk_s)
-        clean = request.look.clean_filter()
-        if clean:
-            cleaned = trim_source(
-                request.source,
-                request.output.with_name(request.output.stem + ".clean.mp4"),
-                0.0,
-                duration,
-                video_filter=clean,
+        def feed(encoder: IO[bytes]) -> None:
+            reader = threading.Thread(target=read, name="span-decode", daemon=True)
+            writer = threading.Thread(
+                target=write, args=(encoder,), name="span-encode", daemon=True
             )
-            request = replace(request, source=cleaned)
-        return _run_flashvsr(request, backend=backend)
+            reader.start()
+            writer.start()
+            decoded_all = False
+            try:
+                while (block := blocks.get()) is not None:
+                    count = len(block) // frame_in
+                    restored = _restore_span(
+                        loaded,
+                        _Prepared(source, size, count, rate, payload=block),
+                    )
+                    del block
+                    if stop.is_set():
+                        break
+                    upscaled.put(restored)
+                    del restored
+                else:
+                    decoded_all = True
+            except BaseException:
+                stop.set()
+                raise
+            finally:
+                upscaled.put(None)
+                writer.join()
+                stop.set()
+                # Stopped early, the reader may be blocked on a full queue:
+                # take blocks until its end mark (the loop took it otherwise).
+                while not decoded_all and blocks.get() is not None:
+                    pass
+                reader.join()
+            if decoded.is_set() and decoder.wait() != 0:
+                # Raised here, the encoder's half-written file is thrown
+                # away; it also names the cause of any frame shortfall.
+                decode_errors.seek(0)
+                detail = decode_errors.read().decode("utf-8", errors="replace")
+                reason = detail.strip() or f"ffmpeg exited with {decoder.returncode}"
+                raise UpscaleError(f"decoding {source.name} for SPAN failed: {reason}")
+            if failures:
+                raise failures[0]
 
-
-def _last_resort(request: UpscaleRequest, reason: str, shortest_s: float) -> Path:
-    """Restore a clip whose shortest piece did not fit, using system RAM too.
-
-    Runs in a child with managed GPU memory (see
-    :mod:`super_processor.managed_memory`); inside that child, or when it
-    cannot run, the out-of-memory error is raised for the wizard.
-    """
-    from .managed_memory import in_managed_memory, upscale_in_managed_memory
-
-    advice = (
-        "Close other programs that use the GPU (games, other AI tools) and try again."
-    )
-    if in_managed_memory():
-        raise GpuOutOfMemory(
-            "FlashVSR ran out of GPU memory and system RAM even in the "
-            f"shortest pieces. {advice} ({reason})"
-        )
-    try:
-        return upscale_in_managed_memory(request, chunk_s=shortest_s)
-    except GpuOutOfMemory as exc:
-        # The child's own message already says GPU and RAM were both short.
-        message = str(exc)
-    except UpscaleError as exc:
-        # No system RAM to fall back on here (no nvcc, a failed build or
-        # child): still an out-of-memory error, with what stopped the fallback.
-        message = (
-            "FlashVSR ran out of GPU memory even in the shortest pieces, and "
-            f"could not use system RAM instead ({exc}). {advice} ({reason})"
-        )
-    raise GpuOutOfMemory(message) from None
-
-
-def _frame_rate(video: Path) -> float:
-    """Frames per second of ``video``; 24 when it cannot be read."""
-    try:
-        return float(Fraction(video_stream_facts(video)[1]))
-    except (UpscaleError, ValueError, ZeroDivisionError):
-        return 24.0
-
-
-def _load_flashvsr(home: Path, infer: Path) -> tuple[Any, Any, str, list[str]]:
-    """Import the tiny script with WanVSR and the repo root on ``sys.path``."""
-    wan = infer.parent
-    loader = importlib.util.spec_from_file_location("flashvsr_infer_tiny", infer)
-    if loader is None or loader.loader is None:
-        raise UpscaleError(f"could not load {infer}")
-    module = importlib.util.module_from_spec(loader)
-    previous = os.getcwd()
-    path_added = [entry for entry in (str(wan), str(home)) if entry not in sys.path]
-    sys.path[:0] = path_added
-    _prefer_expandable_segments()
-    os.chdir(wan)
-    try:
-        loader.loader.exec_module(module)
-        pipe = module.init_pipeline()
-    except Exception:
-        os.chdir(previous)
-        for entry in path_added:
-            with contextlib.suppress(ValueError):
-                sys.path.remove(entry)
-        raise
-    return module, pipe, previous, path_added
-
-
-def _unload_flashvsr(previous: str, path_added: list[str]) -> None:
-    os.chdir(previous)
-    for entry in path_added:
-        with contextlib.suppress(ValueError):
-            sys.path.remove(entry)
-
-
-def _prefer_expandable_segments() -> None:
-    """Let a later 2GB block reuse the reserved cache instead of failing
-    while several gigabytes sit fragmented (FlashVSR+ at 4x needs it).
-
-    Must be set before CUDA starts. The managed-memory child brings its own
-    allocator, which ignores this.
-    """
-    if os.environ.get("SUPER_PROCESSOR_MANAGED_MEMORY") != "1":
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-
-def _plus_modules() -> list[str]:
-    """Loaded modules named like FlashVSR+'s top-level packages."""
-    # A copy: another thread's first import would resize the live dict.
-    return [name for name in list(sys.modules) if name.split(".")[0] in _PLUS_PACKAGES]
-
-
-def _from_checkout(name: str, home: Path) -> bool:
-    module = sys.modules.get(name)
-    origin = getattr(module, "__file__", None) or next(
-        iter(getattr(module, "__path__", None) or ()), None
-    )
-    return origin is not None and Path(origin).resolve().is_relative_to(home.resolve())
-
-
-def _load_flashvsr_plus(home: Path) -> tuple[Any, Any, list[str]]:
-    """Import FlashVSR+ from its checkout and build the turbo pipeline.
-
-    Its packages have generic names (``inference``, ``models``), so a module
-    of the same name from anywhere else would be used in its place; that
-    refuses to load instead of running the wrong code.
-    """
-    clash = [name for name in _plus_modules() if not _from_checkout(name, home)]
-    if clash:
-        raise UpscaleError(
-            f"FlashVSR+ cannot load: a different {clash[0]!r} module is "
-            "already imported in this process"
-        )
-    _prefer_expandable_segments()
-    # Its block-sparse attention extension needs torch loaded first.
-    importlib.import_module("torch")
-    path_added = [str(home)] if str(home) not in sys.path else []
-    sys.path[:0] = path_added
-    try:
-        plus = importlib.import_module("flashvsr_plus")
-        presets = importlib.import_module("inference.presets")
-        output = importlib.import_module("inference.output")
-        config = plus.stream_config_for_mode(
-            PLUS_MODE, seed=0, color_correction=PLUS_COLOR_CORRECTION
-        )
-        pipe = plus.build_inference_pipeline(
-            config, presets.model_paths_for_mode(home, PLUS_MODE)
-        )
-    except Exception:
-        _unload_flashvsr_plus(home, path_added)
-        raise
-    module = _PlusApi(plus.InferenceRequest, output.tensor_to_uint8_frame)
-    return module, pipe, path_added
-
-
-@dataclass(frozen=True)
-class _PlusApi:
-    """What a run needs from FlashVSR+ besides the pipeline."""
-
-    request: Any
-    to_uint8: Callable[[Any], Any]
-
-
-def _unload_flashvsr_plus(home: Path, path_added: list[str]) -> None:
-    for entry in path_added:
-        with contextlib.suppress(ValueError):
-            sys.path.remove(entry)
-    # So nothing else later imports FlashVSR+'s ``models`` or ``inference``.
-    for name in _plus_modules():
-        if _from_checkout(name, home):
-            sys.modules.pop(name, None)
-
-
-def _prepare_plus(module: _PlusApi, source: Path, scale: int) -> _Prepared:
-    """Pad a clip for FlashVSR+ (it pads and trims the frame count itself)."""
-    prepared = _prepared_geometry(source, scale)
-    if any(prepared.pad):
-        prepared.reads = _pad_for_flashvsr(source, prepared.pad, 0)
-    return prepared
-
-
-def _restore_plus(
-    module: _PlusApi, pipe: Any, prepared: _Prepared, scale: int
-) -> _Restored:
-    """Run FlashVSR+ on a prepared clip; its frames stay in memory.
-
-    They go to :func:`_write_restored` rather than through FlashVSR+'s own
-    writer (CRF 25).
-    """
-    width, height = prepared.padded_size
-    try:
-        result = pipe.infer(
-            module.request(
-                input_path=str(prepared.reads),
-                height=height * scale,
-                width=width * scale,
+        try:
+            encode_delivery(
+                None,
+                request.output,
+                blend_with=source,
+                strength=request.strength,
+                look=request.look,
+                regions=request.regions,
+                frames_in=(width * SPAN_SCALE, height * SPAN_SCALE, rate, feed),
             )
-        )
-        video = result.video[0]  # [C, F, H, W], on the CPU
-        del result
-    finally:
-        prepared.discard()
-    _clear_pipeline_state(pipe)
+        finally:
+            if decoder.poll() is None:
+                decoder.kill()
+            decoder.wait()
+            assert decoder.stdout is not None
+            decoder.stdout.close()
+    return request.output
+
+
+def _read_into(stream: IO[bytes], buffer: bytearray) -> int:
+    """Fill ``buffer`` from ``stream``; the bytes read (fewer only at the end)."""
+    view = memoryview(buffer)
+    got = 0
+    while got < len(buffer):
+        n = stream.readinto(view[got:])  # type: ignore[attr-defined]
+        if not n:
+            break
+        got += n
+    return got
+
+
+def _restore_span(loaded: _Loaded, prepared: _Prepared) -> _Restored:
+    """Run SPAN on a prepared clip; its frames stay in memory.
+
+    SPAN's GPU memory follows the batch (frames per call), not the clip. A
+    batch that does not fit (another program holds GPU memory) is halved
+    until one does, down to a single frame; only then is it an error.
+    """
+    from .span_sr import SPAN_SCALE, batch_size, upscale_frames
+
+    width, height = prepared.size
+    raw: bytes | bytearray = prepared.payload
+    prepared.payload = None
+    count = len(raw) // (width * height * 3)
+    frames = _frames_view(raw, count, width, height)
+    del raw
+    batch = loaded.batch or batch_size(width, height)
+    while True:
+        try:
+            pictures = upscale_frames(loaded.model, frames, batch=batch)
+            break
+        except Exception as exc:
+            if not _gpu_out_of_memory(exc):
+                raise
+            reason = str(exc).splitlines()[0]
+            _forget_frames(exc)
+        if batch <= 1:
+            raise GpuOutOfMemory(
+                "SPAN ran out of GPU memory even one frame at a time. "
+                f"{_GPU_ADVICE} ({reason})"
+            )
+        batch = loaded.batch = batch // 2
+        _empty_cuda_cache()
+    del frames
     return _Restored(
-        count=int(video.shape[1]),
-        size=(width * scale, height * scale),
-        frame=lambda index: module.to_uint8(video[:, index]).tobytes(),
+        count=len(pictures),
+        size=(width * SPAN_SCALE, height * SPAN_SCALE),
+        frame=lambda index: _frame_view(pictures, index),
     )
 
 
-def _clear_pipeline_state(pipe: Any) -> None:
-    """Drop what a loaded pipeline keeps from the clip it just restored.
+def _frame_view(pictures: Any, index: int) -> memoryview:
+    """One upscaled frame of :func:`~super_processor.span_sr.upscale_frames`
+    as packed RGB, without copying it."""
+    return memoryview(pictures[index].numpy()).cast("B")
 
-    FlashVSR clears its input-projection cache and decoder memory at the
-    start of a call, not the end, so they stayed on the GPU while the next
-    clip was loaded next to them: a 24-frame clip that fits on its own ran
-    out of memory right after a 16-frame one.
-    """
+
+def _frames_view(raw: bytes | bytearray, count: int, width: int, height: int) -> Any:
+    """``raw`` as a uint8 N x H x W x 3 tensor, sharing a ``bytearray``'s
+    memory (torch needs a writable buffer, so ``bytes`` are copied)."""
+    torch = importlib.import_module("torch")
+    buffer = raw if isinstance(raw, bytearray) else bytearray(raw)
+    flat = torch.frombuffer(buffer, dtype=torch.uint8)
+    return flat[: count * height * width * 3].view(count, height, width, 3)
+
+
+def _empty_cuda_cache() -> None:
+    """Return PyTorch's cached GPU blocks to the driver, if CUDA is loaded."""
     import gc
 
-    dit = getattr(pipe, "dit", None)
-    for holder, name in (
-        (getattr(dit, "LQ_proj_in", None), "clear_cache"),
-        (getattr(pipe, "TCDecoder", None), "clean_mem"),
-    ):
-        clear = getattr(holder, name, None)
-        if callable(clear):
-            with contextlib.suppress(Exception):
-                clear()
     gc.collect()
-    torch_mod = sys.modules.get("torch")
-    cuda = getattr(torch_mod, "cuda", None) if torch_mod is not None else None
-    if cuda is not None and getattr(cuda, "is_available", lambda: False)():
-        cuda.empty_cache()
-
-
-def _release_gpu(pipe: Any | None = None) -> None:
-    """Move one pipeline off the GPU and return its cache to the driver.
-
-    Deleting the name inside this function does not drop the caller's
-    reference, so the caller sets its own variables to None and calls this
-    again. The weights are a reference cycle with the VRAM wrappers, and
-    PyTorch will not collect that cycle while it is trying to allocate.
-    """
-    import gc
-
-    mover = getattr(pipe, "to", None)
-    if mover is not None:
-        with contextlib.suppress(Exception):
-            mover("cpu")
-    del pipe
-    sys.modules.pop("flashvsr_infer_tiny", None)
-    gc.collect()
-    _return_freed_heap()
     torch_mod = sys.modules.get("torch")
     cuda = getattr(torch_mod, "cuda", None) if torch_mod is not None else None
     if cuda is None or not getattr(cuda, "is_available", lambda: False)():
@@ -1162,14 +904,30 @@ def _release_gpu(pipe: Any | None = None) -> None:
         ipc()
 
 
-def _return_freed_heap() -> None:
-    """Hand the heap a FlashVSR call freed back to the system (glibc only).
+def _release_gpu(model: Any | None = None) -> None:
+    """Move the model off the GPU and return its cache to the driver.
 
-    Loading the weights and decoding the frames go through several GiB of
-    host memory. Freed, it stays in glibc's heap, split over one arena per
-    worker thread, so the wizard kept about 10 GiB between previews. Asking
-    glibc to trim takes a process from 5.1 to 2.5 GiB after each call; what
-    is left is mostly CUDA's own host state. Elsewhere this does nothing.
+    Deleting the name inside this function does not drop the caller's
+    reference, so the caller sets its own variable to None and calls this
+    again.
+    """
+    mover = getattr(model, "to", None)
+    if mover is not None:
+        with contextlib.suppress(Exception):
+            mover("cpu")
+    del model
+    _return_freed_heap()
+    _empty_cuda_cache()
+
+
+def _return_freed_heap() -> None:
+    """Hand the heap an upscale call freed back to the system (glibc only).
+
+    Decoding and upscaling a chunk go through several GiB of host memory.
+    Freed, it stays in glibc's heap, split over one arena per worker thread,
+    so the wizard kept about 10 GiB between previews (measured with the
+    FlashVSR engine SPAN replaced). Asking glibc to trim took a process from
+    5.1 to 2.5 GiB after each call. Elsewhere this does nothing.
     """
     import ctypes
     import ctypes.util
@@ -1181,262 +939,24 @@ def _return_freed_heap() -> None:
         ctypes.CDLL(name).malloc_trim(0)
 
 
-# FlashVSR works on whole 128-pixel blocks of the upscaled picture, and its
-# input loader centre-crops anything past the last whole block.
-FLASHVSR_BLOCK = 128
-
-
-def flashvsr_padding(width: int, height: int, scale: int) -> tuple[int, int, int, int]:
-    """Edge padding (left, top, right, bottom) so FlashVSR crops nothing.
-
-    Without it, 854x480 at 2x would come back as the middle 1664x896 of
-    1708x960: smaller than promised, and out of line with the full-frame
-    base it is blended over. Padded to a multiple of ``128 / scale``, the
-    upscaled clip is whole blocks; the padding is cropped off afterwards.
-    Offsets stay even so 4:2:0 chroma lines up.
-    """
-    step = FLASHVSR_BLOCK // scale
-    padded_w = -(-width // step) * step
-    padded_h = -(-height // step) * step
-    left = (padded_w - width) // 4 * 2
-    top = (padded_h - height) // 4 * 2
-    return left, top, padded_w - width - left, padded_h - height - top
-
-
-def flashvsr_extra_frames(frames: int) -> int:
-    """Copies of the last frame to add so FlashVSR returns every real frame.
-
-    Its loader appends four copies of the last frame, keeps the largest
-    8n + 1 frames that fit, and returns four fewer: up to three short of the
-    clip, which the conform step used to fill by freezing the last frame.
-    With ``frames + extra + 3`` a multiple of 8 it returns ``frames + extra``,
-    and the conform step trims the copies off again.
-    """
-    return -(frames + 3) % 8
-
-
-def _pad_for_flashvsr(
-    source: Path, pad: tuple[int, int, int, int], extra_frames: int
-) -> Path:
-    """``source`` with its edge pixels repeated into the padding and its last
-    frame repeated ``extra_frames`` times, losslessly."""
-    left, top, right, bottom = pad
-    padded = source.with_name(source.stem + ".pad.mp4")
-    space = (
-        f"pad=iw+{left + right}:ih+{top + bottom}:{left}:{top},"
-        f"fillborders=left={left}:right={right}:top={top}:bottom={bottom}"
-        ":mode=smear"
-        if any(pad)
-        else ""
-    )
-    time = f"tpad=stop_mode=clone:stop={extra_frames}" if extra_frames else ""
-    _run_ffmpeg(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(source),
-            "-vf",
-            _join_filters(space, time),
-            "-an",
-            "-c:v",
-            "libx264",
-            "-qp",
-            "0",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            str(padded),
-        ]
-    )
-    return padded
-
-
-def _prepare_v11(module: Any, source: Path, scale: int) -> _Prepared:
-    """Pad a clip for FlashVSR v1.1 and read it into a tensor, on the CPU.
-
-    Padded so FlashVSR keeps every pixel and every frame (see
-    :func:`flashvsr_padding` and :func:`flashvsr_extra_frames`). Nothing
-    here touches the GPU, so the next clip can be prepared while the GPU
-    restores this one.
-    """
-    prepared = _prepared_geometry(source, scale)
-    extra = flashvsr_extra_frames(prepared.frames)
-    if any(prepared.pad) or extra > 0:
-        prepared.reads = _pad_for_flashvsr(source, prepared.pad, extra)
-    prepared.payload = module.prepare_input_tensor(
-        str(prepared.reads),
-        scale=float(scale),
-        dtype=module.torch.bfloat16,
-        device="cpu",
-    )
-    return prepared
-
-
-def _restore_v11(module: Any, pipe: Any, prepared: _Prepared, scale: int) -> _Restored:
-    """Run one already-loaded v1.1 pipeline on a prepared clip.
-
-    Its frames stay in memory for :func:`_write_restored`, rather than going
-    through the example script's writer (libx264 CRF 20) and back.
-    """
-    low, height, width, frames, _fps = prepared.payload
-    prepared.payload = None
-    move = getattr(low, "to", None)
-    if callable(move):
-        low = move("cuda")
-    try:
-        video = pipe(
-            prompt="",
-            negative_prompt="",
-            cfg_scale=1.0,
-            num_inference_steps=1,
-            seed=0,
-            LQ_video=low,
-            num_frames=frames,
-            height=height,
-            width=width,
-            is_full_block=False,
-            if_buffer=True,
-            topk_ratio=FLASHVSR_SPARSE_RATIO * 768 * 1280 / (height * width),
-            kv_ratio=3.0,
-            local_range=FLASHVSR_LOCAL_RANGE,
-            color_fix=True,
-        )
-        del low
-        pictures = module.tensor2video(video)
-        del video
-    finally:
-        prepared.discard()
-    _clear_pipeline_state(pipe)
-    return _Restored(
-        count=len(pictures),
-        size=tuple(pictures[0].size) if pictures else (0, 0),
-        frame=lambda index: pictures[index].tobytes(),
-    )
-
-
 @dataclass
 class _Prepared:
-    """A clip ready for FlashVSR: its geometry, padded copy, and input."""
+    """A clip ready for SPAN: its geometry and decoded frames."""
 
     source: Path
     size: tuple[int, int]
-    pad: tuple[int, int, int, int]
     frames: int
     rate: str
-    reads: Path
     payload: Any = None
-
-    @property
-    def padded_size(self) -> tuple[int, int]:
-        left, top, right, bottom = self.pad
-        return self.size[0] + left + right, self.size[1] + top + bottom
-
-    def discard(self) -> None:
-        if self.reads != self.source:
-            self.reads.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
 class _Restored:
-    """FlashVSR's frames, in memory, as packed RGB."""
+    """SPAN's frames, in memory, as packed RGB."""
 
     count: int
     size: tuple[int, int]
-    frame: Callable[[int], bytes]
-
-
-def _prepared_geometry(source: Path, scale: int) -> _Prepared:
-    size = _frame_size(source)
-    if size is None:
-        raise UpscaleError(f"could not read the frame size of {source.name}")
-    frames, rate = video_stream_facts(source)
-    return _Prepared(
-        source=source,
-        size=size,
-        pad=flashvsr_padding(*size, scale),
-        frames=frames,
-        rate=rate,
-        reads=source,
-    )
-
-
-def _write_restored(
-    restored: _Restored,
-    prepared: _Prepared,
-    output: Path,
-    *,
-    scale: int,
-    skip: int = 0,
-) -> Path:
-    """Encode restored frames once, losslessly, as the clip's frames.
-
-    One encode crops the padding, drops the first ``skip`` frames (what an
-    earlier chunk already covers), keeps exactly the clip's frame count at
-    its frame rate (FlashVSR v1.1 returns a few padding frames; a few
-    missing ones repeat the last), and writes at ``-qp 0``.
-    """
-    want = prepared.frames
-    have = restored.count
-    if have < 1 or abs(have - want) > max(FRAME_SLACK, int(want * 0.02)):
-        raise UpscaleError(
-            f"FlashVSR returned {have} frames for a {want}-frame clip "
-            f"({prepared.source.name}); refusing to splice a misaligned picture"
-        )
-    width, height = restored.size
-    left, top, _right, _bottom = prepared.pad
-    crop = (
-        f"crop={prepared.size[0] * scale}:{prepared.size[1] * scale}"
-        f":{left * scale}:{top * scale},"
-        if any(prepared.pad)
-        else ""
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with subprocess.Popen(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{width}x{height}",
-            "-framerate",
-            prepared.rate,
-            "-i",
-            "-",
-            "-vf",
-            f"{crop}format=yuv420p",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-qp",
-            "0",
-            "-preset",
-            "veryfast",
-            str(output),
-        ],
-        stdin=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ) as encoder:
-        assert encoder.stdin is not None
-        # One frame at a time, so only one packed frame is copied at once.
-        with contextlib.suppress(BrokenPipeError):
-            for index in range(skip, want):
-                encoder.stdin.write(restored.frame(min(index, have - 1)))
-        _out, detail = encoder.communicate()
-    if encoder.returncode != 0:
-        message = detail.decode("utf-8", errors="replace").strip()
-        raise UpscaleError(f"encoding FlashVSR frames failed: {message}")
-    return output
+    frame: Callable[[int], bytes | memoryview]
 
 
 def video_stream_facts(video: Path, *, ffprobe_bin: str = "ffprobe") -> tuple[int, str]:
@@ -1470,230 +990,6 @@ def video_stream_facts(video: Path, *, ffprobe_bin: str = "ffprobe") -> tuple[in
         raise UpscaleError(
             f"could not count the frames of {video}: {detail or exc}"
         ) from exc
-
-
-def conform_frames(
-    restored: Path,
-    source: Path,
-    *,
-    ffmpeg_bin: str = "ffmpeg",
-    ffprobe_bin: str = "ffprobe",
-) -> Path:
-    """Make ``restored`` hold exactly the source's frames at the source's rate.
-
-    The keyframe splice and the chunk overlap both cut by time, so a restored
-    clip that is a few frames short or long, or written at a rounded rate,
-    would shift everything after it. A small difference is fixed losslessly at
-    the end of the clip (trim, or repeat the last frame). A larger one raises
-    before anything is spliced.
-    """
-    want, rate = video_stream_facts(source, ffprobe_bin=ffprobe_bin)
-    have, have_rate = video_stream_facts(restored, ffprobe_bin=ffprobe_bin)
-    if have == want and have_rate == rate:
-        return restored
-    if abs(have - want) > max(FRAME_SLACK, int(want * 0.02)):
-        raise UpscaleError(
-            f"FlashVSR returned {have} frames for a {want}-frame clip "
-            f"({source.name}); refusing to splice a misaligned picture"
-        )
-    filters = [f"setpts=N/({rate})/TB"]
-    if have < want:
-        filters.append(f"tpad=stop_mode=clone:stop={want - have}")
-    tmp = restored.with_name(restored.stem + ".conform" + restored.suffix)
-    _run_ffmpeg(
-        [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(restored),
-            "-vf",
-            ",".join(filters),
-            "-r",
-            rate,
-            "-frames:v",
-            str(want),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-qp",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            "-an",
-            str(tmp),
-        ]
-    )
-    tmp.replace(restored)
-    return restored
-
-
-def _run_flashvsr(request: UpscaleRequest, *, backend: _V11 | _Plus) -> Path:
-    """Load FlashVSR and run one file."""
-    try:
-        loaded = backend.load()
-    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
-        failure = _flashvsr_failure(exc)
-        del exc
-        _release_gpu()
-        raise failure from None
-    failed: UpscaleError | None = None
-    try:
-        loaded.run(request.source, request.output, scale=request.scale)
-    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
-        failed = _flashvsr_failure(exc)
-        del exc
-    finally:
-        _release_gpu(loaded.pipe)
-        loaded.module = loaded.pipe = None
-        _release_gpu()
-        loaded.close()
-    if failed is not None:
-        raise failed from None
-    if not request.output.is_file():
-        raise UpscaleError("FlashVSR produced no output")
-    return request.output
-
-
-def chunk_frames(total: int, length: int, overlap: int) -> list[tuple[int, int]]:
-    """``[first, stop)`` frame ranges of ``length`` overlapping by ``overlap``.
-
-    Planned in whole frames so a cut never lands between two frames (at 25
-    fps, 7.5 s is frame 187.5). The last range is a full ``length`` too,
-    reaching further back into the one before: a short remainder can be
-    below what FlashVSR accepts.
-    """
-    if total <= 0:
-        raise UpscaleError("media has no frames")
-    if length >= total:
-        return [(0, total)]
-    step = length - overlap
-    ranges: list[tuple[int, int]] = []
-    first = 0
-    while first + length < total:
-        ranges.append((first, first + length))
-        first += step
-    ranges.append((total - length, total))
-    return ranges
-
-
-def flashvsr_chunks(
-    total: int, fps: float, *, chunk_s: float = CHUNK_SECONDS
-) -> list[tuple[int, int]]:
-    """Inference ranges; retained pieces join at each preceding range's stop."""
-    length = max(FLASHVSR_MIN_CHUNK_FRAMES, round(chunk_s * fps))
-    overlap = min(round(CHUNK_OVERLAP_S * fps), length // 4)
-    return chunk_frames(total, length, overlap)
-
-
-def _run_flashvsr_chunked(
-    request: UpscaleRequest,
-    *,
-    backend: _V11 | _Plus,
-    chunk_s: float = CHUNK_SECONDS,
-) -> Path:
-    """Upscale overlapping pieces of ``chunk_s`` so the whole clip is not on the GPU.
-
-    Each piece's restored picture goes to disk before the next one starts;
-    the join, blend, and delivery encode then run once on the files.
-    """
-    total, rate = video_stream_facts(request.source)
-    fps = float(Fraction(rate))
-    chunks = flashvsr_chunks(total, fps, chunk_s=chunk_s)
-    work = request.output.parent / "flash_chunks"
-    work.mkdir(parents=True, exist_ok=True)
-    try:
-        loaded = backend.load()
-    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
-        failure = _flashvsr_failure(exc)
-        del exc
-        _release_gpu()
-        raise failure from None
-    pieces = [work / f"keep_{index}.mp4" for index in range(len(chunks))]
-    failed: UpscaleError | None = None
-    # The chunks are most of the work; the blend and delivery encode after
-    # them report the rest, so the bar does not wait at 100%.
-    restored = _part_of(request.on_progress, 0.0, RESTORE_SHARE)
-    clean = request.look.clean_filter()
-
-    def prepare(index: int) -> _Prepared:
-        first, stop = chunks[index]
-        clip = trim_source(
-            request.source,
-            work / f"in_{index}.mp4",
-            _cut_time(first, fps),
-            _cut_time(stop, fps),
-            video_filter=clean,
-        )
-        return loaded.prepare(clip, scale=request.scale)
-
-    def write(index: int, frames: _Restored, prepared: _Prepared) -> None:
-        # The frames the previous piece already covers are dropped here.
-        first = chunks[index][0]
-        covered = chunks[index - 1][1] if index else 0
-        _write_restored(
-            frames,
-            prepared,
-            pieces[index],
-            scale=request.scale,
-            skip=covered - first,
-        )
-        prepared.source.unlink(missing_ok=True)
-
-    # Three stages overlap: while the GPU restores one piece, the next is
-    # cut and read in, and the one before is encoded. Each waits for its own
-    # previous step, so at most one piece is in each stage.
-    try:
-        with (
-            ThreadPoolExecutor(1, thread_name_prefix="flashvsr-in") as reader,
-            ThreadPoolExecutor(1, thread_name_prefix="flashvsr-out") as writer,
-        ):
-            upcoming: Future[_Prepared] = reader.submit(prepare, 0)
-            writing: Future[None] | None = None
-            for index in range(len(chunks)):
-                prepared = upcoming.result()
-                if index + 1 < len(chunks):
-                    upcoming = reader.submit(prepare, index + 1)
-                frames = loaded.restore(prepared, scale=request.scale)
-                if writing is not None:
-                    writing.result()
-                    if restored is not None:
-                        restored(index / len(chunks))
-                writing = writer.submit(write, index, frames, prepared)
-                del frames
-            if writing is not None:
-                writing.result()
-            if restored is not None:
-                restored(1.0)
-    except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
-        failed = _flashvsr_failure(exc)
-        del exc
-    finally:
-        _release_gpu(loaded.pipe)
-        loaded.module = loaded.pipe = None
-        _release_gpu()
-        loaded.close()
-    if failed is not None:
-        raise failed from None
-    # Join, blend, and encode once into the delivery settings, so the caller
-    # does not encode this picture a second time.
-    listing = _write_listing(work / "join.txt", pieces)
-    encode_delivery(
-        listing,
-        request.output,
-        concat=True,
-        blend_with=request.source,
-        strength=request.strength,
-        look=request.look,
-        regions=request.regions,
-        on_progress=_part_of(request.on_progress, RESTORE_SHARE, 1.0 - RESTORE_SHARE),
-    )
-    if not request.output.is_file():
-        raise UpscaleError("FlashVSR produced no output")
-    return request.output
 
 
 def trim_source(
@@ -1752,6 +1048,7 @@ def _delivery_marker() -> dict[str, Any]:
         "version": DELIVERY_VERSION,
         "bframes": 0,
         "codec": "libx264",
+        "preset": DELIVERY_PRESET,
         "crf": DELIVERY_CRF,
         "keyframe_s": KEYFRAME_INTERVAL_S,
     }
@@ -1814,7 +1111,7 @@ def blend_filter(
     swapped for the base's before the mix: the result is
     ``base + s * (detail(restored) - detail(base))``, where ``detail`` is a
     frame minus its Gaussian blur. At strength 0 that is the base; at 1 it is
-    the base's shapes and colour with FlashVSR's fine detail. The strength
+    the base's shapes and colour with SPAN's fine detail. The strength
     ``s`` is per pixel: lower inside protected ``regions``.
 
     Every two-input step takes the restored picture's branch as its first
@@ -1893,8 +1190,13 @@ def _join_filters(*parts: str) -> str:
     return ",".join(part for part in parts if part)
 
 
+# Frames fed to the delivery encoder through a pipe: their width, height,
+# frame rate, and a function that writes them (packed RGB) to the pipe.
+FramesIn = tuple[int, int, str, Callable[[IO[bytes]], None]]
+
+
 def encode_delivery(
-    source: Path,
+    source: Path | None,
     dest: Path,
     *,
     ffmpeg_bin: str = "ffmpeg",
@@ -1904,6 +1206,7 @@ def encode_delivery(
     look: ShotLook | None = None,
     regions: tuple[Region, ...] = (),
     on_progress: ProgressFn | None = None,
+    frames_in: FramesIn | None = None,
 ) -> Path:
     """Encode a picture once into the settings every splice part shares.
 
@@ -1914,10 +1217,20 @@ def encode_delivery(
     taking its coarse layer from that base (see :func:`blend_filter`). The
     look's finish step runs in this encode too. ``on_progress`` gets the
     share of frames encoded, 0 to 1, when the frame count can be read.
+    With ``frames_in`` the picture comes from a pipe instead of ``source``
+    (see :func:`_stream_span`); its feeder reports its own progress.
     """
     look = look or ShotLook()
     record = _blend_record(strength, regions) if blend_with is not None else None
     finish = look.finish_filter()
+    if frames_in is not None:
+        if blend_with is None:
+            raise UpscaleError("a piped picture is always blended")
+        return _encode_piped(
+            frames_in, dest, blend_with, strength, look, regions, ffmpeg_bin, record
+        )
+    if source is None:
+        raise UpscaleError("encode_delivery needs a source or frames_in")
     if not concat and is_delivery(source):
         done = _read_marker(source) or {}
         same_look = done.get("look", ShotLook().to_dict()) == look.to_dict()
@@ -1959,33 +1272,7 @@ def encode_delivery(
         picture = ["-filter_complex", f"[0:v]{finish}[v]", "-map", "[v]"]
     tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
     _run_ffmpeg(
-        [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            *inputs,
-            *picture,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            str(DELIVERY_CRF),
-            "-pix_fmt",
-            "yuv420p",
-            "-force_key_frames",
-            f"expr:gte(t,n_forced*{KEYFRAME_INTERVAL_S:g})",
-            "-forced-idr",
-            "1",
-            # No B-frames: presentation and decode order match, so a stream
-            # copy cut at a keyframe takes exactly the frames before it.
-            "-bf",
-            "0",
-            "-an",
-            str(tmp),
-        ],
+        [ffmpeg_bin, *_QUIET, "-y", *inputs, *picture, *_delivery_codec(), str(tmp)],
         on_progress=on_progress,
         total_frames=_count_frames(
             blend_with if blend_with is not None else None if concat else source,
@@ -1994,6 +1281,109 @@ def encode_delivery(
         if on_progress is not None
         else 0,
     )
+    tmp.replace(dest)
+    _write_marker(dest, blend=record, look=None if look.is_neutral() else look)
+    return dest
+
+
+_QUIET = ("-hide_banner", "-loglevel", "error")
+
+
+def _delivery_codec() -> list[str]:
+    """The encode every delivery part shares, so parts splice by stream copy."""
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        DELIVERY_PRESET,
+        "-crf",
+        str(DELIVERY_CRF),
+        "-pix_fmt",
+        "yuv420p",
+        "-force_key_frames",
+        f"expr:gte(t,n_forced*{KEYFRAME_INTERVAL_S:g})",
+        "-forced-idr",
+        "1",
+        # No B-frames: presentation and decode order match, so a stream
+        # copy cut at a keyframe takes exactly the frames before it.
+        "-bf",
+        "0",
+        "-an",
+    ]
+
+
+def _encode_piped(
+    frames_in: FramesIn,
+    dest: Path,
+    blend_with: Path,
+    strength: float,
+    look: ShotLook,
+    regions: tuple[Region, ...],
+    ffmpeg_bin: str,
+    record: dict[str, Any] | None,
+) -> Path:
+    """:func:`encode_delivery` of frames written to the encoder's stdin."""
+    width, height, rate, feed = frames_in
+    base_size = _frame_size(blend_with)
+    if base_size is None:
+        raise UpscaleError(f"could not read the frame size of {blend_with}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    delivery_marker_path(dest).unlink(missing_ok=True)
+    tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
+    sigma = STRUCTURE_SIGMA * width / base_size[0]
+    command = [
+        ffmpeg_bin,
+        *_QUIET,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-framerate",
+        rate,
+        "-i",
+        "pipe:0",
+        "-i",
+        str(blend_with),
+        "-filter_complex",
+        blend_filter(width, height, strength, look, regions=regions, sigma=sigma),
+        "-map",
+        "[v]",
+        *_delivery_codec(),
+        str(tmp),
+    ]
+    # Errors go to a file: nothing reads the encoder's stderr while it runs.
+    with tempfile.TemporaryFile() as errors:
+        try:
+            encoder = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=errors)
+        except OSError as exc:
+            raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
+        assert encoder.stdin is not None
+        try:
+            feed(encoder.stdin)
+            encoder.stdin.close()
+        except BaseException:
+            # A feeder that fails because the encoder died reports the
+            # encoder's own error instead (a broken pipe says nothing).
+            encoder.kill()
+            encoder.wait()
+            # Its buffered bytes cannot reach a dead encoder.
+            with contextlib.suppress(OSError):
+                encoder.stdin.close()
+            tmp.unlink(missing_ok=True)
+            errors.seek(0)
+            detail = errors.read().decode("utf-8", errors="replace").strip()
+            if detail:
+                raise UpscaleError(f"encoding SPAN frames failed: {detail}") from None
+            raise
+        encoder.wait()
+        errors.seek(0)
+        detail = errors.read().decode("utf-8", errors="replace").strip()
+    if encoder.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise UpscaleError(f"encoding SPAN frames failed: {detail or 'ffmpeg failed'}")
     tmp.replace(dest)
     _write_marker(dest, blend=record, look=None if look.is_neutral() else look)
     return dest
@@ -2286,7 +1676,8 @@ def render_plan(
 
     A pending range on an existing output is spliced in by
     :func:`apply_range_revise`. Anything else (the first render, a pending
-    span over the whole file, a scale change) renders every shot again.
+    span over the whole file, a scale change, an output at another scale
+    than the pending range) renders every shot again.
     """
     require_supported_timing(source, ffmpeg_bin=ffmpeg_bin)
     pending = plan.pending
@@ -2294,6 +1685,9 @@ def render_plan(
         pending is not None
         and output.is_file()
         and not _covers_all(pending, duration_s)
+        # An output rendered at another scale (4x, before it was retired,
+        # with the plan now loaded at 2x) cannot take a 2x range.
+        and rendered_scale(source, output) in (None, pending.scale)
     ):
         return apply_range_revise(
             source,
@@ -2315,6 +1709,19 @@ def render_plan(
         duration_s=duration_s,
         on_progress=on_progress,
     )
+
+
+def rendered_scale(source: Path, output: Path) -> int | None:
+    """The whole-number scale ``output`` has over ``source``; None when either
+    size cannot be read or they are not a whole multiple of each other."""
+    source_size = _frame_size(source)
+    output_size = _frame_size(output)
+    if source_size is None or output_size is None:
+        return None
+    (width, height), (out_width, out_height) = source_size, output_size
+    if out_width % width or out_width // width != out_height / height:
+        return None
+    return out_width // width
 
 
 def shot_timeline(
@@ -2365,21 +1772,19 @@ def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
 _CUT_MARGIN_FRAMES = 0.25
 
 
-# What a source frame costs to render without FlashVSR (a lanczos resize and
-# the delivery encode), against 1 for a frame FlashVSR restores.
-PLAIN_FRAME_COST = 0.05
-# The share of a FlashVSR part spent restoring; the rest is its blend and
-# delivery encode. Measured on a 640x480 film at 2x: FlashVSR at about 9.5
-# frames a second, the blend and encode at about 155.
-RESTORE_SHARE = 0.92
+# What a source frame costs to render without SPAN (a lanczos resize and the
+# delivery encode), against 1 for a frame SPAN upscales and blends. Measured
+# on 20 s noisy test films on an RTX 5090: 5.9 against 16.0 s at 640x480 and
+# 22.9 against 65.0 s at 1440x1080. (It was 0.05 with FlashVSR at 9.5 fps.)
+PLAIN_FRAME_COST = 0.35
 
 
-def _flash(span: UpscaleSpan) -> bool:
+def _upscaled(span: UpscaleSpan) -> bool:
     return span.use_upscale and span.scale > 1
 
 
 def _frame_cost(span: UpscaleSpan) -> float:
-    return 1.0 if _flash(span) else PLAIN_FRAME_COST
+    return 1.0 if _upscaled(span) else PLAIN_FRAME_COST
 
 
 def _restore_then_deliver(
@@ -2387,11 +1792,11 @@ def _restore_then_deliver(
 ) -> tuple[ProgressFn | None, ProgressFn | None]:
     """Progress for a part's restore and for its delivery encode after it.
 
-    FlashVSR blends and encodes into the delivery settings itself and
+    SPAN blends and encodes into the delivery settings itself and
     reports both, so it gets the whole part and the encode after it finds
     nothing to do. A plain resize and its encode get half each.
     """
-    if _flash(span):
+    if _upscaled(span):
         return on_progress, None
     return _part_of(on_progress, 0.0, 0.5), _part_of(on_progress, 0.5, 0.5)
 
@@ -2429,7 +1834,7 @@ def render_shots(
     Shot edges snap to source frames, so the parts hold every source frame
     exactly once. Each part goes through the delivery encode, which starts it
     on a keyframe, and the parts are joined by stream copy. Neighbouring
-    shots with the same settings render as one part, so FlashVSR is not
+    shots with the same settings render as one part, so SPAN is not
     loaded once per shot when most shots look alike.
     """
     require_supported_timing(source, ffmpeg_bin=ffmpeg_bin)
@@ -2451,7 +1856,7 @@ def render_shots(
     fps = float(Fraction(rate))
     timeline = render_shot_parts(spans, duration_s, want, fps)
     # Each part's share of the work is its frames times what a frame costs,
-    # so a part FlashVSR skips does not make the time left jump.
+    # so a part SPAN skips does not make the time left jump.
     costs = [(stop - first) * _frame_cost(span) for span, first, stop in timeline]
     total_cost = sum(costs) or 1.0
     parts: list[Path] = []
@@ -2632,9 +2037,9 @@ def _count_frames(video: Path | None, ffmpeg_bin: str) -> int:
 
 def _require_scale(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise UpscaleError("scale must be 1, 2, or 4")
+        raise UpscaleError("scale must be 1 or 2")
     if value not in _SCALES:
-        raise UpscaleError("scale must be 1, 2, or 4")
+        raise UpscaleError("scale must be 1 or 2")
     return value
 
 

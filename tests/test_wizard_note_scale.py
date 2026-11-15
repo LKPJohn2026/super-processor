@@ -15,7 +15,7 @@ from super_processor.gemini import GeminiClient
 from super_processor.probe import probe_file
 from super_processor.review import WizardServer
 from super_processor.shot_plan import (
-    allowed_scales,
+    UPSCALE_SCALES,
     default_scale,
     note_scale,
     reply_scale,
@@ -27,10 +27,12 @@ from super_processor.upscale import (
     UpscaleSpan,
     load_upscale_plan,
 )
-from super_processor.wizard import WizardController, WizardStep, strength_summary
-
-# A 32 GB GPU, which allows 4x for a small source.
-GB_32 = 32 * 1000**3
+from super_processor.wizard import (
+    SCALE_OPTIONS,
+    WizardController,
+    WizardStep,
+    strength_summary,
+)
 
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg required"
@@ -142,13 +144,13 @@ def _size(video: Path) -> tuple[int | None, int | None]:
     ("note", "current", "expected"),
     [
         # A named size wins, whatever the model replies.
-        ("make it 4x", 2, 4),
+        ("make it 1x", 2, 1),
         ("Make it 2× please", 1, 2),
         ("2x", 1, 2),
         ("2 x please", 1, 2),
         ("render at 2x from 2s to 5s", 1, 2),
-        ("less detail, make it 4x", 2, 4),
-        ("go back to 2x, less contrast", 4, 2),
+        ("less detail, make it 1x", 2, 1),
+        ("go back to 2x, less contrast", 1, 2),
         ("not 4x, 2x", 1, 2),
         # Everything else keeps the size.
         ("", 2, 2),
@@ -174,17 +176,14 @@ def _size(video: Path) -> tuple[int | None, int | None]:
     ],
 )
 def test_note_scale(note: str, current: int, expected: int) -> None:
-    assert note_scale(note, current, (1, 2, 4)) == expected
+    assert note_scale(note, current, SCALE_OPTIONS) == expected
 
 
-@pytest.mark.parametrize(
-    ("note", "allowed"), [("make it 4x", (1, 2)), ("make it 3x", (1, 2, 4))]
-)
-def test_note_for_a_size_the_source_lacks_is_refused(
-    note: str, allowed: tuple[int, ...]
-) -> None:
-    with pytest.raises(ValueError, match="kept 2x and rendered nothing"):
-        note_scale(note, 2, allowed)
+@pytest.mark.parametrize("note", ["make it 4x", "make it 3x", "less detail, 4x"])
+def test_note_for_a_size_that_is_not_offered_is_refused(note: str) -> None:
+    with pytest.raises(ValueError, match="kept 2x and rendered nothing") as caught:
+        note_scale(note, 2, SCALE_OPTIONS)
+    assert "can be 1x or 2x" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -192,6 +191,9 @@ def test_note_for_a_size_the_source_lacks_is_refused(
     [
         (2, 2),
         (2.0, 2),
+        (1, 1),
+        # 4x was removed: a model that still answers 4 is ignored.
+        (4, None),
         (3, None),
         (2.5, None),
         (True, None),
@@ -206,65 +208,15 @@ def test_reply_scale(raw: Any, expected: int | None) -> None:
     assert reply_scale(raw) == expected
 
 
-def test_scale_one_spans_report_flashvsr_off() -> None:
+def test_scale_one_spans_report_upscaling_off() -> None:
     assert strength_summary((UpscaleSpan(0.0, 6.0, scale=1, strength=0.2),)) == (
-        "FlashVSR off"
+        "upscaling off"
     )
 
 
-def test_4x_needs_a_gpu_with_24_gb() -> None:
-    # Sold as 24 GB, an RTX 4090 reports 24564 MiB: still enough.
-    for enough in (24 * 1000**3, 24564 * 1024**2, GB_32):
-        assert allowed_scales(854, 480, vram_bytes=enough) == (2, 4)
-    for short in (0, 16 * 1024**3, 23 * 1000**3):
-        assert allowed_scales(854, 480, vram_bytes=short) == (2,)
-
-
-def test_the_gpu_size_comes_from_the_setting_or_nvidia_smi(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from super_processor import upscale
-
-    monkeypatch.setenv("SUPER_PROCESSOR_GPU_VRAM_GB", "12")
-    assert upscale.gpu_vram_bytes() == 12 * 1000**3
-    monkeypatch.delenv("SUPER_PROCESSOR_GPU_VRAM_GB")
-    monkeypatch.setattr(upscale, "_detected_vram", [])
-
-    def smi(command: list[str], **_kwargs: object) -> object:
-        assert command[0] == "nvidia-smi"
-        return type("Done", (), {"stdout": "32607\n"})()
-
-    monkeypatch.setattr("super_processor.upscale.subprocess.run", smi)
-    assert upscale.gpu_vram_bytes() == 32607 * 1024**2
-    # A setting that is not a number is ignored, not a failed job.
-    for typo in ("24GB", "lots", "inf"):
-        monkeypatch.setenv("SUPER_PROCESSOR_GPU_VRAM_GB", typo)
-        assert upscale.gpu_vram_bytes() == 32607 * 1024**2
-    monkeypatch.delenv("SUPER_PROCESSOR_GPU_VRAM_GB")
-    monkeypatch.setattr(upscale, "_detected_vram", [])
-
-    def missing(*_args: object, **_kwargs: object) -> object:
-        raise FileNotFoundError("nvidia-smi")
-
-    monkeypatch.setattr("super_processor.upscale.subprocess.run", missing)
-    monkeypatch.delitem(__import__("sys").modules, "torch", raising=False)
-    assert upscale.gpu_vram_bytes() == 0
-
-
-def test_unknown_size_does_not_unlock_4x() -> None:
-    assert allowed_scales(0, 0, vram_bytes=GB_32) == (2,)
-    assert allowed_scales(854, 480, vram_bytes=GB_32) == (2, 4)
-    assert allowed_scales(1280, 960, vram_bytes=GB_32) == (2,)
-
-
-def test_a_large_source_is_not_offered_flashvsr() -> None:
-    # 2x of 1440x1080 is 2880x2160: past the GPU, many hours in system RAM.
-    for width, height in ((1440, 1080), (1920, 800), (1080, 1920), (1281, 720)):
-        assert allowed_scales(width, height, vram_bytes=GB_32) == ()
-    assert allowed_scales(1280, 720, vram_bytes=GB_32) == (2,)
-    assert default_scale((1, 2, 4)) == 2 and default_scale((1,)) == 1
-    with pytest.raises(ValueError, match="larger than 1280 px"):
-        note_scale("make it 2x", 1, (1,))
+def test_every_source_is_offered_1x_and_2x() -> None:
+    assert UPSCALE_SCALES == (2,) and SCALE_OPTIONS == (1, 2)
+    assert default_scale(SCALE_OPTIONS) == 2 and default_scale((1,)) == 1
 
 
 @needs_ffmpeg
@@ -295,31 +247,6 @@ def test_note_on_dont_upscale_render_cannot_change_the_picture(
 
 
 @needs_ffmpeg
-def test_note_on_a_2x_render_of_a_source_now_over_the_limit_renders_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    controller, transport, job_dir = _render(
-        tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=2
-    )
-    before = (job_dir / "output.mp4").read_bytes()
-    monkeypatch.setattr("super_processor.shot_plan.MAX_UPSCALE_LONG_EDGE", 100)
-    controller.handle_post("/result", {"note": ["warmer from 1s to 2s"]})
-    state = controller.current_state()
-    assert state.step is WizardStep.RESULT
-    assert state.error is not None and "cannot be upscaled" in state.error
-    assert transport.revise_prompts == []
-    assert (job_dir / "output.mp4").read_bytes() == before
-    # Asking for the size it can have still works: back to the source size.
-    controller.handle_post("/result", {"note": ["make it 1x"]})
-    plan = load_upscale_plan(job_dir)
-    assert plan is not None and {span.scale for span in plan.spans} == {1}
-    controller.run_render()
-    state = controller.current_state()
-    assert state.step is WizardStep.RESULT, state.error
-    assert _size(job_dir / "output.mp4") == (160, 90)
-
-
-@needs_ffmpeg
 def test_note_asking_for_size_on_dont_upscale_render_is_honoured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -327,7 +254,7 @@ def test_note_asking_for_size_on_dont_upscale_render_is_honoured(
         tmp_path, monkeypatch, size="160x90", ready_scale="1", revise_scale=2
     )
     controller.handle_post("/result", {"note": ["make it 2x"]})
-    assert "only one of: 1, 2, 4" in transport.revise_prompts[-1]
+    assert "only one of: 1, 2;" in transport.revise_prompts[-1]
     assert "Keep scale=1" in transport.revise_prompts[-1]
     plan = load_upscale_plan(job_dir)
     assert plan is not None
@@ -370,23 +297,23 @@ def test_non_finite_reply_keeps_scale_without_an_error(
 
 
 @needs_ffmpeg
-def test_size_the_source_lacks_renders_nothing_and_says_so(
+def test_a_4x_note_renders_nothing_and_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller, transport, job_dir = _render(
-        tmp_path, monkeypatch, size="1000x90", ready_scale="2", revise_scale=4
+        tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=4
     )
     before = load_upscale_plan(job_dir)
     controller.handle_post("/result", {"note": ["make it 4x"]})
     state = controller.current_state()
     assert state.step is WizardStep.RESULT
-    assert state.error is not None and "1x, 2x" in state.error
+    assert state.error is not None and "1x or 2x" in state.error
     assert transport.revise_prompts == []
     assert load_upscale_plan(job_dir) == before
 
 
 @needs_ffmpeg
-def test_source_limit_reaches_the_prompt(
+def test_the_offered_scales_reach_the_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller, transport, _job_dir = _render(
@@ -401,12 +328,12 @@ def test_note_may_still_change_to_an_allowed_scale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller, _transport, job_dir = _render(
-        tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=4
+        tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=2
     )
-    controller.handle_post("/result", {"note": ["make it 4x"]})
+    controller.handle_post("/result", {"note": ["make it 1x"]})
     plan = load_upscale_plan(job_dir)
     assert plan is not None
-    assert {span.scale for span in plan.spans} == {4}
+    assert {span.scale for span in plan.spans} == {1}
 
 
 @needs_ffmpeg
@@ -414,7 +341,7 @@ def test_reply_ignored_for_a_plain_note_is_reported_after_the_render(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller, _transport, job_dir = _render(
-        tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=4
+        tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=1
     )
     controller.handle_post("/result", {"note": ["less contrast from 1s to 3s"]})
     state = controller.current_state()
@@ -423,55 +350,38 @@ def test_reply_ignored_for_a_plain_note_is_reported_after_the_render(
     state = controller.current_state()
     assert state.step is WizardStep.RESULT
     assert state.error is not None and state.error.startswith("Kept 2x")
-    assert 'say "make it 4x"' in state.error
+    assert 'say "make it 1x"' in state.error
     assert state.notice is None
     assert _size(job_dir / "output.mp4") == (320, 180)
 
 
 @needs_ffmpeg
-@pytest.mark.parametrize(
-    ("ready", "note", "reply", "failed_scale", "size"),
-    [
-        ("2", "make it 4x", 4, 4, (320, 180)),
-        ("4", "make it 2x", 2, 2, (640, 360)),
-    ],
-)
 def test_plain_note_after_a_failed_rescale_uses_the_size_on_disk(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    ready: str,
-    note: str,
-    reply: int,
-    failed_scale: int,
-    size: tuple[int, int],
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller, transport, job_dir = _render(
-        tmp_path, monkeypatch, size="160x90", ready_scale=ready, revise_scale=reply
+        tmp_path, monkeypatch, size="160x90", ready_scale="1", revise_scale=2
     )
     before = load_upscale_plan(job_dir)
     engine = controller.upscale_engine()
     assert isinstance(engine, _Engine)
-    engine.fail_scale = failed_scale
-    controller.handle_post("/result", {"note": [note]})
+    engine.fail_scale = 2
+    controller.handle_post("/result", {"note": ["make it 2x"]})
     controller.run_render()
     state = controller.current_state()
     assert state.step is WizardStep.RESULT and state.error == "simulated GPU failure"
-    assert _size(job_dir / "output.mp4") == size
+    assert _size(job_dir / "output.mp4") == (160, 90)
     assert load_upscale_plan(job_dir) == before
 
-    engine.fail_scale = None
-    engine.scales.clear()
+    # The output on disk is still 1x, so a plain note cannot change it; the
+    # 2x that failed is not taken as the current size.
+    prompts = len(transport.revise_prompts)
     controller.handle_post("/result", {"note": ["less contrast from 1s to 3s"]})
-    assert f"Keep scale={ready}" in transport.revise_prompts[-1]
-    controller.run_render()
     state = controller.current_state()
     assert state.step is WizardStep.RESULT
-    assert state.error is None or state.error.startswith("Kept")
-    assert _size(job_dir / "output.mp4") == size
-    assert set(engine.scales) == {int(ready)}
-    plan = load_upscale_plan(job_dir)
-    assert plan is not None and plan.pending is None
-    assert {span.scale for span in plan.spans} == {int(ready)}
+    assert state.error is not None and "make it 2x" in state.error
+    assert len(transport.revise_prompts) == prompts
+    assert load_upscale_plan(job_dir) == before
 
 
 @needs_ffmpeg
@@ -517,3 +427,39 @@ def test_output_url_with_a_version_serves_the_file(
             assert response.read() == (job_dir / "output.mp4").read_bytes()[:4]
     finally:
         server.stop()
+
+
+@needs_ffmpeg
+def test_note_on_a_4x_output_from_before_4x_was_retired_renders_it_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, _transport, job_dir = _render(
+        tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=2
+    )
+    # What a 3.7.0 job left behind: a 4x output and a plan that says 4.
+    output = job_dir / "output.mp4"
+    four = job_dir / "four.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(output), "-vf", "scale=640:360",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(four),
+        ],
+        check=True,
+    )  # fmt: skip
+    four.replace(output)
+    plan_file = job_dir / "upscale_plan.json"
+    saved = json.loads(plan_file.read_text())
+    for span in saved["spans"]:
+        span["scale"] = 4
+    plan_file.write_text(json.dumps(saved))
+    # The Result line reports the size on disk, not the plan's 2x.
+    assert "Scale 4×" in controller.render()
+    assert controller.api_view()["scale"] == 4
+
+    controller.handle_post("/result", {"note": ["less contrast from 1s to 3s"]})
+    controller.run_render()
+    state = controller.current_state()
+    assert state.step is WizardStep.RESULT and state.error is None, state.error
+    assert _size(output) == (320, 180)
+    assert "Scale 2×" in controller.render()

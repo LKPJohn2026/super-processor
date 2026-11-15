@@ -10,21 +10,22 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
-from test_upscale import _V11_FAKE_BASE
+from test_upscale import fake_span
 
+from super_processor import upscale
+from super_processor.span_sr import batch_size
 from super_processor.upscale import (
-    FLASHVSR_MIN_CHUNK_FRAMES,
     FakeUpscaleEngine,
-    FlashVsrEngine,
     GpuOutOfMemory,
+    SpanEngine,
     UpscaleError,
     UpscaleRequest,
     UpscaleSpan,
-    _flashvsr_failure,
-    chunk_frames,
-    flashvsr_extra_frames,
+    _upscale_failure,
+    block_frames,
     render_shots,
 )
 
@@ -33,6 +34,21 @@ needs_ffmpeg = pytest.mark.skipif(
 )
 FPS = 24
 STEP = 5  # grey levels per frame; numbers repeat every 40 frames
+FRAME_BYTES = 96 * 64 * 3  # one packed RGB frame of the numbered clips
+
+
+def _small_blocks(monkeypatch: pytest.MonkeyPatch, frames: int) -> list[int]:
+    """Hand SPAN ``frames`` frames per block; the frames each block held."""
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", FRAME_BYTES * frames)
+    restore = upscale._restore_span
+    counts: list[int] = []
+
+    def counted(loaded: Any, prepared: Any) -> Any:
+        counts.append(len(prepared.payload) // FRAME_BYTES)
+        return restore(loaded, prepared)
+
+    monkeypatch.setattr(upscale, "_restore_span", counted)
+    return counts
 
 
 def _numbered(path: Path, frames: int) -> Path:
@@ -99,16 +115,6 @@ def _segment_errors(want: list[int], got: list[int], cuts: list[int]) -> list[st
     return errors
 
 
-def test_extra_frames_make_flashvsr_return_every_frame() -> None:
-    for frames in range(1, 300):
-        extra = flashvsr_extra_frames(frames)
-        assert 0 <= extra < 8
-        padded = frames + extra
-        # FlashVSR's loader: four copies on, largest 8n + 1, four off.
-        returned = ((padded + 4 - 1) // 8) * 8 + 1 - 4
-        assert returned == padded >= frames
-
-
 @needs_ffmpeg
 def test_every_segment_lines_up_with_the_source(tmp_path: Path) -> None:
     # The trailer's cuts that came out a frame early: 141.5/24 written to six
@@ -137,115 +143,88 @@ def test_every_segment_lines_up_with_the_source(tmp_path: Path) -> None:
     assert _segment_errors(want, got, cuts) == []
 
 
-# Like FlashVSR's loader: return only the largest 8n + 1 of (frames + 4),
-# less four, at twice the size.
-_EIGHT_N_INFER = (
-    _V11_FAKE_BASE
-    + """
-
-def prepare_input_tensor(path, scale, dtype, device):
-    count = _count(path)
-    limit = int(os.environ.get("FAKE_MAX_FRAMES", "100000"))
-    if count > limit:
-        # What PyTorch raises when the working memory does not fit.
-        raise RuntimeError(f"CUDA out of memory. Tried to allocate 2 GiB ({count})")
-    keep = ((count + 3) // 8) * 8 + 1 - 4
-    return ({"path": path, "scale": int(scale), "keep": keep}, 8, 8, 1, 24)
-
-
-def tensor2video(video):
-    scale = video["scale"]
-    return _frames(video["path"], f"scale=iw*{scale}:ih*{scale}", video["keep"])
-"""
-)
-
-
 @needs_ffmpeg
-@pytest.mark.parametrize("frames", [48, 94, 95])
-def test_flashvsr_tail_is_real_frames(
+@pytest.mark.parametrize("frames", [48, 49, 95])
+def test_span_returns_every_frame_in_place(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, frames: int
 ) -> None:
-    from test_upscale import _flashvsr_tree
-
-    home, _script = _flashvsr_tree(tmp_path, _EIGHT_N_INFER)
-    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
-    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+    # Seven frames per block: 49 ends on a block edge, 48 and 95 part way in.
+    fake_span(tmp_path, monkeypatch)
+    counts = _small_blocks(monkeypatch, 7)
     source = _numbered(tmp_path / "in.mp4", frames)
-    output = FlashVsrEngine().upscale(
+    output = SpanEngine().upscale(
         UpscaleRequest(source, tmp_path / "out" / "clip.mp4", scale=2)
     )
-    # Without the extra frames, 48 came back as 45 and the last three froze.
     assert _numbers(output) == _numbers(source)
-
-
-def _fake_flashvsr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from test_upscale import _flashvsr_tree
-
-    home, _script = _flashvsr_tree(tmp_path, _EIGHT_N_INFER)
-    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
-    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
+    assert sum(counts) == frames and len(counts) == -(-frames // 7)
+    assert set(counts[:-1]) == {7}
 
 
 @needs_ffmpeg
-def test_out_of_memory_retries_in_shorter_pieces(
+def test_out_of_memory_retries_with_smaller_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fake_flashvsr(tmp_path, monkeypatch)
-    # Like the trailer next to a game: 24 frames do not fit, 20 do.
-    monkeypatch.setenv("FAKE_MAX_FRAMES", "23")
+    # Like a render next to a game: 8 frames per call do not fit, 2 do.
+    fake = fake_span(tmp_path, monkeypatch, max_batch=2)
+    counts = _small_blocks(monkeypatch, 20)
     source = _numbered(tmp_path / "in.mp4", 130)
     seen: list[float] = []
-    output = FlashVsrEngine().upscale(
+    output = SpanEngine().upscale(
         UpscaleRequest(
             source, tmp_path / "out" / "clip.mp4", scale=2, on_progress=seen.append
         )
     )
     assert _numbers(output) == _numbers(source)
+    assert len(counts) == 7
     assert seen and seen[-1] == pytest.approx(1.0)
-    # Runtime retries introduce joins even in clips below the nominal 8s
-    # limit. The plan alone cannot recover those joins: no render trace is
-    # retained. Keep this limitation explicit rather than claiming coverage.
-    from super_processor.stability import seam_candidates
-    from super_processor.upscale import UpscalePlan
-
-    assert len(list((output.parent / "flash_chunks").glob("keep_*.mp4"))) > 1
-    assert (
-        seam_candidates(
-            UpscalePlan(spans=(UpscaleSpan(0, 130 / FPS),)),
-            130 / FPS,
-            fps=FPS,
-            total_frames=130,
-        )
-        == []
-    )
+    assert seen == sorted(seen)
+    first = batch_size(96, 64)
+    assert first == 8
+    # Halved until it fits in the first block, then kept for every later one.
+    assert fake.batches == [8, 4, 2] + [2] * 6
+    assert fake.loads == 1
 
 
 @needs_ffmpeg
-def test_out_of_memory_in_the_shortest_piece_says_what_to_do(
+def test_out_of_memory_one_frame_at_a_time_says_what_to_do(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fake_flashvsr(tmp_path, monkeypatch)
-    monkeypatch.setenv("FAKE_MAX_FRAMES", "5")
+    fake = fake_span(tmp_path, monkeypatch, max_batch=0)
+    _small_blocks(monkeypatch, 7)
     source = _numbered(tmp_path / "in.mp4", 60)
     with pytest.raises(GpuOutOfMemory, match="Close other programs that use the GPU"):
-        FlashVsrEngine().upscale(UpscaleRequest(source, tmp_path / "out.mp4", scale=2))
+        SpanEngine().upscale(UpscaleRequest(source, tmp_path / "out.mp4", scale=2))
+    # The first block fails; the stream stops there, with nothing half written.
+    assert fake.batches == [8, 4, 2, 1]
+    assert not (tmp_path / "out.mp4").exists()
+    assert not (tmp_path / "out.encoding.mp4").exists()
+    fake.batches.clear()
+    with pytest.raises(GpuOutOfMemory, match="even one frame at a time"):
+        SpanEngine().upscale_many(
+            [UpscaleRequest(source, tmp_path / "out" / "a.mp4", scale=2)]
+        )
+    assert fake.batches == [8, 4, 2, 1]
 
 
 @needs_ffmpeg
-def test_preview_batch_falls_back_to_pieces(
+def test_preview_batch_shrinks_its_batch_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fake_flashvsr(tmp_path, monkeypatch)
-    monkeypatch.setenv("FAKE_MAX_FRAMES", "30")
+    fake = fake_span(tmp_path, monkeypatch, max_batch=3)
+    counts = _small_blocks(monkeypatch, 16)
     first = _numbered(tmp_path / "a.mp4", 48)
     second = _numbered(tmp_path / "b.mp4", 20)
-    outputs = FlashVsrEngine().upscale_many(
+    outputs = SpanEngine().upscale_many(
         [
             UpscaleRequest(first, tmp_path / "out" / "a.mp4", scale=2),
             UpscaleRequest(second, tmp_path / "out" / "b.mp4", scale=2),
         ]
     )
     assert [_numbers(o) for o in outputs] == [_numbers(first), _numbers(second)]
+    assert counts == [16, 16, 16, 16, 4]
+    # The later blocks, and the second clip, start at the batch the first found.
+    assert fake.batches == [8, 4, 2, 2, 2, 2, 2]
+    assert fake.loads == 1
 
 
 def test_a_failure_lets_go_of_what_the_call_held() -> None:
@@ -264,31 +243,26 @@ def test_a_failure_lets_go_of_what_the_call_held() -> None:
     try:
         infer()
     except RuntimeError as exc:
-        failure = _flashvsr_failure(exc)
+        failure = _upscale_failure(exc)
     gc.collect()
     assert alive[0]() is None
     assert isinstance(failure, GpuOutOfMemory)
     assert failure.__cause__ is None and failure.__traceback__ is None
-    other = _flashvsr_failure(ValueError("bad shape"))
+    other = _upscale_failure(ValueError("bad shape"))
     assert type(other) is UpscaleError
-    assert str(other) == "FlashVSR failed: bad shape"
+    assert str(other) == "SPAN failed: bad shape"
 
 
-def test_chunks_are_whole_frames_that_meet() -> None:
-    assert chunk_frames(100, 200, 12) == [(0, 100)]
-    # 8 s at 25 fps with 0.5 s overlap: no half frames anywhere.
-    ranges = chunk_frames(500, 200, 12)
-    # The last piece is a full 200, reaching back past the usual overlap.
-    assert ranges == [(0, 200), (188, 388), (300, 500)]
-    # A remainder shorter than FlashVSR accepts never happens.
-    short = chunk_frames(130, 17, 4)
-    assert all(stop - first == 17 for first, stop in short)
-    assert short[0][0] == 0 and short[-1][1] == 130
-    for before, after in zip(short, short[1:], strict=False):
-        assert after[0] < before[1]
-    assert FLASHVSR_MIN_CHUNK_FRAMES >= 17
-    with pytest.raises(UpscaleError):
-        chunk_frames(0, 200, 12)
+def test_blocks_hold_whole_frames_of_a_fixed_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 256 MiB of packed RGB input per hand-off, whatever the frame size.
+    assert block_frames(1440, 1080) == 57
+    assert block_frames(640, 480) == 291
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", FRAME_BYTES * 3 + 1)
+    assert block_frames(96, 64) == 3
+    # A frame larger than a block still goes one frame at a time.
+    assert block_frames(96 * 4, 64) == 1
 
 
 def test_releasing_the_gpu_returns_freed_heap(monkeypatch: pytest.MonkeyPatch) -> None:

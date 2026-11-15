@@ -527,9 +527,9 @@ class _ScaleEngine(FakeUpscaleEngine):
 
 
 @needs_ffmpeg
-def test_previews_are_2x_even_where_4x_is_allowed(tmp_path: Path) -> None:
-    # 320x180 allows 4x, which at 854x480 never fits FlashVSR on the GPU:
-    # every 4x preview went to the system-RAM fallback.
+def test_previews_are_at_the_plan_scale_and_4x_is_ignored(tmp_path: Path) -> None:
+    # 4x was removed: Gemini still answering 4 leaves the plan and its
+    # previews at 2x.
     clip = _clip(tmp_path / "in.mp4")
     gemini = _Gemini4x()
     engine = _ScaleEngine()
@@ -550,12 +550,10 @@ def test_previews_are_2x_even_where_4x_is_allowed(tmp_path: Path) -> None:
     assert state.job_id
     plan = load_plan(controller.store.job_dir(state.job_id))
     assert plan is not None and plan.scale == 2
-    # 4x is still a choice when the render starts, with 2x picked.
-    assert controller._scale_options(state.job_id) == (1, 2, 4)
 
 
 def test_result_strength_describes_every_restored_span() -> None:
-    # Run 9 ended on credits that skip FlashVSR, and the Result line read
+    # Run 9 ended on credits that skip upscaling, and the Result line read
     # "strength 0.00" although the restored segments ran at 0.30-0.45.
     spans = (
         UpscaleSpan(0.0, 6.9, strength=0.45),
@@ -564,9 +562,9 @@ def test_result_strength_describes_every_restored_span() -> None:
         UpscaleSpan(42.3, 52.2, strength=0.0, use_upscale=False),
     )
     summary = strength_summary(spans)
-    assert summary == "strength 0.30–0.45 · FlashVSR off for 9.9 s"
+    assert summary == "strength 0.30–0.45 · upscaling off for 9.9 s"
     page = render_result(output_url="/output.mp4", scale=2, strength=summary)
-    assert "Scale 2× · strength 0.30–0.45 · FlashVSR off for 9.9 s." in page
+    assert "Scale 2× · strength 0.30–0.45 · upscaling off for 9.9 s." in page
 
 
 def test_result_strength_for_one_recipe_or_none() -> None:
@@ -574,4 +572,4 @@ def test_result_strength_for_one_recipe_or_none() -> None:
     same = (UpscaleSpan(0.0, 2.0, strength=0.4), UpscaleSpan(2.0, 5.0, strength=0.4))
     assert strength_summary(same) == "strength 0.40"
     off = (UpscaleSpan(0.0, 5.0, use_upscale=False),)
-    assert strength_summary(off) == "FlashVSR off"
+    assert strength_summary(off) == "upscaling off"

@@ -429,9 +429,9 @@ label.inline {{ display: inline-flex; gap: 0.4rem; align-items: center; }}
 def render_intro() -> str:
     body = """
 <p class="brand-hero">Super Processor</p>
-<p class="lede">Enhance the video you already shot. FlashVSR restores and
-upscales it on your GPU and adds fine detail; strength sets how much, and 0 is
-a plain upscale. Every frame and its timing are kept — no new scenes.</p>
+<p class="lede">Enhance the video you already shot. SPAN upscales it 2× on
+your GPU and adds fine detail; strength sets how much, and 0 is a plain
+upscale. Every frame and its timing are kept — no new scenes.</p>
 <p class="muted">Localhost website · media stays on your machine</p>
 <form method="post" action="/intro">
 <button type="submit" class="full">Continue</button>
@@ -681,7 +681,7 @@ def _look_card(shot: dict[str, object], redo: str) -> str:
     look = raw_look if isinstance(raw_look, dict) else {}
     summary = settings_summary(float(str(shot.get("strength", 0.5))), look)
     if shot.get("use_upscale") is False:
-        summary = "No FlashVSR: resized only. " + summary
+        summary = "No upscaling: resized only. " + summary
     raw_check = shot.get("check")
     check = raw_check if isinstance(raw_check, dict) else {}
     shimmer = _shimmer_text(shot.get("shimmer"))
@@ -757,14 +757,14 @@ def _progress_bar(progress: dict[str, object] | None) -> str:
         return (
             f'<p class="progress"><progress max="100" value="{pct}">{pct}%'
             f"</progress> {step}</p>"
-        )
+        ) + _notice(progress.get("note"))
     whole = max(0, min(100, round(overall)))
     return (
         f'<p class="progress"><progress max="100" value="{whole}" '
         f'aria-label="Whole job">{whole}%</progress> '
         f"<strong>{whole}% of the job</strong></p>"
         f'<p class="progress muted">This step: {step}</p>'
-    )
+    ) + _notice(progress.get("note"))
 
 
 def _busy(title: str, lede: str, run_url: str, phase: str, progress: object) -> str:
@@ -941,13 +941,15 @@ or tell me what to change.</p>
 
 
 def _upscale_toggle(shot: object) -> str:
-    """Let the editor turn FlashVSR on or off for this segment."""
+    """Let the editor turn upscaling on or off for this segment."""
     if not isinstance(shot, dict):
         return ""
     on = shot.get("use_upscale") is not False
     who = "You" if isinstance(shot.get("upscale_override"), bool) else "Gemini"
-    state = "uses FlashVSR" if on else "skips FlashVSR (plain resize)"
-    label = "Skip FlashVSR for this segment" if on else "Use FlashVSR for this segment"
+    state = "is upscaled with SPAN" if on else "skips upscaling (plain resize)"
+    label = (
+        "Skip upscaling for this segment" if on else "Use upscaling for this segment"
+    )
     return f"""<form method="post" action="/preview">
 <p class="tags muted">{who} chose: this segment {state}.</p>
 <input type="hidden" name="action" value="upscale">
@@ -966,7 +968,7 @@ def render_ready(view: dict[str, object], *, error: str | None = None) -> str:
         look = raw_look if isinstance(raw_look, dict) else {}
         summary = settings_summary(float(str(shot.get("strength", 0.5))), look)
         if shot.get("use_upscale") is False:
-            summary = "No FlashVSR: resized only. " + summary
+            summary = "No upscaling: resized only. " + summary
         start = float(str(shot.get("start_s", 0)))
         end = float(str(shot.get("end_s", 0)))
         label = escape(str(shot.get("label") or "Unlabelled segment"))
@@ -989,8 +991,6 @@ render the whole video with these settings.</p>
 <form method="post" action="/ready">
 <input type="hidden" name="action" value="render">
 {_scale_options(view)}
-{_size_note(view)}
-{_vram_note(view)}
 <button type="submit" class="full">Render the whole video</button>
 </form>
 <div class="back"><!--back:segments--></div>
@@ -1002,11 +1002,6 @@ def output_size_line(scale: object) -> str:
     """What the whole video becomes, said on each segment's preview."""
     if scale == 1:
         return "The whole video keeps its size; these previews show the clean-up."
-    if isinstance(scale, int) and scale > 2:
-        return (
-            f"The whole video is upscaled {scale}×; previews are 2×, which "
-            "shows the same restoration at a size any GPU fits."
-        )
     return f"The whole video is upscaled {scale}×."
 
 
@@ -1019,33 +1014,8 @@ def _scale_choice(scale: object, reason: object) -> str:
     return f'<p class="muted">Gemini chose to {what}{why}</p>'
 
 
-def _size_note(view: dict[str, object]) -> str:
-    """Say why a large source is not offered FlashVSR."""
-    limit = _number(view.get("max_upscale_long_edge"))
-    if not view.get("large_source") or not limit:
-        return ""
-    return (
-        '<p class="muted">Upscaling is offered only for videos up to '
-        f"{limit:g} px on the long edge; larger ones would not fit the GPU "
-        "and take many hours. This one keeps its size.</p>"
-    )
-
-
-def _vram_note(view: dict[str, object]) -> str:
-    """Say so when a small source could go to 4× on a larger GPU."""
-    scales = _items(view, "scales")
-    vram = _number(view.get("gpu_vram_gb"))
-    if 4 in scales or not view.get("small_source") or vram is None:
-        return ""
-    have = f"this one has {vram:g} GB" if vram else "none was found"
-    return (
-        '<p class="muted">4× needs an NVIDIA GPU with at least 24 GB of '
-        f"memory; {have}.</p>"
-    )
-
-
 def _scale_options(view: dict[str, object]) -> str:
-    """Upscale 2× or 4× (when allowed), or keep the size."""
+    """Upscale 2× or keep the size."""
     scales = [s for s in _items(view, "scales") if isinstance(s, int)]
     if not scales:
         return ""
@@ -1062,10 +1032,10 @@ def _scale_options(view: dict[str, object]) -> str:
         if scale == 1:
             text = (
                 f"<strong>Don't upscale</strong>{out} · clean-up and finishing "
-                "only, no FlashVSR"
+                "only, no upscaling"
             )
         else:
-            text = f"<strong>Upscale {scale}×</strong>{out} · FlashVSR on the GPU"
+            text = f"<strong>Upscale {scale}×</strong>{out} · SPAN on the GPU"
         checked = " checked" if scale == chosen else ""
         rows.append(
             f'<label class="option"><input type="radio" name="scale" '

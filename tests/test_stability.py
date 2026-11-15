@@ -163,11 +163,9 @@ def test_seam_candidates_cover_restarts() -> None:
         pending=UpscaleSpan(33.2, 36.8),
     )
     times = seam_candidates(plan, 40, fps=25, total_frames=1000)
-    # First chunk is retained in full; the next joins at its predecessor's stop.
-    assert 8 in times and 15.52 in times and 7.5 not in times
-    assert 28 in times  # equal 20-25 and 25-30 spans render as one 10s part
-    # Settings change at 20 and 30; 25 is the same settings, so one part.
-    assert 20 in times and 30 in times and 25 not in times
+    # Settings change at 20 and 30; 25 is the same settings, so one part. SPAN
+    # works frame by frame, so the chunks inside a part add no joins.
+    assert times == [20, 30]
     # A pending request alone does not establish that a splice happened.
     assert 33.2 not in times and 36.8 not in times
     revised = seam_candidates(
@@ -182,44 +180,43 @@ def test_seam_candidates_cover_restarts() -> None:
 
 
 @needs_ffmpeg
-def test_candidates_detect_visible_jump_at_retained_eight_second_join(
+def test_candidates_detect_a_visible_jump_where_the_recipe_changes(
     tmp_path: Path,
 ) -> None:
     source = _source(tmp_path, seconds=10)
     jump = _restored(
-        tmp_path, source, "jump8", "eq=brightness='if(gte(t,8),0.3,0)':eval=frame"
+        tmp_path, source, "jump5", "eq=brightness='if(gte(t,5),0.3,0)':eval=frame"
     )
-    # Two equal spans are one render part, not two independent 5s calls.
-    plan = UpscalePlan(spans=(UpscaleSpan(0, 5), UpscaleSpan(5, 10)))
+    plan = UpscalePlan(spans=(UpscaleSpan(0, 5), UpscaleSpan(5, 10, strength=0.2)))
     candidates = seam_candidates(plan, 10, fps=10, total_frames=100)
-    assert candidates == [8]
-    assert seam_score(jump, source, 7.5) < SEAM_LIMIT
-    assert [seam["time_s"] for seam in find_seams(jump, source, candidates)] == [8]
+    assert candidates == [5]
+    assert seam_score(jump, source, 4.5) < SEAM_LIMIT
+    assert [seam["time_s"] for seam in find_seams(jump, source, candidates)] == [5]
+    # Two equal spans are one render part: no join to check.
+    same = UpscalePlan(spans=(UpscaleSpan(0, 5), UpscaleSpan(5, 10)))
+    assert seam_candidates(same, 10, fps=10, total_frames=100) == []
 
 
 @pytest.mark.parametrize("fps", [24.0, 25.0, 30000 / 1001])
-def test_candidates_share_frame_snapping_and_last_anchored_chunk(fps: float) -> None:
-    from super_processor.upscale import flashvsr_chunks, render_shot_parts
+def test_candidates_share_frame_snapping(fps: float) -> None:
+    from super_processor.upscale import render_shot_parts
 
     total = round(31.7 * fps)
+    # One long part: its upscale chunks are not joins.
     plan = UpscalePlan(spans=(UpscaleSpan(0, 31.7),))
-    chunks = flashvsr_chunks(total, fps)
-    assert chunks[-1][0] == total - round(8 * fps)
-    assert seam_candidates(plan, 31.7, fps=fps, total_frames=total) == [
-        stop / fps for _first, stop in chunks[:-1]
-    ]
+    assert seam_candidates(plan, 31.7, fps=fps, total_frames=total) == []
     split = UpscalePlan(
         spans=(UpscaleSpan(0, 5.919), UpscaleSpan(5.919, 31.7, strength=0.2))
     )
     parts = render_shot_parts(split.spans, 31.7, total, fps)
     assert parts[0][2] == parts[1][1] == round(5.919 * fps)
-    assert round(5.919 * fps) / fps in seam_candidates(
-        split, 31.7, fps=fps, total_frames=total
-    )
+    assert seam_candidates(split, 31.7, fps=fps, total_frames=total) == [
+        round(5.919 * fps) / fps
+    ]
 
 
 @pytest.mark.parametrize("scale,use", [(1, True), (2, False)])
-def test_candidates_do_not_chunk_without_flashvsr(scale: int, use: bool) -> None:
+def test_candidates_without_upscaling(scale: int, use: bool) -> None:
     plan = UpscalePlan(spans=(UpscaleSpan(0, 20, scale=scale, use_upscale=use),))
     assert seam_candidates(plan, 20, fps=25, total_frames=500) == []
 
@@ -232,10 +229,7 @@ def test_upscale_toggle_splits_otherwise_equal_spans() -> None:
             UpscaleSpan(20, 30, use_upscale=False),
         )
     )
-    assert seam_candidates(plan, 30, fps=25, total_frames=750) == [10, 18, 20]
-    # The engine's dispatch tolerance is not a reason to invent a chunk join.
-    short = UpscalePlan(spans=(UpscaleSpan(0, 8.04),))
-    assert seam_candidates(short, 8.04, fps=25, total_frames=201) == []
+    assert seam_candidates(plan, 30, fps=25, total_frames=750) == [10, 20]
 
 
 @needs_ffmpeg
@@ -277,14 +271,14 @@ def test_full_render_ignores_pending_edges_and_drops_zero_frame_parts() -> None:
         ),
         pending=UpscaleSpan(2.2, 4.8),
     )
-    assert seam_candidates(plan, 10, fps=25, total_frames=250) == [8]
+    assert seam_candidates(plan, 10, fps=25, total_frames=250) == []
 
 
-def test_revision_chunks_are_relative_to_actual_splice_not_requested_edges() -> None:
+def test_revision_joins_are_the_actual_splice_not_requested_edges() -> None:
     plan = UpscalePlan(spans=(UpscaleSpan(0, 30),), pending=UpscaleSpan(3.2, 16.8))
     assert seam_candidates(
         plan, 30, fps=25, total_frames=750, revised_range=(3, 17)
-    ) == [3, 11, 17]
+    ) == [3, 17]
     with pytest.raises(ValueError, match="pending"):
         seam_candidates(
             UpscalePlan(spans=plan.spans),

@@ -122,10 +122,8 @@ def test_pages_show_the_job_the_step_and_the_time_left() -> None:
         "scales": [1, 2],
         "source_size": [640, 480],
         "scale_reason": "fine at 2x",
-        "gpu_vram_gb": 16.0,
-        "small_source": True,
     }
     page = render_ready(ready)
     assert "Gemini chose to upscale 2×: fine at 2x" in page
-    assert "at least 24 GB of memory; this one has 16 GB" in page
-    assert "24 GB" not in render_ready({**ready, "scales": [1, 2, 4]})
+    assert "Upscale 2×</strong> · 1280×960 · SPAN on the GPU" in page
+    assert "GB" not in page

@@ -84,7 +84,7 @@ class _Transport:
 def test_the_video_is_sent_with_1_fps_and_the_scale_is_asked() -> None:
     reply = {
         "segments": [{"start_s": 0, "end_s": 9, "label": "x", "contains": []}],
-        "scale": 4,
+        "scale": 2,
         "scale_reason": "  A small, soft  480p film. ",
     }
     transport = _Transport(reply)
@@ -92,10 +92,10 @@ def test_the_video_is_sent_with_1_fps_and_the_scale_is_asked() -> None:
     out = client.propose_segments(
         video=VIDEO,
         duration_s=9.0,
-        scales=(1, 2, 4),
+        scales=(1, 2),
         source_size=(640, 480),
     )
-    assert out["scale"] == 4
+    assert out["scale"] == 2
     assert out["scale_reason"] == "A small, soft 480p film."
     body = transport.bodies[-1]
     parts = body["contents"][-1]["parts"]
@@ -107,12 +107,15 @@ def test_the_video_is_sent_with_1_fps_and_the_scale_is_asked() -> None:
     assert "sampled at 1 frame per second" in parts[1]["text"]
     assert "The source is 640x480" in parts[1]["text"]
     assert "Use 2 unless" in parts[1]["text"]
+    assert "[1, 2] (1 keeps the source size" in parts[1]["text"]
+    assert "2 doubles it with SPAN" in parts[1]["text"]
+    assert "4 quadruples" not in parts[1]["text"]
     schema = body["generationConfig"]["responseSchema"]
     assert set(schema["required"]) == {"segments", "scale", "scale_reason"}
     assert _has_video(body)
 
 
-@pytest.mark.parametrize("answer", [8, "4", True, None, 2.5])
+@pytest.mark.parametrize("answer", [4, 8, "4", True, None, 2.5])
 def test_a_scale_not_offered_is_dropped(answer: Any) -> None:
     reply = {
         "segments": [{"start_s": 0, "end_s": 9, "label": "x", "contains": []}],
@@ -252,7 +255,7 @@ def test_the_copy_for_gemini_is_silent_and_small(tmp_path: Path) -> None:
 class _Watcher:
     """A fake Gemini that can upload, and picks ``scale`` for the video."""
 
-    def __init__(self, scale: int = 4, *, upload_fails: bool = False) -> None:
+    def __init__(self, scale: int = 2, *, upload_fails: bool = False) -> None:
         self.scale = scale
         self.upload_fails = upload_fails
         self.uploads: list[Path] = []
@@ -306,8 +309,8 @@ class _Scales(FakeUpscaleEngine):
 
 
 @needs_ffmpeg
-def test_gemini_watches_the_video_and_chooses_4x(tmp_path: Path) -> None:
-    gemini = _Watcher(scale=4)
+def test_gemini_watches_the_video_and_chooses_2x(tmp_path: Path) -> None:
+    gemini = _Watcher(scale=2)
     engine = _Scales()
     controller = WizardController(
         tmp_path / "jobs",
@@ -321,21 +324,21 @@ def test_gemini_watches_the_video_and_chooses_4x(tmp_path: Path) -> None:
     assert [path.name for path in gemini.uploads] == [GEMINI_COPY_NAME]
     asked = gemini.segment_calls[0]
     assert asked["video"] == VIDEO and "stills" not in asked
-    assert asked["scales"] == (1, 2, 4)
+    assert asked["scales"] == (1, 2)
     assert asked["source_size"] == (320, 180)
     found = load_segment_list(job_dir)
     assert found is not None
-    assert (found.scale, found.scale_reason, found.error) == (4, "small and soft", None)
+    assert (found.scale, found.scale_reason, found.error) == (2, "small and soft", None)
     view = controller.api_view()["segments"]
-    assert view["scale"] == 4 and view["scale_reason"] == "small and soft"
+    assert view["scale"] == 2 and view["scale_reason"] == "small and soft"
 
     approve_segments(controller)
     plan = load_plan(job_dir)
-    assert plan is not None and plan.scale == 4
-    # Previews stay at 2x; the planner watches its segment of the upload.
+    assert plan is not None and plan.scale == 2
+    # Previews are at the plan's 2x; the planner watches its segment of the upload.
     assert engine.scales and set(engine.scales) == {2}
     assert gemini.looks_calls[0]["video"] == VIDEO
-    assert gemini.looks_calls[0]["scales"] == (4,)
+    assert gemini.looks_calls[0]["scales"] == (2,)
     assert len(gemini.uploads) == 1
     progress = controller.current_state().progress
     assert progress is not None and progress["elapsed_s"] < 60
@@ -343,14 +346,12 @@ def test_gemini_watches_the_video_and_chooses_4x(tmp_path: Path) -> None:
         pass
     assert controller.current_state().step is WizardStep.READY_TO_RENDER
     ready = controller.api_view()["looks"]
-    assert ready["scale"] == 4 and ready["scale_reason"] == "small and soft"
+    assert ready["scale"] == 2 and ready["scale_reason"] == "small and soft"
 
 
 @needs_ffmpeg
-def test_a_small_gpu_keeps_gemini_from_4x(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("SUPER_PROCESSOR_GPU_VRAM_GB", "16")
+def test_gemini_answering_4x_gets_the_default_2x(tmp_path: Path) -> None:
+    # 4x was removed; a stale answer of 4 is dropped, not clamped.
     gemini = _Watcher(scale=4)
     controller = WizardController(
         tmp_path / "jobs",
@@ -376,7 +377,7 @@ def test_gemini_may_keep_the_size(tmp_path: Path) -> None:
     job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
     plan = load_plan(job_dir)
     assert plan is not None and plan.scale == 1
-    # Without upscaling, FlashVSR never runs, not even for previews.
+    # Without upscaling, SPAN never runs, not even for previews.
     assert engine.scales == []
 
 

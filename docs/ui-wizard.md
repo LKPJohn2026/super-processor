@@ -40,7 +40,7 @@ Walk introduction → LLM type (Gemini) → setup → pick file → sampling/pro
 note, then approve. For **each segment**, wait for analyzing → before/after
 preview; play and seek both clips, inspect protection boxes and checks, send a
 recipe note, and approve. On **Ready to render**, inspect the scale and every
-segment's FlashVSR/pass-through choice, then render → result. Send a range
+segment's upscale/pass-through choice, then render → result. Send a range
 note (for example "less artificial detail from 2s to 5s"), wait for the revise,
 and inspect it before choosing happy. Confirm `output.mp4`, the plans, chat,
 and `render_report.json` in the job directory. Reopen with `review JOB_ID` and
@@ -143,27 +143,34 @@ Playwright's npm package alone.
 
 ## Range revise and re-encoding
 
-The upscaled picture is encoded once into delivery settings: libx264 CRF 16,
-a forced IDR frame every second, no B-frames. A sidecar
-`output.mp4.delivery.json` records those settings. A result note re-upscales
+The upscaled picture is encoded once into delivery settings: libx264 preset
+`faster`, CRF 16, a forced IDR frame every second, no B-frames. A sidecar
+`output.mp4.delivery.json` records those settings with `version: 2`. A result note re-upscales
 its range widened out to the nearest keyframes, and the head and tail are
 stream-copied for a single-recipe revision. A note that changes scale or crosses
 multiple stored recipe spans re-renders the whole clip from the source. Each
-span keeps its look, protected regions, and FlashVSR/pass-through choice; only
-the requested strength and scale are retuned. Clips handed to FlashVSR are
-encoded losslessly (`-qp 0`).
+span keeps its look, protected regions, and upscale/pass-through choice; only
+the requested strength and scale are retuned. The upscaled frames are piped
+straight into the delivery encode, blend included, with no lossless
+intermediate file. An output rendered by 3.7.0 or earlier (version 1, preset
+`medium`) is re-encoded once into the current settings before a revise
+splices into it, so the two presets never share one file.
+
+`faster` replaced `medium` because the delivery encode was half the CPU of a
+render. Against the lossless upscale of a 1440x1080 -> 2880x2160 clip it
+scored 44.29 against 44.44 dB PSNR and SSIM 0.9862 against 0.9863, 1%
+smaller, for 57% less encoder CPU.
 
 ## Strength
 
-`strength` (0.0–1.0) is how much of FlashVSR's fine detail reaches the
+`strength` (0.0–1.0) is how much of SPAN's fine detail reaches the
 output. Shapes, colour, and layout always come from a lanczos upscale of the
 (cleaned) source: the blend splits both pictures at a Gaussian blur of 1.5
 source pixels and keeps the source's coarse layer, so the result is
-`base + strength × (detail(FlashVSR) − detail(base))`. At 0.0 the output is a
+`base + strength × (detail(SPAN) − detail(base))`. At 0.0 the output is a
 plain upscale with nothing invented; at 1.0 it is the source's structure with
-all of FlashVSR's fine detail. FlashVSR can sharpen what is there but cannot
-move, reshape, or recolour it. FlashVSR always runs at its upstream settings
-(sparse ratio 2.0, local range 11). A note such as "less artificial detail
+all of SPAN's fine detail. SPAN can sharpen what is there but cannot move,
+reshape, or recolour it. It has no settings of its own. A note such as "less artificial detail
 from 2s to 5s" lowers strength for that range only.
 
 ### Protected regions
@@ -171,7 +178,7 @@ from 2s to 5s" lowers strength for that range only.
 Before the first segment is planned, every segment whose contents include
 faces, hands, or text gets three stills (10%, 50%, 90% through it), and Gemini boxes them
 so one box covers the thing's whole path. Boxes are padded by 3% of the
-frame. Inside a box, the FlashVSR share is held to 0.3 for faces and hands
+frame. Inside a box, the SPAN detail share is held to 0.3 for faces and hands
 and 0.15 for text (or the shot's strength, if lower), and it rises back to
 the shot's strength over a 3% feather outside the box, so there is no seam.
 The segment preview draws the boxes over both previews. A segment that
@@ -201,7 +208,7 @@ Shared restoration and preview entry points enforce the same check for resumed
 jobs and direct callers, before GPU work or replacing an output. Successful
 checks are cached only in memory, keyed by file identity, size, and modification
 metadata; changed files and a restarted process are checked again. Internal
-chunks do not repeatedly decode the whole original file for this guard.
+work clips do not repeatedly decode the whole original file for this guard.
 
 ## Serving output
 
@@ -218,14 +225,15 @@ uses `-movflags +faststart`.
 
 The same-frame/timing contract applies to supported CFR inputs; arbitrary VFR
 preservation is not implemented. The admission check above prevents the
-constant-rate shot and chunk arithmetic from silently changing a VFR timeline.
+constant-rate shot and part arithmetic from silently changing a VFR timeline.
 
-Range revises and chunk joins cut by time, so each FlashVSR clip must hold
-exactly the frames it was given, at the source rate. After every FlashVSR
-call the clip is checked with ffprobe. A difference of up to 8 frames (or 2%)
-at the end of the clip, or a rounded frame rate, is fixed losslessly (trim,
-or repeat the last frame, and restamp at the source rate). A larger
-difference stops the job. A splice that would change the output's total
+Range revises and part joins cut by time, so each upscaled clip must hold
+exactly the frames it was given, at the source rate. SPAN works frame by
+frame, so nothing is padded and no frames are added, and the streaming
+upscale counts what reaches the encoder. A decoder up to 8 frames (or 2%)
+short repeats the last frame, extra frames are dropped, and the encode is
+stamped at the source rate. A larger shortfall, or no frames at all, stops
+the job rather than splice a misaligned picture. A splice that would change the output's total
 frame count is refused and the previous `output.mp4` is kept.
 
 ## Screen inventory
@@ -241,9 +249,9 @@ frame count is refused and the previous `output.mp4` is kept.
 | Finding segments | `GET /segment?run=1` (`/api/segment?run=1`) | States `sampling` then `proposing`: FFmpeg saves the still grid and a silent copy, which is uploaded to Gemini; Gemini watches it and proposes segments and the output scale (from the stills if the video cannot be used) |
 | Segments | `POST /segments` (`/api/segments`) | `action=approve`, or `action=note` with `note` to propose again |
 | Analyzing | `GET /analyze?run=1` (`/api/analyze?run=1`) | The current segment only: Gemini proposes its settings, a short preview renders, Gemini checks it |
-| Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one; `action=upscale` with `on=0` or `on=1` overrides Gemini's FlashVSR choice for this segment, which later proposals keep |
-| Ready to render | `POST /ready` (`/api/ready`) | Starts at Gemini's scale and shows its reason; a source over 1280 px on the long edge starts at 1 and says why. Choose the upscale: `scale=2` (when the source's long edge is 1280 or less), `4` (when the source's long edge is 960 or less and the GPU has at least 24 GB), or `1` ("Don't upscale": same size, clean-up and finishing only, no FlashVSR). `action=render` starts the full render from every approved segment |
-| Upscaling | `GET /render` | FlashVSR restore + upscale; FFmpeg trims, splices, encodes |
+| Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one; `action=upscale` with `on=0` or `on=1` overrides Gemini's upscale choice for this segment, which later proposals keep |
+| Ready to render | `POST /ready` (`/api/ready`) | Starts at Gemini's scale and shows its reason. Choose the upscale: `scale=2` ("Upscale 2× · SPAN on the GPU") or `scale=1` ("Don't upscale": same size, clean-up and finishing only, no upscaling); both are offered for every source. `action=render` starts the full render from every approved segment |
+| Upscaling | `GET /render` | SPAN 2x upscale and strength blend; FFmpeg trims, splices, encodes |
 | Result | `GET/POST /result` | Play output; happy, a note that retunes a time range, or a note with `restart=1` that starts over from the segments |
 | Done | `GET /` (state `done`) | Confirmation |
 | New video | `POST /new` (`/api/new`) | From Done or Result: back to pick (or setup without a key); the old job stays on disk |
@@ -313,17 +321,19 @@ While a worker runs, `/api/state` returns `progress`:
 - `eta_s` is the seconds left in the running step's measurable task (saving
   stills, the copy, the upload, the render), or `null` while Gemini is
   thinking or too little has been measured (under 0.5% or 3 s). The time
-  before the task's first report, such as loading FlashVSR, is ignored. The
+  before the task's first report, such as loading SPAN, is ignored. The
   rate is the average of the task's own average rate and a recent, smoothed
   one (`progress.py`, `StepClock`).
 - `elapsed_s` is the time since the worker step began; `updated_at` is when
   the worker last saved. Between saves, `/api/state` counts `eta_s` down and
   `elapsed_s` up by the age of the save.
 
-The render's work is weighted: a frame FlashVSR restores counts 1, a plain
-resize frame 0.05 (`PLAIN_FRAME_COST`), and 92% of a FlashVSR part is the
-restore, the rest its encode (`RESTORE_SHARE`). A part FlashVSR skips does not
-make the time left jump.
+The render's work is weighted: a frame SPAN upscales counts 1, a plain
+resize frame less (`PLAIN_FRAME_COST`). An upscaled part counts the frames
+its writer has handed to the delivery encoder, out of the source's frames,
+since the upscale and the encode run at once; a plain resize and its encode
+get half each. A part that skips the upscale does not make the time left
+jump.
 
 Both shells show a bar for the whole job, "N% of the job", and "This step:
 pct · message · about X left" (or "X so far" while there is no estimate). The
@@ -392,30 +402,19 @@ The hints go to Gemini with each segment's still when it is planned.
 
 ## Segment previews (loop 2)
 
-Segments are planned one at a time, in order. Each gets a recipe: a FlashVSR
+Segments are planned one at a time, in order. Each gets a recipe: a SPAN
 `strength`, a look (the bounded clean-up and finishing settings in
 `look.py`), and `use_upscale`. Gemini sets `use_upscale: false` where
-FlashVSR would only harm (footage already clean and sharp, or fine texture it
-would invent over); that segment is then resized with lanczos and keeps its
-look. The whole video shares one scale, which Gemini chooses while it
-proposes segments: `scale` 1 ("Don't upscale"), 2, or 4, with a
-`scale_reason`, from the options code offers. Without a valid choice the plan
-starts at 2×. A source whose long edge is over 1280 pixels
-(`MAX_UPSCALE_LONG_EDGE`) is offered no upscaling: Gemini is not asked, the
-plan starts at 1×, and the Ready screen says why. Its 2× output would not fit
-the GPU, and the system-RAM fallback took about 16 hours for a 20-minute
-1440×1080 film. 4× is offered only when the source's long edge is 960 pixels or
-less and the GPU has at least 24 GB (decimal: `MIN_4X_VRAM_BYTES` is
-24 × 1000³, so a 24564 MiB card counts). GPU memory comes from
-`SUPER_PROCESSOR_GPU_VRAM_GB` (GB; a value that is not a number is ignored),
-else `nvidia-smi` `memory.total`, else PyTorch if it is already loaded, else 0,
-which rules out 4×. Previews are rendered at no more than 2×
-(`preview_scale`), so a 4× job previews at 2×; at 854×480, 4× is 3456×1920,
-which FlashVSR v1.1 cannot fit in 32 GB of VRAM. A 1× plan never runs FlashVSR
-for its previews. The Segments screen shows Gemini's choice and reason, and
-the Ready screen shows the reason while that choice stands and, on a small
-source, says when the GPU is too small for 4×. The editor can still change
-the scale there.
+the upscaler would only harm (footage already clean and sharp, or fine texture
+it would sharpen into noise); that segment is then resized with lanczos and
+keeps its look. The whole video shares one scale, which Gemini chooses while
+it proposes segments: `scale` 1 ("Don't upscale") or 2, with a
+`scale_reason`. Both are offered for every source the wizard accepts (up to
+1080p; SPAN takes 1440×1080 to 2880×2160 in about 4–9 GB). Without a valid
+choice the plan starts at 2×. Previews render at the plan's scale, and a 1×
+plan never runs SPAN for its previews. The Segments screen shows Gemini's
+choice and reason, and the Ready screen shows the reason while that choice
+stands. The editor can still change the scale there.
 Faces, hands, and text are boxed and held down inside the boxes (see Protected
 regions); a segment that contains them without boxes is capped at 0.6 as a
 whole.
@@ -448,27 +447,19 @@ Gemini also sees the number. A clip with almost no fine detail is not judged.
 ### Seams
 
 After a full render, seam candidates come from the same coalesced,
-source-frame-snapped parts and nominal chunk ranges as the renderer. Adjacent
-segments with equal scale, strength, look, protected regions, and `use_upscale`
-render as one part; changing the FlashVSR toggle creates a part boundary too.
-Only FlashVSR-enabled parts above scale 1 can have chunk joins, and only when
-long enough for the engine's chunked dispatch (over 8.05 s by default).
-
-The first chunk is retained in full: its join is at 8 s, not the next chunk's
-7.5 s overlap start. Subsequent joins are at the preceding chunk's stop frame.
-Chunk length and overlap round to whole source frames; the last chunk is
-anchored to the end, so a guessed repeating seconds interval is not exact.
-For example, at 25 fps a 20 s part joins at 8 and 15.52 s. A range revision
-checks the renderer's actual, outward-keyframe-expanded splice edges and the
-replacement's nominal internal joins, not the raw requested edges or
+source-frame-snapped parts as the renderer. Adjacent segments with equal
+scale, strength, look, protected regions, and `use_upscale` render as one
+part; changing the upscale toggle creates a part boundary too. Each part
+streams through SPAN and the encoder in one pass, so a part has no internal
+joins however long it is. A range revision checks the renderer's actual,
+outward-keyframe-expanded splice edges, not the raw requested edges or
 hypothetical joins in the untouched head and tail. Those edges are captured
-before the pending revision is cleared, including for legacy delivery conversion.
-A pending request that instead triggers a full render uses the full timeline.
+before the pending revision is cleared. A pending request that instead
+triggers a full render, including a revise of an output from 3.7.0 or
+earlier, uses the full timeline.
 
-This is nominal chunk coverage, not a complete render history. OOM retries,
-custom chunk lengths, and the system-RAM fallback can use shorter chunks whose
-actual joins are not recorded; the checker can miss those seams. Synthetic
-CPU-only tests establish boundary mechanics and visible-jump detection, not
+Out-of-memory retries shrink only the GPU batch, so they add no joins.
+Synthetic CPU-only tests establish boundary mechanics and visible-jump detection, not
 quality calibration on real footage. Shimmer and seam thresholds are unchanged.
 
 After each render, a 1 s window around each candidate more than 0.5 s from
@@ -519,16 +510,15 @@ A result note becomes a range and knobs.
 {"start_s": 2.0, "end_s": 5.0, "scale": 2, "strength": 0.3}
 ```
 
-`scale` must be one the Ready screen offers for this source (1; 2 when its
-long edge is 1280 or less; and 4 when it is 960 or less and the GPU has at
-least 24 GB) and `strength`
+`scale` must be one the Ready screen offers (1 or 2) and `strength`
 0–1; the range is clamped to the file. The size changes only when the note
-names a multiple as a request ("make it 4x", "go back to 2x", or "4x" alone).
+names a multiple as a request ("go back to 2x", or "2x" alone).
 Code holds that whatever Gemini replies: any other note keeps the current
 scale, even "make it bigger", and if Gemini answered a different scale the
-Result screen says so and how to ask. A named size the source does not offer
-is refused before anything runs. A note on a "Don't upscale" render that names
-no size is refused too, since strength does not apply without FlashVSR. If a
+Result screen says so and how to ask. A named size that is not offered (such
+as 4x, removed with FlashVSR) is refused before anything runs. A note on a
+"Don't upscale" render that names
+no size is refused too, since strength does not apply without the upscale. If a
 scale change fails to render, the plan goes back to what `output.mp4` holds. A
 scale change re-renders the whole clip (see Range revise above).
 
@@ -572,7 +562,7 @@ name in the URL.
 | `output.mp4` | Current result |
 | `render_report.json` | Seam check of the latest render: times checked and seams found |
 | `output.mp4.delivery.json` | Encode settings marker for keyframe splices |
-| `range_work/`, `flash_chunks/` | Work clips for revises and chunked FlashVSR |
+| `range_work/` | Work clips for range revises (the upscale itself streams and writes no work files) |
 
 ## UI presentation
 

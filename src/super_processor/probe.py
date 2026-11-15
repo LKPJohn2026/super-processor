@@ -65,8 +65,13 @@ def _check_cfr_timing(source: Path, identity: _TimingIdentity, ffprobe: str) -> 
                 ffprobe,
                 "-v",
                 "error",
+                # Decoded frames' timestamps do not depend on the thread
+                # count (byte-identical JSON for 1, 8, and all threads on
+                # three test films). One thread took 203 s for 20 minutes of
+                # 1440x1080; 8 took 42 s with the CPU at 86 C, and all 32
+                # took 23 s but ran it to 94 C.
                 "-threads",
-                "1",
+                "8",
                 "-select_streams",
                 "v:0",
                 "-show_frames",

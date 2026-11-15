@@ -45,6 +45,8 @@ export type Progress = {
   eta_s?: number | null;
   elapsed_s?: number;
   updated_at?: number;
+  // A friendly hint while the step runs, such as undervolting a hot GPU.
+  note?: string;
 };
 
 /** `42 s`, `3 min 05 s`, or `1 h 07 min`, as the server says it. */
@@ -73,9 +75,6 @@ export function progressTiming(progress: Progress, sinceS = 0): string {
 /** What the whole video becomes, said on each segment's preview. */
 export function outputSizeLine(scale: number): string {
   if (scale === 1) return "The whole video keeps its size; these previews show the clean-up.";
-  if (scale > 2) {
-    return `The whole video is upscaled ${scale}×; previews are 2×, which shows the same restoration at a size any GPU fits.`;
-  }
   return `The whole video is upscaled ${scale}×.`;
 }
 
@@ -84,24 +83,6 @@ export function scaleChoiceText(scale: number | null | undefined, reason?: strin
   if (typeof scale !== "number") return "";
   const what = scale === 1 ? "keep the size (no upscaling)" : `upscale ${scale}×`;
   return `Gemini chose to ${what}${reason ? `: ${reason}` : "."}`;
-}
-
-/** Say why a large source is not offered FlashVSR. */
-export function sizeNote(looks: Looks): string {
-  const limit = looks.max_upscale_long_edge;
-  if (!looks.large_source || !limit) return "";
-  return (
-    `Upscaling is offered only for videos up to ${limit} px on the long edge; ` +
-    "larger ones would not fit the GPU and take many hours. This one keeps its size."
-  );
-}
-
-/** Say so when a small source could go to 4× on a larger GPU. */
-export function vramNote(looks: Looks): string {
-  const vram = looks.gpu_vram_gb;
-  if (looks.scales?.includes(4) || !looks.small_source || typeof vram !== "number") return "";
-  const have = vram ? `this one has ${vram} GB` : "none was found";
-  return `4× needs an NVIDIA GPU with at least 24 GB of memory; ${have}.`;
 }
 
 export type ShotLook = Record<
@@ -149,12 +130,8 @@ export type Looks = {
   // On the ready screen: 1 is "do not upscale".
   scales?: number[];
   source_size?: [number, number];
-  // Gemini's reason while its scale stands, and what keeps 4× off the list.
+  // Gemini's reason while its scale stands.
   scale_reason?: string;
-  gpu_vram_gb?: number;
-  small_source?: boolean;
-  large_source?: boolean;
-  max_upscale_long_edge?: number;
 };
 
 export type Navigation = { setup: boolean; file: boolean; segments: boolean };

@@ -21,30 +21,11 @@ def _own_config_dir(
     """
     folder = tmp_path_factory.mktemp("config")
     monkeypatch.setenv("SUPER_PROCESSOR_CONFIG_DIR", str(folder))
-    # An exported FlashVSR+ choice would send the v1.1 tests to the real model.
-    for name in ("SUPER_PROCESSOR_FLASHVSR", "FLASHVSR_PLUS_HOME"):
-        monkeypatch.delenv(name, raising=False)
-    # Every test sees the same GPU size, whatever this machine has: 32 GB,
-    # which allows 4x for a small source. Tests of the gate set their own.
-    monkeypatch.setenv("SUPER_PROCESSOR_GPU_VRAM_GB", "32")
+    # An exported weights path would send the SPAN tests to the user's file.
+    monkeypatch.delenv("SUPER_PROCESSOR_SPAN_WEIGHTS", raising=False)
     empty = types.SimpleNamespace(
         get_password=lambda service, name: None,
         set_password=lambda service, name, value: None,
     )
     monkeypatch.setitem(sys.modules, "keyring", empty)
     return folder
-
-
-@pytest.fixture(autouse=True)
-def _no_managed_memory_child(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A clip that runs out of memory never starts a real FlashVSR child.
-
-    Tests that check the fallback replace this with their own.
-    """
-    from super_processor import managed_memory
-    from super_processor.upscale import UpscaleError
-
-    def refuse(request: object, **_kwargs: object) -> Path:
-        raise UpscaleError("the system-RAM fallback is off in tests")
-
-    monkeypatch.setattr(managed_memory, "upscale_in_managed_memory", refuse)

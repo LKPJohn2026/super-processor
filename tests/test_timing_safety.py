@@ -16,7 +16,7 @@ from super_processor.shot_plan import new_plan, render_previews
 from super_processor.shots import Shot, ShotList
 from super_processor.upscale import (
     FakeUpscaleEngine,
-    FlashVsrEngine,
+    SpanEngine,
     UpscaleError,
     UpscalePlan,
     UpscaleRequest,
@@ -249,9 +249,9 @@ class _NoWorkEngine:
         "restore",
         "plain",
         "fake",
-        "flash",
+        "span",
         "batch",
-        "flash_batch",
+        "span_batch",
         "previews",
     ],
 )
@@ -267,10 +267,10 @@ def test_vfr_is_rejected_before_work_or_overwriting_output(
     span = UpscaleSpan(0, 4.5)
     engine = _NoWorkEngine()
 
-    def no_gpu(_scale: int) -> tuple[Path, Path]:
+    def no_gpu(_scale: int) -> object:
         pytest.fail("unsupported media reached GPU readiness / loading")
 
-    monkeypatch.setattr(upscale, "_flashvsr_ready", no_gpu)
+    monkeypatch.setattr(upscale, "_span_ready", no_gpu)
     with pytest.raises(UpscaleError, match="VFR/unsupported"):
         if entry == "plan":
             render_plan(
@@ -288,12 +288,12 @@ def test_vfr_is_rejected_before_work_or_overwriting_output(
             plain_upscale(request)
         elif entry == "fake":
             FakeUpscaleEngine().upscale(request)
-        elif entry == "flash":
-            FlashVsrEngine().upscale(request)
+        elif entry == "span":
+            SpanEngine().upscale(request)
         elif entry == "batch":
             upscale_all(engine, [request])
-        elif entry == "flash_batch":
-            FlashVsrEngine().upscale_many([request])
+        elif entry == "span_batch":
+            SpanEngine().upscale_many([request])
         else:
             shots = ShotList(shots=[Shot(0, 4.5)])
             render_previews(
@@ -307,9 +307,9 @@ def test_vfr_is_rejected_before_work_or_overwriting_output(
 
 
 @needs_ffmpeg
-@pytest.mark.parametrize("flash", [False, True])
+@pytest.mark.parametrize("span", [False, True])
 def test_batch_preflights_all_inputs_before_starting_any(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flash: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, span: bool
 ) -> None:
     good = _clip(tmp_path / "good.mp4")
     bad = _clip(tmp_path / "bad.mp4", vfr=True)
@@ -318,13 +318,13 @@ def test_batch_preflights_all_inputs_before_starting_any(
         for i, source in enumerate([good, bad])
     ]
 
-    def no_gpu(_scale: int) -> tuple[Path, Path]:
+    def no_gpu(_scale: int) -> object:
         pytest.fail("batch loaded the GPU before checking every input")
 
-    monkeypatch.setattr(upscale, "_flashvsr_ready", no_gpu)
+    monkeypatch.setattr(upscale, "_span_ready", no_gpu)
     with pytest.raises(UpscaleError, match="VFR/unsupported"):
-        if flash:
-            FlashVsrEngine().upscale_many(requests)
+        if span:
+            SpanEngine().upscale_many(requests)
         else:
             upscale_all(_NoWorkEngine(), requests)
     assert all(not request.output.exists() for request in requests)
@@ -448,27 +448,41 @@ def test_source_changed_during_decode_is_not_cached(
 
 
 @needs_ffmpeg
-def test_chunked_fake_inference_scans_original_only_once(
+def test_streamed_fake_inference_reads_original_a_fixed_number_of_times(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from test_frame_alignment import _fake_flashvsr
+    from test_upscale import fake_span
 
-    _fake_flashvsr(tmp_path, monkeypatch)
+    fake_span(tmp_path, monkeypatch)
+    # Five frames per block: twelve blocks for the 60-frame clip.
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", 96 * 64 * 3 * 5)
     source = _clip(tmp_path / "input.mp4")
     original_run = subprocess.run
+    original_popen = subprocess.Popen
     scans: list[list[str]] = []
+    decodes: list[list[str]] = []
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
         if "-show_frames" in command:
             scans.append(command)
         return original_run(command, **kwargs)
 
+    def popen(command: list[str], *args: Any, **kwargs: Any) -> Any:
+        if Path(command[0]).name == "ffmpeg" and str(source) in command:
+            decodes.append(command)
+        return original_popen(command, *args, **kwargs)
+
     monkeypatch.setattr("super_processor.probe.subprocess.run", run)
-    output = FlashVsrEngine(chunk_s=1).upscale(
-        UpscaleRequest(source, tmp_path / "out" / "clip.mp4")
-    )
+    monkeypatch.setattr("super_processor.upscale.subprocess.Popen", popen)
+    output = SpanEngine().upscale(UpscaleRequest(source, tmp_path / "out" / "clip.mp4"))
+    # The timing check decodes the original once, before any work.
     assert len(scans) == 1
     assert scans[0][-1] == str(source)
+    # Then FFmpeg reads it twice however many blocks there are: once to
+    # feed SPAN, once as the delivery encoder's lanczos blend base. A
+    # count that grows with the blocks means a pass per block crept back.
+    assert len(decodes) == 2
+    assert "pipe:0" not in decodes[0] and "pipe:0" in decodes[1]
     assert video_stream_facts(output)[0] == 60
 
 

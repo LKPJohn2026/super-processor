@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SUPER_PROCESSOR_SPAN_WEIGHTS` points at the SPAN weights file when it is not
+  at `<models>/SPAN/2xLiveActionV1_SPAN_490000.pth`. The file is checked by
+  size and sha256 before it loads, and a wrong or missing one names the
+  pinned download.
+- The `gpu` extra installs spandrel, which loads the SPAN network.
+- `THIRD_PARTY_NOTICES.md` credits the SPAN weights and architecture.
+- While a render runs, the progress screen suggests undervolting the GPU once
+  if the render has slowed by at least 20% from its first minute while the
+  GPU is at 80 C or more or the driver is slowing it for heat. A SPAN render
+  keeps an RTX 5090 near 500 W, and a 20-minute 1080p film warmed the case
+  until the CPU, though only a third busy, reached 92 C. The app never slows
+  itself down for heat. GPU readings come from `nvidia-smi`.
+
+### Changed
+
+- SPAN (2xLiveActionV1_SPAN, Apache-2.0) replaces FlashVSR as the only
+  upscaler. In a bake-off on an RTX 5090, FlashVSR v1.1 blended at strength
+  0.5, as the wizard uses it, was almost the same as plain SPAN 2x on SD
+  (consistency 41.9 against 41.5 dB, detail 32.1 against 32.6, added shimmer
+  +0.04 against +0.07), at 97 against 3 minutes per 20-minute film and 26
+  against 2 GB of GPU memory. On 1440x1080 FlashVSR did not fit 32 GB at all;
+  SPAN does 2880x2160 at about 30-40 fps in about 4-9 GB. Recent jobs used
+  strength 0.5 or less for 85% of segments, never above 0.7, and never 4x.
+  Strength still means the same: the plain upscale's shapes plus that share
+  of SPAN's fine detail.
+- Every source the wizard accepts (up to 1080p) is offered 1x and 2x, and
+  segment previews render at the plan's scale.
+- Each clip streams through SPAN in one pass: FFmpeg decodes and cleans the
+  source onto a pipe, a reader thread fills blocks of about 256 MiB of input
+  frames, the GPU upscales them, and a writer thread pipes the upscaled frames
+  into the delivery encoder, which blends them with the source. Nothing is
+  written to scratch disk; an earlier chunked SPAN pipeline wrote about 63 GB
+  of lossless 4K chunk files for a full-length 1080p film and ran a 16-core
+  CPU at its 95 C limit. On an RTX 5090 a 60 s 1440x1080 slice rendered to
+  2880x2160 at 22.2 fps end to end (about 23 minutes for a 20-minute 1080p
+  film; about 8 minutes or less for a 20-minute SD film) at 0.43 CPU-seconds
+  per frame against 1.21, about a third of a 32-thread CPU on average, with
+  4.4 GB peak RSS. Segment previews use the same path under one model load,
+  without the 8 s limit on a batch.
+- The output of an upscale holds exactly the source's frame count: a decoder
+  up to 8 frames (or 2%) short repeats the last frame, extra frames are
+  dropped, and a larger shortfall stops the render rather than splice a
+  misaligned picture.
+- The delivery encode uses the x264 preset `faster` instead of `medium`
+  (still CRF 16, an IDR every second, no B-frames). Against the lossless
+  upscale of a 1440x1080 -> 2880x2160 clip it scored 44.29 against 44.44 dB
+  PSNR and SSIM 0.9862 against 0.9863, 1% smaller, for 57% less encoder CPU.
+  The delivery marker records the preset and version 2. Before a revise
+  splices into an output rendered by 3.7.0 or earlier, that output is
+  re-encoded once into the new settings, so one file never mixes presets.
+- When the GPU runs out of memory, the upscale retries with smaller batches,
+  down to one frame, and then stops with advice to close other GPU programs.
+  Retries add no joins.
+- A plan saved at 4x loads and renders at 2x. A result note on a job whose
+  output is still 4x renders the whole file again at 2x, and the Result line
+  reports the size on disk.
+- The Ready screen offers "Upscale 2× · SPAN on the GPU", and the per-segment
+  toggle reads "Use upscaling" / "Skip upscaling".
+- Render progress counts the frames an upscaled part has handed to the
+  delivery encoder, since the upscale and the encode now run at once.
+
+- The timing check that decodes every frame of a source before it is
+  restored now uses 8 decoder threads instead of 1: 42 s instead of 203 s for
+  a 20-minute 1440x1080 film, with byte-identical timestamps. All 32 threads
+  took 23 s but ran the CPU to 94 C.
+
+### Removed
+
+- FlashVSR v1.1 and FlashVSR+, with `SUPER_PROCESSOR_FLASHVSR`,
+  `FLASHVSR_HOME`, and `FLASHVSR_PLUS_HOME`.
+- 4x output, and with it `SUPER_PROCESSOR_GPU_VRAM_GB` and the GPU-memory
+  check that gated it.
+- The system-RAM fallback and its CUDA managed-memory allocator
+  (`managed_alloc.cu`, built with `nvcc`), and the chunk-halving retries.
+- The chunked upscale: 8 s chunks with a 0.5 s overlap and their lossless
+  (`-qp 0`) work files in `flash_chunks/`.
+- The 1280 px limit on upscaled sources and the Ready screen's notes about
+  source size and GPU memory.
+
 ## [3.7.0] - 2026-11-12
 
 ### Added

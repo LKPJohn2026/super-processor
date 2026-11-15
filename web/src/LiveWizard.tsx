@@ -6,8 +6,6 @@ import {
   postAction,
   progressTiming,
   scaleChoiceText,
-  sizeNote,
-  vramNote,
   runAnalyze,
   runRender,
   runSegmenting,
@@ -464,6 +462,11 @@ function Busy({
           {step}
         </p>
       ) : null}
+      {progress?.note ? (
+        <p className="notice" role="status">
+          {progress.note}
+        </p>
+      ) : null}
       {message ? <Alert text={message} /> : null}
     </>
   );
@@ -626,8 +629,7 @@ function PickStep({
       <p className="lede">
         Choose a video on this computer. Gemini splits it into segments, you
         approve a short before/after preview of each, and then you choose
-        whether to upscale the whole video on your GPU (videos up to 1280 px
-        on the long edge).
+        whether to upscale the whole video 2× on your GPU.
       </p>
       <p className="muted">Up to 1080p and 30 minutes.</p>
       {message ? <Alert text={message} /> : null}
@@ -1069,7 +1071,7 @@ function LookCard({ origin, shot }: { origin: string; shot: LookShot }) {
       ) : null}
       <p>
         <strong>
-          {shot.use_upscale === false ? `No FlashVSR: resized only. ${summary}` : summary}
+          {shot.use_upscale === false ? `No upscaling: resized only. ${summary}` : summary}
         </strong>
       </p>
       <Protected regions={shot.regions ?? []} contains={shot.contains} />
@@ -1180,7 +1182,7 @@ function UpscaleToggle({
   return (
     <div className="actions">
       <p className="muted">
-        {who} chose: this segment {on ? "uses FlashVSR" : "skips FlashVSR (plain resize)"}.
+        {who} chose: this segment {on ? "uses upscaling" : "skips upscaling (plain resize)"}.
       </p>
       <button
         type="button"
@@ -1188,7 +1190,7 @@ function UpscaleToggle({
         disabled={busy}
         onClick={() => void onSend("preview", { action: "upscale", on: on ? "0" : "1" })}
       >
-        {on ? "Skip FlashVSR for this segment" : "Use FlashVSR for this segment"}
+        {on ? "Skip upscaling for this segment" : "Use upscaling for this segment"}
       </button>
     </div>
   );
@@ -1227,7 +1229,7 @@ function ReadyStep({
             <li key={shot.index}>
               {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
               {shot.label || "Unlabelled segment"}:{" "}
-              {shot.use_upscale === false ? `No FlashVSR: resized only. ${summary}` : summary}
+              {shot.use_upscale === false ? `No upscaling: resized only. ${summary}` : summary}
             </li>
           );
         })}
@@ -1251,12 +1253,12 @@ function ReadyStep({
                   {option === 1 ? (
                     <>
                       <strong>Don&apos;t upscale</strong>
-                      {size} · clean-up and finishing only, no FlashVSR
+                      {size} · clean-up and finishing only, no upscaling
                     </>
                   ) : (
                     <>
                       <strong>Upscale {option}×</strong>
-                      {size} · FlashVSR on the GPU
+                      {size} · SPAN on the GPU
                     </>
                   )}
                 </span>
@@ -1265,8 +1267,6 @@ function ReadyStep({
           })}
         </fieldset>
       ) : null}
-      {sizeNote(looks) ? <p className="muted">{sizeNote(looks)}</p> : null}
-      {vramNote(looks) ? <p className="muted">{vramNote(looks)}</p> : null}
       <div className="actions">
         <button
           type="button"

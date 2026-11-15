@@ -1,4 +1,4 @@
-"""Spans and previews that skip FlashVSR and are only resized."""
+"""Spans and previews that skip SPAN and are only resized."""
 
 from __future__ import annotations
 
@@ -161,7 +161,7 @@ class _RevisionTransport:
 @needs_ffmpeg
 @pytest.mark.parametrize(
     ("start", "end", "scale", "revision_calls"),
-    [(1, 2, 2, 0), (1, 5, 2, 2), (0, 6, 2, 1), (1, 2, 4, 1), (1, 5, 4, 2)],
+    [(1, 2, 2, 0), (1, 5, 2, 2), (0, 6, 2, 1)],
 )
 def test_result_note_preserves_each_shots_settings(
     tmp_path: Path, start: float, end: float, scale: int, revision_calls: int
@@ -201,8 +201,7 @@ def test_result_note_preserves_each_shots_settings(
     assert controller.current_state().step is WizardStep.RESULT
     assert engine.calls == 1
 
-    note = "less invented detail" if scale == 2 else "less detail, make it 4x"
-    controller.handle_post("/result", {"note": [note]})
+    controller.handle_post("/result", {"note": ["less invented detail"]})
     state = controller.current_state()
     assert state.step is WizardStep.RENDERING and state.error is None
     assert transport.calls == 1
@@ -381,7 +380,7 @@ def test_render_reports_progress_by_the_work_left(tmp_path: Path) -> None:
         on_progress=seen.append,
     )
     # Frames weigh by what they cost: a pass-through frame is a small share
-    # of a FlashVSR one. FlashVSR reports its own restore and encode (this
+    # of an upscaled one. SPAN reports its own restore and encode (this
     # fake stops halfway); a pass-through part's resize is its first half and
     # its delivery encode, which counts frames, the second.
     costs = [3.0, 1.5 * PLAIN_FRAME_COST, 1.5]

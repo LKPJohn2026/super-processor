@@ -3,7 +3,7 @@
 Super Processor is a local-first video processor. A localhost wizard has
 Gemini watch a small, audio-free copy of footage you already shot, cut it
 into segments, and choose the output size; it then plans and previews each
-segment in turn for you to approve, runs a local FlashVSR restoration
+segment in turn for you to approve, runs a local SPAN restoration
 upscale, and lets you revise a time range or start over with a
 plain-language note. Gemini only proposes segments and a scale from the
 offered ones, picks bounded per-segment settings, checks previews, and turns
@@ -39,7 +39,7 @@ Super Processor targets a different market:
 | Source | Synthesized frames | Existing footage |
 | Typical duration | Short clips | Files up to 30 minutes at 1080p |
 | AI role | Pixel generator | Restoration upscaler plus a bounded revise planner |
-| Processing | Usually hosted | Local FlashVSR and FFmpeg |
+| Processing | Usually hosted | Local SPAN and FFmpeg |
 | Main risk | Invented content and temporal drift | Invented fine texture (bounded by strength) and flicker |
 | Recovery | Regenerate | Re-run a time range at a lower strength |
 | Trust model | Inspect final pixels | Same frames and timing as supported CFR sources; each revise is stored as JSON |
@@ -69,7 +69,7 @@ informational, not an admission decision.
 
 Successful checks use a bounded process-local cache keyed by resolved source,
 file identity, size, and modification metadata. Nested calls and retries reuse
-checks; internal chunks do not re-scan the original. Changed sources and new
+checks; work clips do not re-scan the original. Changed sources and new
 processes require verification again. The guard does not normalize inputs;
 errors advise that external CFR conversion may change frames/timing. Supporting
 VFR later requires a source-frame/timestamp mapping across selection, inference,
@@ -77,7 +77,7 @@ blending, concatenation, revises, and audio, not a different average-rate guess.
 
 ### Restoration upscale instead of an FFmpeg grade
 
-The wizard picture path is a local GPU restoration upscale (FlashVSR). FFmpeg
+The wizard picture path is a local GPU restoration upscale (SPAN 2x). FFmpeg
 probes, trims a cited time range, splices that range back, and copies audio.
 Before the first render, the segment loop (below) cuts the clip into
 segments and gets each one's settings approved on a short preview. Gemini
@@ -85,27 +85,30 @@ turns a result note into `start_s`, `end_s`, `scale`, and
 `strength` (0–1). Re-runs read the original source for that range so detail
 does not stack.
 
-`SUPER_PROCESSOR_FLASHVSR` picks the model: v1.1 through its tiny example
-script (the default), FlashVSR+ turbo through its Python API, or `auto`,
-which picks per clip from its scale: FlashVSR+ at 4x, v1.1 below, and the
-other when only its checkout folder is present (an incomplete checkout
-names its missing files instead of being passed over). Both run behind one backend interface
-(`load()` returns the pipeline and a `run`), so chunking, the out-of-memory
-ladder, and the system-RAM child are shared; the child inherits the variable
-and the clip's scale, so it picks the same model. A preview batch that mixes
-scales under `auto` loads each model once for its own clips. FlashVSR+ is padded to 128-pixel blocks like
-v1.1. Its frames go straight into one lossless encode that also crops the
-padding, rather than through its own CRF 25 writer. Its packages have
-generic names (`inference`, `models`), so the loader refuses to load next to
-a different module of those names and removes its own when done.
+There is one model: SPAN (`span_sr.py`), the 2xLiveActionV1_SPAN weights
+loaded through spandrel, in half precision on the GPU. It sees one frame at a
+time, so a clip needs no padding to blocks and no extra frames; the frames go
+to the GPU in batches of about four megapixels of input (at most 8 frames),
+so GPU memory follows the batch, not the clip. The weights are checked by
+size and sha256 before loading (`SUPER_PROCESSOR_SPAN_WEIGHTS` points at
+another file). One lock keeps two wizard threads from loading it at once, and
+a batch of preview clips shares one load.
+
+It replaced FlashVSR v1.1 and FlashVSR+ outright. In a bake-off on an RTX
+5090, FlashVSR blended at strength 0.5 was almost the same as plain SPAN 2x
+on SD (consistency 41.9 against 41.5 dB, detail 32.1 against 32.6, added
+shimmer +0.04 against +0.07) at 97 against 3 minutes per 20-minute film and
+26 against 2 GB of VRAM; 2x of 1440x1080 did not fit 32 GB with FlashVSR,
+while SPAN does it at about 30-40 fps in about 4-9 GB. Recent jobs used
+strength 0.5 or less for 85% of spans, never above 0.7, and never 4x.
 
 Each span in the plan is a segment with its own look (`look.py`): bounded
 FFmpeg settings that always run in the same order.
 
 | Stage | Settings | Why |
 |---|---|---|
-| Clean | `deblock`, `denoise` (0–1) | FlashVSR treats blocks and noise as detail; removing them first leaves it less to invent from |
-| Restore | `scale`, `strength`, protected regions | FlashVSR's fine detail on the cleaned plain upscale's shapes and colour; held down inside face, hand, and text boxes |
+| Clean | `deblock`, `denoise` (0–1) | The upscaler sharpens blocks and noise as if they were detail; removing them first leaves it less to sharpen |
+| Restore | `scale`, `strength`, protected regions | SPAN's fine detail on the cleaned plain upscale's shapes and colour; held down inside face, hand, and text boxes |
 | Finish | `contrast`, `brightness`, `saturation`, `gamma`, `grain` | Grade and texture on the restored picture |
 
 Filter text is built from the numbers in code; model output never reaches
@@ -116,34 +119,40 @@ count.
 A span can skip the restore stage (`use_upscale: false`). It is resized with
 lanczos to the same scale and goes through the same delivery encode at
 strength 0, so it keeps its look and lines up with its neighbours frame for
-frame. Gemini sets it where FlashVSR would only harm.
+frame. Gemini sets it where the upscaler would only harm.
 
 Text-to-video, inpainting, and face reenactment stay out. A lower strength
-asks the restorer for less invented texture. The job stores
-`upscale_plan.json` with ordered spans, one per segment; FlashVSR runs long
-spans in about 8 s pieces with a short overlap to bound per-chunk memory.
-This does not guarantee GPU memory fit, especially at 4x; long/1080p and
-memory-pressure acceptance remain pending.
+keeps less of SPAN's fine detail. The job stores `upscale_plan.json` with
+ordered spans, one per segment. Each clip streams through SPAN in one pass,
+whatever its length: an FFmpeg decoder (source plus the look's clean filter,
+rgb24 on a pipe) feeds a reader thread that fills blocks of about 256 MiB of
+input frames; the main thread upscales each block on the GPU; a writer thread
+pipes the upscaled frames into the delivery encoder, which takes the source
+as its second input for the strength blend. At most two blocks wait to be
+upscaled and one to be written, so host memory stays bounded (4.4 GB peak at
+1080p) and nothing goes to scratch disk. The output holds exactly the
+source's frame count: a decoder a few frames short (up to 8, or 2%) repeats
+the last frame, extra frames are dropped, and a larger shortfall stops the
+render rather than splice a misaligned picture. Preview batches use the same
+path under one model load.
 
-When another program holds GPU memory, a piece that runs out is retried at
-half the length, down to 17 frames. If even that does not fit, the clip is
-restored once more in a child process whose PyTorch allocator uses CUDA
-managed memory (`managed_alloc.cu`, built with `nvcc` on first use into the
-models folder): blocks stay on the GPU while they fit and the driver pages
-the rest to system RAM. It is slower but gives the same picture: at 2x of
-854x480 with 8 GiB free, 0.53-0.70 s a frame against 0.27-0.30 s with the
-GPU to itself. A child is needed because PyTorch only lets the allocator
-change before CUDA starts in a process. It is Linux only: on Windows,
-managed memory cannot be larger than free VRAM.
+On an RTX 5090 a 60 s 1440x1080 slice rendered to 2880x2160 at 22.2 fps end
+to end (about 23 minutes for a 20-minute 1080p film), at 0.43 CPU-seconds
+per frame with about 9.5 of 32 CPU threads busy on average and the GPU a
+median 83% busy. The earlier chunked pipeline used 1.21 CPU-seconds per
+frame: a full-length 1080p render ran a 16-core CPU at its 95 C limit and
+wrote about 63 GB of lossless 4K chunk files. Profiling 200 frames of it
+put 118 of 242 CPU-seconds in the x264 `medium` encode, 60 in writing the
+chunk files, and 30 in decoding them again. A 5-minute 640x480 film took
+117 s end to end even then, so a 20-minute SD film takes about 8 minutes or
+less. A 200-frame 1080p clip from the streaming path matches the chunked
+pipeline's apart from the encoder preset (45.5 dB). Long and memory-pressure
+acceptance remain pending.
 
-System RAM is bounded three ways, since the driver pages managed memory to
-RAM without a ceiling of its own (one preview took 80 GiB). The child works
-in the shortest pieces. Its allocator refuses past a byte limit of the free
-VRAM plus the RAM available past a reserve (a quarter of the RAM, at least
-8 GiB), at most half the machine; it throws `std::bad_alloc`, which ends as
-the usual out-of-memory error. And the wizard kills the child if available
-RAM drops below half the reserve. With too little RAM to spare, no child is
-started.
+When another program holds GPU memory and a batch runs out, it is retried
+with a smaller batch, down to one frame. If even one frame does not fit, the
+render stops with `GpuOutOfMemory` and advice to close other GPU programs.
+The FlashVSR chunk-halving ladder and its system-RAM fallback are gone.
 
 ### Segment loop
 
@@ -173,15 +182,10 @@ preview_segment) per segment → ready_to_render → rendering → result`.
   FFmpeg's `scdet` is not used for this flow: a cut is not the same as a
   change in what the restoration needs.
 - **Gemini picks the scale.** With the segments, Gemini returns `scale` (1 =
-  don't upscale, 2, or 4) and `scale_reason` for the whole video, from the
-  options code offers; 2 is the default when it gives none. A source whose
-  long edge is over 1280 px (`MAX_UPSCALE_LONG_EDGE`) is offered no FlashVSR
-  scale: Gemini is not asked and the plan starts at 1, since its 2x output
-  would not fit the GPU and the system-RAM fallback takes hours. 4x is offered
-  only when the source's long edge is 960 px or less and the GPU has at
-  least 24 GB (decimal, `MIN_4X_VRAM_BYTES`). GPU memory comes from
-  `SUPER_PROCESSOR_GPU_VRAM_GB`, else `nvidia-smi`, else PyTorch if loaded,
-  else 0, which rules out 4x. The editor can still change it on Ready.
+  don't upscale, or 2) and `scale_reason` for the whole video; 2 is the
+  default when it gives none. Both are offered for every source the wizard
+  accepts (up to 1080p). A plan saved with scale 4, from before 4x was
+  removed, loads and renders at 2x. The editor can still change it on Ready.
 - **Few, long segments.** Each segment is planned, previewed, and approved
   on its own, so Gemini is asked for as few as the footage needs: at most 10,
   each at least 3 s. Code holds that whatever the reply: the segments are
@@ -196,8 +200,8 @@ preview_segment) per segment → ready_to_render → rendering → result`.
   count, and is kept when the segment is redone, so a note is judged on the
   same seconds. The editor approves it, moving to the next segment, or sends
   a note that redoes only that segment. All segments share the scale chosen
-  with the segments. Previews are rendered at no more than 2x, and a 1x plan
-  never runs FlashVSR for its previews.
+  with the segments. Previews render at the plan's scale, and a 1x plan
+  never runs SPAN for its previews.
 - **Full render** builds `upscale_plan.json` from the approved recipes and
   renders it as before, with pass-through spans where `use_upscale` is false.
 
@@ -265,8 +269,8 @@ user is happy; otherwise a note such as "less artificial detail from 2s to
 For a single-recipe revision, untouched parts are stream-copied. A note that
 changes scale or crosses multiple stored recipe spans re-renders the whole clip
 from the source, preserving each span's look, regions, and pass-through choice.
-Strength is the share of the
-FlashVSR picture in the output; the rest is a lanczos upscale of the same
+Strength is the share of SPAN's
+fine detail in the output; the rest is a lanczos upscale of the same
 frames.
 
 ### Inputs up to 1080p and 30 minutes
@@ -278,7 +282,7 @@ minutes, before a job is created.
 
 An earlier wizard had Gemini propose timeline split layouts and per-segment
 FFmpeg filter options with short previews, then concatenated the graded
-segments. Once the picture path became a FlashVSR upscale, that flow was no
+segments. Once the picture path became a restoration upscale, that flow was no
 longer reachable from the wizard, and it has been removed. The CLI `segment`
 and `plans` commands still provide a classical split and grade. Their
 `segments.json` shares the file name with the wizard's segment list; each
@@ -307,8 +311,15 @@ The processing vocabulary stays allowlisted:
 
 ### Wizard H.264 delivery; legacy HEVC with optional hardware
 
-Wizard previews and restoration delivery use `libx264`; delivery is CRF 16
-with a forced IDR every second and no B-frames for range splicing. The wizard
+Wizard previews and restoration delivery use `libx264`; delivery is preset
+`faster`, CRF 16, with a forced IDR every second and no B-frames for range
+splicing. Against the lossless upscale of a 1440x1080 -> 2880x2160 clip,
+`faster` scored 44.29 dB PSNR and SSIM 0.9862 against `medium`'s 44.44 dB and
+0.9863, 1% smaller, for 57% less encoder CPU; the encode had been half the CPU
+of a render. The marker records the preset and `version: 2`. Outputs rendered
+by 3.7.0 or earlier carry version 1 (`medium`), so a revise first re-encodes
+them once into the current settings and splices into that copy; `faster` and
+`medium` frames never share one file. The wizard
 does not offer HEVC or hardware-encoder selection. Software `libx265` defaults
 and optional NVENC, QSV, AMF, and VideoToolbox selection belong to the legacy
 CLI encode paths. Doctor currently requires both `libx264` and `libx265`.
@@ -331,15 +342,15 @@ silent copy (≤ 960 px) ──► Gemini File API, 1 fps (still grid if it fail
 Gemini: segments + scale ──► editor: approve or note
    │
    ▼  for each segment
-measure + box faces/hands/text ──► Gemini: recipe ──► 3 s preview (FlashVSR or resize)
+measure + box faces/hands/text ──► Gemini: recipe ──► 3 s preview (SPAN or resize)
    │                                              │
    │                         Gemini check ◄───────┘
    ▼
 editor: approve (next segment) or note (redo this one)
    │
    ▼
-FlashVSR restore + upscale per span (8 s chunks, frame count conformed),
-pass-through spans resized
+decode + clean ──► SPAN 2x on the GPU ──► pipe (one pass per span,
+pass-through spans resized; no scratch files)
    │
    ▼
 lanczos blend at strength ──► delivery encode (IDR every 1 s) ──► join + audio
@@ -377,7 +388,7 @@ Each job has an on-disk directory containing:
   recipe, preview window, and check), with `previews/`;
 - `upscale_plan.json` spans with scale, strength, look, and `use_upscale`;
 - `output.mp4` and its `output.mp4.delivery.json` encode marker;
-- work folders for chunks and range splices.
+- `range_work/`, the work folder for range splices.
 
 Wizard steps:
 
@@ -427,7 +438,7 @@ may remain for compatibility; the wizard is the primary product path.
 Included:
 
 - localhost wizard on the review server;
-- local FlashVSR restoration upscale with FFmpeg trim, splice, and encode;
+- local SPAN restoration upscale with FFmpeg trim, splice, and encode;
 - Gemini structured result notes (range, scale, strength);
 - CLI FFmpeg-filter grade paths (diagnose, plan, segment, plans);
 - wizard `libx264` encoding; legacy CLI HEVC and optional hardware encoding;
@@ -450,9 +461,9 @@ not deferred features. Models supply bounded structured data only.
 
 The [acceptance matrix](acceptance.md) separates synthetic regression mechanics
 from real GPU, Gemini, and browser acceptance. Real-footage calibration and
-runtime OOM chunk-join coverage remain open: seam candidates describe nominal
-renderer joins, not every shorter join produced by OOM retries or managed-memory
-fallback. Do not infer quality, memory fit, or full seam coverage from fake-engine
+full seam coverage remain open: seam candidates are the renderer's part
+edges and revised-range edges. Each part streams in one pass and OOM retries
+shrink only the GPU batch, so neither adds joins. Do not infer quality, memory fit, or full seam coverage from fake-engine
 tests or earlier timing examples.
 
 The [ordered release plan](release-plan.md) records the pushed implementation

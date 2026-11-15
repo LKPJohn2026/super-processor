@@ -1,12 +1,12 @@
-"""Per-shot FFmpeg settings around the FlashVSR restore.
+"""Per-shot FFmpeg settings around the SPAN upscale.
 
 Every shot runs the same fixed pipeline. Only the numbers change:
 
-1. clean: ``deblock`` then ``denoise``, on the source frames. FlashVSR reads
-   compression blocks and noise as real detail and sharpens them into texture,
-   so removing them first leaves it less to invent from. The plain-upscale base
+1. clean: ``deblock`` then ``denoise``, on the source frames. SPAN reads
+   compression blocks and noise as real detail and sharpens them, so removing
+   them first leaves it less to sharpen. The plain-upscale base
    of the strength blend is cleaned the same way.
-2. restore: FlashVSR at the shot's ``scale``, mixed with the cleaned base by
+2. restore: SPAN at the shot's ``scale``, mixed with the cleaned base by
    ``strength`` (see :mod:`super_processor.upscale`).
 3. finish: ``contrast``, ``brightness``, ``saturation``, ``gamma``, then
    ``grain``, on the restored picture.

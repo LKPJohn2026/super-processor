@@ -411,7 +411,7 @@ def _half_detail(path: Path) -> tuple[float, float]:
 
 
 @needs_ffmpeg
-def test_text_box_holds_flashvsr_down_in_a_real_render(tmp_path: Path) -> None:
+def test_text_box_holds_span_down_in_a_real_render(tmp_path: Path) -> None:
     source = _gray(tmp_path / "in.mp4")
     output = tmp_path / "out.mp4"
     sign = Region("text", 0.0, 0.0, 0.4, 1.0)

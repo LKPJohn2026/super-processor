@@ -37,6 +37,7 @@ dependencies = []
 
 [project.optional-dependencies]
 gpu = [
+  "spandrel>=0.4.2,<0.5",
   "torch>=2.4",
 ]
 dev = [
@@ -66,7 +67,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-super_processor = ["*.pyi", "managed_alloc.cu", "py.typed"]
+super_processor = ["*.pyi", "py.typed"]
 
 [tool.setuptools.exclude-package-data]
 super_processor = ["*.c", "*.html", "*.pyx"]
@@ -88,6 +89,7 @@ testpaths = ["tests"]
 filterwarnings = ["error"]
 markers = [
   "gemini_live: calls the real Gemini API (needs GEMINI_API_KEY / Gemini_API_Test)",
+  "gpu: runs SPAN on a CUDA GPU (needs torch; skipped without it)",
 ]
 
 [tool.coverage.run]

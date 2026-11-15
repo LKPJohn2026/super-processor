@@ -37,12 +37,12 @@ for this train.
 - Protection is per content kind: a face box does not remove the fallback cap
   for unboxed hands or text. Boxes are not frame-by-frame tracking, and protection
   is not a guarantee against identity/anatomy/text damage.
-- **Runtime OOM seam gap.** The checker covers coalesced parts, nominal retained
-  chunk joins, and actual expanded revision splice edges. Shorter chunks from
-  OOM retries/custom lengths/managed-memory fallback are not a complete recorded
-  render history; their actual joins may be missed. Real memory-pressure tests
-  and a release decision on this gap remain pending. Do not claim all seams are
-  covered.
+- **Seam coverage.** The checker covers coalesced parts and actual expanded
+  revision splice edges. Each part streams through SPAN and the delivery
+  encoder in one pass, and out-of-memory retries shrink only the GPU batch
+  (down to one frame), so neither adds joins; the chunked upscale, its
+  chunk-halving ladder, and the managed-memory fallback are gone. Real
+  memory-pressure tests remain pending. Do not claim all seams are covered.
 - Shimmer `1.6`, seam `2.5`, and region strength caps are existing heuristics,
   not newly calibrated real-footage guarantees. Seam warnings are advisory.
 - No telemetry implementation is present. Model-generated shell commands are
@@ -59,14 +59,17 @@ below are **PENDING** real acceptance; regression coverage is not a substitute.
 | Faces | Close-up, head turn, occlusion, multiple skin tones; lower-strength redo | No newly visible identity drift, waxy skin, halos, or crawling detail; inspect box coverage and fallback when face boxes are absent | PENDING |
 | Hands | Fingers moving across objects and frame edges | No newly invented anatomy/texture; valid hand coverage or fallback cap retained | PENDING |
 | Text | Signs, subtitles, small moving lettering; face and text together with text box missing | Legibility not degraded or invented; per-kind missing-box fallback remains even when a face box exists | PENDING |
-| Fine patterns | Fabric, fences, brick, foliage, already-sharp detail | No objectionable moiré or crawling; compare FlashVSR on/off and shimmer reports against human judgment | PENDING |
-| Motion | Pan, fast subject, hard cut, low-motion hold; spans longer than nominal chunks | No new discontinuity, repeated/dropped frames, or visible chunk flash; inspect retained joins and advisory seam report | PENDING |
+| Fine patterns | Fabric, fences, brick, foliage, already-sharp detail | No objectionable moiré or crawling; compare SPAN on/off and shimmer reports against human judgment | PENDING |
+| Motion | Pan, fast subject, hard cut, low-motion hold; spans longer than one streaming block (about 256 MiB of input frames) | No new discontinuity, repeated/dropped frames, or visible flash at block edges; inspect part joins and advisory seam report | PENDING |
+| SPAN on SD | 480p/576p sources, soft and blocky, at 2x; strengths 0.3, 0.5 and 0.7 | Detail added without waxy skin, halos or crawl; shimmer near the bake-off's (+0.07 over the source at 0.5); record upscale fps and peak VRAM | PENDING |
+| SPAN on 1080p | 1920x1080 and 1440x1080 sources at 2x (3840x2160 and 2880x2160) | Renders without OOM; record end-to-end fps (a 60 s 1440x1080 slice: 22.2 fps on an RTX 5090, 0.43 CPU-seconds per frame, 4.4 GB peak RSS), peak VRAM (about 4-9 GB), CPU use and temperature, and that no scratch files are written | PENDING |
 | Noise / damage | Low light, compression blocks, soft SD material, clean control | Useful cleanup without waxy detail/halos or invented texture; record recipe, strength, and false shimmer/seam warnings | PENDING |
-| Mixed pass-through | Alternate restored and `use_upscale: false` spans, including equal-looking neighboring recipes | Pass-through avoids FlashVSR, retains look and common dimensions; toggle boundaries and coalesced parts match report candidates | PENDING |
+| Mixed pass-through | Alternate restored and `use_upscale: false` spans, including equal-looking neighboring recipes | Pass-through avoids SPAN, retains look and common dimensions; toggle boundaries and coalesced parts match report candidates | PENDING |
 | Repeated revisions | Within one span, across mixed spans, scale change, then reopen and revise again | Preserve look/regions/toggles; use original source rather than stacking detail; expanded splice edges checked; failed revise retains previous output | PENDING |
 | Audio | Speech/lip sync and sharp audio/visual cue near start, joins, revised range, and end | Record source/output frame counts, durations and cue offsets; no introduced drift, loss, click, or truncation after render and repeated revisions | PENDING |
-| Long / 1080p | Landscape and portrait at the supported limit, including a near-30-minute source | Complete timing preflight, preview, render, and revise; record wall time, peak RAM/VRAM, disk use, responsiveness, counts, and audio alignment | PENDING |
-| 4x / memory pressure | Eligible source (long edge ≤960), normal allocation then constrained free VRAM; managed-memory fallback where supported | Correct output dimensions/counts; record actual retry/fallback behavior, RAM reserve, cancellation, output preservation, and visible joins; explicitly retain OOM seam-coverage gap | PENDING |
+| Long / 1080p | Landscape and portrait at the supported limit, including a near-30-minute source | Complete timing preflight, preview, render, and revise (including a revise of an output from 3.7.0 or earlier, which is re-encoded into the new delivery settings before the splice); record wall time (about 23 minutes expected for 20 minutes of 1080p), peak RAM/VRAM, disk use, responsiveness, counts, and audio alignment | PENDING |
+| Memory pressure | 2x of a 1080p source with another program holding most of the free VRAM | Smaller-batch retries, then a clear `GpuOutOfMemory` error naming other GPU programs; correct output dimensions/counts when it fits; record cancellation, output preservation, and that no extra joins appear | PENDING |
+| Saved 4x plans | Reopen a job whose `upscale_plan.json` was saved at scale 4, with and without its 4x `output.mp4`, and with a 4x Gemini choice in `segments.json` | Loads and renders at 2x; Ready offers only 1 and 2; Segments shows no 4x choice; Result says 4× while the 4x file is on disk, and a result note re-renders the whole file at 2x | PENDING |
 | Unsupported timing / limits | True VFR, misleading rate metadata, missing/nonmonotonic timestamps, >1080p, >30 minutes | Clear early refusal before job creation/GPU work/output replacement; no silent normalization; supported rational-rate CFR control accepted | PENDING manual confirmation; synthetic regressions only |
 
 For audio/frame comparisons, record measured offsets and the acceptance tolerance
@@ -188,11 +191,11 @@ multi-platform release gate pass.
 | Frontend tests/build and frontend CI run URL | 17 passed and production build passed locally; remote CI URL/outcome PENDING |
 | Supported-platform CI run URLs / outcomes | PENDING |
 | Fresh local sdist/wheel, metadata, install/self-test/doctor, unpacked-web build | PASSED for `c004fdc` plus staged documentation; CPython 3.13 wheel, isolated install and offline unpacked-web build; these are development validation artifacts, not release artifacts |
-| GPU model, VRAM, driver/CUDA/PyTorch, FlashVSR revision/weights | PENDING |
+| GPU model, VRAM, driver/CUDA/PyTorch/spandrel, SPAN weights sha256 (expected `8b166c75831ea7f694d9058ee9c8df8148af8cc1d2b57e69e6581b15cab572f7`) | PENDING |
 | Footage matrix, timings, peak RAM/VRAM, audio/frame comparisons | PENDING |
 | Live Gemini model, consented evidence, visual review | PENDING |
 | Browser/OS/version matrix and accessibility review | PENDING |
-| OOM runtime seam gap disposition / threshold calibration decision | PENDING |
+| Seam coverage disposition / threshold calibration decision | PENDING |
 | Known-limitations review and explicit release approval | PENDING |
 | Release commit, version/tag, workflow/artifact URLs | PENDING — no tag or release created |
 

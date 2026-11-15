@@ -48,8 +48,8 @@ without embedding a self-referential commit hash here.
    still needs real-footage acceptance.
 3. **Quality checks — nominal joins corrected.** Candidates share coalesced,
    frame-snapped parts, retained chunk joins, and expanded revision splice edges.
-   Actual shorter joins from runtime OOM retries/custom chunks/managed-memory
-   fallback are not fully recorded and may be missed. Calibration remains open.
+   Out-of-memory retries now shrink SPAN's GPU batch, not the chunk, so they add
+   no joins; custom chunk lengths are still not fully recorded and may be missed. Calibration remains open.
 4. **Frontend — offline regressions delivered and wired into CI.** Media/upload
    routing, CORS, backend-port guidance, token isolation, subscriptions, timeouts,
    retries, and explicit recovery are covered. Real-browser E2E is still pending.
@@ -91,7 +91,7 @@ implementation commits is not authorization to create a public release.
 
 1. Complete every gate in the [final evidence record](acceptance.md#final-release-evidence-record)
    or obtain explicit approval for a scoped limitation. Review CI on the exact
-   candidate, real-footage results, and the runtime OOM seam gap.
+   candidate, real-footage results, and the custom-chunk seam gap.
 2. With release approval, prepare a separate release commit: move Unreleased
    notes to the chosen version/date, with actual validation and known limitations.
    Push that commit before proceeding to the tag. Do not edit `_version.py`;
@@ -111,10 +111,13 @@ implementation commits is not authorization to create a public release.
 ## Remaining gates / explicit limits
 
 - Full timestamp-preserving VFR support is absent; this train is verified-CFR only.
+- SPAN replaced FlashVSR as the only upscaler after this train (Unreleased in
+  the changelog). Its SD and 1080p rows in the footage matrix need recorded
+  outcomes like every other row.
 - Real-footage restoration quality, threshold calibration, GPU memory-pressure
   recovery, live Gemini visual decisions, browser/accessibility checks, and
   supported-platform CI need recorded outcomes or an approved scope decision.
-- Runtime OOM/fallback joins are not completely covered by seam candidates.
+- Joins from custom chunk lengths are not completely covered by seam candidates.
 - Wizard delivery is H.264; HEVC/hardware selection stays in legacy CLI scope.
 - Telemetry is absent. Local LLMs, desktop shells, cloud workers, generative
   features, and multi-track editing remain out of scope. Model-generated shell

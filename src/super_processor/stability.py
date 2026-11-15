@@ -8,8 +8,9 @@ from one frame to the next. Their ratio is how unstable the texture is.
 motion that moves both cancels out. Well above 1 means the restoration added
 texture that is less stable than the footage.
 
-**Seams.** FlashVSR starts again at every chunk, shot part, and revised
-range, and its output can jump there. :func:`seam_score` looks at a short
+**Seams.** The recipe changes at every shot part and revised range, and the
+output can jump there. SPAN looks at one frame at a time, so the chunks a
+part is upscaled in add no joins of their own. :func:`seam_score` looks at a short
 window around such a time and compares the frame-to-frame change at that
 frame with the change around it, in the output and in the source. A jump the
 source does not have is a seam.
@@ -28,10 +29,8 @@ from pathlib import Path
 from .probe import ProbeError, probe_file
 from .shots import ShotError, parse_metadata_log
 from .upscale import (
-    CHUNK_SECONDS,
     STRUCTURE_SIGMA,
     UpscalePlan,
-    flashvsr_chunks,
     render_shot_parts,
 )
 
@@ -164,14 +163,11 @@ def seam_candidates(
 ) -> list[float]:
     """Frame-snapped joins introduced by the latest render.
 
-    Full renders share the renderer's coalesced parts and nominal FlashVSR
-    ranges. A splice checks only the actual keyframe-expanded replacement
-    and its edges, not hypothetical re-renders of the untouched head/tail.
-    ``revised_range`` comes from the renderer before pending is cleared.
-
-    Runtime OOM retries (including the system-RAM child) can shorten chunks.
-    Their actual joins are not recorded, so these nominal candidates cannot
-    cover them reliably. Threshold calibration on real footage is separate.
+    Full renders share the renderer's coalesced parts. A splice checks only
+    the actual keyframe-expanded replacement and its edges, not hypothetical
+    re-renders of the untouched head/tail. ``revised_range`` comes from the
+    renderer before pending is cleared. Threshold calibration on real footage
+    is separate.
     """
     if revised_range is not None:
         if plan.pending is None:
@@ -181,17 +177,8 @@ def seam_candidates(
     else:
         parts = render_shot_parts(plan.spans, duration_s, total_frames, fps)
     frames: set[int] = set()
-    for span, first, stop in parts:
+    for _span, first, stop in parts:
         frames.update((first, stop))
-        # restore_clip bypasses FlashVSR for pass-through and scale 1. The
-        # engine dispatch also allows 0.05 s beyond chunk_s before chunking.
-        if (
-            span.use_upscale
-            and span.scale != 1
-            and (stop - first) / fps > (CHUNK_SECONDS + 0.05)
-        ):
-            chunks = flashvsr_chunks(stop - first, fps)
-            frames.update(first + end for _start, end in chunks[:-1])
     return sorted(
         frame / fps for frame in frames if 0.5 < frame / fps < total_frames / fps - 0.5
     )

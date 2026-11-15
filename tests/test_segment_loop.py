@@ -412,6 +412,14 @@ def test_repair_coverage_keeps_known_contents() -> None:
     assert SegmentList.from_dict(saved.to_dict()) == saved
 
 
+def test_saved_4x_scale_choice_is_dropped() -> None:
+    kept = SegmentList(segments=[], scale=2, scale_reason="soft source")
+    assert SegmentList.from_dict(kept.to_dict()) == kept
+    old = {**kept.to_dict(), "scale": 4, "scale_reason": "small source"}
+    loaded = SegmentList.from_dict(old)
+    assert (loaded.scale, loaded.scale_reason) == (None, "")
+
+
 # Gemini's 22 segments for the Sintel trailer, before the limits existed.
 _TRAILER_22 = [
     (0.0, 5.4, "Snowy mountain landscape", []),

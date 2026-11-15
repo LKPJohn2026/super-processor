@@ -1337,22 +1337,22 @@ class GeminiClient:
         )
         intro = (
             "You plan a restoration of an editor's footage. Each shot goes "
-            "through fixed FFmpeg clean-up (deblock, denoise), then FlashVSR "
-            "upscaling, whose fine detail is added to a plain upscale by "
+            "through fixed FFmpeg clean-up (deblock, denoise), then a SPAN 2x "
+            "upscale, whose fine detail is added to a plain upscale by "
             "'strength' (0 adds none, 1 adds all of it), then fixed FFmpeg finishing "
-            "(contrast, brightness, saturation, gamma, grain). FlashVSR treats "
+            "(contrast, brightness, saturation, gamma, grain). SPAN treats "
             "blocks and noise as detail and sharpens them into texture, so "
             "clean those first and do not ask for more strength than the shot "
             "needs. The goal is footage that looks well shot, not AI made: no "
             "waxy skin, no crunchy edges, no invented patterns, faces and text "
             "unchanged. Set only what the shot needs; leave the rest at its "
             f"no-change value. Ranges: {limits}. Shapes and colour always "
-            "come from the source; strength only sets how much of FlashVSR's "
+            "come from the source; strength only sets how much of SPAN's "
             "fine detail is added. A shot listing protected boxes is held "
             "down inside them automatically, so its strength can suit the "
             "rest of the frame; a shot that contains faces, hands, or text "
             f"without boxes is capped at strength {protected_strength:g}. "
-            "Set use_upscale to false for a shot that FlashVSR would only "
+            "Set use_upscale to false for a shot that SPAN would only "
             "harm (already clean and sharp, or fine texture it would invent "
             "over); it is then resized with a plain upscale and keeps its "
             "look. "
@@ -1600,7 +1600,7 @@ class GeminiClient:
         prior_start_s: float,
         prior_end_s: float,
         duration_s: float,
-        allowed_scales: tuple[int, ...] = (2, 4),
+        allowed_scales: tuple[int, ...] = (1, 2),
         job_dir: Path | None = None,
     ) -> dict[str, Any]:
         """Turn a result note into a bounded scale, strength, and time range."""
@@ -1641,17 +1641,15 @@ def _scale_question(scales: tuple[int, ...], source_size: tuple[int, int]) -> st
     width, height = source_size
     size = f"The source is {width}x{height}. " if width and height else ""
     options = {
-        1: "1 keeps the source size: clean-up and finishing only, no FlashVSR",
-        2: "2 doubles it with FlashVSR, the default",
-        4: "4 quadruples it with FlashVSR, for a small, soft source",
+        1: "1 keeps the source size: clean-up and finishing only, no SPAN",
+        2: "2 doubles it with SPAN, the default",
     }
     listed = "; ".join(options[scale] for scale in scales if scale in options)
     return (
         f"{size}Also choose one output scale for the whole video from "
         f"{list(scales)} ({listed}). Use 2 unless the video gives a reason: "
         "1 when it is already large and sharp enough that upscaling would add "
-        "nothing but invented detail, 4 when it is small enough that 2 would "
-        "still look small on a modern screen and its picture can bear it. Say "
+        "nothing but invented detail. Say "
         "why in scale_reason, one short sentence an editor understands."
     )
 

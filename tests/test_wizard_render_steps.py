@@ -145,7 +145,7 @@ def test_wizard_server_serves_output_only(tmp_path: Path) -> None:
 
 class _BrokenEngine:
     def upscale(self, request: object) -> Path:
-        raise UpscaleError("FlashVSR needs an NVIDIA GPU with CUDA")
+        raise UpscaleError("SPAN needs an NVIDIA GPU with CUDA")
 
 
 class _NoGemini:

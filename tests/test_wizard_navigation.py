@@ -16,7 +16,7 @@ from loop_driver import analyze, pick_and_segment, preview, to_ready
 
 from super_processor.file_dialog import FileDialogError, choose_video
 from super_processor.review import WizardServer
-from super_processor.shot_plan import load_plan
+from super_processor.shot_plan import load_plan, save_plan
 from super_processor.upscale import (
     FakeUpscaleEngine,
     UpscaleRequest,
@@ -316,7 +316,7 @@ def test_pick_page_offers_dialog_drop_and_path() -> None:
 
 
 @needs_ffmpeg
-def test_editor_can_turn_flashvsr_off_for_a_segment(tmp_path: Path) -> None:
+def test_editor_can_turn_upscaling_off_for_a_segment(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
     controller.handle_post("/goto", {"to": ["segments"]})
@@ -330,34 +330,28 @@ def test_editor_can_turn_flashvsr_off_for_a_segment(tmp_path: Path) -> None:
     analyze(controller)
     shot = preview(controller)["shot"]
     assert shot["use_upscale"] is True and shot["upscale_override"] is None
-    assert "Gemini chose: this segment uses FlashVSR" in controller.render()
+    assert "Gemini chose: this segment is upscaled with SPAN" in controller.render()
     controller.handle_post("/preview", {"action": ["upscale"], "on": ["0"]})
     assert controller.current_state().step is WizardStep.ANALYZING
     analyze(controller)
     shot = preview(controller)["shot"]
-    # Gemini proposed FlashVSR again; the editor's choice holds.
+    # Gemini proposed upscaling again; the editor's choice holds.
     assert shot["use_upscale"] is False and shot["upscale_override"] is False
     page = controller.render()
-    assert "You chose: this segment skips FlashVSR" in page
-    assert "Use FlashVSR for this segment" in page
+    assert "You chose: this segment skips upscaling" in page
+    assert "Use upscaling for this segment" in page
     assert job_dir.is_dir()
 
 
 @needs_ffmpeg
-def test_a_large_source_keeps_its_size_without_asking_gemini(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The 320x180 clip stands in for a source over the long-edge limit.
-    monkeypatch.setattr("super_processor.shot_plan.MAX_UPSCALE_LONG_EDGE", 300)
-    monkeypatch.setattr("super_processor.wizard.MAX_UPSCALE_LONG_EDGE", 300)
+def test_gemini_is_asked_for_1x_or_2x(tmp_path: Path) -> None:
     asked: list[Any] = []
 
     class _Asking(_Gemini):
         def propose_segments(self, **kwargs: Any) -> Any:
             asked.append(kwargs.get("scales"))
-            # What happened on the 1440x1080 film: Gemini answered 2x anyway.
             segments = super().propose_segments(**kwargs)
-            return {"segments": segments, "scale": 2, "scale_reason": "SD"}
+            return {"segments": segments, "scale": 1, "scale_reason": "sharp"}
 
     controller = WizardController(
         tmp_path / "jobs",
@@ -365,35 +359,29 @@ def test_a_large_source_keeps_its_size_without_asking_gemini(
         upscale_engine=FakeUpscaleEngine(),
     )
     job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
-    assert asked == [()]
+    assert asked == [(1, 2)]
     plan = load_plan(job_dir)
     assert plan is not None and plan.scale == 1
     view = controller.api_view()["looks"]
-    assert view["scales"] == [1] and view["large_source"] is True
-    page = controller.render()
-    assert "up to 300 px on the long edge" in page
-    assert "Upscale 2×" not in page
-    controller.handle_post("/ready", {"action": ["render"], "scale": ["2"]})
-    assert "pick one of the upscale options" in (controller.current_state().error or "")
+    assert view["scales"] == [1, 2] and view["scale_reason"] == "sharp"
+    for gone in ("large_source", "small_source", "max_upscale_long_edge"):
+        assert gone not in view
+    assert "gpu_vram_gb" not in view
 
 
 @needs_ffmpeg
-def test_a_plan_saved_at_2x_before_the_limit_is_brought_down(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_plan_saved_at_4x_is_brought_down_to_2x(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
     plan = load_plan(job_dir)
-    assert plan is not None and plan.scale == 2
-    # The limit arrives with the job already planned at 2x.
-    monkeypatch.setattr("super_processor.shot_plan.MAX_UPSCALE_LONG_EDGE", 300)
-    monkeypatch.setattr("super_processor.wizard.MAX_UPSCALE_LONG_EDGE", 300)
-    view = controller.api_view()["looks"]
-    assert view["scales"] == [1] and view["scale_reason"] == ""
+    assert plan is not None
+    # A job planned before 4x was removed.
+    plan.scale = 4
+    save_plan(job_dir, plan)
     controller.handle_post("/ready", {"action": ["render"]})
     assert controller.current_state().step is WizardStep.RENDERING
     upscale = load_upscale_plan(job_dir)
-    assert upscale is not None and {span.scale for span in upscale.spans} == {1}
+    assert upscale is not None and {span.scale for span in upscale.spans} == {2}
 
 
 @needs_ffmpeg
@@ -403,13 +391,13 @@ def test_ready_screen_offers_the_upscale_choice(tmp_path: Path) -> None:
     clip = _clip(tmp_path / "in.mp4")
     job_dir = to_ready(controller, clip)
     view = controller.api_view()["looks"]
-    assert view["scales"] == [1, 2, 4] and view["source_size"] == [320, 180]
-    assert view["large_source"] is False
+    assert view["scales"] == [1, 2] and view["source_size"] == [320, 180]
     page = controller.render()
-    assert "Don't upscale" in page and "Upscale 4×" in page and "1280×720" in page
+    assert "Don't upscale" in page and "Upscale 2×" in page and "640×360" in page
+    assert "SPAN on the GPU" in page and "Upscale 4×" not in page
     assert 'name="scale" value="2" checked' in page
 
-    controller.handle_post("/ready", {"action": ["render"], "scale": ["8"]})
+    controller.handle_post("/ready", {"action": ["render"], "scale": ["4"]})
     assert "pick one of the upscale options" in (controller.current_state().error or "")
     controller.handle_post("/ready", {"action": ["render"], "scale": ["1"]})
     assert controller.current_state().step is WizardStep.RENDERING

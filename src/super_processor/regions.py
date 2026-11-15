@@ -1,4 +1,4 @@
-"""Protected regions: where FlashVSR is held down inside a shot.
+"""Protected regions: where SPAN's detail is held down inside a shot.
 
 Faces, hands, and text are where invented detail shows first: a sixth finger,
 a different iris, a sign that no longer reads. Gemini marks boxes around them
@@ -6,7 +6,7 @@ on three stills of the shot (start, middle, end), so one box covers where the
 thing moves during the shot. Boxes are normalised to the frame (0-1), padded,
 and feathered, so the same expression works on every plane and at any scale.
 
-Inside a box, the FlashVSR share drops to the kind's ceiling in
+Inside a box, the SPAN share drops to the kind's ceiling in
 :data:`REGION_STRENGTH`; it rises back to the shot's strength across
 :data:`FEATHER` of the frame outside the box, so there is no seam.
 """
@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-# Highest FlashVSR share allowed inside a box of each kind.
+# Highest SPAN share allowed inside a box of each kind.
 REGION_STRENGTH: dict[str, float] = {"faces": 0.3, "hands": 0.3, "text": 0.15}
 KINDS = tuple(REGION_STRENGTH)
 # Padding added on every side of a box, and the width of the soft edge, as a
@@ -123,7 +123,7 @@ def _box_weight(region: Region) -> str:
 
 
 def strength_expr(strength: float, regions: tuple[Region, ...]) -> str:
-    """Per-pixel FlashVSR share for an FFmpeg ``blend`` expression.
+    """Per-pixel SPAN share for an FFmpeg ``blend`` expression.
 
     Without regions this is just ``strength``. With them, each kind lowers the
     share towards its ceiling where its boxes are, and the lowest share wins

@@ -1,6 +1,6 @@
 """Loop 2: a recipe per shot, short previews, a self-check, editor approval.
 
-Every approved shot gets a recipe: a FlashVSR ``strength`` and a
+Every approved shot gets a recipe: a SPAN ``strength`` and a
 :class:`~super_processor.look.ShotLook`. The whole video shares one ``scale``.
 Gemini proposes the recipes from the shot labels and measurements (or the
 rules in :func:`fallback_recipe` do, without Gemini). Each shot then gets a
@@ -11,7 +11,7 @@ writes a note on one shot, which sends only that shot round again.
 Model numbers are clamped into :data:`~super_processor.look.LOOK_BOUNDS`.
 Faces, hands, and text are where invented detail shows, so before the first
 proposal Gemini boxes them (:func:`locate_targets`) and the blend holds
-FlashVSR down inside the boxes. If any protected content kind lacks a valid
+SPAN's detail down inside the boxes. If any protected content kind lacks a valid
 box, the whole shot is also capped at :data:`PROTECTED_STRENGTH`.
 """
 
@@ -46,16 +46,10 @@ PREVIEWS_DIR = "previews"
 # Preview length, from the middle of the shot.
 PREVIEW_S = 3.0
 CHECK_STILL_WIDTH = 960
-# 4x only for small sources; on larger ones it is mostly invented detail.
-MAX_4X_LONG_EDGE = 960
-# FlashVSR at all only up to this long edge. 2x of 1440x1080 is 2880x2160,
-# which v1.1 cannot restore in 32 GB; the system-RAM fallback then took about
-# 16 h for a 20-minute film. FlashVSR is built and measured on small sources.
-MAX_UPSCALE_LONG_EDGE = 1280
-# ... and only on a GPU with at least this much memory. Decimal GB, so a card
-# sold as 24 GB (24564 MiB on an RTX 4090) qualifies.
-MIN_4X_VRAM_BYTES = 24 * 1000**3
-MAX_PREVIEW_SCALE = 2
+# The upscale multiples every source may use, besides 1 (keep the size). SPAN
+# 2x fits any source the wizard takes: 1440x1080 runs at about 30 fps in
+# 4-9 GB. 4x is gone; no job used it.
+UPSCALE_SCALES = (2,)
 # Output scale when Gemini gives none.
 DEFAULT_SCALE = 2
 DEFAULT_STRENGTH = 0.5
@@ -126,13 +120,13 @@ class ShotRecipe:
     note: str = ""
     # Measured on the latest preview: see :func:`.stability.shimmer_index`.
     shimmer: float | None = None
-    # False: Gemini judged FlashVSR detail a risk here; the shot is only
+    # False: Gemini judged SPAN detail a risk here; the shot is only
     # resized to the output scale, with its look applied.
     use_upscale: bool = True
     # Segment loop: where the preview window starts, picked once at random
     # so a redo shows the same seconds. ``None`` previews the middle.
     preview_start: float | None = None
-    # The editor's own FlashVSR choice for this segment; when set it wins
+    # The editor's own upscale choice for this segment; when set it wins
     # over what Gemini proposes.
     upscale_override: bool | None = None
 
@@ -199,7 +193,8 @@ class ShotPlan:
         error = data.get("error")
         return cls(
             # 1 is the editor's "do not upscale" from the ready screen.
-            scale=scale if scale in (1, 2, 4) else 2,
+            # A plan saved at 4x, before 4x was removed, renders at 2x.
+            scale=scale if scale in (1, 2) else 2,
             recipes=[ShotRecipe.from_dict(item) for item in data["recipes"]],
             error=str(error) if error else None,
         )
@@ -265,8 +260,8 @@ def look_from_model(raw: Any) -> ShotLook:
 
 
 # A result note changes the output size only by naming a multiple as a request:
-# "make it 4x", "go back to 2x", or "4x" on its own. Everything else keeps the
-# size, including "the sign reads 4x", "16x9", "1.5x", and "don't make it 4x".
+# "make it 2x", "go back to 1x", or "2x" on its own. Everything else keeps the
+# size, including "the sign reads 4x", "16x9", "1.5x", and "don't make it 2x".
 _NOTE_CLAUSE = re.compile(r"[,;!?\n]|[.:](?!\d)|\b(?:and|but)\b")
 _NOTE_NEGATION = re.compile(r"\b(?:not|no|never|without|don't|dont)\b")
 _MULTIPLE = r"(?<![\w.])(\d+)\s?[x×](?![\w.]|\s*\d)"
@@ -277,37 +272,9 @@ _NOTE_SIZE_REQUEST = re.compile(
 )
 
 
-def allowed_scales(width: int, height: int, *, vram_bytes: int) -> tuple[int, ...]:
-    """The FlashVSR scales for a source: none when it is large, 4x only when
-    it is small and the GPU has at least 24 GB.
-
-    Above ``MAX_UPSCALE_LONG_EDGE`` the output would not fit the GPU, and the
-    system-RAM fallback takes many hours, so the source only keeps its size.
-    The long edge must be small enough for 4x to recover detail rather than
-    invent it, and the GPU large enough to restore it without spilling into
-    system RAM for most of the run. An unknown size or GPU (0) does not
-    qualify for 4x; an unknown size still allows 2x.
-    """
-    long_edge = max(width, height)
-    if long_edge > MAX_UPSCALE_LONG_EDGE:
-        return ()
-    small = 0 < long_edge <= MAX_4X_LONG_EDGE
-    return (2, 4) if small and vram_bytes >= MIN_4X_VRAM_BYTES else (2,)
-
-
 def default_scale(options: tuple[int, ...]) -> int:
     """The scale a plan starts at when Gemini gives none it may use."""
     return DEFAULT_SCALE if DEFAULT_SCALE in options else 1
-
-
-def preview_scale(scale: int) -> int:
-    """Previews are at most 2x, whatever the output scale.
-
-    At 4x a preview of 854x480 is 3456x1920, which v1.1 cannot restore in
-    32 GB of VRAM; every 4x preview went to the system-RAM fallback. A 2x
-    preview shows the same restoration at a size any GPU fits.
-    """
-    return min(scale, MAX_PREVIEW_SCALE)
 
 
 def note_scale(note: str, current: int, allowed: tuple[int, ...]) -> int:
@@ -322,14 +289,8 @@ def note_scale(note: str, current: int, allowed: tuple[int, ...]) -> int:
         if match is None or _NOTE_NEGATION.search(clause) is not None:
             continue
         wanted = int(match.group(1) or match.group(2))
-        if wanted not in allowed and allowed == (1,):
-            raise ValueError(
-                f"kept {current}x and rendered nothing: this video is larger "
-                f"than {MAX_UPSCALE_LONG_EDGE} px on its long edge, so it keeps "
-                "its size. Send the note again without the size."
-            )
         if wanted not in allowed:
-            choices = ", ".join(f"{scale}x" for scale in allowed)
+            choices = " or ".join(f"{scale}x" for scale in allowed)
             raise ValueError(
                 f"kept {current}x and rendered nothing: this video can be "
                 f"{choices}. Send the note again with one of those, or without "
@@ -344,7 +305,7 @@ def reply_scale(raw: Any) -> int | None:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
     # ``in`` also turns away fractions, infinity and NaN, without calling int().
-    return int(raw) if raw in (1, 2, 4) else None
+    return int(raw) if raw in (1, *UPSCALE_SCALES) else None
 
 
 def cap_strength(strength: float, shot: Shot) -> float:
@@ -435,7 +396,7 @@ def fallback_recipe(shot: Shot) -> ShotRecipe:
     if "soft" in issues:
         strength = 0.6
     if issues & {"blocky", "noisy"}:
-        # Clean first, and ask FlashVSR for less: what is left of the damage
+        # Clean first, and ask SPAN for less: what is left of the damage
         # is what it would sharpen into texture.
         strength = min(strength, 0.45)
     look = ShotLook(
@@ -484,7 +445,7 @@ def apply_proposals(
             look=look_from_model(item.get("look")),
             reason=" ".join(str(item.get("reason", "")).split())[:240],
         )
-        # The editor's own FlashVSR choice for the segment wins.
+        # The editor's own upscale choice for the segment wins.
         recipes[index] = keep_editor_choices(
             replace(recipes[index], use_upscale=item.get("use_upscale") is not False),
             recipes[index],
@@ -635,7 +596,7 @@ def render_previews(
     recipes = list(plan.recipes)
     clips: dict[int, Path] = {}
     requests: list[UpscaleRequest] = []
-    # Shots that skip FlashVSR are only resized; see :func:`restore_clip`.
+    # Shots that skip SPAN are only resized; see :func:`restore_clip`.
     plain: dict[int, Path] = {}
     for index in indexes:
         recipe = replace(recipes[index], rev=recipes[index].rev + 1)
@@ -653,7 +614,7 @@ def render_previews(
         request = UpscaleRequest(
             clip,
             work / f"shot_{index:03d}_up.mp4",
-            scale=preview_scale(plan.scale),
+            scale=plan.scale,
             strength=recipe.strength,
             look=recipe.look,
             regions=shots.shots[index].regions,
@@ -723,7 +684,7 @@ def measure_shimmer(
             value = shimmer_index(
                 before,
                 after,
-                scale=preview_scale(plan.scale),
+                scale=plan.scale,
                 after_size=video_size(after),
                 ffmpeg_bin=ffmpeg_bin,
             )
@@ -813,7 +774,7 @@ def keep_editor_choices(fresh: ShotRecipe, old: ShotRecipe) -> ShotRecipe:
     """``fresh`` with what the editor set on ``old`` kept.
 
     That is the preview count and window, a pending note, and their own
-    FlashVSR choice.
+    upscale choice.
     """
     use = (
         old.upscale_override if old.upscale_override is not None else fresh.use_upscale
@@ -829,7 +790,7 @@ def keep_editor_choices(fresh: ShotRecipe, old: ShotRecipe) -> ShotRecipe:
 
 
 def set_upscale(plan: ShotPlan, index: int, on: bool) -> ShotPlan:
-    """Use FlashVSR on one segment or not, as the editor chose; redo its preview."""
+    """Upscale one segment or not, as the editor chose; redo its preview."""
     if not 0 <= index < len(plan.recipes):
         raise ShotPlanError("no such shot")
     recipes = list(plan.recipes)

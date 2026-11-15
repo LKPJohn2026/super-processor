@@ -284,22 +284,13 @@ test("progress text counts the time left down between polls", async (t) => {
   assert.equal(api.progressTiming({ phase: "x", pct: 1, message: "" }), "");
 });
 
-test("scale lines say what Gemini chose and what the GPU allows", async (t) => {
+test("scale lines say what Gemini chose", async (t) => {
   const api = await fixture(t, async () => Response.json({}));
-  assert.equal(api.scaleChoiceText(4, "small and soft"), "Gemini chose to upscale 4×: small and soft");
+  assert.equal(api.scaleChoiceText(2, "soft SD source"), "Gemini chose to upscale 2×: soft SD source");
   assert.equal(api.scaleChoiceText(1), "Gemini chose to keep the size (no upscaling).");
   assert.equal(api.scaleChoiceText(null, "x"), "");
-  assert.match(api.outputSizeLine(4), /previews are 2×/);
   assert.match(api.outputSizeLine(1), /keeps its size/);
   assert.equal(api.outputSizeLine(2), "The whole video is upscaled 2×.");
-  const looks = { scale: 2, error: null, shots: [], scales: [1, 2], small_source: true, gpu_vram_gb: 16 };
-  assert.equal(api.vramNote(looks), "4× needs an NVIDIA GPU with at least 24 GB of memory; this one has 16 GB.");
-  assert.equal(api.vramNote({ ...looks, gpu_vram_gb: 0 }), "4× needs an NVIDIA GPU with at least 24 GB of memory; none was found.");
-  assert.equal(api.vramNote({ ...looks, scales: [1, 2, 4] }), "");
-  assert.equal(api.vramNote({ ...looks, small_source: false }), "");
-  assert.equal(api.sizeNote(looks), "");
-  assert.match(
-    api.sizeNote({ ...looks, scales: [1], large_source: true, max_upscale_long_edge: 1280 }),
-    /^Upscaling is offered only for videos up to 1280 px on the long edge; .* This one keeps its size\.$/,
-  );
+  assert.equal(api.sizeNote, undefined);
+  assert.equal(api.vramNote, undefined);
 });

@@ -6,7 +6,6 @@ import json
 import math
 import shutil
 import subprocess
-import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,6 @@ from loop_driver import (
     preview,
     segments,
 )
-from test_upscale import _V11_FAKE_BASE
 
 from super_processor.gemini import GeminiClient, GeminiError
 from super_processor.look import LOOK_BOUNDS, ShotLook
@@ -31,7 +29,6 @@ from super_processor.shot_plan import (
     ShotPlan,
     ShotPlanError,
     ShotRecipe,
-    allowed_scales,
     apply_checks,
     apply_proposals,
     fallback_recipe,
@@ -49,9 +46,6 @@ from super_processor.shot_plan import (
 from super_processor.shots import Shot, ShotList, ShotMetrics
 from super_processor.upscale import (
     FakeUpscaleEngine,
-    FlashVsrEngine,
-    UpscaleError,
-    UpscaleRequest,
     load_upscale_plan,
     video_stream_facts,
 )
@@ -60,9 +54,6 @@ from super_processor.wizard import (
     WizardStep,
 )
 from super_processor.wizard_pages import check_summary, settings_summary
-
-# A 32 GB GPU, which allows 4x for a small source.
-GB_32 = 32 * 1000**3
 
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg required"
@@ -85,9 +76,6 @@ def test_model_looks_are_clamped() -> None:
     )
     assert look == ShotLook(deblock=1.0, contrast=LOOK_BOUNDS["contrast"][0])
     assert look_from_model(None) == ShotLook()
-    assert allowed_scales(960, 540, vram_bytes=GB_32) == (2, 4)
-    assert allowed_scales(540, 960, vram_bytes=GB_32) == (2, 4)
-    assert allowed_scales(1280, 720, vram_bytes=GB_32) == (2,)
 
 
 def test_fallback_recipes_follow_the_measurements() -> None:
@@ -168,7 +156,7 @@ def test_checks_fix_only_failed_shots() -> None:
 
 def test_redo_marks_one_shot_and_storage_round_trips(tmp_path: Path) -> None:
     shots = _shots()
-    plan = finish(new_plan(shots, 4), [0, 1, 2])
+    plan = finish(new_plan(shots, 2), [0, 1, 2])
     assert plan.stale_indexes() == []
     with pytest.raises(ShotPlanError, match="say what"):
         request_redo(plan, 1, "   ")
@@ -288,22 +276,6 @@ def _three_shots(path: Path) -> Path:
     return path
 
 
-def _flashvsr_tree(tmp_path: Path, script: str) -> tuple[Path, Path]:
-    home = tmp_path / "FlashVSR"
-    wan = home / "examples" / "WanVSR"
-    weights = wan / "FlashVSR-v1.1"
-    weights.mkdir(parents=True)
-    for name in (
-        "diffusion_pytorch_model_streaming_dmd.safetensors",
-        "LQ_proj_in.ckpt",
-        "TCDecoder.ckpt",
-    ):
-        (weights / name).write_bytes(b"w")
-    infer = wan / "infer_flashvsr_v1.1_tiny.py"
-    infer.write_text(script, encoding="utf-8")
-    return home, infer
-
-
 class _Transport:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
@@ -327,14 +299,14 @@ def test_gemini_propose_and_check_requests(tmp_path: Path) -> None:
         shots=[{"index": 0}],
         stills=[jpg],
         bounds=LOOK_BOUNDS,
-        scales=(2, 4),
+        scales=(1, 2),
         protected_strength=0.6,
         job_dir=tmp_path,
     )
     assert out == reply
     body = transport.bodies[0]
     text = body["contents"][0]["parts"][0]["text"]
-    assert "deblock 0 to 1" in text and "[2, 4]" in text and "0.6" in text
+    assert "deblock 0 to 1" in text and "[1, 2]" in text and "0.6" in text
     schema = body["generationConfig"]["responseSchema"]
     assert (
         "grain"
@@ -421,7 +393,7 @@ class _Planner:
 
 @needs_ffmpeg
 def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
-    clip = _three_shots(tmp_path / "cuts.mp4")  # 320x180: 4x is allowed
+    clip = _three_shots(tmp_path / "cuts.mp4")
     planner = _Planner()
     controller = WizardController(
         tmp_path / "jobs",
@@ -431,7 +403,7 @@ def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
     pick_and_segment(controller, clip)
     state = approve_segments(controller)
     assert state.step is WizardStep.PREVIEW_SEGMENT, state.error
-    # Previews are 2x even where 4x is allowed; the planner's 4x is refused.
+    # Previews are at the plan's 2x; the planner's 4x is no longer a scale.
     assert planner.scales == [(2,)]
     first = preview(controller)
     assert first["scale"] == 2 and first["error"] is None
@@ -487,58 +459,6 @@ def test_preview_post_needs_the_preview_step(tmp_path: Path) -> None:
         controller.handle_post("/looks", {"action": ["approve"]})
 
 
-_COUNTING_INFER = (
-    _V11_FAKE_BASE
-    + """
-
-LOADS = Path(os.environ["FAKE_LOADS"])
-
-
-def init_pipeline():
-    LOADS.write_text(str(int(LOADS.read_text() or "0") + 1))
-    return lambda **kwargs: kwargs["LQ_video"]
-
-
-def prepare_input_tensor(path, scale, dtype, device):
-    return ({"path": path, "scale": int(scale)}, 8, 8, 1, 10)
-
-
-def tensor2video(video):
-    scale = video["scale"]
-    return _frames(video["path"], f"scale=iw*{scale}:ih*{scale}", _count(video["path"]))
-"""
-)
-
-
-@needs_ffmpeg
-def test_flashvsr_batches_previews_with_one_load(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home, _script = _flashvsr_tree(tmp_path, _COUNTING_INFER)
-    loads = tmp_path / "loads.txt"
-    loads.write_text("0")
-    monkeypatch.setenv("FAKE_LOADS", str(loads))
-    monkeypatch.setattr("super_processor.upscale.cuda_available", lambda: True)
-    monkeypatch.setattr("super_processor.upscale.flashvsr_home", lambda: home)
-    clips = [_clip(tmp_path / f"c{i}.mp4", seconds=2) for i in range(3)]
-    requests = [
-        UpscaleRequest(
-            clip, tmp_path / "out" / f"{clip.stem}.mp4", look=ShotLook(denoise=0.5)
-        )
-        for clip in clips
-    ]
-    engine = FlashVsrEngine()
-    outputs = engine.upscale_many(requests)
-    assert loads.read_text() == "1"
-    assert all(video_stream_facts(out)[0] == 20 for out in outputs)
-    assert (tmp_path / "out" / "c0.clean.mp4").is_file()
-    assert engine.upscale_many([]) == []
-    assert str(home) not in sys.path
-    long = _clip(tmp_path / "long.mp4", seconds=10)
-    with pytest.raises(UpscaleError, match="at most"):
-        engine.upscale_many([UpscaleRequest(long, tmp_path / "out" / "long.mp4")])
-
-
 def test_proposals_carry_use_upscale() -> None:
     shots = _shots()
     plan = new_plan(shots, 2)
@@ -584,3 +504,10 @@ def test_redo_can_resample_the_preview_window() -> None:
     fresh = request_redo(plan, 0, "show another part", resample=True)
     assert fresh.recipes[0].preview_start is None
     assert ShotRecipe.from_dict(kept.recipes[0].to_dict()).preview_start == 4.0
+
+
+def test_a_plan_saved_at_4x_renders_at_2x() -> None:
+    # 4x was removed; plans saved before that come back at 2x instead of failing.
+    old = ShotPlan.from_dict({"scale": 4, "recipes": [ShotRecipe().to_dict()]})
+    assert old.scale == 2
+    assert ShotPlan.from_dict({"scale": 1, "recipes": []}).scale == 1
