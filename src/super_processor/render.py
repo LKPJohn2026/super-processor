@@ -110,7 +110,7 @@ def ensure_encoder(encoder: str) -> None:
         kind="encoders",
         token=encoder,
         required=True,
-        hint="install ffmpeg with this encoder or render with libx265",
+        hint="install ffmpeg with this encoder or render with libx264",
     )
     if not result.ok:
         raise RenderError(result.detail)

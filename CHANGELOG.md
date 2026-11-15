@@ -18,9 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - While a render runs, the progress screen suggests undervolting the GPU once
   if the render has slowed by at least 20% from its first minute while the
   GPU is at 80 C or more or the driver is slowing it for heat. A SPAN render
-  keeps an RTX 5090 near 500 W, and a 20-minute 1080p film warmed the case
-  until the CPU, though only a third busy, reached 92 C. The app never slows
-  itself down for heat. GPU readings come from `nvidia-smi`.
+  keeps an RTX 5090 near 500 W, which heats the whole case: a 20-minute 1080p
+  film took the CPU to 92-95 C while the blend and encode still ran on it.
+  The app never slows itself down for heat. GPU readings come from
+  `nvidia-smi`.
 
 ### Changed
 
@@ -36,29 +37,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of SPAN's fine detail.
 - Every source the wizard accepts (up to 1080p) is offered 1x and 2x, and
   segment previews render at the plan's scale.
-- Each clip streams through SPAN in one pass: FFmpeg decodes and cleans the
-  source onto a pipe, a reader thread fills blocks of about 256 MiB of input
-  frames, the GPU upscales them, and a writer thread pipes the upscaled frames
-  into the delivery encoder, which blends them with the source. Nothing is
-  written to scratch disk; an earlier chunked SPAN pipeline wrote about 63 GB
-  of lossless 4K chunk files for a full-length 1080p film and ran a 16-core
-  CPU at its 95 C limit. On an RTX 5090 a 60 s 1440x1080 slice rendered to
-  2880x2160 at 22.2 fps end to end (about 23 minutes for a 20-minute 1080p
-  film; about 8 minutes or less for a 20-minute SD film) at 0.43 CPU-seconds
-  per frame against 1.21, about a third of a 32-thread CPU on average, with
-  4.4 GB peak RSS. Segment previews use the same path under one model load,
-  without the 8 s limit on a batch.
+- Each clip streams through SPAN in one pass, with the per-frame work on the
+  GPU. FFmpeg decodes with NVDEC (`-hwaccel cuda` when a cached probe shows
+  it works; codecs NVDEC cannot read fall back to software decoding), applies
+  the look's clean filter, and pipes `yuv420p` frames to a reader thread that
+  fills blocks of about 128 MiB. On the GPU each block goes from YUV to RGB
+  (BT.601), through SPAN, into the strength blend with a Lanczos-3 base and
+  a Gaussian detail split (per-pixel strength from a protected-region map
+  built once per clip), and back to `yuv420p`. A writer thread pipes the 2x
+  frames into the delivery encoder, which adds only a look's grade and grain
+  on the CPU. Nothing is written to scratch disk; an earlier chunked SPAN
+  pipeline wrote about 63 GB of lossless 4K chunk files for a full-length
+  1080p film and ran a 16-core CPU at its 95 C limit. On an RTX 5090, 1500
+  frames of 1440x1080 rendered to 2880x2160 at 26.8 fps end to end with 0.054
+  CPU-seconds per frame, and the CPU went from 70 C to 76 C over the minute.
+  A stream that blended (lanczos, Gaussian blurs, mixes at 4K) and encoded
+  with x264 on the CPU ran at 22.2 fps and 0.43 CPU-seconds per frame, half
+  of it in x264 and a quarter in the blend; the GPU path's average Y, U and V
+  are within 0.3 levels of it, at 44.96 dB PSNR. Segment previews use the same path under
+  one model load, without the 8 s limit on a batch.
+- Pass-through spans (no SPAN, or scale 1) are one encode from the source:
+  NVDEC decode, the look's clean step, a lanczos resize, the finish step,
+  and the delivery encoder. They went through a 2x `libx264` veryfast work
+  file and then a 4K FFmpeg blend whose blurs and lookup tables a strength of
+  0 threw away. On 200 frames of 1440x1080 with NVENC: 2.6 s and 0.027
+  CPU-seconds a frame, against 5.0 s and 0.26, for identical frames.
+- Every output is H.264. The legacy CLI export (`plans --choose`, recipe
+  runs) uses `libx264` `medium` CRF 23 by default (40.63 dB in 4.0 MB on 120
+  frames of 1440x1080, where the `libx265` CRF 24 it replaces made 40.60 dB
+  in 3.4 MB), or `h264_nvenc`, `h264_qsv`, `h264_amf`, or
+  `h264_videotoolbox` with `--encoder`. The `encode_hevc_size_cap` op is now
+  `encode_size_cap` and the export codec is `h264`; recipes saved with the
+  old names, or with HEVC encoders, load as the H.264 equivalents.
+- Doctor no longer requires `libx265`, lists the H.264 hardware encoders,
+  and reports whether `h264_nvenc` and CUDA decoding actually run here.
+- A failed NVENC or CUDA-decode probe is asked again after 60 s (a working
+  one is kept), and each render decides its encoder once, so one output
+  never mixes encoders. Probes no longer pipe their output, which on Windows
+  could hang a timed-out probe behind Chocolatey's ffmpeg shim.
 - The output of an upscale holds exactly the source's frame count: a decoder
   up to 8 frames (or 2%) short repeats the last frame, extra frames are
   dropped, and a larger shortfall stops the render rather than splice a
   misaligned picture.
-- The delivery encode uses the x264 preset `faster` instead of `medium`
-  (still CRF 16, an IDR every second, no B-frames). Against the lossless
-  upscale of a 1440x1080 -> 2880x2160 clip it scored 44.29 against 44.44 dB
-  PSNR and SSIM 0.9862 against 0.9863, 1% smaller, for 57% less encoder CPU.
-  The delivery marker records the preset and version 2. Before a revise
-  splices into an output rendered by 3.7.0 or earlier, that output is
-  re-encoded once into the new settings, so one file never mixes presets.
+- Restoration delivery stays H.264 only and is encoded with `h264_nvenc`
+  (preset `p5`, tune `hq`, VBR CQ 17, High profile) when a one-frame test
+  encode, cached per FFmpeg binary, works on this machine, and with `libx264`
+  preset `faster` (instead of `medium`), CRF 16, otherwise (CI, Macs, AMD).
+  Both keep `yuv420p`, an IDR every second, and no B-frames, and every part
+  of a job uses the same encoder so parts still join by stream copy. Against
+  a lossless 2880x2160 reference (200 frames), NVENC CQ 17 gave 81.8 MB,
+  44.29 dB PSNR and SSIM 0.98588 with almost no CPU; x264 `faster` CRF 16
+  gave 88.7 MB, 44.44 dB and 0.98655 for about 48 CPU-seconds. The delivery
+  marker records the encoder used (`codec`), its quality setting, and
+  version 3. Before a revise splices into an output from an earlier version
+  (3.7.0 or earlier) or one made with the other encoder, that output is
+  re-encoded once into the current settings, so one file never mixes
+  encoders. NVENC is given H.264 level 4.1 or the level the size and rate
+  need: left to pick the lowest, it held a 320x180 clip at level 1.1 to
+  192 kbit/s (26.9 dB on moving grain, against 41.8 for x264). Outputs
+  outside 145x49 to 4096x4096, which NVENC's H.264 refuses, use `libx264`.
 - When the GPU runs out of memory, the upscale retries with smaller batches,
   down to one frame, and then stops with advice to close other GPU programs.
   Retries add no joins.

@@ -15,6 +15,9 @@ Work clips handed to the engine are encoded losslessly. The engine output is
 encoded once into the delivery settings, with a keyframe every second. A range
 revise snaps outward to those keyframes and stream-copies the head and tail, so
 the parts of the video a note did not name are never encoded again.
+
+Delivery video is always H.264: NVENC where this machine has it (see
+:func:`delivery_encoder`), libx264 elsewhere.
 """
 
 from __future__ import annotations
@@ -28,7 +31,8 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
@@ -40,16 +44,44 @@ from .regions import Region, regions_from_dicts, strength_expr
 UPSCALE_PLAN_FILE = "upscale_plan.json"
 CHUNK_SECONDS = 8.0
 CHUNK_OVERLAP_S = 0.5
-# 2: the "faster" x264 preset. Outputs from version 1 ("medium") are not
-# spliced into: a revise renders them again whole (see apply_range_revise).
-DELIVERY_VERSION = 2
-# On a 1440x1080 -> 2880x2160 clip, "faster" was within 0.15 dB PSNR and
-# 0.0001 SSIM of "medium" against the lossless upscale (44.29 against 44.44
-# dB, 1% smaller) for 57% less encoder CPU (51 against 118 CPU-seconds for
-# 200 frames). The encode was half the CPU of a SPAN render, which ran a
-# 16-core CPU at its 95 C limit.
-DELIVERY_PRESET = "faster"
-DELIVERY_CRF = 16
+# 3: H.264 from NVENC or libx264, named in the marker. Outputs from an
+# older version, or from the other encoder, are not spliced into: a revise
+# encodes them again first (see apply_range_revise), so one file never mixes
+# encoders.
+DELIVERY_VERSION = 3
+NVENC = "h264_nvenc"
+X264 = "libx264"
+# Against a lossless 2880x2160 upscale (200 frames, these keyframe flags):
+# x264 "faster" crf 16 made 88.7 MB at 44.44 dB (SSIM 0.98655) for about
+# 48 CPU-seconds; NVENC p5 cq 17 made 81.8 MB at 44.29 dB (SSIM 0.98588)
+# for next to none (cq 16: 92.9 MB, 44.97 dB; cq 18: 71.2 MB, 43.62 dB).
+# The x264 encode was half the CPU of a SPAN render, which ran a 16-core CPU
+# at its 95 C limit. ("faster" was within 0.15 dB of "medium" for 57% less.)
+NVENC_PRESET = "p5"
+NVENC_CQ = 17
+X264_PRESET = "faster"
+X264_CRF = 16
+# Frame sizes NVENC's H.264 encoder takes on an RTX 5090: 128x96 and 4098
+# wide were refused. Outside them the delivery is libx264, which every part
+# of that output shares (they are all one size).
+_NVENC_MIN = (145, 49)
+_NVENC_MAX = (4096, 4096)
+# NVENC holds VBR to the bitrate of the level it picks, the lowest the size
+# and rate allow: 320x180 at 10 fps got level 1.1 (192 kbit/s), and moving
+# grain came out at 26.9 dB where x264 made 41.8 (2.3 dB short of NVENC's
+# own constant QP 17). So the level is at least 4.1 (62.5 Mbit/s High), the
+# next one up when the size or rate needs it, as (name, MaxMBPS, MaxFS).
+# Every width NVENC takes (<= 256 macroblocks) fits these levels' width limit.
+_H264_LEVELS = (
+    ("4.1", 245760, 8192),
+    ("4.2", 522240, 8704),
+    ("5.0", 589824, 22080),
+    ("5.1", 983040, 36864),
+    ("5.2", 2073600, 36864),
+    ("6.0", 4177920, 139264),
+    ("6.1", 8355840, 139264),
+    ("6.2", 16711680, 139264),
+)
 KEYFRAME_INTERVAL_S = 1.0
 _KEY_EPSILON_S = 0.02
 # An engine may return a frame or two more or fewer than it was given (a
@@ -64,7 +96,7 @@ FRAME_SLACK = 8
 # recolour it.
 STRUCTURE_SIGMA = 1.5
 # 1 is "do not upscale": the clip keeps its size, goes through clean-up and
-# finishing, and never reaches SPAN (see :func:`restore_clip`). SPAN only
+# finishing, and never reaches SPAN (see :func:`restore_to_delivery`). SPAN only
 # does 2x.
 _SCALES = frozenset({1, 2})
 # Plans saved while 4x existed still name it; they render at 2x.
@@ -164,7 +196,7 @@ class UpscaleSpan:
     source: str = "original"
     look: ShotLook = field(default_factory=ShotLook)
     regions: tuple[Region, ...] = ()
-    # False: skip SPAN and only resize this span (see :func:`restore_clip`).
+    # False: skip SPAN and only resize this span (see :func:`restore_to_delivery`).
     use_upscale: bool = True
 
     def __post_init__(self) -> None:
@@ -504,54 +536,94 @@ def _span_ready(scale: int) -> _Span:
     return _Span(resolve_span_weights(models_dir()))
 
 
-def plain_upscale(request: UpscaleRequest, *, ffmpeg_bin: str = "ffmpeg") -> Path:
-    """Resize ``request.source`` by its scale with lanczos, without SPAN."""
+def plain_delivery(
+    request: UpscaleRequest, dest: Path, *, ffmpeg_bin: str = "ffmpeg"
+) -> Path:
+    """Deliver ``request.source`` resized by its scale with lanczos, without
+    SPAN, in one encode.
+
+    This is the blend's base at strength 0 (see :func:`blend_filter`): the
+    look's clean step, the lanczos resize, the finish step. It is encoded
+    straight into the delivery settings, decoded on NVDEC where it can be.
+    It went through a libx264 work file at 2x first, then a 4K blend whose
+    two blurs and three lookup tables a strength of 0 threw away: on 200
+    frames of 1440x1080 that took 0.29 CPU-seconds a frame against 0.10 now
+    (with NVENC; the lanczos resize is most of what is left).
+    """
     require_supported_timing(request.source, ffmpeg_bin=ffmpeg_bin)
-    request.output.parent.mkdir(parents=True, exist_ok=True)
+    size = _frame_size(request.source)
+    if size is None:
+        raise UpscaleError(f"could not read the frame size of {request.source}")
+    out = (size[0] * request.scale, size[1] * request.scale)
+    encoder = delivery_encoder(ffmpeg_bin, out)
+    rate = _frame_rate(request.source) if encoder == NVENC else None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    delivery_marker_path(dest).unlink(missing_ok=True)
+    picture = _join_filters(
+        _base_chain(out[0], out[1], request.look), request.look.finish_filter()
+    )
+    tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
     _run_ffmpeg(
         [
             ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
+            *_QUIET,
             "-y",
+            *(["-hwaccel", "cuda"] if cuda_decode_works(ffmpeg_bin) else []),
             "-i",
             str(request.source),
+            "-map",
+            "0:v:0",
             "-vf",
-            f"scale=iw*{request.scale}:ih*{request.scale}:flags=lanczos",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-an",
-            str(request.output),
-        ]
+            picture,
+            *_delivery_codec(encoder, out, rate),
+            str(tmp),
+        ],
+        on_progress=request.on_progress,
+        total_frames=_count_frames(request.source, ffmpeg_bin)
+        if request.on_progress is not None
+        else 0,
     )
-    if not request.output.is_file():
-        raise UpscaleError("the plain upscale produced no output")
-    return request.output
+    tmp.replace(dest)
+    look = request.look
+    _write_marker(
+        dest,
+        encoder,
+        blend=_blend_record(0.0, request.regions),
+        look=None if look.is_neutral() else look,
+    )
+    return dest
 
 
-def restore_clip(
+def restore_to_delivery(
     engine: UpscaleEngine,
     request: UpscaleRequest,
+    dest: Path,
     *,
     use_upscale: bool,
     ffmpeg_bin: str = "ffmpeg",
-) -> tuple[Path, float]:
-    """The restored clip and the strength to blend it at.
+) -> Path:
+    """Restore ``request`` and encode it into the delivery settings at ``dest``.
 
-    Without SPAN (``use_upscale`` off, or scale 1) the clip is only
-    resized, or at scale 1 only re-encoded. Blended at strength 0 the
-    delivery encode keeps just its lanczos base with the look applied, so a
+    Without SPAN (``use_upscale`` off, or scale 1) the clip is only resized
+    (at scale 1 only cleaned, finished, and re-encoded) by
+    :func:`plain_delivery`, which is the blend's base at strength 0, so a
     pass-through span matches its neighbours' size and frame timing.
+    ``request.on_progress`` covers the whole part either way: SPAN blends
+    and encodes in its own pass, and the encode after it only renames.
     """
     require_supported_timing(request.source, ffmpeg_bin=ffmpeg_bin)
-    if use_upscale and request.scale > 1:
-        return engine.upscale(request), request.strength
-    return plain_upscale(request, ffmpeg_bin=ffmpeg_bin), 0.0
+    if not (use_upscale and request.scale > 1):
+        return plain_delivery(request, dest, ffmpeg_bin=ffmpeg_bin)
+    raw = engine.upscale(request)
+    return encode_delivery(
+        raw,
+        dest,
+        ffmpeg_bin=ffmpeg_bin,
+        blend_with=request.source,
+        strength=request.strength,
+        look=request.look,
+        regions=request.regions,
+    )
 
 
 def upscale_all(
@@ -574,13 +646,16 @@ def upscale_all(
 class SpanEngine:
     """2x upscale with SPAN (see :mod:`super_processor.span_sr`), on the GPU.
 
-    A clip streams through three processes at once: an FFmpeg decoder reads
-    the source (through the look's clean step) as packed RGB, SPAN upscales
-    it a block of frames at a time, and the delivery encoder blends each
-    upscaled frame with a lanczos upscale of the source as it arrives (see
-    :func:`encode_delivery`). Nothing is written in between, so a 20-minute
-    1080p film needs no scratch space beyond its output, and host memory
-    holds a few blocks of frames, never the clip.
+    A clip streams through three processes at once: an FFmpeg decoder (NVDEC
+    where it can) reads the source through the look's clean step as yuv420p,
+    the GPU upscales and blends it a block of frames at a time (see
+    :func:`~super_processor.span_sr.restore_block`), and the delivery encoder
+    (NVENC where it can) takes the finished yuv420p frames as they arrive.
+    Nothing is written in between, so a 20-minute 1080p film needs no scratch
+    space beyond its output, and host memory holds a few blocks of frames,
+    never the clip. On 1440x1080 -> 2880x2160 that is 26 frames a second at
+    0.044 CPU-seconds a frame; with the blend and x264 on the CPU it was 22
+    at 0.43, and a 16-core CPU reached 95 C.
     """
 
     def upscale_many(self, requests: list[UpscaleRequest]) -> list[Path]:
@@ -635,16 +710,87 @@ def _unload(loaded: _Loaded) -> None:
     _release_gpu()
 
 
-# Source bytes decoded per hand-off to the GPU. Each block's 2x output is
-# four times as large, and at most two input blocks (queued) and two output
-# blocks (one upscaling, one being encoded) exist at once: about 2.5 GB of
-# host memory at any source size (57 frames of 1440x1080, 291 of 640x480).
-STREAM_BLOCK_BYTES = 256 * 1024 * 1024
+# Source bytes (yuv420p) decoded per hand-off to the GPU. Each block's 2x
+# output is four times as large, and at most two input blocks (queued) and
+# two output blocks (one upscaling, one being encoded) exist at once: about
+# 1.3 GB of host memory at any source size (57 frames of 1440x1080, 291 of
+# 640x480).
+STREAM_BLOCK_BYTES = 128 * 1024 * 1024
+
+
+def yuv420_frame_bytes(width: int, height: int) -> int:
+    """Bytes in one packed yuv420p frame, as FFmpeg's rawvideo lays it out:
+    chroma planes of ceil(w/2) x ceil(h/2)."""
+    return width * height + 2 * (-(-width // 2)) * (-(-height // 2))
 
 
 def block_frames(width: int, height: int) -> int:
     """Frames per GPU hand-off for a ``width`` x ``height`` source."""
-    return max(1, STREAM_BLOCK_BYTES // max(1, width * height * 3))
+    return max(1, STREAM_BLOCK_BYTES // max(1, yuv420_frame_bytes(width, height)))
+
+
+# A probe that works is kept for the life of the process. One that fails is
+# asked again after this long: a failure that passes (another program holding
+# every NVENC session when the wizard starts) would otherwise keep a
+# long-running wizard on libx264, and make its next revise of an NVENC film
+# re-encode the whole film, until a restart.
+_PROBE_RETRY_S = 60.0
+
+
+class _Probe:
+    """``probe(ffmpeg_bin)``, kept once it is True; False is kept for
+    :data:`_PROBE_RETRY_S` and then asked again."""
+
+    def __init__(self, probe: Callable[[str], bool]) -> None:
+        self._probe = probe
+        self._works: set[str] = set()
+        self._failed_at: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def __call__(self, ffmpeg_bin: str) -> bool:
+        with self._lock:
+            if ffmpeg_bin in self._works:
+                return True
+            failed = self._failed_at.get(ffmpeg_bin)
+            if failed is not None and time.monotonic() - failed < _PROBE_RETRY_S:
+                return False
+            if self._probe(ffmpeg_bin):
+                self._works.add(ffmpeg_bin)
+                self._failed_at.pop(ffmpeg_bin, None)
+                return True
+            self._failed_at[ffmpeg_bin] = time.monotonic()
+            return False
+
+    def cache_clear(self) -> None:
+        with self._lock:
+            self._works.clear()
+            self._failed_at.clear()
+
+
+@_Probe
+def _cuda_decode_probe(ffmpeg_bin: str) -> bool:
+    """True when ``ffmpeg_bin`` can open a CUDA device for decoding."""
+    command = [
+        ffmpeg_bin,
+        *_QUIET,
+        "-init_hw_device",
+        "cuda",
+        *_PROBE_PICTURE,
+        "-f",
+        "null",
+        "-",
+    ]
+    return _succeeds(command)
+
+
+def cuda_decode_works(ffmpeg_bin: str = "ffmpeg") -> bool:
+    """Whether SPAN's and pass-through decoders ask for ``-hwaccel cuda``
+    (NVDEC).
+
+    A codec NVDEC cannot decode still decodes: FFmpeg falls back to its own
+    decoder for it.
+    """
+    return _cuda_decode_probe(ffmpeg_bin)
 
 
 def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
@@ -657,6 +803,7 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
     an error. A failed decode is an error too, raised before the output is
     published.
     """
+    from . import span_sr
     from .span_sr import SPAN_SCALE
 
     source = request.source
@@ -665,16 +812,15 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
         raise UpscaleError(f"could not read the frame size of {source.name}")
     want, rate = video_stream_facts(source)
     width, height = size
-    frame_in = width * height * 3
+    frame_in = yuv420_frame_bytes(width, height)
     per_block = block_frames(width, height)
     slack = max(FRAME_SLACK, int(want * 0.02))
     clean = request.look.clean_filter()
     decode = [
         "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
+        *_QUIET,
         "-nostdin",
+        *(["-hwaccel", "cuda"] if cuda_decode_works() else []),
         "-i",
         str(source),
         *(["-vf", clean] if clean else []),
@@ -682,9 +828,17 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "rgb24",
+        "yuv420p",
         "-",
     ]
+    # The strength map is drawn once per clip, on the GPU.
+    blend = span_sr.prepare_blend(
+        width,
+        height,
+        strength=request.strength,
+        regions=request.regions,
+        sigma=STRUCTURE_SIGMA * SPAN_SCALE,
+    )
     report = request.on_progress
     blocks: queue.Queue[bytearray | None] = queue.Queue(maxsize=2)
     upscaled: queue.Queue[_Restored | None] = queue.Queue(maxsize=1)
@@ -770,7 +924,7 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
                     count = len(block) // frame_in
                     restored = _restore_span(
                         loaded,
-                        _Prepared(source, size, count, rate, payload=block),
+                        _Prepared(source, size, count, rate, blend, payload=block),
                     )
                     del block
                     if stop.is_set():
@@ -854,24 +1008,21 @@ def _read_into(stream: IO[bytes], buffer: bytearray) -> int:
 
 
 def _restore_span(loaded: _Loaded, prepared: _Prepared) -> _Restored:
-    """Run SPAN on a prepared clip; its frames stay in memory.
+    """Upscale and blend one block of decoded frames on the GPU.
 
-    SPAN's GPU memory follows the batch (frames per call), not the clip. A
-    batch that does not fit (another program holds GPU memory) is halved
-    until one does, down to a single frame; only then is it an error.
+    GPU memory follows the batch (frames per call), not the block. A batch
+    that does not fit (another program holds GPU memory) is halved until one
+    does, down to a single frame; only then is it an error.
     """
-    from .span_sr import SPAN_SCALE, batch_size, upscale_frames
+    from .span_sr import SPAN_SCALE, batch_size, restore_block
 
     width, height = prepared.size
-    raw: bytes | bytearray = prepared.payload
+    raw: bytearray = prepared.payload
     prepared.payload = None
-    count = len(raw) // (width * height * 3)
-    frames = _frames_view(raw, count, width, height)
-    del raw
     batch = loaded.batch or batch_size(width, height)
     while True:
         try:
-            pictures = upscale_frames(loaded.model, frames, batch=batch)
+            pictures = restore_block(loaded.model, prepared.blend, raw, batch=batch)
             break
         except Exception as exc:
             if not _gpu_out_of_memory(exc):
@@ -885,27 +1036,15 @@ def _restore_span(loaded: _Loaded, prepared: _Prepared) -> _Restored:
             )
         batch = loaded.batch = batch // 2
         _empty_cuda_cache()
-    del frames
+    del raw
+    size = (width * SPAN_SCALE, height * SPAN_SCALE)
+    frame_out = yuv420_frame_bytes(*size)
+    view = memoryview(pictures)
     return _Restored(
-        count=len(pictures),
-        size=(width * SPAN_SCALE, height * SPAN_SCALE),
-        frame=lambda index: _frame_view(pictures, index),
+        count=len(pictures) // frame_out,
+        size=size,
+        frame=lambda index: view[index * frame_out : (index + 1) * frame_out],
     )
-
-
-def _frame_view(pictures: Any, index: int) -> memoryview:
-    """One upscaled frame of :func:`~super_processor.span_sr.upscale_frames`
-    as packed RGB, without copying it."""
-    return memoryview(pictures[index].numpy()).cast("B")
-
-
-def _frames_view(raw: bytes | bytearray, count: int, width: int, height: int) -> Any:
-    """``raw`` as a uint8 N x H x W x 3 tensor, sharing a ``bytearray``'s
-    memory (torch needs a writable buffer, so ``bytes`` are copied)."""
-    torch = importlib.import_module("torch")
-    buffer = raw if isinstance(raw, bytearray) else bytearray(raw)
-    flat = torch.frombuffer(buffer, dtype=torch.uint8)
-    return flat[: count * height * width * 3].view(count, height, width, 3)
 
 
 def _empty_cuda_cache() -> None:
@@ -962,18 +1101,19 @@ def _return_freed_heap() -> None:
 
 @dataclass
 class _Prepared:
-    """A clip ready for SPAN: its geometry and decoded frames."""
+    """A block ready for SPAN: its geometry, blend, and decoded frames."""
 
     source: Path
     size: tuple[int, int]
     frames: int
     rate: str
+    blend: Any = None
     payload: Any = None
 
 
 @dataclass(frozen=True)
 class _Restored:
-    """SPAN's frames, in memory, as packed RGB."""
+    """The GPU's finished frames, in memory, as packed yuv420p."""
 
     count: int
     size: tuple[int, int]
@@ -1064,13 +1204,18 @@ def delivery_marker_path(video: Path) -> Path:
     return video.with_name(video.name + ".delivery.json")
 
 
-def _delivery_marker() -> dict[str, Any]:
+def _delivery_marker(encoder: str = X264) -> dict[str, Any]:
+    """What a delivery made with ``encoder`` records about its encode."""
+    quality: dict[str, Any] = (
+        {"preset": NVENC_PRESET, "cq": NVENC_CQ}
+        if encoder == NVENC
+        else {"preset": X264_PRESET, "crf": X264_CRF}
+    )
     return {
         "version": DELIVERY_VERSION,
         "bframes": 0,
-        "codec": "libx264",
-        "preset": DELIVERY_PRESET,
-        "crf": DELIVERY_CRF,
+        "codec": encoder,
+        **quality,
         "keyframe_s": KEYFRAME_INTERVAL_S,
     }
 
@@ -1086,21 +1231,26 @@ def _read_marker(video: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def is_delivery(video: Path) -> bool:
-    """True when ``video`` was written by :func:`encode_delivery` (this version)."""
+def is_delivery(video: Path, *, ffmpeg_bin: str = "ffmpeg") -> bool:
+    """True when ``video`` was written by :func:`encode_delivery` (this
+    version) with the encoder this machine picks for its size, so a part
+    encoded now splices into it by stream copy."""
     data = _read_marker(video)
     if data is None:
         return False
-    return all(data.get(key) == value for key, value in _delivery_marker().items())
+    encoder = delivery_encoder(ffmpeg_bin, _frame_size(video))
+    expected = _delivery_marker(encoder)
+    return all(data.get(key) == value for key, value in expected.items())
 
 
 def _write_marker(
     video: Path,
+    encoder: str,
     *,
     blend: dict[str, Any] | None = None,
     look: ShotLook | None = None,
 ) -> None:
-    data = _delivery_marker()
+    data = _delivery_marker(encoder)
     if blend is not None:
         data["blend"] = blend
     if look is not None:
@@ -1146,10 +1296,7 @@ def blend_filter(
     _require_strength(strength)
     look = look or ShotLook()
     base = _join_filters(
-        "setpts=PTS-STARTPTS",
-        look.clean_filter(),
-        f"scale={width}:{height}:flags=lanczos,format=yuv420p",
-        "tpad=stop_mode=clone:stop_duration=1",
+        _base_chain(width, height, look), "tpad=stop_mode=clone:stop_duration=1"
     )
     finish = look.finish_filter()
     mixed = "[mix];[mix]" + finish + "[v]" if finish else "[v]"
@@ -1201,6 +1348,16 @@ def blend_filter(
     )
 
 
+def _base_chain(width: int, height: int, look: ShotLook) -> str:
+    """The plain upscale everything is mixed onto: the look's clean step,
+    then lanczos to ``width`` x ``height``."""
+    return _join_filters(
+        "setpts=PTS-STARTPTS",
+        look.clean_filter(),
+        f"scale={width}:{height}:flags=lanczos,format=yuv420p",
+    )
+
+
 def _lut2(expr: str) -> str:
     """A two-input ``lut2`` on every plane; the first input sets the length."""
     planes = ":".join(f"c{index}='{expr}'" for index in range(3))
@@ -1212,10 +1369,42 @@ def _join_filters(*parts: str) -> str:
 
 
 # Frames fed to the delivery encoder through a pipe: their width, height,
-# frame rate, and a function that writes them (packed RGB) to the pipe.
+# frame rate, and a function that writes them (packed yuv420p) to the pipe.
 FramesIn = tuple[int, int, str, Callable[[IO[bytes]], None]]
 
 
+@contextlib.contextmanager
+def one_encoder() -> Iterator[None]:
+    """Decide each FFmpeg's delivery encoder once for everything inside.
+
+    A failed NVENC probe is asked again after a while (see :class:`_Probe`),
+    so its answer can change. Inside this, on this thread, it does not: the
+    parts of one output, and the check that a part needs no second encode,
+    all see the same encoder, so one file never mixes encoders.
+    """
+    if getattr(_PINNED, "choices", None) is not None:
+        yield
+        return
+    _PINNED.choices = {}
+    try:
+        yield
+    finally:
+        _PINNED.choices = None
+
+
+_PINNED = threading.local()
+
+
+def _nvenc_here(ffmpeg_bin: str) -> bool:
+    choices: dict[str, bool] | None = getattr(_PINNED, "choices", None)
+    if choices is None:
+        return nvenc_works(ffmpeg_bin)
+    if ffmpeg_bin not in choices:
+        choices[ffmpeg_bin] = nvenc_works(ffmpeg_bin)
+    return choices[ffmpeg_bin]
+
+
+@one_encoder()
 def encode_delivery(
     source: Path | None,
     dest: Path,
@@ -1239,20 +1428,19 @@ def encode_delivery(
     look's finish step runs in this encode too. ``on_progress`` gets the
     share of frames encoded, 0 to 1, when the frame count can be read.
     With ``frames_in`` the picture comes from a pipe instead of ``source``
-    (see :func:`_stream_span`); its feeder reports its own progress.
+    (see :func:`_stream_span`), already blended on the GPU: ``blend_with``
+    and the strength are only recorded. Its feeder reports its own progress.
     """
     look = look or ShotLook()
     record = _blend_record(strength, regions) if blend_with is not None else None
     finish = look.finish_filter()
     if frames_in is not None:
-        if blend_with is None:
+        if record is None:
             raise UpscaleError("a piped picture is always blended")
-        return _encode_piped(
-            frames_in, dest, blend_with, strength, look, regions, ffmpeg_bin, record
-        )
+        return _encode_piped(frames_in, dest, look, ffmpeg_bin, record)
     if source is None:
         raise UpscaleError("encode_delivery needs a source or frames_in")
-    if not concat and is_delivery(source):
+    if not concat and is_delivery(source, ffmpeg_bin=ffmpeg_bin):
         done = _read_marker(source) or {}
         same_look = done.get("look", ShotLook().to_dict()) == look.to_dict()
         if done.get("blend") == record and same_look:
@@ -1272,8 +1460,11 @@ def encode_delivery(
         ]
     )
     picture = ["-map", "0:v:0"]
+    picture_file = _first_part(source) if concat else source
+    size = _frame_size(picture_file)
+    encoder = delivery_encoder(ffmpeg_bin, size)
+    rate = _frame_rate(picture_file) if encoder == NVENC else None
     if blend_with is not None:
-        size = _frame_size(_first_part(source) if concat else source)
         if size is None:
             raise UpscaleError(f"could not read the frame size of {source}")
         base_size = _frame_size(blend_with)
@@ -1293,7 +1484,15 @@ def encode_delivery(
         picture = ["-filter_complex", f"[0:v]{finish}[v]", "-map", "[v]"]
     tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
     _run_ffmpeg(
-        [ffmpeg_bin, *_QUIET, "-y", *inputs, *picture, *_delivery_codec(), str(tmp)],
+        [
+            ffmpeg_bin,
+            *_QUIET,
+            "-y",
+            *inputs,
+            *picture,
+            *_delivery_codec(encoder, size, rate),
+            str(tmp),
+        ],
         on_progress=on_progress,
         total_frames=_count_frames(
             blend_with if blend_with is not None else None if concat else source,
@@ -1303,22 +1502,134 @@ def encode_delivery(
         else 0,
     )
     tmp.replace(dest)
-    _write_marker(dest, blend=record, look=None if look.is_neutral() else look)
+    _write_marker(dest, encoder, blend=record, look=None if look.is_neutral() else look)
     return dest
 
 
 _QUIET = ("-hide_banner", "-loglevel", "error")
+# One black frame, for the probes below.
+_PROBE_PICTURE = (
+    "-f",
+    "lavfi",
+    "-i",
+    "color=c=black:s=256x144:d=0.04",
+    "-frames:v",
+    "1",
+)
 
 
-def _delivery_codec() -> list[str]:
-    """The encode every delivery part shares, so parts splice by stream copy."""
-    return [
+def _succeeds(command: list[str]) -> bool:
+    """True when ``command`` runs and exits 0; any failure is False.
+
+    Only the exit code is read, so nothing is piped. On Windows a timeout
+    kills Chocolatey's ffmpeg shim and then reads its pipes to the end; the
+    real ffmpeg it started still held them, so a hung probe never returned.
+    """
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+@_Probe
+def _nvenc_probe(ffmpeg_bin: str) -> bool:
+    """True when ``ffmpeg_bin`` can encode a frame with NVENC's H.264.
+
+    FFmpeg lists h264_nvenc whenever it was built with it, GPU or not, so
+    only an encode tells.
+    """
+    command = [
+        ffmpeg_bin,
+        *_QUIET,
+        *_PROBE_PICTURE,
         "-c:v",
-        "libx264",
-        "-preset",
-        DELIVERY_PRESET,
-        "-crf",
-        str(DELIVERY_CRF),
+        NVENC,
+        "-f",
+        "null",
+        "-",
+    ]
+    return _succeeds(command)
+
+
+def nvenc_works(ffmpeg_bin: str = "ffmpeg") -> bool:
+    """Whether NVENC's H.264 encoder works here (see :class:`_Probe`)."""
+    return _nvenc_probe(ffmpeg_bin)
+
+
+def delivery_encoder(
+    ffmpeg_bin: str = "ffmpeg", size: tuple[int, int] | None = None
+) -> str:
+    """The H.264 encoder for a delivery of ``size`` (``None``: any size).
+
+    NVENC where it works and takes the size, so the CPU does not encode;
+    libx264 elsewhere (CI, Macs, AMD), in the same container and keyframe
+    settings. Inside :func:`one_encoder` the answer does not change.
+    """
+    if not _nvenc_here(ffmpeg_bin):
+        return X264
+    if size is not None and not (
+        _NVENC_MIN[0] <= size[0] <= _NVENC_MAX[0]
+        and _NVENC_MIN[1] <= size[1] <= _NVENC_MAX[1]
+    ):
+        return X264
+    return NVENC
+
+
+def h264_level(size: tuple[int, int], rate: str) -> str | None:
+    """The H.264 level NVENC is given for ``size`` at ``rate`` frames/s.
+
+    ``None`` when the rate cannot be read or no level is big enough: NVENC
+    then picks its own.
+    """
+    try:
+        fps = Fraction(rate)
+    except (ValueError, ZeroDivisionError):
+        return None
+    macroblocks = -(-size[0] // 16) * -(-size[1] // 16)
+    for name, per_second, per_frame in _H264_LEVELS:
+        if macroblocks <= per_frame and macroblocks * fps <= per_second:
+            return name if fps > 0 else None
+    return None
+
+
+def _delivery_codec(
+    encoder: str, size: tuple[int, int] | None = None, rate: str | None = None
+) -> list[str]:
+    """The encode every delivery part shares, so parts splice by stream copy.
+
+    Parts of one output share its size and rate, so they share the level.
+    """
+    if encoder == NVENC:
+        level = None if size is None or rate is None else h264_level(size, rate)
+        quality = [
+            "-c:v",
+            NVENC,
+            "-preset",
+            NVENC_PRESET,
+            "-tune",
+            "hq",
+            "-rc",
+            "vbr",
+            "-cq",
+            str(NVENC_CQ),
+            "-b:v",
+            "0",
+            "-profile:v",
+            "high",
+            *(["-level", level] if level else []),
+        ]
+    else:
+        quality = ["-c:v", X264, "-preset", X264_PRESET, "-crf", str(X264_CRF)]
+    return [
+        *quality,
         "-pix_fmt",
         "yuv420p",
         "-force_key_frames",
@@ -1336,22 +1647,18 @@ def _delivery_codec() -> list[str]:
 def _encode_piped(
     frames_in: FramesIn,
     dest: Path,
-    blend_with: Path,
-    strength: float,
     look: ShotLook,
-    regions: tuple[Region, ...],
     ffmpeg_bin: str,
-    record: dict[str, Any] | None,
+    record: dict[str, Any],
 ) -> Path:
-    """:func:`encode_delivery` of frames written to the encoder's stdin."""
+    """:func:`encode_delivery` of yuv420p frames written to the encoder's
+    stdin. Only a look's finish step (eq, grain) still runs on the CPU."""
     width, height, rate, feed = frames_in
-    base_size = _frame_size(blend_with)
-    if base_size is None:
-        raise UpscaleError(f"could not read the frame size of {blend_with}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     delivery_marker_path(dest).unlink(missing_ok=True)
     tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
-    sigma = STRUCTURE_SIGMA * width / base_size[0]
+    encoder_name = delivery_encoder(ffmpeg_bin, (width, height))
+    finish = look.finish_filter()
     command = [
         ffmpeg_bin,
         *_QUIET,
@@ -1359,20 +1666,15 @@ def _encode_piped(
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "rgb24",
+        "yuv420p",
         "-s",
         f"{width}x{height}",
         "-framerate",
         rate,
         "-i",
         "pipe:0",
-        "-i",
-        str(blend_with),
-        "-filter_complex",
-        blend_filter(width, height, strength, look, regions=regions, sigma=sigma),
-        "-map",
-        "[v]",
-        *_delivery_codec(),
+        *(["-vf", finish] if finish else []),
+        *_delivery_codec(encoder_name, (width, height), rate),
         str(tmp),
     ]
     # Errors go to a file: nothing reads the encoder's stderr while it runs.
@@ -1402,7 +1704,9 @@ def _encode_piped(
         tmp.unlink(missing_ok=True)
         raise UpscaleError(f"encoding SPAN frames failed: {detail or 'ffmpeg failed'}")
     tmp.replace(dest)
-    _write_marker(dest, blend=record, look=None if look.is_neutral() else look)
+    _write_marker(
+        dest, encoder_name, blend=record, look=None if look.is_neutral() else look
+    )
     return dest
 
 
@@ -1509,6 +1813,17 @@ def _copy_range(
     return dest
 
 
+def _frame_rate(video: Path) -> str | None:
+    """The video's ``r_frame_rate`` (``None`` when it cannot be read)."""
+    from .probe import ProbeError, probe_file
+
+    try:
+        stream = probe_file(video).primary_video()
+    except ProbeError:
+        return None
+    return None if stream is None else stream.r_frame_rate
+
+
 def _frame_size(video: Path) -> tuple[int, int] | None:
     from .probe import ProbeError, probe_file
 
@@ -1521,6 +1836,7 @@ def _frame_size(video: Path) -> tuple[int, int] | None:
     return stream.width, stream.height
 
 
+@one_encoder()
 def _upscale_full(
     source: Path,
     output: Path,
@@ -1531,8 +1847,7 @@ def _upscale_full(
     ffmpeg_bin: str,
     on_progress: ProgressFn | None = None,
 ) -> Path:
-    restore, deliver = _restore_then_deliver(on_progress, span)
-    raw, strength = restore_clip(
+    restore_to_delivery(
         engine,
         UpscaleRequest(
             source,
@@ -1541,25 +1856,17 @@ def _upscale_full(
             strength=span.strength,
             look=span.look,
             regions=span.regions,
-            on_progress=restore,
+            on_progress=on_progress,
         ),
+        output,
         use_upscale=span.use_upscale,
         ffmpeg_bin=ffmpeg_bin,
-    )
-    encode_delivery(
-        raw,
-        output,
-        ffmpeg_bin=ffmpeg_bin,
-        blend_with=source,
-        strength=strength,
-        look=span.look,
-        regions=span.regions,
-        on_progress=deliver,
     )
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
 
 
+@one_encoder()
 def apply_range_revise(
     source: Path,
     current: Path,
@@ -1594,7 +1901,7 @@ def apply_range_revise(
             on_progress=on_progress,
         )
     require_supported_timing(current, ffmpeg_bin=ffmpeg_bin)
-    if not is_delivery(current):
+    if not is_delivery(current, ffmpeg_bin=ffmpeg_bin):
         current = encode_delivery(current, work / "current.mp4", ffmpeg_bin=ffmpeg_bin)
     keys = keyframe_times(current, ffprobe_bin=_ffprobe_for(ffmpeg_bin))
     start, end = snap_to_keyframes(keys, span.start_s, span.end_s, duration_s)
@@ -1617,7 +1924,7 @@ def apply_range_revise(
         duration_s if end is None else end,
         ffmpeg_bin=ffmpeg_bin,
     )
-    raw, strength = restore_clip(
+    middle = restore_to_delivery(
         engine,
         UpscaleRequest(
             clip,
@@ -1628,17 +1935,9 @@ def apply_range_revise(
             regions=span.regions,
             on_progress=on_progress,
         ),
+        work / "range_delivery.mp4",
         use_upscale=span.use_upscale,
         ffmpeg_bin=ffmpeg_bin,
-    )
-    middle = encode_delivery(
-        raw,
-        work / "range_delivery.mp4",
-        ffmpeg_bin=ffmpeg_bin,
-        blend_with=clip,
-        strength=strength,
-        look=span.look,
-        regions=span.regions,
     )
     current_size = _frame_size(current)
     middle_size = _frame_size(middle)
@@ -1669,7 +1968,7 @@ def apply_range_revise(
             "the previous output is left unchanged"
         )
     silent.replace(output)
-    _write_marker(output)
+    _write_marker(output, delivery_encoder(ffmpeg_bin, _frame_size(output)))
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
 
@@ -1789,10 +2088,11 @@ def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
 _CUT_MARGIN_FRAMES = 0.25
 
 
-# What a source frame costs to render without SPAN (a lanczos resize and the
-# delivery encode), against 1 for a frame SPAN upscales and blends. Measured
-# on 20 s noisy test films on an RTX 5090: 5.9 against 16.0 s at 640x480 and
-# 22.9 against 65.0 s at 1440x1080. (It was 0.05 with FlashVSR at 9.5 fps.)
+# What a source frame costs to render without SPAN (one lanczos resize and
+# delivery encode, see :func:`plain_delivery`), against 1 for a frame SPAN
+# upscales and blends. On 200 frames of 1440x1080 on an RTX 5090: 2.6 s
+# against 7.6 s for SPAN at 26 fps. (With a 2x work file and an FFmpeg
+# blend it was 5.0 s; with FlashVSR at 9.5 fps it was 0.05.)
 PLAIN_FRAME_COST = 0.35
 
 
@@ -1802,20 +2102,6 @@ def _upscaled(span: UpscaleSpan) -> bool:
 
 def _frame_cost(span: UpscaleSpan) -> float:
     return 1.0 if _upscaled(span) else PLAIN_FRAME_COST
-
-
-def _restore_then_deliver(
-    on_progress: ProgressFn | None, span: UpscaleSpan
-) -> tuple[ProgressFn | None, ProgressFn | None]:
-    """Progress for a part's restore and for its delivery encode after it.
-
-    SPAN blends and encodes into the delivery settings itself and
-    reports both, so it gets the whole part and the encode after it finds
-    nothing to do. A plain resize and its encode get half each.
-    """
-    if _upscaled(span):
-        return on_progress, None
-    return _part_of(on_progress, 0.0, 0.5), _part_of(on_progress, 0.5, 0.5)
 
 
 def render_shot_parts(
@@ -1836,6 +2122,7 @@ def _cut_time(frame: int, fps: float) -> float:
     return max(0.0, (frame - _CUT_MARGIN_FRAMES) / fps)
 
 
+@one_encoder()
 def render_shots(
     source: Path,
     output: Path,
@@ -1881,7 +2168,6 @@ def render_shots(
     for index, (span, first, stop) in enumerate(timeline):
         whole = _part_of(on_progress, done_cost / total_cost, costs[index] / total_cost)
         done_cost += costs[index]
-        restore, deliver = _restore_then_deliver(whole, span)
         clip = trim_source(
             source,
             work / f"shot_{index}.mp4",
@@ -1890,30 +2176,21 @@ def render_shots(
             ffmpeg_bin=ffmpeg_bin,
             video_filter="setpts=PTS-STARTPTS",
         )
-        raw, strength = restore_clip(
-            engine,
-            UpscaleRequest(
-                clip,
-                work / f"shot_{index}_up.mp4",
-                scale=span.scale,
-                strength=span.strength,
-                look=span.look,
-                regions=span.regions,
-                on_progress=restore,
-            ),
-            use_upscale=span.use_upscale,
-            ffmpeg_bin=ffmpeg_bin,
-        )
         parts.append(
-            encode_delivery(
-                raw,
+            restore_to_delivery(
+                engine,
+                UpscaleRequest(
+                    clip,
+                    work / f"shot_{index}_up.mp4",
+                    scale=span.scale,
+                    strength=span.strength,
+                    look=span.look,
+                    regions=span.regions,
+                    on_progress=whole,
+                ),
                 work / f"shot_{index}_delivery.mp4",
+                use_upscale=span.use_upscale,
                 ffmpeg_bin=ffmpeg_bin,
-                blend_with=clip,
-                strength=strength,
-                look=span.look,
-                regions=span.regions,
-                on_progress=deliver,
             )
         )
         if whole is not None:
@@ -1927,7 +2204,7 @@ def render_shots(
             "the previous output is left unchanged"
         )
     silent.replace(output)
-    _write_marker(output)
+    _write_marker(output, delivery_encoder(ffmpeg_bin, _frame_size(output)))
     mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
     return output
 

@@ -145,3 +145,29 @@ def strength_expr(strength: float, regions: tuple[Region, ...]) -> str:
     for term in terms[1:]:
         expr = f"min({expr},{term})"
     return expr
+
+
+def strength_at(
+    strength: float, regions: tuple[Region, ...], x: float, y: float
+) -> float:
+    """:func:`strength_expr` at one point (normalised, 0-1), in Python.
+
+    The GPU blend draws its strength map by the same rule (see
+    :func:`super_processor.span_sr.strength_map`); this is what it is checked
+    against.
+    """
+    share = strength
+    for kind in KINDS:
+        boxes = [r for r in regions if r.kind == kind]
+        ceiling = min(strength, REGION_STRENGTH[kind])
+        if not boxes or ceiling >= strength:
+            continue
+        weight = max(_weight_at(box, x, y) for box in boxes)
+        share = min(share, strength - (strength - ceiling) * weight)
+    return share
+
+
+def _weight_at(region: Region, x: float, y: float) -> float:
+    """:func:`_box_weight` at one point."""
+    inside = min(x - region.x0, region.x1 - x, y - region.y0, region.y1 - y)
+    return min(max((inside + FEATHER) / FEATHER, 0.0), 1.0)

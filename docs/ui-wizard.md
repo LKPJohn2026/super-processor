@@ -143,23 +143,30 @@ Playwright's npm package alone.
 
 ## Range revise and re-encoding
 
-The upscaled picture is encoded once into delivery settings: libx264 preset
-`faster`, CRF 16, a forced IDR frame every second, no B-frames. A sidecar
-`output.mp4.delivery.json` records those settings with `version: 2`. A result note re-upscales
-its range widened out to the nearest keyframes, and the head and tail are
-stream-copied for a single-recipe revision. A note that changes scale or crosses
-multiple stored recipe spans re-renders the whole clip from the source. Each
-span keeps its look, protected regions, and upscale/pass-through choice; only
-the requested strength and scale are retuned. The upscaled frames are piped
-straight into the delivery encode, blend included, with no lossless
-intermediate file. An output rendered by 3.7.0 or earlier (version 1, preset
-`medium`) is re-encoded once into the current settings before a revise
-splices into it, so the two presets never share one file.
+The upscaled picture is encoded once into H.264 delivery settings:
+`h264_nvenc` preset `p5`, tune `hq`, CQ 17, High profile when a cached
+one-frame test encode shows NVENC works on this machine, otherwise libx264
+preset `faster`, CRF 16. Both force an IDR frame every second and use no
+B-frames, and every part of a job uses the same encoder so parts join by
+stream copy. A sidecar `output.mp4.delivery.json` records the encoder
+actually used (`codec`), its quality setting, and `version: 3`. A result
+note re-upscales its range widened out to the nearest keyframes, and the head
+and tail are stream-copied for a single-recipe revision. A note that changes
+scale or crosses multiple stored recipe spans re-renders the whole clip from
+the source. Each span keeps its look, protected regions, and
+upscale/pass-through choice; only the requested strength and scale are
+retuned. The upscaled frames are piped straight into the delivery encode,
+with no lossless intermediate file. An output whose marker is from an
+earlier version or names the other encoder is re-encoded once into the
+current settings before a revise splices into it, so one file never mixes
+encoders.
 
-`faster` replaced `medium` because the delivery encode was half the CPU of a
-render. Against the lossless upscale of a 1440x1080 -> 2880x2160 clip it
-scored 44.29 against 44.44 dB PSNR and SSIM 0.9862 against 0.9863, 1%
-smaller, for 57% less encoder CPU.
+NVENC replaced x264 on machines that have it because the x264 encode was
+about half the CPU of a render, which ran the CPU to 95 C on a 20-minute
+film. Against a lossless 2880x2160 reference (200 frames), `h264_nvenc` CQ 17
+gave 81.8 MB, 44.29 dB PSNR and SSIM 0.98588 with almost no CPU; x264
+`faster` CRF 16 gave 88.7 MB, 44.44 dB and 0.98655 for about 48
+CPU-seconds.
 
 ## Strength
 
@@ -167,9 +174,11 @@ smaller, for 57% less encoder CPU.
 output. Shapes, colour, and layout always come from a lanczos upscale of the
 (cleaned) source: the blend splits both pictures at a Gaussian blur of 1.5
 source pixels and keeps the source's coarse layer, so the result is
-`base + strength × (detail(SPAN) − detail(base))`. At 0.0 the output is a
-plain upscale with nothing invented; at 1.0 it is the source's structure with
-all of SPAN's fine detail. SPAN can sharpen what is there but cannot move,
+`base + strength × (detail(SPAN) − detail(base))`. For upscaled spans the
+blend runs on the GPU next to SPAN; a pass-through span is that formula at
+strength 0, the lanczos base alone, encoded in one pass from the source. At 0.0 the output is a plain upscale with nothing
+invented; at 1.0 it is the source's structure with all of SPAN's fine detail.
+SPAN can sharpen what is there but cannot move,
 reshape, or recolour it. It has no settings of its own. A note such as "less artificial detail
 from 2s to 5s" lowers strength for that range only.
 
@@ -251,7 +260,7 @@ frame count is refused and the previous `output.mp4` is kept.
 | Analyzing | `GET /analyze?run=1` (`/api/analyze?run=1`) | The current segment only: Gemini proposes its settings, a short preview renders, Gemini checks it |
 | Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one; `action=upscale` with `on=0` or `on=1` overrides Gemini's upscale choice for this segment, which later proposals keep |
 | Ready to render | `POST /ready` (`/api/ready`) | Starts at Gemini's scale and shows its reason. Choose the upscale: `scale=2` ("Upscale 2× · SPAN on the GPU") or `scale=1` ("Don't upscale": same size, clean-up and finishing only, no upscaling); both are offered for every source. `action=render` starts the full render from every approved segment |
-| Upscaling | `GET /render` | SPAN 2x upscale and strength blend; FFmpeg trims, splices, encodes |
+| Upscaling | `GET /render` | SPAN 2x upscale and strength blend on the GPU; FFmpeg trims, splices, and encodes H.264 (`h264_nvenc`, or `libx264` without it) |
 | Result | `GET/POST /result` | Play output; happy, a note that retunes a time range, or a note with `restart=1` that starts over from the segments |
 | Done | `GET /` (state `done`) | Confirmation |
 | New video | `POST /new` (`/api/new`) | From Done or Result: back to pick (or setup without a key); the old job stays on disk |

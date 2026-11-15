@@ -520,3 +520,44 @@ def test_a_look_does_not_shift_black_at_the_cut(tmp_path: Path) -> None:
     # The trailer's credits dropped black from 16 to 7.5 here.
     assert max(levels) - min(levels) < 1.0
     assert min(levels) >= 15.5
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("nvdec", [True, False])
+def test_pass_through_is_one_encode_straight_from_the_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nvdec: bool
+) -> None:
+    from super_processor import upscale
+
+    source = _clip(tmp_path / "in.mp4", seconds=1)
+    ran: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: Any) -> None:
+        ran.append(command)
+        Path(command[-1]).write_bytes(b"encoded")
+
+    monkeypatch.setattr(upscale, "_run_ffmpeg", run)
+    monkeypatch.setattr(upscale, "cuda_decode_works", lambda ffmpeg_bin="ffmpeg": nvdec)
+    look = ShotLook(denoise=0.3, grain=0.2)
+    regions = (Region("faces", 0.1, 0.1, 0.4, 0.4),)
+    dest = tmp_path / "out.mp4"
+    request = UpscaleRequest(
+        source, tmp_path / "unused.mp4", strength=0.6, look=look, regions=regions
+    )
+    assert upscale.plain_delivery(request, dest) == dest
+    # One encode from the source: no 2x work file, and none of the blend's
+    # blurs and lookup tables, which a strength of 0 would throw away.
+    assert len(ran) == 1
+    command = ran[0]
+    assert command[command.index("-i") + 1] == str(source)
+    assert ("-hwaccel" in command) is nvdec
+    picture = command[command.index("-vf") + 1]
+    assert picture.startswith("setpts=PTS-STARTPTS," + look.clean_filter())
+    assert "scale=320:180:flags=lanczos" in picture
+    assert picture.endswith(look.finish_filter())
+    assert "gblur" not in picture and "lut2" not in picture
+    assert command.count("-c:v") == 1 and "veryfast" not in command
+    assert not (tmp_path / "unused.mp4").exists()
+    marker = json.loads(upscale.delivery_marker_path(dest).read_text())
+    assert marker["blend"] == upscale._blend_record(0.0, regions)
+    assert marker["look"] == look.to_dict()

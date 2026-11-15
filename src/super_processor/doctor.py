@@ -177,25 +177,47 @@ def check_ffmpeg_capability(
     )
 
 
+def check_gpu_video() -> list[CheckResult]:
+    """Whether NVENC and NVDEC actually run, not only whether FFmpeg lists
+    them (it lists them without a GPU). Optional: without them delivery is
+    libx264 and decoding is FFmpeg's own, on the CPU."""
+    from .upscale import cuda_decode_works, nvenc_works
+
+    return [
+        CheckResult(
+            name="gpu:h264_nvenc",
+            ok=True,
+            detail=(
+                "h264_nvenc encodes on this GPU; delivery uses it"
+                if nvenc_works()
+                else "h264_nvenc does not run here; delivery uses libx264 (CPU)"
+            ),
+        ),
+        CheckResult(
+            name="gpu:cuda_decode",
+            ok=True,
+            detail=(
+                "CUDA decoding works; SPAN and pass-through shots decode on NVDEC"
+                if cuda_decode_works()
+                else "CUDA decoding does not run here; FFmpeg decodes on the CPU"
+            ),
+        ),
+    ]
+
+
 def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
     """Run all doctor checks and return structured results."""
     return [
         check_tool("ffmpeg", "ffmpeg", "-version"),
         check_tool("ffprobe", "ffprobe", "-version"),
         check_ffmpeg_capability(
-            "encoder:libx264",
-            kind="encoders",
-            token="libx264",
-            required=True,
-            hint="required for previews and restoration delivery",
-        ),
-        check_ffmpeg_capability(
             f"encoder:{SOFTWARE_ENCODER}",
             kind="encoders",
             token=SOFTWARE_ENCODER,
             required=True,
-            hint="required for HEVC export",
+            hint="required for previews, delivery, and export",
         ),
+        *check_gpu_video(),
         *[
             check_ffmpeg_capability(
                 f"encoder:{name}",
@@ -247,7 +269,7 @@ def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
 
 def doctor_report_as_dict(results: list[CheckResult]) -> dict[str, Any]:
     """Serialize doctor results for JSON output."""
-    required = {"ffmpeg", "ffprobe", "encoder:libx264", "encoder:libx265"}
+    required = {"ffmpeg", "ffprobe", f"encoder:{SOFTWARE_ENCODER}"}
     return {
         "ok": all(item.ok for item in results if item.name in required),
         "checks": [asdict(item) for item in results],
@@ -264,7 +286,7 @@ def format_doctor_text(results: list[CheckResult]) -> str:
     summary = doctor_report_as_dict(results)
     lines.append(
         "required tools: "
-        + ("ready" if summary["ok"] else "missing ffmpeg/ffprobe/libx264/libx265")
+        + ("ready" if summary["ok"] else "missing ffmpeg/ffprobe/libx264")
     )
     return "\n".join(lines)
 

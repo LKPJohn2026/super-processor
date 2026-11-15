@@ -22,10 +22,10 @@ from super_processor.upscale import (
     UpscaleRequest,
     UpscaleSpan,
     apply_range_revise,
-    plain_upscale,
+    plain_delivery,
     render_plan,
     render_shots,
-    restore_clip,
+    restore_to_delivery,
     upscale_all,
     video_stream_facts,
 )
@@ -283,9 +283,9 @@ def test_vfr_is_rejected_before_work_or_overwriting_output(
                 source, output, UpscaleSpan(1, 2), output, engine=engine, duration_s=4.5
             )
         elif entry == "restore":
-            restore_clip(engine, request, use_upscale=True)
+            restore_to_delivery(engine, request, output, use_upscale=True)
         elif entry == "plain":
-            plain_upscale(request)
+            plain_delivery(request, output)
         elif entry == "fake":
             FakeUpscaleEngine().upscale(request)
         elif entry == "span":
@@ -455,7 +455,7 @@ def test_streamed_fake_inference_reads_original_a_fixed_number_of_times(
 
     fake_span(tmp_path, monkeypatch)
     # Five frames per block: twelve blocks for the 60-frame clip.
-    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", 96 * 64 * 3 * 5)
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", 96 * 64 * 3 // 2 * 5)
     source = _clip(tmp_path / "input.mp4")
     original_run = subprocess.run
     original_popen = subprocess.Popen
@@ -478,11 +478,12 @@ def test_streamed_fake_inference_reads_original_a_fixed_number_of_times(
     # The timing check decodes the original once, before any work.
     assert len(scans) == 1
     assert scans[0][-1] == str(source)
-    # Then FFmpeg reads it twice however many blocks there are: once to
-    # feed SPAN, once as the delivery encoder's lanczos blend base. A
-    # count that grows with the blocks means a pass per block crept back.
-    assert len(decodes) == 2
-    assert "pipe:0" not in decodes[0] and "pipe:0" in decodes[1]
+    # Then FFmpeg reads it once however many blocks there are, to feed the
+    # GPU, which also makes the lanczos blend base: the encoder reads only
+    # its pipe. A count that grows with the blocks means a pass per block
+    # crept back.
+    assert len(decodes) == 1
+    assert "pipe:0" not in decodes[0]
     assert video_stream_facts(output)[0] == 60
 
 

@@ -103,15 +103,16 @@ def test_doctor_reports_each_hardware_encoder(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         "super_processor.doctor._ffmpeg_listing",
         lambda kind: (
-            " V..... libx264\n V..... libx265\n V..... hevc_nvenc\n"
+            " V..... libx264\n V..... h264_nvenc\n"
             if kind == "encoders"
             else " T. deshake\n"
         ),
     )
     results = {item.name: item for item in doctor.collect_doctor_report()}
-    assert results["encoder:libx265"].ok is True
-    assert "available" in results["encoder:hevc_nvenc"].detail
-    for name in ("hevc_qsv", "hevc_amf", "hevc_videotoolbox"):
+    assert results["encoder:libx264"].ok is True
+    assert "encoder:libx265" not in results
+    assert "available" in results["encoder:h264_nvenc"].detail
+    for name in ("h264_qsv", "h264_amf", "h264_videotoolbox"):
         assert results[f"encoder:{name}"].ok is True
         assert "missing" in results[f"encoder:{name}"].detail
     assert doctor.doctor_report_as_dict(list(results.values()))["ok"] is True
@@ -127,9 +128,7 @@ def test_doctor_reports_each_hardware_decoder(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         "super_processor.doctor._ffmpeg_listing",
         lambda kind: (
-            " V..... hevc_cuvid\n"
-            if kind == "decoders"
-            else " V..... libx264\n V..... libx265\n"
+            " V..... hevc_cuvid\n" if kind == "decoders" else " V..... libx264\n"
         ),
     )
     results = {item.name: item for item in doctor.collect_doctor_report()}
@@ -143,12 +142,12 @@ def test_doctor_reports_each_hardware_decoder(monkeypatch: pytest.MonkeyPatch) -
     ("encoders", "ready"),
     [
         ("libx264 libx265", True),
+        ("libx264", True),
         ("libx265", False),
-        ("libx264", False),
         ("", False),
     ],
 )
-def test_doctor_requires_both_software_encoders(
+def test_doctor_requires_libx264_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -179,17 +178,15 @@ def test_doctor_requires_both_software_encoders(
             payload = json.loads(output)
             assert payload["ok"] is ready
             checks = {item["name"]: item for item in payload["checks"]}
-            for encoder in ("libx264", "libx265"):
-                assert checks[f"encoder:{encoder}"]["ok"] is (
-                    encoder in encoders.split()
-                )
+            assert checks["encoder:libx264"]["ok"] is ("libx264" in encoders.split())
+            assert "encoder:libx265" not in checks
         else:
             assert f"required tools: {'ready' if ready else 'missing'}" in output
-            for encoder in ("libx264", "libx265"):
-                mark = "ok" if encoder in encoders.split() else "FAIL"
-                assert f"[{mark}] encoder:{encoder}" in output
+            mark = "ok" if ready else "FAIL"
+            assert f"[{mark}] encoder:libx264" in output
+            assert "libx265" not in output
             if not ready:
-                assert "missing ffmpeg/ffprobe/libx264/libx265" in output
+                assert "missing ffmpeg/ffprobe/libx264" in output
 
 
 def test_ffmpeg_capability_present(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,3 +258,22 @@ def test_doctor_cli_json(
     payload = capsys.readouterr().out
     assert '"ok": false' in payload
     assert "ffmpeg" in payload
+
+
+@pytest.mark.parametrize("works", [True, False])
+def test_doctor_says_whether_nvenc_and_nvdec_run(
+    monkeypatch: pytest.MonkeyPatch, works: bool
+) -> None:
+    from super_processor import upscale
+
+    monkeypatch.setattr(upscale, "nvenc_works", lambda ffmpeg_bin="ffmpeg": works)
+    monkeypatch.setattr(upscale, "cuda_decode_works", lambda ffmpeg_bin="ffmpeg": works)
+    results = {item.name: item for item in doctor.check_gpu_video()}
+    # Optional either way: libx264 and FFmpeg's own decoders stand in.
+    assert results["gpu:h264_nvenc"].ok and results["gpu:cuda_decode"].ok
+    if works:
+        assert "delivery uses it" in results["gpu:h264_nvenc"].detail
+        assert "NVDEC" in results["gpu:cuda_decode"].detail
+    else:
+        assert "libx264 (CPU)" in results["gpu:h264_nvenc"].detail
+        assert "on the CPU" in results["gpu:cuda_decode"].detail

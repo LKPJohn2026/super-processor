@@ -178,7 +178,7 @@ def _reframe_filter(ops: dict[OpName, RecipeOp], recipe: Recipe) -> str | None:
 
     padding = float(reframe.params.get("padding", 0.0))
     max_height = recipe.target.export.max_height or 1920
-    size_op = ops.get(OpName.ENCODE_HEVC_SIZE_CAP)
+    size_op = ops.get(OpName.ENCODE_SIZE_CAP)
     if size_op is not None and "max_height" in size_op.params:
         max_height = int(float(size_op.params["max_height"]))
 
@@ -187,7 +187,7 @@ def _reframe_filter(ops: dict[OpName, RecipeOp], recipe: Recipe) -> str | None:
     pad_px = int(round(min(target_w, target_h) * padding))
     inner_w = max(2, target_w - 2 * pad_px)
     inner_h = max(2, target_h - 2 * pad_px)
-    # Keep even dimensions for yuv420p / libx265.
+    # Keep even dimensions for yuv420p / libx264.
     inner_w -= inner_w % 2
     inner_h -= inner_h % 2
     target_w -= target_w % 2
@@ -237,7 +237,7 @@ def _join_filters(parts: list[str]) -> str:
 def _size_cap_bitrate_kbps(recipe: Recipe, duration_s: float | None) -> int | None:
     ops = _op_map(recipe)
     max_size_mb = recipe.target.export.max_size_mb
-    size_op = ops.get(OpName.ENCODE_HEVC_SIZE_CAP)
+    size_op = ops.get(OpName.ENCODE_SIZE_CAP)
     if size_op is not None and "max_size_mb" in size_op.params:
         max_size_mb = float(size_op.params["max_size_mb"])
     if max_size_mb is None:

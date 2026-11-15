@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from super_processor.probe import MediaFacts, StreamFacts, write_media_facts
-from super_processor.recipe import OpName, empty_recipe, write_recipe
+from super_processor.recipe import OpName, Recipe, empty_recipe, write_recipe
 from super_processor.validator import (
     MIN_BITRATE_KBPS,
     validate_job_recipe,
@@ -101,7 +102,7 @@ def test_size_cap_acknowledged(tmp_path: Path) -> None:
     recipe = empty_recipe("abcd1234abcd1234", str(source.resolve()))
     recipe.target.export.max_size_mb = 1.0
     for op in recipe.ops:
-        if op.op is OpName.ENCODE_HEVC_SIZE_CAP:
+        if op.op is OpName.ENCODE_SIZE_CAP:
             op.enabled = True
             op.params = {
                 "max_size_mb": 1.0,
@@ -142,17 +143,43 @@ def test_sharpen_amount_is_capped(tmp_path: Path) -> None:
     assert validate_recipe(recipe, _facts(source)).ok is True
 
 
-def test_encoder_allowlist_keeps_libx265_as_default(tmp_path: Path) -> None:
+def test_only_h264_is_exported_and_libx264_is_the_default(tmp_path: Path) -> None:
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"x")
     recipe = empty_recipe("abcd1234abcd1234", str(source.resolve()))
-    assert recipe.encode.video_codec == "libx265"
+    assert recipe.encode.video_codec == "libx264"
+    assert recipe.encode.crf == 23
+    assert recipe.target.export.codec == "h264"
     assert validate_recipe(recipe, _facts(source)).ok is True
-    recipe.encode.video_codec = "hevc_nvenc"
+    recipe.encode.video_codec = "h264_nvenc"
     assert validate_recipe(recipe, _facts(source)).ok is True
+    for codec in ("libx265", "hevc_nvenc", "libsvtav1"):
+        recipe.encode.video_codec = codec
+        rejected = validate_recipe(recipe, _facts(source))
+        assert any(issue.code == "encode_codec" for issue in rejected.errors)
     recipe.encode.video_codec = "libx264"
+    recipe.target.export.codec = "av1"
     rejected = validate_recipe(recipe, _facts(source))
-    assert any(issue.code == "encode_codec" for issue in rejected.errors)
+    assert any(issue.code == "export_codec" for issue in rejected.errors)
+
+
+def test_a_recipe_saved_for_hevc_loads_as_h264(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    data = empty_recipe("abcd1234abcd1234", str(source.resolve())).to_dict()
+    data["target"]["export"]["codec"] = "hevc"
+    data["encode"]["video"]["codec"] = "hevc_nvenc"
+    for op in data["ops"]:
+        if op["op"] == "encode_size_cap":
+            op["op"] = "encode_hevc_size_cap"
+    recipe = Recipe.from_dict(data)
+    assert recipe.target.export.codec == "h264"
+    assert recipe.encode.video_codec == "h264_nvenc"
+    assert any(op.op is OpName.ENCODE_SIZE_CAP for op in recipe.ops)
+    assert validate_recipe(recipe, _facts(source)).ok is True
+    saved = recipe.to_dict()
+    del saved["source_path"]  # tmp_path is named after this test
+    assert "hevc" not in json.dumps(saved)
 
 
 def test_trim_must_keep_five_seconds(tmp_path: Path) -> None:

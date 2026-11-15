@@ -93,7 +93,7 @@ def test_reframe_and_size_cap_bitrate(tmp_path: Path) -> None:
                 "crop_h": 1280.0,
                 "subject_cx": 0.3,
             }
-        if op.op is OpName.ENCODE_HEVC_SIZE_CAP:
+        if op.op is OpName.ENCODE_SIZE_CAP:
             op.enabled = True
             op.params = {"max_size_mb": 20.0, "max_height": 1280}
     plan = build_ffmpeg_plan(

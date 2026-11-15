@@ -10,6 +10,7 @@ from .encoders import ALLOWED_ENCODERS
 from .probe import MediaFacts, load_media_facts
 from .recipe import (
     DEFAULT_OP_ORDER,
+    EXPORT_CODEC,
     OpName,
     Recipe,
     RecipeError,
@@ -86,7 +87,7 @@ PARAM_BOUNDS: dict[OpName, dict[str, tuple[float, float]]] = {
         "crop_h": (2.0, 16_384.0),
         "subject_cx": (0.0, 1.0),
     },
-    OpName.ENCODE_HEVC_SIZE_CAP: {
+    OpName.ENCODE_SIZE_CAP: {
         "max_size_mb": (1.0, 10_000.0),
         "max_height": (360.0, 4320.0),
         "acknowledge_size_risk": (0.0, 1.0),
@@ -179,7 +180,7 @@ def validate_op_order(recipe: Recipe) -> list[ValidationIssue]:
 
 
 def validate_encode_settings(recipe: Recipe) -> list[ValidationIssue]:
-    """Check encode settings. ``libx265`` remains the default."""
+    """Check encode settings. Output is H.264; ``libx264`` is the default."""
     issues: list[ValidationIssue] = []
     if recipe.encode.video_codec not in ALLOWED_ENCODERS:
         allowed = ", ".join(ALLOWED_ENCODERS)
@@ -196,11 +197,11 @@ def validate_encode_settings(recipe: Recipe) -> list[ValidationIssue]:
                 message=f"encode CRF {recipe.encode.crf} outside [10, 40]",
             )
         )
-    if recipe.target.export.codec != "hevc":
+    if recipe.target.export.codec != EXPORT_CODEC:
         issues.append(
             ValidationIssue(
                 code="export_codec",
-                message="export.codec must be hevc in v1",
+                message=f"export.codec must be {EXPORT_CODEC}",
             )
         )
     return issues
@@ -281,7 +282,7 @@ def validate_size_cap_feasibility(
     avg_kbps = (budget_bits / facts.duration_s) / 1000.0
     acknowledged = False
     for op in recipe.enabled_ops():
-        if op.op is OpName.ENCODE_HEVC_SIZE_CAP:
+        if op.op is OpName.ENCODE_SIZE_CAP:
             acknowledged = float(op.params.get("acknowledge_size_risk", 0.0)) >= 1.0
             break
     if avg_kbps < MIN_BITRATE_KBPS:

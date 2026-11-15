@@ -1,7 +1,9 @@
-"""Keep tests away from the user's own settings and saved keys."""
+"""Keep tests away from the user's own settings and saved keys, and the
+delivery encoder fixed."""
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
@@ -29,3 +31,25 @@ def _own_config_dir(
     )
     monkeypatch.setitem(sys.modules, "keyring", empty)
     return folder
+
+
+# Set to h264_nvenc to run the whole suite against NVENC (and NVDEC, where
+# FFmpeg can open CUDA) instead of libx264 and FFmpeg's own decoders.
+TEST_ENCODER_ENV = "SUPER_PROCESSOR_TEST_ENCODER"
+
+
+@pytest.fixture(autouse=True)
+def _fixed_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """libx264 and software decoding everywhere, unless asked otherwise.
+
+    The delivery encoder depends on the machine (NVENC where it works);
+    tests that compare frames or markers must not.
+    """
+    from super_processor import upscale
+
+    nvenc = os.environ.get(TEST_ENCODER_ENV, "").strip() == upscale.NVENC
+    monkeypatch.setattr(upscale, "nvenc_works", lambda ffmpeg_bin="ffmpeg": nvenc)
+    if not nvenc:
+        monkeypatch.setattr(
+            upscale, "cuda_decode_works", lambda ffmpeg_bin="ffmpeg": False
+        )

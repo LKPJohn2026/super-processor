@@ -284,7 +284,7 @@ def test_worker_preview_encode_atomic(tmp_path: Path) -> None:
 
 @requires_ffmpeg
 def test_worker_cancel(tmp_path: Path) -> None:
-    source = _make_clip(tmp_path / "src.mp4", duration=8.0)
+    source = _make_clip(tmp_path / "src.mp4", duration=60.0)
     recipe = empty_recipe("abcd1234abcd1234", str(source))
     recipe.target.mode = TargetMode.FINAL
     output = tmp_path / "out.mp4"
@@ -292,14 +292,15 @@ def test_worker_cancel(tmp_path: Path) -> None:
         recipe,
         output_path=output,
         work_dir=tmp_path / "work",
-        duration_s=8.0,
+        duration_s=60.0,
     )
-    # Force a slower encode so cancel has time to land.
+    # Force a slower encode so cancel has time to land: libx264 "slow" did
+    # this clip's first 8 s in under the 0.2 s the cancel waits.
     encode = plan.steps[-1]
     crf_index = encode.argv.index("-crf")
     encode.argv[crf_index + 1] = "18"
     preset_index = encode.argv.index("-preset")
-    encode.argv[preset_index + 1] = "slow"
+    encode.argv[preset_index + 1] = "placebo"
 
     worker = FFmpegWorker()
 

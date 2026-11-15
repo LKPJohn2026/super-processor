@@ -226,7 +226,7 @@ def test_resolve_secret_and_diagnose_ack(
         job_id="abcd1234abcd1234",
         source_path=source,
     )
-    encode = next(op for op in recipe.ops if op.op is OpName.ENCODE_HEVC_SIZE_CAP)
+    encode = next(op for op in recipe.ops if op.op is OpName.ENCODE_SIZE_CAP)
     assert encode.params.get("acknowledge_size_risk") == 1.0
     reframe = next(op for op in recipe.ops if op.op is OpName.REFRAME_VERTICAL)
     assert reframe.params["crop_x"] == 420.0

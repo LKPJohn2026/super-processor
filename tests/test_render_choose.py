@@ -84,11 +84,11 @@ def test_missing_encoder_fails_before_ffmpeg(
 
     def missing(*_args: object, **_kwargs: object) -> CheckResult:
         return CheckResult(
-            name="encoder:hevc_nvenc",
+            name="encoder:h264_nvenc",
             ok=False,
             detail=(
-                "hevc_nvenc missing "
-                "(install ffmpeg with this encoder or render with libx265)"
+                "h264_nvenc missing "
+                "(install ffmpeg with this encoder or render with libx264)"
             ),
         )
 
@@ -106,11 +106,11 @@ def test_missing_encoder_fails_before_ffmpeg(
             "--choose",
             "0",
             "--encoder",
-            "hevc_nvenc",
+            "h264_nvenc",
         ]
     )
     assert code == 1
-    assert "hevc_nvenc missing" in capsys.readouterr().out
+    assert "h264_nvenc missing" in capsys.readouterr().out
     assert store.load(JOB_ID).state is JobState.PLANS_READY
 
 

@@ -34,7 +34,7 @@ needs_ffmpeg = pytest.mark.skipif(
 )
 FPS = 24
 STEP = 5  # grey levels per frame; numbers repeat every 40 frames
-FRAME_BYTES = 96 * 64 * 3  # one packed RGB frame of the numbered clips
+FRAME_BYTES = 96 * 64 * 3 // 2  # one yuv420p frame of the numbered clips
 
 
 def _small_blocks(monkeypatch: pytest.MonkeyPatch, frames: int) -> list[int]:
@@ -256,7 +256,7 @@ def test_a_failure_lets_go_of_what_the_call_held() -> None:
 def test_blocks_hold_whole_frames_of_a_fixed_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 256 MiB of packed RGB input per hand-off, whatever the frame size.
+    # 128 MiB of yuv420p input per hand-off, whatever the frame size.
     assert block_frames(1440, 1080) == 57
     assert block_frames(640, 480) == 291
     monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", FRAME_BYTES * 3 + 1)

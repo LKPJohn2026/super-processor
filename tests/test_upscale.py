@@ -627,26 +627,22 @@ def test_splice_refuses_to_change_the_frame_count(tmp_path: Path) -> None:
 _FAKE_WEIGHTS = b"not really SPAN"
 
 
-class _Picture:
-    """One upscaled frame, used the way a CPU tensor row is."""
-
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-
-    def numpy(self) -> bytes:
-        return self._data
-
-
 class FakeSpan:
-    """What the stand-in network was asked to do."""
+    """What the stand-in GPU block was asked to do."""
 
     def __init__(self, weights: Path) -> None:
         self.weights = weights
         self.loads = 0
         self.batches: list[int] = []
-        # Frames in each block handed to the network, and its first frame.
+        # Frames in each block handed to the GPU, and its first frame.
         self.frames: list[int] = []
         self.firsts: list[bytes] = []
+        # What each clip's blend was prepared with.
+        self.blends: list[dict[str, Any]] = []
+
+
+def _yuv420(width: int, height: int) -> int:
+    return upscale.yuv420_frame_bytes(width, height)
 
 
 def fake_span(
@@ -657,11 +653,12 @@ def fake_span(
     drop: int = 0,
     fail: str = "",
 ) -> FakeSpan:
-    """Stand in for SPAN without torch or a GPU: a nearest-neighbour 2x.
+    """Stand in for the GPU block without torch or a GPU: a nearest-neighbour
+    2x of the packed yuv420p frames, by FFmpeg.
 
     Batches over ``max_batch`` frames raise PyTorch's out-of-memory text,
     ``drop`` returns that many frames fewer, and ``fail`` raises instead.
-    Everything around the network (weights check, decoder, threads, the
+    Everything around the GPU block (weights check, decoder, threads, the
     delivery encode) is the real code.
     """
     weights = tmp_path / "models" / "SPAN" / SPAN_FILE
@@ -678,19 +675,24 @@ def fake_span(
         fake.loads += 1
         return "model"
 
-    def frames_view(raw: bytearray, count: int, width: int, height: int) -> Any:
-        return raw, count, width, height
+    def prepare_blend(width: int, height: int, **kwargs: Any) -> Any:
+        fake.blends.append({"size": (width, height), **kwargs})
+        return types.SimpleNamespace(width=width, height=height)
 
-    def upscale_frames(model: str, frames: Any, *, batch: int = 0) -> list[_Picture]:
+    def restore_block(
+        model: str, blend: Any, frames: bytearray, *, batch: int
+    ) -> bytearray:
         assert model == "model"
+        assert isinstance(frames, bytearray)
         fake.batches.append(batch)
         if fail:
             raise RuntimeError(fail)
         if max_batch is not None and batch > max_batch:
             raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
-        raw, count, width, height = frames
+        width, height = blend.width, blend.height
+        count = len(frames) // _yuv420(width, height)
         fake.frames.append(count)
-        fake.firsts.append(bytes(raw[: width * height * 3]))
+        fake.firsts.append(bytes(frames[: _yuv420(width, height)]))
         doubled = subprocess.run(
             [
                 "ffmpeg",
@@ -699,7 +701,7 @@ def fake_span(
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
-                "rgb24",
+                "yuv420p",
                 "-s",
                 f"{width}x{height}",
                 "-i",
@@ -709,30 +711,26 @@ def fake_span(
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
-                "rgb24",
+                "yuv420p",
                 "-",
             ],
-            input=bytes(raw),
+            input=bytes(frames),
             check=True,
             capture_output=True,
         ).stdout
-        step = width * height * 12
-        return [
-            _Picture(doubled[i * step : (i + 1) * step])
-            for i in range(max(1, count - drop))
-        ]
+        keep = max(1, count - drop) * _yuv420(2 * width, 2 * height)
+        return bytearray(doubled[:keep])
 
     monkeypatch.setattr(span_sr, "load_span", load_span)
-    monkeypatch.setattr(span_sr, "upscale_frames", upscale_frames)
-    monkeypatch.setattr(upscale, "_frames_view", frames_view)
+    monkeypatch.setattr(span_sr, "prepare_blend", prepare_blend)
+    monkeypatch.setattr(span_sr, "restore_block", restore_block)
     return fake
 
 
 # Frames whose fine detail spells their own index: band b (8 rows of the
 # 64x48 source) is a 1-pixel checkerboard when bit b of the frame number is
-# set and flat grey otherwise. The delivery blend takes coarse shapes from
-# the source but fine detail from SPAN's frame, so the output's bands read
-# back which upscaled frame landed where.
+# set and flat grey otherwise. The output's bands read back which upscaled
+# frame landed where.
 _BANDS = 6
 _BAND_ROWS = 8
 
@@ -855,6 +853,10 @@ def test_span_writes_every_frame_at_twice_the_size(
     # A 4 s clip is one block, upscaled in one call.
     assert fake.batches == [batch_size(160, 90)]
     assert fake.frames == [40]
+    # The blend is prepared once for the clip, at 3 output pixels of detail.
+    assert fake.blends == [
+        {"size": (160, 90), "strength": 0.2, "regions": (), "sigma": 3.0}
+    ]
     # Streamed: nothing but the delivery file and its marker is left behind.
     assert sorted(p.name for p in output.parent.iterdir()) == [
         "clip.mp4",
@@ -868,7 +870,7 @@ def test_many_blocks_keep_the_frame_order(
 ) -> None:
     fake = fake_span(tmp_path, monkeypatch)
     # Seven 64x48 frames per block: 40 frames are six blocks.
-    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", 64 * 48 * 3 * 7 + 5)
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", _yuv420(64, 48) * 7 + 5)
     assert upscale.block_frames(64, 48) == 7
     source = tmp_path / "numbered.mp4"
     _numbered(source)
@@ -910,7 +912,7 @@ def test_the_decoder_applies_the_clean_step(
     def first_frame(*vf: str) -> bytes:
         return subprocess.run(
             ["ffmpeg", "-v", "error", "-i", str(source), *vf, "-frames:v", "1",
-             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+             "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"],
             check=True,
             capture_output=True,
         ).stdout  # fmt: skip
@@ -964,8 +966,10 @@ def test_span_output_is_a_delivery_the_caller_only_renames(
     raw = tmp_path / "out" / "restored.mp4"
     SpanEngine().upscale(UpscaleRequest(source, raw, strength=0.3, look=look))
     marker = json.loads(upscale.delivery_marker_path(raw).read_text("utf-8"))
-    assert marker["version"] == 2
-    assert marker["preset"] == "faster"
+    # libx264 here; h264_nvenc when the suite runs against NVENC.
+    expected = upscale._delivery_marker(upscale.delivery_encoder("ffmpeg", (320, 180)))
+    assert marker["version"] == 3
+    assert {key: marker[key] for key in expected} == expected
     assert marker["blend"]["strength"] == 0.3
     assert is_delivery(raw)
     before = _frame_hashes(raw)
@@ -984,7 +988,7 @@ def test_a_version_1_delivery_is_not_a_delivery(tmp_path: Path) -> None:
     video = tmp_path / "out.mp4"
     video.write_bytes(b"picture")
     marker = upscale.delivery_marker_path(video)
-    current = upscale._delivery_marker()
+    current = upscale._delivery_marker(upscale.delivery_encoder())
     marker.write_text(json.dumps(current), encoding="utf-8")
     assert is_delivery(video)
     # Version 1 used the "medium" preset and wrote no preset key.
@@ -1015,7 +1019,8 @@ def test_a_revise_re_encodes_a_version_1_output(tmp_path: Path) -> None:
         source, output, UpscaleSpan(2, 4), output, engine=engine, duration_s=6
     )
     assert is_delivery(output)
-    assert json.loads(marker.read_text("utf-8"))["preset"] == "faster"
+    expected = upscale._delivery_marker(upscale.delivery_encoder("ffmpeg", (320, 180)))
+    assert json.loads(marker.read_text("utf-8"))["preset"] == expected["preset"]
     assert len(_frame_hashes(output)) == 6 * 24
 
 
@@ -1192,7 +1197,7 @@ def test_span_refuses_far_too_many_frames(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = fake_span(tmp_path, monkeypatch)
-    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", 64 * 48 * 3 * 4)
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", _yuv420(64, 48) * 4)
     source = tmp_path / "numbered.mp4"
     _numbered(source)
     real = upscale.video_stream_facts
@@ -1217,17 +1222,17 @@ def test_a_gpu_error_partway_stops_the_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_span(tmp_path, monkeypatch)
-    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", 64 * 48 * 3 * 4)
-    real = span_sr.upscale_frames
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", _yuv420(64, 48) * 4)
+    real = span_sr.restore_block
     calls: list[int] = []
 
-    def third_fails(model: str, frames: Any, *, batch: int = 0) -> Any:
+    def third_fails(model: str, blend: Any, frames: Any, *, batch: int) -> Any:
         calls.append(batch)
         if len(calls) == 3:
             raise RuntimeError("illegal memory access")
-        return real(model, frames, batch=batch)
+        return real(model, blend, frames, batch=batch)
 
-    monkeypatch.setattr(span_sr, "upscale_frames", third_fails)
+    monkeypatch.setattr(span_sr, "restore_block", third_fails)
     source = tmp_path / "numbered.mp4"
     _numbered(source)
     output = tmp_path / "out" / "clip.mp4"
@@ -1262,20 +1267,20 @@ def test_a_failed_stream_ends_ffmpeg_behind_a_launcher(
     )
     shim.chmod(0o755)
     fake_span(tmp_path, monkeypatch)
-    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", 64 * 48 * 3 * 4)
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", _yuv420(64, 48) * 4)
     source = tmp_path / "numbered.mp4"
     _numbered(source)
     monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
-    upscale_frames = span_sr.upscale_frames
+    restore = span_sr.restore_block
     calls: list[int] = []
 
-    def third_fails(model: str, frames: Any, *, batch: int = 0) -> Any:
+    def third_fails(model: str, blend: Any, frames: Any, *, batch: int) -> Any:
         calls.append(batch)
         if len(calls) == 3:
             raise RuntimeError("illegal memory access")
-        return upscale_frames(model, frames, batch=batch)
+        return restore(model, blend, frames, batch=batch)
 
-    monkeypatch.setattr(span_sr, "upscale_frames", third_fails)
+    monkeypatch.setattr(span_sr, "restore_block", third_fails)
     # Windows refuses to delete a file a live process has open: note any
     # FFmpeg behind the launcher still running when the output is deleted.
     held_open: list[int] = []
@@ -1297,7 +1302,7 @@ def test_a_failed_stream_ends_ffmpeg_behind_a_launcher(
     assert list(output.parent.iterdir()) == []
     # The decoder and the encoder both ran behind the launcher.
     started = children.read_text()
-    assert "rgb24 -" in started and "clip.encoding.mp4" in started
+    assert "yuv420p -" in started and "clip.encoding.mp4" in started
     assert held_open == []
 
 
@@ -1317,8 +1322,11 @@ def test_an_encoder_failure_reports_ffmpeg_and_leaves_nothing(
     source = tmp_path / "in.mp4"
     _tiny(source, seconds=4)
     output = tmp_path / "out" / "clip.mp4"
+    real = upscale._delivery_codec
     monkeypatch.setattr(
-        upscale, "blend_filter", lambda *_a, **_k: "[0:v]no_such_filter[v]"
+        upscale,
+        "_delivery_codec",
+        lambda *args: ["-vf", "no_such_filter", *real(*args)],
     )
     started = _started_processes(monkeypatch)
     with pytest.raises(
@@ -1369,7 +1377,7 @@ def test_decoder_failures_are_refused(
 
     def dies_at_the_end(_command: list[str]) -> list[str]:
         script = (
-            "import sys; sys.stdout.buffer.write(bytes(160 * 90 * 3 * 40)); "
+            "import sys; sys.stdout.buffer.write(bytes(160 * 90 * 3 // 2 * 40)); "
             "sys.stdout.flush(); sys.stderr.write('corrupt packet'); sys.exit(1)"
         )
         return [sys.executable, "-c", script]
@@ -1383,7 +1391,7 @@ def test_decoder_failures_are_refused(
 
     def quits(_command: list[str]) -> list[str]:
         script = (
-            "import os, sys; sys.stdout.buffer.write(bytes(160 * 90 * 3 * 38)); "
+            "import os, sys; sys.stdout.buffer.write(bytes(160 * 90 * 3 // 2 * 38)); "
             "sys.stdout.flush(); os._exit(3)"
         )
         return [sys.executable, "-c", script]
@@ -1412,7 +1420,6 @@ def test_batches_by_size() -> None:
     ]
 
 
-@needs_ffmpeg
 def test_a_piped_encode_needs_a_base_and_a_source(tmp_path: Path) -> None:
     with pytest.raises(UpscaleError, match="always blended"):
         encode_delivery(
@@ -1420,55 +1427,19 @@ def test_a_piped_encode_needs_a_base_and_a_source(tmp_path: Path) -> None:
         )
     with pytest.raises(UpscaleError, match="needs a source or frames_in"):
         encode_delivery(None, tmp_path / "out.mp4")
-    bad = tmp_path / "bad.mp4"
-    bad.write_bytes(b"not a video")
-    with pytest.raises(UpscaleError, match="frame size"):
-        encode_delivery(
-            None,
-            tmp_path / "out.mp4",
-            blend_with=bad,
-            frames_in=(2, 2, "10/1", lambda _pipe: None),
-        )
 
 
 def test_gpu_helpers_with_a_stand_in_torch(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[object] = []
-
-    class Flat:
-        def __init__(self, data: bytes) -> None:
-            self.data = data
-
-        def __getitem__(self, key: slice) -> Flat:
-            return Flat(self.data[key])
-
-        def view(self, *shape: int) -> Flat:
-            calls.append(shape)
-            return self
-
     cuda = types.SimpleNamespace(
         is_available=lambda: True,
         empty_cache=lambda: calls.append("empty"),
         ipc_collect=lambda: calls.append("ipc"),
     )
-    torch = types.SimpleNamespace(
-        cuda=cuda,
-        uint8="uint8",
-        frombuffer=lambda buffer, dtype: Flat(bytes(buffer)),
-    )
-    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
     assert upscale.cuda_available()
     upscale._empty_cuda_cache()
     assert calls == ["empty", "ipc"]
-    # Two 1x5 frames, plus a stray byte past the last whole frame.
-    view = upscale._frames_view(bytes(range(31)), 2, 1, 5)
-    assert view.data == bytes(range(30))
-    assert calls[-1] == (2, 5, 1, 3)
-    # A bytearray is shared, not copied.
-    shared = bytearray(range(30))
-    assert upscale._frames_view(shared, 2, 1, 5).data == bytes(shared)
-    # An upscaled frame is read as packed bytes, without a copy.
-    pictures = [_Picture(b"abc"), _Picture(b"def")]
-    assert bytes(upscale._frame_view(pictures, 1)) == b"def"
     monkeypatch.setitem(sys.modules, "torch", None)
     assert not upscale.cuda_available()
 

@@ -8,6 +8,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .encoders import DEFAULT_CRF, SOFTWARE_ENCODER
+
 RECIPE_VERSION = "1"
 RECIPE_FILE_NAME = "recipe.json"
 
@@ -26,7 +28,24 @@ class OpName(str, Enum):
     STABILIZE = "stabilize"
     REFRAME_VERTICAL = "reframe_vertical"
     TRIM = "trim"
-    ENCODE_HEVC_SIZE_CAP = "encode_hevc_size_cap"
+    ENCODE_SIZE_CAP = "encode_size_cap"
+
+
+# Recipes saved while the CLI exported HEVC name the old op and encoders.
+# Every output is H.264 now, so they load as the H.264 equivalents.
+_LEGACY_OPS = {"encode_hevc_size_cap": OpName.ENCODE_SIZE_CAP.value}
+_LEGACY_ENCODERS = {
+    "libx265": "libx264",
+    "hevc_nvenc": "h264_nvenc",
+    "hevc_qsv": "h264_qsv",
+    "hevc_amf": "h264_amf",
+    "hevc_videotoolbox": "h264_videotoolbox",
+}
+EXPORT_CODEC = "h264"
+
+
+def _export_codec(codec: str) -> str:
+    return EXPORT_CODEC if codec == "hevc" else codec
 
 
 class TargetMode(str, Enum):
@@ -45,7 +64,7 @@ DEFAULT_OP_ORDER: tuple[OpName, ...] = (
     OpName.STABILIZE,
     OpName.REFRAME_VERTICAL,
     OpName.TRIM,
-    OpName.ENCODE_HEVC_SIZE_CAP,
+    OpName.ENCODE_SIZE_CAP,
 )
 
 
@@ -73,7 +92,7 @@ class ExportTarget:
 
     profile: str = "social_vertical"
     aspect: str = "9:16"
-    codec: str = "hevc"
+    codec: str = EXPORT_CODEC
     max_size_mb: float | None = None
     max_height: int | None = 1920
 
@@ -87,7 +106,7 @@ class ExportTarget:
         return cls(
             profile=str(data.get("profile", "social_vertical")),
             aspect=str(data.get("aspect", "9:16")),
-            codec=str(data.get("codec", "hevc")),
+            codec=_export_codec(str(data.get("codec", EXPORT_CODEC))),
             max_size_mb=None if max_size is None else float(max_size),
             max_height=None if max_height is None else int(max_height),
         )
@@ -144,7 +163,8 @@ class RecipeOp:
         if "op" not in data:
             raise RecipeError("recipe op missing 'op' field")
         try:
-            op = OpName(str(data["op"]))
+            name = str(data["op"])
+            op = OpName(_LEGACY_OPS.get(name, name))
         except ValueError as exc:
             raise RecipeError(f"unsupported op: {data['op']!r}") from exc
         params = data.get("params") or {}
@@ -157,9 +177,9 @@ class RecipeOp:
 class EncodeSettings:
     """Software encode settings for the recipe."""
 
-    video_codec: str = "libx265"
+    video_codec: str = SOFTWARE_ENCODER
     mode: str = "crf_or_size_cap"
-    crf: int = 24
+    crf: int = DEFAULT_CRF
     preset: str = "medium"
     audio_action: str = "copy_or_aac"
 
@@ -178,10 +198,11 @@ class EncodeSettings:
     def from_dict(cls, data: dict[str, Any]) -> EncodeSettings:
         video = dict(data.get("video") or {})
         audio = dict(data.get("audio") or {})
+        codec = str(video.get("codec", SOFTWARE_ENCODER))
         return cls(
-            video_codec=str(video.get("codec", "libx265")),
+            video_codec=_LEGACY_ENCODERS.get(codec, codec),
             mode=str(video.get("mode", "crf_or_size_cap")),
-            crf=int(video.get("crf", 24)),
+            crf=int(video.get("crf", DEFAULT_CRF)),
             preset=str(video.get("preset", "medium")),
             audio_action=str(audio.get("action", "copy_or_aac")),
         )

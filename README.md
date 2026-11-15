@@ -18,9 +18,12 @@ lists. Models never write shell commands.
 ## Requirements
 
 - Python 3.10 or newer and a C compiler (Cython extension)
-- FFmpeg 6 or newer and `ffprobe`, with both `libx264` (previews and
-  restoration delivery) and `libx265` (HEVC export). `super-processor doctor`
-  requires both encoders for readiness; hardware codecs are optional. The
+- FFmpeg 6 or newer and `ffprobe`, with `libx264`. Every output is H.264:
+  restoration delivery uses `h264_nvenc` when a test encode works on this
+  machine and `libx264` otherwise, and the CLI export is `libx264` (or an
+  H.264 hardware encoder named with `--encoder`). `super-processor doctor`
+  requires `libx264` and reports whether NVENC and CUDA decoding actually
+  run here. The
   wizard makes a small, audio-free copy for Gemini to watch, then measures the
   segments Gemini proposes with `blockdetect`, `blurdetect`, `signalstats`,
   `hqdn3d`, and `psnr`. `scdet` is used by legacy shot detection, not wizard
@@ -98,18 +101,21 @@ Legacy shot detection additionally needs `scdet`.
 
 SPAN sees one frame at a time and the frames go to the GPU in small batches,
 so GPU memory follows the batch, not the clip: about 4-9 GB for 1440x1080 to
-2880x2160. Each clip streams in one pass: FFmpeg decodes and cleans the
-source, SPAN upscales it on the GPU, and the upscaled frames go straight into
-the delivery encoder through a pipe, so nothing is written to scratch disk.
-On an RTX 5090 a 1440x1080 to 2880x2160 render runs at about 22 frames a
-second end to end, blend and delivery encode included: about 23 minutes for
-a 20-minute 1080p film, and about 8 minutes or less for a 20-minute SD film.
-It uses 0.43 CPU-seconds per 1080p frame, about a third of a 32-thread CPU on
-average (an earlier chunked pipeline used 1.21, ran a 16-core CPU at its
-95 C limit, and wrote about 63 GB of lossless 4K work files for a full-length
-1080p film). If the GPU runs out of memory, the upscale retries with smaller
-batches, down to one frame, and then stops with advice to close other GPU
-programs.
+2880x2160. Each clip streams in one pass with nearly all of the work on the
+GPU. FFmpeg decodes the source with NVDEC (`-hwaccel cuda`; codecs NVDEC
+cannot read fall back to software decoding) and applies the look's clean
+filter. On the GPU the frames go from YUV to RGB, through SPAN and the
+strength blend with a lanczos upscale, and back to YUV, and `h264_nvenc`
+encodes them from a pipe, so nothing is written to scratch disk. Only a
+look's grade and grain, when it has them, still run on the CPU. On an RTX
+5090, 1500 frames of 1440x1080 to 2880x2160 ran at 26.8 frames a second end
+to end with 0.054 CPU-seconds per frame, and the CPU was at 76 C after the
+minute. The previous stream blended and encoded with x264 on the CPU: 22.2
+frames a second at 0.43 CPU-seconds per frame (about 9.5 of 32 threads, half
+of it in x264), and a 20-minute film took the CPU to 95 C. Without NVENC
+(Macs, AMD GPUs, CI) the delivery encode falls back to `libx264`. If the
+GPU runs out of memory, the upscale retries with smaller batches, down to one
+frame, and then stops with advice to close other GPU programs.
 
 ### Why SPAN and not FlashVSR
 

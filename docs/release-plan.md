@@ -58,7 +58,7 @@ without embedding a self-referential commit hash here.
    entry point have regressions. Fresh-artifact checks and platform CI remain
    distinct from local unit-test evidence.
 6. **Acceptance/documentation — contract recorded, live gates open.** Current
-   segment/preview flow, verified-CFR limits, wizard H.264 versus CLI HEVC,
+   segment/preview flow, verified-CFR limits, H.264-only output,
    credential precedence, absent telemetry, and prohibited model shell commands
    are documented. Use the [footage matrix](acceptance.md#representative-footage-matrix)
    to collect actual GPU/Gemini/browser evidence, not inferred quality claims.
@@ -118,7 +118,7 @@ implementation commits is not authorization to create a public release.
   recovery, live Gemini visual decisions, browser/accessibility checks, and
   supported-platform CI need recorded outcomes or an approved scope decision.
 - Joins from custom chunk lengths are not completely covered by seam candidates.
-- Wizard delivery is H.264; HEVC/hardware selection stays in legacy CLI scope.
+- Every output is H.264; the legacy CLI may name an H.264 hardware encoder.
 - Telemetry is absent. Local LLMs, desktop shells, cloud workers, generative
   features, and multi-track editing remain out of scope. Model-generated shell
   commands are prohibited, not deferred.

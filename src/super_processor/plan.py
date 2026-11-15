@@ -77,7 +77,7 @@ def recipe_from_diagnosis(
                 op.params = params
     if diagnosis.size_cap is not None:
         for op in ops:
-            if op.op is OpName.ENCODE_HEVC_SIZE_CAP:
+            if op.op is OpName.ENCODE_SIZE_CAP:
                 op.enabled = True
                 params = {
                     "max_size_mb": float(diagnosis.size_cap.get("max_size_mb", 50.0)),

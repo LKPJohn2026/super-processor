@@ -39,7 +39,14 @@ from .plans import (
 )
 from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
 from .qa import analyze_preview, write_qa_report
-from .recipe import RecipeError, TargetMode, empty_recipe, load_recipe, write_recipe
+from .recipe import (
+    OpName,
+    RecipeError,
+    TargetMode,
+    empty_recipe,
+    load_recipe,
+    write_recipe,
+)
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
 from .render import RenderError, ensure_encoder, render_chosen_plan
 from .review import ReviewError, ReviewServer, WizardServer
@@ -274,7 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     plans_cmd.add_argument(
         "--encoder",
         default=None,
-        help="HEVC encoder for --choose; libx265 when omitted",
+        help="H.264 encoder for --choose; libx264 when omitted",
     )
 
     job = subparsers.add_parser("job", help="low-level job management commands")
@@ -697,7 +704,7 @@ def run_plan_command(arguments: argparse.Namespace) -> int:
 
     if ack:
         for op in recipe.ops:
-            if op.op.value == "encode_hevc_size_cap" and op.enabled:
+            if op.op is OpName.ENCODE_SIZE_CAP and op.enabled:
                 op.params = dict(op.params)
                 op.params["acknowledge_size_risk"] = 1.0
         write_recipe(store.job_dir(job_id), recipe)
@@ -769,7 +776,7 @@ def run_apply_command(arguments: argparse.Namespace) -> int:
     if bool(getattr(arguments, "acknowledge_size_risk", False)):
         recipe = load_recipe(store.job_dir(job_id))
         for op in recipe.ops:
-            if op.op.value == "encode_hevc_size_cap" and op.enabled:
+            if op.op is OpName.ENCODE_SIZE_CAP and op.enabled:
                 op.params = dict(op.params)
                 op.params["acknowledge_size_risk"] = 1.0
         write_recipe(store.job_dir(job_id), recipe)

@@ -1,15 +1,23 @@
-"""Allowed HEVC encoders. ``libx265`` stays the default and the quality reference."""
+"""Allowed H.264 encoders for the CLI export. ``libx264`` is the default.
+
+Every output this project writes is H.264; HEVC and AV1 are not offered.
+Decoders below only read sources, whatever codec they are in.
+"""
 
 from __future__ import annotations
 
-SOFTWARE_ENCODER = "libx265"
+SOFTWARE_ENCODER = "libx264"
 HARDWARE_ENCODERS: tuple[str, ...] = (
-    "hevc_nvenc",
-    "hevc_qsv",
-    "hevc_amf",
-    "hevc_videotoolbox",
+    "h264_nvenc",
+    "h264_qsv",
+    "h264_amf",
+    "h264_videotoolbox",
 )
 ALLOWED_ENCODERS: tuple[str, ...] = (SOFTWARE_ENCODER, *HARDWARE_ENCODERS)
+# On 120 frames of a 1440x1080 film, libx264 "medium" at CRF 23 made
+# 40.63 dB in 4.0 MB where the libx265 CRF 24 this replaced made 40.60 dB
+# in 3.4 MB (x264 CRF 24: 39.86 dB).
+DEFAULT_CRF = 23
 DECODER_INPUT_ARGS: dict[str, tuple[str, ...]] = {
     "hevc_cuvid": ("-hwaccel", "cuda", "-c:v", "hevc_cuvid"),
     "hevc_qsv": ("-hwaccel", "qsv", "-c:v", "hevc_qsv"),
@@ -36,7 +44,7 @@ class EncoderError(ValueError):
     """Raised when an encoder name is outside the allowlist."""
 
 
-def encoder_rate_args(encoder: str, *, crf: int = 24) -> list[str]:
+def encoder_rate_args(encoder: str, *, crf: int = DEFAULT_CRF) -> list[str]:
     """Return rate-control flags for one encoder.
 
     The filter graph and the trim stay outside this list. Each encoder uses
@@ -56,7 +64,7 @@ def encoder_rate_args(encoder: str, *, crf: int = 24) -> list[str]:
             "-pix_fmt",
             "yuv420p",
         ]
-    if encoder == "hevc_nvenc":
+    if encoder == "h264_nvenc":
         return [
             "-c:v",
             encoder,
@@ -67,7 +75,7 @@ def encoder_rate_args(encoder: str, *, crf: int = 24) -> list[str]:
             "-pix_fmt",
             "yuv420p",
         ]
-    if encoder == "hevc_qsv":
+    if encoder == "h264_qsv":
         return [
             "-c:v",
             encoder,
@@ -76,7 +84,7 @@ def encoder_rate_args(encoder: str, *, crf: int = 24) -> list[str]:
             "-pix_fmt",
             "yuv420p",
         ]
-    if encoder == "hevc_amf":
+    if encoder == "h264_amf":
         return [
             "-c:v",
             encoder,

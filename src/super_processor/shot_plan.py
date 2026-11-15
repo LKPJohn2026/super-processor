@@ -34,8 +34,9 @@ from .upscale import (
     UpscaleRequest,
     UpscaleSpan,
     encode_delivery,
+    one_encoder,
+    plain_delivery,
     require_supported_timing,
-    restore_clip,
     trim_source,
     upscale_all,
 )
@@ -574,6 +575,7 @@ def preview_name(index: int, rev: int, side: str, ext: str = "mp4") -> str:
     return f"shot_{index:03d}_r{rev}_{side}.{ext}"
 
 
+@one_encoder()
 def render_previews(
     source: Path,
     job_dir: Path,
@@ -596,8 +598,8 @@ def render_previews(
     recipes = list(plan.recipes)
     clips: dict[int, Path] = {}
     requests: list[UpscaleRequest] = []
-    # Shots that skip SPAN are only resized; see :func:`restore_clip`.
-    plain: dict[int, Path] = {}
+    # Shots that skip SPAN are only resized; see :func:`plain_delivery`.
+    plain: dict[int, UpscaleRequest] = {}
     for index in indexes:
         recipe = replace(recipes[index], rev=recipes[index].rev + 1)
         recipes[index] = recipe
@@ -622,29 +624,28 @@ def render_previews(
         if recipe.use_upscale and request.scale > 1:
             requests.append(request)
         else:
-            plain[index] = restore_clip(
-                engine, request, use_upscale=False, ffmpeg_bin=ffmpeg_bin
-            )[0]
+            plain[index] = request
     upscaled = [index for index in indexes if index not in plain]
     raws = dict(
         zip(upscaled, upscale_all(engine, requests, ffmpeg_bin=ffmpeg_bin), strict=True)
     )
-    raws.update(plain)
     for index in indexes:
-        raw = raws[index]
         recipe = recipes[index]
         _remove_old_previews(folder, index)
         after = folder / preview_name(index, recipe.rev, "after")
         before = folder / preview_name(index, recipe.rev, "before")
-        encode_delivery(
-            raw,
-            after,
-            ffmpeg_bin=ffmpeg_bin,
-            blend_with=clips[index],
-            strength=recipe.strength if recipe.use_upscale else 0.0,
-            look=recipe.look,
-            regions=shots.shots[index].regions,
-        )
+        if index in plain:
+            plain_delivery(plain[index], after, ffmpeg_bin=ffmpeg_bin)
+        else:
+            encode_delivery(
+                raws[index],
+                after,
+                ffmpeg_bin=ffmpeg_bin,
+                blend_with=clips[index],
+                strength=recipe.strength,
+                look=recipe.look,
+                regions=shots.shots[index].regions,
+            )
         encode_delivery(clips[index], before, ffmpeg_bin=ffmpeg_bin)
         for side, video in (("before", before), ("after", after)):
             middle = _middle_s(shots.shots[index], recipe.preview_start)
