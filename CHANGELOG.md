@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The last step of a render copies AAC and MP3 source audio onto the
+  upscaled picture as it is, instead of encoding it to AAC again, and keeps
+  the copy only if its audio decodes cleanly (a recording whose audio
+  changes format partway is still encoded). Other audio is encoded to AAC
+  as before. On a 20-minute film the re-encode was 15 of the step's 18
+  CPU-seconds, a single-core burst that took a heat-soaked CPU from 86 C to
+  94.6 C after the GPU had finished; the step now takes 4.3 CPU-seconds.
 - SPAN (2xLiveActionV1_SPAN, Apache-2.0) replaces FlashVSR as the only
   upscaler. In a bake-off on an RTX 5090, FlashVSR v1.1 blended at strength
   0.5, as the wizard uses it, was almost the same as plain SPAN 2x on SD

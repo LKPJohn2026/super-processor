@@ -2221,11 +2221,102 @@ def mux_source_audio(
     shorter audio just ends early. (``-shortest`` would instead drop the
     last frames of a picture whose audio is shorter, which is common.) If
     the frame count still changes, the picture is kept without audio.
+
+    Audio MP4 can carry as it is (see ``_COPY_AUDIO``) is copied, not
+    encoded again: re-encoding a 20-minute film's AAC track was 15 of the
+    18 CPU-seconds this step took, a single-core burst that took a
+    heat-soaked CPU from 86 C to 94.6 C at the end of a render. Other
+    audio, or a copy FFmpeg refuses, is encoded to AAC.
     """
-    mixed = video.with_suffix(".mux.mp4")
     ffprobe_bin = _ffprobe_for(ffmpeg_bin)
     frames, rate = video_stream_facts(video, ffprobe_bin=ffprobe_bin)
     length = frames / Fraction(rate)
+    codecs = ["aac"]
+    if _audio_codec(source, ffprobe_bin=ffprobe_bin) in _COPY_AUDIO:
+        codecs.insert(0, "copy")
+    for codec in codecs:
+        mixed = _mux_audio(video, source, codec, length, ffmpeg_bin=ffmpeg_bin)
+        if mixed is None:
+            continue
+        # A copy keeps the first packet's AAC config for the whole track, so
+        # a recording whose audio changes format partway (stereo to 5.1, 48
+        # to 44.1 kHz) muxes without complaint and then decodes garbled. An
+        # encode reconfigures at the change; decoding costs far less.
+        if codec == "copy" and not _audio_decodes(mixed, ffmpeg_bin=ffmpeg_bin):
+            mixed.unlink(missing_ok=True)
+            continue
+        if video_stream_facts(mixed, ffprobe_bin=ffprobe_bin)[0] != frames:
+            mixed.unlink(missing_ok=True)
+            return video
+        mixed.replace(video)
+        return video
+    return video
+
+
+# Audio codecs every browser plays from MP4, so they are copied as they are.
+_COPY_AUDIO = frozenset({"aac", "mp3"})
+
+
+def _audio_codec(source: Path, *, ffprobe_bin: str) -> str | None:
+    """The first audio stream's codec name, or None with no audio."""
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+                str(source),
+            ],
+            check=False,
+            capture_output=True,
+            # ffprobe echoes paths in its own bytes; a strict locale decode
+            # of an odd one would crash the end of a finished render.
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    name = (completed.stdout or "").strip().splitlines()
+    return name[0].strip() if completed.returncode == 0 and name else None
+
+
+def _audio_decodes(video: Path, *, ffmpeg_bin: str) -> bool:
+    """True when ``video``'s audio decodes from end to end without an error."""
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-v",
+                "error",
+                "-xerror",
+                "-i",
+                str(video),
+                "-map",
+                "0:a:0?",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and not completed.stderr.strip()
+
+
+def _mux_audio(
+    video: Path, source: Path, codec: str, length: Fraction, *, ffmpeg_bin: str
+) -> Path | None:
+    """``video``'s picture with ``source``'s audio as ``codec``, or None."""
+    mixed = video.with_suffix(".mux.mp4")
     completed = subprocess.run(
         [
             ffmpeg_bin,
@@ -2244,7 +2335,7 @@ def mux_source_audio(
             "-c:v",
             "copy",
             "-c:a",
-            "aac",
+            codec,
             "-t",
             f"{float(length):.6f}",
             # moov at the front, so a browser can start playing and seeking
@@ -2257,12 +2348,9 @@ def mux_source_audio(
         capture_output=True,
     )
     if completed.returncode != 0 or not mixed.is_file():
-        return video
-    if video_stream_facts(mixed, ffprobe_bin=ffprobe_bin)[0] != frames:
         mixed.unlink(missing_ok=True)
-        return video
-    mixed.replace(video)
-    return video
+        return None
+    return mixed
 
 
 def _write_listing(path: Path, parts: list[Path]) -> Path:
