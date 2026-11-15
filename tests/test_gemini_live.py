@@ -58,8 +58,10 @@ def test_live_gemini_revise_upscale_params(tmp_path: Path) -> None:
         )
     except GeminiError as exc:
         pytest.fail(f"live Gemini upscale note failed: {exc}")
+    # SPAN 2x is the only upscaler: Gemini is offered 1 and 2, and the note
+    # does not ask for another size.
+    assert data["scale"] in {1, 2}
     span = UpscaleSpan.from_dict(data)
-    assert span.scale in {2, 4}
     assert 0.0 <= span.strength < 0.5
     assert 0.0 <= span.start_s < span.end_s <= 20.0
     assert (tmp_path / "gemini_chat.json").is_file()

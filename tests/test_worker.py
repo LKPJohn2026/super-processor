@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -17,14 +18,27 @@ from unittest.mock import Mock, call
 import pytest
 
 from super_processor import cli
+from super_processor import templates as templates_mod
 from super_processor import worker as worker_mod
 from super_processor.jobs import JobState, JobStore
-from super_processor.probe import probe_file, write_media_facts
+from super_processor.probe import (
+    MediaFacts,
+    StreamFacts,
+    probe_file,
+    write_media_facts,
+)
 from super_processor.recipe import OpName, TargetMode, empty_recipe, write_recipe
-from super_processor.templates import FFmpegPlan, FFmpegStep, build_ffmpeg_plan
+from super_processor.templates import (
+    FFmpegPlan,
+    FFmpegStep,
+    TemplateError,
+    build_ffmpeg_plan,
+)
 from super_processor.worker import (
     FFmpegWorker,
     RunResult,
+    StepResult,
+    WorkerError,
     format_progress_status,
     parse_progress_line,
 )
@@ -283,9 +297,9 @@ def test_worker_preview_encode_atomic(tmp_path: Path) -> None:
 
 
 @requires_ffmpeg
-def test_worker_cancel(tmp_path: Path) -> None:
+def test_cancelling_a_real_encode_leaves_no_output(tmp_path: Path) -> None:
     source = _make_clip(tmp_path / "src.mp4", duration=60.0)
-    recipe = empty_recipe("abcd1234abcd1234", str(source))
+    recipe = empty_recipe("abcd1234abcd1234", str(source.resolve()))
     recipe.target.mode = TargetMode.FINAL
     output = tmp_path / "out.mp4"
     plan = build_ffmpeg_plan(
@@ -294,28 +308,127 @@ def test_worker_cancel(tmp_path: Path) -> None:
         work_dir=tmp_path / "work",
         duration_s=60.0,
     )
-    # Force a slower encode so cancel has time to land: libx264 "slow" did
-    # this clip's first 8 s in under the 0.2 s the cancel waits.
+    # "placebo" keeps the 60 s encode running for many seconds, so it is
+    # still going when the first progress report arrives.
     encode = plan.steps[-1]
-    crf_index = encode.argv.index("-crf")
-    encode.argv[crf_index + 1] = "18"
-    preset_index = encode.argv.index("-preset")
-    encode.argv[preset_index + 1] = "placebo"
+    encode.argv[encode.argv.index("-preset") + 1] = "placebo"
 
     worker = FFmpegWorker()
-
-    def _cancel_soon() -> None:
-        time.sleep(0.2)
-        worker.cancel()
-
-    thread = threading.Thread(target=_cancel_soon)
-    thread.start()
-    result = worker.run_plan(plan)
-    thread.join()
+    # Cancel from FFmpeg's own first progress line rather than after a sleep,
+    # so the cancel always lands while the encode is running.
+    result = worker.run_plan(plan, on_progress=lambda _progress: worker.cancel())
     assert result.cancelled is True
     assert result.ok is False
+    assert result.steps[-1].returncode != 0
     assert not output.is_file()
     assert not output.with_suffix(".partial.mp4").exists()
+
+
+def test_a_failed_step_stops_the_plan_and_keeps_the_old_output(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output.mp4"
+    output.write_text("original")
+    later = tmp_path / "later-step"
+    plan = FFmpegPlan(
+        mode="final",
+        input_path="unused",
+        output_path=str(output),
+        steps=[
+            FFmpegStep(
+                "encode",
+                [
+                    sys.executable,
+                    "-c",
+                    "import pathlib, sys; "
+                    "pathlib.Path(sys.argv[1]).write_text('half'); "
+                    "print('Conversion failed!', file=sys.stderr); sys.exit(3)",
+                    str(output),
+                ],
+            ),
+            FFmpegStep(
+                "later",
+                [sys.executable, "-c", f"open({str(later)!r}, 'w').close()"],
+            ),
+        ],
+        filter_graph="",
+    )
+    result = FFmpegWorker().run_plan(plan)
+    assert result.ok is False
+    assert result.cancelled is False
+    assert [step.name for step in result.steps] == ["encode"]
+    assert result.steps[0].returncode == 3
+    assert result.steps[0].stderr_tail == "Conversion failed!"
+    # A failed encode must not replace a good earlier output with half a file.
+    assert output.read_text() == "original"
+    assert not output.with_name("output.partial.mp4").exists()
+    assert not later.exists()
+
+
+def test_a_successful_encode_replaces_the_output_through_a_partial(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output.mp4"
+    output.write_text("original")
+    seen: list[str] = []
+    plan = FFmpegPlan(
+        mode="final",
+        input_path="unused",
+        output_path=str(output),
+        steps=[
+            FFmpegStep(
+                "encode",
+                [
+                    sys.executable,
+                    "-c",
+                    "import pathlib, sys; "
+                    "print('target=' + sys.argv[1], flush=True); "
+                    "pathlib.Path(sys.argv[1]).write_text('new')",
+                    str(output),
+                ],
+            )
+        ],
+        filter_graph="",
+    )
+    result = FFmpegWorker().run_plan(
+        plan, on_progress=lambda progress: seen.append(progress["target"])
+    )
+    assert result.ok is True
+    # FFmpeg writes the partial name, never the final path, while it runs.
+    assert seen == [str(output.with_name("output.partial.mp4"))]
+    assert output.read_text() == "new"
+    assert not output.with_name("output.partial.mp4").exists()
+
+
+def test_a_missing_ffmpeg_binary_is_a_worker_error(tmp_path: Path) -> None:
+    plan = FFmpegPlan(
+        mode="preview",
+        input_path="unused",
+        output_path=str(tmp_path / "out.mp4"),
+        steps=[FFmpegStep("encode", [str(tmp_path / "no-ffmpeg"), "out.mp4"])],
+        filter_graph="",
+    )
+    with pytest.raises(WorkerError, match="failed to start ffmpeg for step encode"):
+        FFmpegWorker().run_plan(plan)
+
+
+def test_an_argv_element_with_a_newline_is_refused(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    plan = FFmpegPlan(
+        mode="preview",
+        input_path="unused",
+        output_path=str(tmp_path / "out.mp4"),
+        steps=[
+            FFmpegStep(
+                "prepare",
+                [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()\n"],
+            )
+        ],
+        filter_graph="",
+    )
+    with pytest.raises(TemplateError, match="newlines"):
+        FFmpegWorker().run_plan(plan)
+    assert not marker.exists()
 
 
 @requires_ffmpeg
@@ -355,9 +468,14 @@ def test_job_run_dry_run_and_preview(
         )
         == 0
     )
-    dry = capsys.readouterr().out
-    assert '"filter_graph"' in dry
-    assert "-vf" in dry or "eq=contrast=" in dry
+    dry = json.loads(capsys.readouterr().out)
+    assert "eq=contrast=1.05" in dry["filter_graph"]
+    encode = dry["steps"][-1]["argv"]
+    assert encode[encode.index("-vf") + 1] == dry["filter_graph"]
+    assert encode[encode.index("-t") + 1] == "0.4"
+    # A dry run validates the recipe but encodes nothing.
+    assert not (store.job_dir(manifest.job_id) / "preview.mp4").exists()
+    assert store.load(manifest.job_id).state is JobState.VALIDATED
 
     assert (
         cli.main(
@@ -373,56 +491,108 @@ def test_job_run_dry_run_and_preview(
         )
         == 0
     )
-    out = capsys.readouterr().out
-    assert '"ok": true' in out
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["validation"]["ok"] is True
     updated = store.load(manifest.job_id)
     assert updated.state is JobState.PREVIEWED
     assert (store.job_dir(manifest.job_id) / "preview.mp4").is_file()
 
 
-@requires_ffmpeg
 def test_job_run_final_requires_approve(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    jobs_dir = tmp_path / "jobs"
-    source = _make_clip(tmp_path / "clip.mp4")
-    assert (
-        cli.main(
-            [
-                "--jobs-dir",
-                str(jobs_dir),
-                "job",
-                "create",
-                str(source),
-                "--job-id",
-                "abcd1234abcd1234",
-            ]
-        )
-        == 0
-    )
-    capsys.readouterr()
-    store = JobStore(jobs_dir)
-    write_media_facts(store.job_dir("abcd1234abcd1234"), probe_file(source))
-    store.transition("abcd1234abcd1234", JobState.PROBED)
-    write_recipe(
-        store.job_dir("abcd1234abcd1234"),
-        empty_recipe("abcd1234abcd1234", str(source.resolve())),
-    )
-
+    # The approval gate comes before any FFmpeg work, so no ffmpeg is needed.
+    store, job_id = _validated_job(tmp_path)
     code = cli.main(
-        [
-            "--jobs-dir",
-            str(jobs_dir),
-            "job",
-            "run",
-            "abcd1234abcd1234",
-            "--mode",
-            "final",
-        ]
+        ["--jobs-dir", str(store.root), "job", "run", job_id, "--mode", "final"]
     )
     assert code == 1
     assert "requires --approve" in capsys.readouterr().out
+    assert store.load(job_id).state is JobState.PROBED
+    assert not (store.job_dir(job_id) / "output.mp4").exists()
+
+
+def _validated_job(tmp_path: Path) -> tuple[JobStore, str]:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake-video")
+    store = JobStore(tmp_path / "jobs")
+    job_id = store.create(source, job_id="abcd1234abcd1234").job_id
+    facts = MediaFacts(
+        schema_version=1,
+        source_path=str(source.resolve()),
+        format_name="mp4",
+        format_long_name="MP4",
+        duration_s=10.0,
+        size_bytes=1_000_000,
+        bit_rate=1_000_000,
+        streams=[
+            StreamFacts(
+                index=0, codec_type="video", codec_name="h264", width=320, height=240
+            )
+        ],
+        has_video=True,
+        has_audio=False,
+        is_vfr=False,
+    )
+    write_media_facts(store.job_dir(job_id), facts)
+    store.transition(job_id, JobState.PROBED)
+    write_recipe(store.job_dir(job_id), empty_recipe(job_id, str(source.resolve())))
+    return store, job_id
+
+
+def test_a_failed_final_encode_marks_the_job_failed_with_ffmpeg_stderr(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job_id = _validated_job(tmp_path)
+
+    class FailingWorker:
+        def run_plan(self, plan: FFmpegPlan, **_kwargs: object) -> RunResult:
+            return RunResult(
+                ok=False,
+                output_path=plan.output_path,
+                steps=[StepResult("encode", 1, 0.1, stderr_tail="No space left")],
+            )
+
+    monkeypatch.setattr(cli, "FFmpegWorker", FailingWorker)
+    # The worker is faked, so no FFmpeg runs; only the plan needs a binary name.
+    # Without this the test fails on CI's wheel run, which has no ffmpeg on PATH.
+    monkeypatch.setattr(templates_mod, "which", lambda _name: "/usr/bin/ffmpeg")
+    argv = ["--jobs-dir", str(store.root), "job", "run", job_id]
+    assert cli.main([*argv, "--mode", "final", "--approve"]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+    manifest = store.load(job_id)
+    assert manifest.state is JobState.FAILED
+    assert manifest.error == "No space left"
+
+
+def test_an_invalid_recipe_is_not_encoded(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job_id = _validated_job(tmp_path)
+    recipe = empty_recipe(job_id, str(tmp_path / "clip.mp4"))
+    for op in recipe.ops:
+        if op.op is OpName.DENOISE:
+            op.enabled = True
+            op.params = {"strength": 5.0}
+    write_recipe(store.job_dir(job_id), recipe)
+
+    class NoWorker:
+        def __init__(self) -> None:
+            raise AssertionError("an invalid recipe reached the worker")
+
+    monkeypatch.setattr(cli, "FFmpegWorker", NoWorker)
+    argv = ["--jobs-dir", str(store.root), "job", "run", job_id, "--mode", "preview"]
+    assert cli.main(argv) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is False
+    assert "param_bounds" in {issue["code"] for issue in report["errors"]}
+    assert store.load(job_id).state is JobState.PROBED
 
 
 @requires_ffmpeg

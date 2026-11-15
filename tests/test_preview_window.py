@@ -43,3 +43,11 @@ def test_window_stays_inside_the_trim() -> None:
 def test_trim_shorter_than_five_seconds_is_refused() -> None:
     with pytest.raises(TreatmentError, match="5s"):
         preview_window(_segment(10.0), _trim(0.0, 4.0))
+
+
+def test_a_preview_window_needs_a_length() -> None:
+    treatment = Treatment("noisy.light", "noisy", ())
+    with pytest.raises(TreatmentError, match="must be positive"):
+        preview_window(_segment(10.0), treatment, span_s=0.0)
+    # A longer window is centred the same way.
+    assert preview_window(_segment(10.0), treatment, span_s=6.0) == (7.0, 13.0)

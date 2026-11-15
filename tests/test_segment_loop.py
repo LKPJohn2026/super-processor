@@ -6,6 +6,7 @@ import json
 import math
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from super_processor.segment_loop import (
     extract_segment_stills,
     load_segment_list,
     load_segment_stills,
+    make_gemini_copy,
     repair_coverage,
     sample_times,
     save_segment_list,
@@ -119,8 +121,12 @@ def test_extract_segment_stills_writes_grid_under_job(tmp_path: Path) -> None:
     job_dir = tmp_path / "job"
     job_dir.mkdir()
     times = sample_times(3.0)
-    stills = extract_segment_stills(source, job_dir, times)
+    seen: list[float] = []
+    stills = extract_segment_stills(source, job_dir, times, on_progress=seen.append)
     assert [still.t_s for still in stills] == times
+    assert seen == pytest.approx([(i + 1) / len(times) for i in range(len(times))])
+    # The Segments screen reads the grid back from the file names.
+    assert load_segment_stills(job_dir) == stills
     for still in stills:
         assert still.path.startswith(f"{STILLS_DIR_NAME}/t_")
         path = job_dir / still.path
@@ -179,6 +185,10 @@ def test_segment_list_round_trips(tmp_path: Path) -> None:
     assert load_segment_list(tmp_path) is None
     saved = _two_segments()
     saved.approved = True
+    saved.note = "split where we go outside"
+    saved.error = "Gemini timed out"
+    saved.scale = 1
+    saved.scale_reason = "already sharp"
     path = save_segment_list(tmp_path, saved)
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["schema_version"] == 2
@@ -347,12 +357,14 @@ def test_repair_coverage_boundary_rules() -> None:
     assert [(s.start_s, s.label) for s in sliver] == [(0.0, "a"), (6.0, "b")]
 
 
-def test_segment_list_keeps_the_editor_note(tmp_path: Path) -> None:
-    saved = _two_segments()
-    saved.note = "split where we go outside"
-    save_segment_list(tmp_path, saved)
-    loaded = load_segment_list(tmp_path)
-    assert loaded is not None and loaded.note == "split where we go outside"
+def test_stills_in_a_symlinked_folder_are_not_listed(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "t_00000000.jpg").write_bytes(b"x")
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / STILLS_DIR_NAME).symlink_to(outside, target_is_directory=True)
+    assert load_segment_stills(job_dir) == []
 
 
 def test_load_segment_stills_reads_times_from_names(tmp_path: Path) -> None:
@@ -412,12 +424,29 @@ def test_repair_coverage_keeps_known_contents() -> None:
     assert SegmentList.from_dict(saved.to_dict()) == saved
 
 
-def test_saved_4x_scale_choice_is_dropped() -> None:
+@pytest.mark.parametrize(
+    "scale",
+    [
+        # Lists saved while 4x existed.
+        4,
+        # True == 1 in Python, but it is not a scale.
+        True,
+        "2",
+        2.0,
+    ],
+)
+def test_a_saved_scale_other_than_1x_or_2x_is_dropped(scale: object) -> None:
     kept = SegmentList(segments=[], scale=2, scale_reason="soft source")
     assert SegmentList.from_dict(kept.to_dict()) == kept
-    old = {**kept.to_dict(), "scale": 4, "scale_reason": "small source"}
+    old = {**kept.to_dict(), "scale": scale, "scale_reason": "small source"}
     loaded = SegmentList.from_dict(old)
+    # The reason goes too, so the screen never explains a scale it ignores.
     assert (loaded.scale, loaded.scale_reason) == (None, "")
+
+
+def test_a_saved_error_that_is_not_text_is_dropped() -> None:
+    data = {**_two_segments().to_dict(), "error": {"code": 500}}
+    assert SegmentList.from_dict(data).error is None
 
 
 # Gemini's 22 segments for the Sintel trailer, before the limits existed.
@@ -486,3 +515,57 @@ def test_a_clip_shorter_than_the_minimum_is_one_segment() -> None:
     assert len(segments) == 1
     assert (segments[0].start_s, segments[0].end_s) == (0.0, 2.5)
     assert segments[0].label == "b" and segments[0].contains == ("faces", "text")
+
+
+def test_repair_coverage_tidies_gemini_labels() -> None:
+    raw = [
+        {"start_s": 0, "end_s": 5, "label": "  Kitchen,\n   window light  "},
+        {"start_s": 5, "end_s": 10, "label": "x" * 200},
+    ]
+    first, second = repair_coverage(raw, 10.0)
+    assert first.label == "Kitchen, window light"
+    assert second.label == "x" * 80
+
+
+def test_a_missing_ffmpeg_is_reported_when_making_the_gemini_copy(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SegmentLoopError, match="copy for Gemini"):
+        make_gemini_copy(
+            tmp_path / "in.mp4", tmp_path, 2.0, ffmpeg_bin=str(tmp_path / "none")
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a shell script as ffmpeg")
+def test_a_failed_gemini_copy_keeps_the_last_copy_and_names_the_last_error(
+    tmp_path: Path,
+) -> None:
+    # A stand-in ffmpeg: unreadable and overlong progress, two error lines,
+    # a half-written output, then failure.
+    fake = tmp_path / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "for last; do :; done\n"
+        "echo out_time_us=N/A\n"
+        "echo out_time_us=9000000\n"
+        "echo 'first problem' >&2\n"
+        "echo 'moov atom not found' >&2\n"
+        ': > "$last"\n'
+        "exit 1\n"
+    )
+    fake.chmod(0o755)
+    previous = tmp_path / "gemini_upload.mp4"
+    previous.write_bytes(b"earlier copy")
+    seen: list[float] = []
+    with pytest.raises(SegmentLoopError, match="moov atom not found$"):
+        make_gemini_copy(
+            tmp_path / "in.mp4",
+            tmp_path,
+            2.0,
+            ffmpeg_bin=str(fake),
+            on_progress=seen.append,
+        )
+    # N/A is skipped and 9 s of a 2 s clip is reported as done, not 450%.
+    assert seen == [1.0]
+    assert previous.read_bytes() == b"earlier copy"
+    assert not (tmp_path / "gemini_upload.part.mp4").exists()

@@ -194,9 +194,10 @@ def _parse_expiry(raw: Any) -> float:
     # Python 3.10 reads at most six fractional digits.
     head, dot, rest = text.partition(".")
     if dot:
-        digits = "".join(ch for ch in rest if ch.isdigit())
-        zone = rest[len(digits) :]
-        text = f"{head}.{digits[:6]}{zone}"
+        count = len(rest) - len(rest.lstrip("0123456789"))
+        digits, zone = rest[:count], rest[count:]
+        # Python 3.10 reads only 3 or 6 fraction digits.
+        text = f"{head}.{digits[:6].ljust(6, '0')}{zone}"
     try:
         return datetime.fromisoformat(text).timestamp()
     except ValueError:
@@ -681,6 +682,8 @@ class ChatTurn:
         structured = data.get("structured")
         if structured is not None and not isinstance(structured, dict):
             raise GeminiError("structured must be an object")
+        if "role" not in data:
+            raise GeminiError("chat turn needs a role")
         return cls(
             role=str(data["role"]),
             text=str(data.get("text", "")),
@@ -787,6 +790,8 @@ def load_chat(job_dir: Path) -> list[ChatTurn]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise GeminiError(f"cannot read {CHAT_FILE_NAME}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise GeminiError(f"{CHAT_FILE_NAME} root must be an object")
     turns = data.get("turns") or []
     if not isinstance(turns, list):
         raise GeminiError("chat turns must be a list")

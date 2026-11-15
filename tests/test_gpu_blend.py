@@ -58,6 +58,34 @@ def test_yuv_rgb_round_trip_keeps_every_plane(width: int, height: int) -> None:
         assert (got.int() - want.int()).abs().max().item() <= 1
 
 
+@needs_ffmpeg
+def test_yuv_to_rgb_keeps_ffmpegs_colours() -> None:
+    # A round trip cannot tell BT.601 from BT.709 or limited from full range
+    # (both directions would be wrong the same way); FFmpeg can. Flat
+    # colours, so chroma resampling plays no part.
+    colours = [(16, 128, 128), (235, 128, 128), (150, 100, 170), (81, 90, 240)]
+    colours += [(145, 54, 34), (41, 240, 110), (110, 200, 60)]
+    width, height = 8, 4
+    raw = b"".join(
+        bytes([y] * (width * height) + [u] * 8 + [v] * 8) for y, u, v in colours
+    )
+    rgb24 = subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+         "-s", f"{width}x{height}", "-i", "-", "-f", "rawvideo",
+         "-pix_fmt", "rgb24", "-"],
+        input=raw,
+        check=True,
+        capture_output=True,
+    ).stdout  # fmt: skip
+    want = torch.tensor(list(rgb24), dtype=torch.float32)
+    want = want.view(len(colours), height, width, 3).permute(0, 3, 1, 2)
+    frames = torch.tensor(list(raw), dtype=torch.uint8).view(len(colours), -1)
+    rgb = span_sr.yuv420_to_rgb(*span_sr.split_yuv420(frames, width, height))
+    # swscale's fixed point is up to 1.9 levels off exact BT.601; BT.709
+    # coefficients would be 4.7 to 38 off on every coloured patch here.
+    assert (rgb * 255 - want).abs().max().item() <= 2.5
+
+
 @pytest.mark.parametrize(("width", "height"), [(32, 24), (33, 25)])
 def test_packed_frames_split_and_pack_in_ffmpeg_layout(width: int, height: int) -> None:
     size = yuv420_frame_bytes(width, height)
@@ -170,20 +198,39 @@ def test_strength_map_shapes() -> None:
         assert tuple(share.shape) == (1, 1, 1, 1)
         assert share.item() == pytest.approx(0.25)
     one = (Region("text", 0.25, 0.25, 0.75, 0.75),)
-    share = span_sr.strength_map(64, 48, 0.8, one)[0, 0]
-    assert share[24, 32].item() == pytest.approx(0.15)
+    share = span_sr.strength_map(100, 60, 0.8, one)
+    assert tuple(share.shape) == (1, 1, 60, 100)
+    share = share[0, 0]
+    assert share[30, 50].item() == pytest.approx(0.15)
     assert share[0, 0].item() == pytest.approx(0.8)
-    # Half a feather outside the box: half way back up.
-    x = 0.75 + FEATHER / 2
-    assert strength_at(0.8, one, x, 0.5) == pytest.approx(0.475)
+    # Column 76's centre is half a feather right of the box: half way back up.
+    centre = (76 + 0.5) / 100
+    assert centre == pytest.approx(0.75 + FEATHER / 2)
+    assert share[30, 76].item() == pytest.approx(0.475)
 
 
-def _nearest_model(x: Any) -> Any:
-    return torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+def _textured_model(x: Any) -> Any:
+    """A stand-in SPAN: a nearest 2x with a one-pixel texture and a colour
+    shift, so its detail and its coarse layer both differ from lanczos."""
+    up = torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+    rows = torch.arange(up.shape[-2]).view(-1, 1)
+    cols = torch.arange(up.shape[-1]).view(1, -1)
+    checker = ((rows + cols) % 2 * 2 - 1).to(up.dtype)
+    return up + 0.1 + 0.04 * checker
 
 
-@pytest.mark.parametrize(("width", "height"), [(24, 16), (25, 17)])
-def test_restore_block_on_the_cpu(width: int, height: int) -> None:
+@pytest.mark.parametrize(
+    ("width", "height", "strength", "regions"),
+    [
+        (24, 16, 0.0, ()),
+        (25, 17, 0.0, ()),
+        (24, 16, 0.8, (Region("faces", 0.2, 0.2, 0.6, 0.7),)),
+        (25, 17, 1.0, ()),
+    ],
+)
+def test_restore_block_is_spans_detail_on_the_lanczos_base(
+    width: int, height: int, strength: float, regions: tuple[Region, ...]
+) -> None:
     frame_in = yuv420_frame_bytes(width, height)
     cw, ch = -(-width // 2), -(-height // 2)
     planes = []
@@ -195,18 +242,30 @@ def test_restore_block_on_the_cpu(width: int, height: int) -> None:
     raw = bytearray(bytes(torch.cat(planes).tolist()) + b"\x07" * 3)
     assert len(raw) == 5 * frame_in + 3
     blend = span_sr.prepare_blend(
-        width, height, strength=0.0, sigma=SIGMA, device="cpu"
+        width, height, strength=strength, regions=regions, sigma=SIGMA, device="cpu"
     )
-    out = span_sr.restore_block(_nearest_model, blend, raw, batch=2)
+    out = span_sr.restore_block(_textured_model, blend, raw, batch=2)
     frame_out = yuv420_frame_bytes(2 * width, 2 * height)
+    # The 3 stray bytes past the last whole frame make no frame.
     assert len(out) == 5 * frame_out
-    # Strength 0 is the lanczos base, frame for frame, whatever the batch.
-    assert span_sr.restore_block(_nearest_model, blend, raw, batch=5) == out
-    assert span_sr.restore_block(_nearest_model, blend, raw, batch=0) == out
+    # Frame for frame the same whatever the batch (0 means one at a time).
+    assert span_sr.restore_block(_textured_model, blend, raw, batch=5) == out
+    assert span_sr.restore_block(_textured_model, blend, raw, batch=0) == out
+    # Each step by hand, on all five frames at once. At strength 0 this is
+    # the lanczos base: SPAN's output is thrown away.
     stack = torch.stack(planes).view(5, frame_in)
     rgb = span_sr.yuv420_to_rgb(*span_sr.split_yuv420(stack, width, height))
-    base = span_sr.lanczos2x(rgb, blend.taps).clamp(0, 1)
-    want = span_sr.pack_yuv420(base)
+    up = _textured_model(rgb).clamp(0, 1)
+    base = span_sr.lanczos2x(rgb, blend.taps)
+    if strength == 0:
+        mixed = base
+    else:
+        mixed = span_sr.blend_detail(up, base, blend.share, SIGMA)
+    want = span_sr.pack_yuv420(mixed.clamp(0, 1))
     got = torch.tensor(list(out), dtype=torch.uint8).view(5, frame_out)
     assert torch.equal(got, want)
-    assert span_sr.restore_block(_nearest_model, blend, bytearray(3), batch=2) == b""
+    if strength > 0:
+        # SPAN's texture made it through: not just the base.
+        assert not torch.equal(got, span_sr.pack_yuv420(base.clamp(0, 1)))
+    empty = span_sr.restore_block(_textured_model, blend, bytearray(3), batch=2)
+    assert empty == b""

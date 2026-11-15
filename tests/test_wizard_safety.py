@@ -298,3 +298,29 @@ def test_concurrent_state_saves_do_not_collide(tmp_path: Path) -> None:
         WizardStep.RESULT,
     }
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_a_save_that_never_gets_the_file_keeps_the_old_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retries are bounded: a file held open for good fails the save, and
+    neither the old state nor a stray temp file is left broken behind it."""
+    monkeypatch.setattr("super_processor.wizard._STATE_RETRY_S", 0)
+    save_session_state(tmp_path, WizardState(step=WizardStep.PICK_FILE))
+    real_replace = Path.replace
+    attempts = {"replace": 0}
+    held = [True]
+
+    def locked(self: Path, target: Path) -> Path:
+        if not held[0]:
+            return real_replace(self, target)
+        attempts["replace"] += 1
+        raise PermissionError(13, "file is open in another program")
+
+    monkeypatch.setattr(Path, "replace", locked)
+    with pytest.raises(PermissionError):
+        save_session_state(tmp_path, WizardState(step=WizardStep.DONE))
+    held[0] = False
+    assert attempts["replace"] == 20
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert WizardController(tmp_path).current_state().step is WizardStep.PICK_FILE

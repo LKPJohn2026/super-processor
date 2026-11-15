@@ -578,8 +578,7 @@ def render_pick(*, error: str | None = None) -> str:
 <h1>Pick a video file</h1>
 <p class="lede">Choose a video on this computer. Gemini splits it into
 segments, you approve a short before/after preview of each, and then you choose
-whether to upscale the whole video on your GPU (videos up to 1280 px on the
-long edge).</p>
+whether to upscale the whole video on your GPU.</p>
 <p class="muted">Up to 1080p and 30 minutes.</p>
 {err}
 <form method="post" action="/browse">

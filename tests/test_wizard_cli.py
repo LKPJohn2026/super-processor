@@ -1,9 +1,8 @@
-"""CLI and remaining wizard route coverage."""
+"""``super-processor review``: which server it starts, and the run worker GET."""
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -12,160 +11,139 @@ from urllib.request import urlopen
 import pytest
 
 from super_processor.cli import run_review_command
-from super_processor.gemini import store_gemini_api_key
-from super_processor.jobs import JobStore
+from super_processor.jobs import JobError, JobStore
 from super_processor.review import WizardServer
 from super_processor.wizard import (
     WizardController,
     WizardState,
     WizardStep,
-    save_job_wizard_state,
     save_session_state,
 )
 
 TOKEN = "test-token"
 
 
-class _FakeTransport:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
-        self.calls = 0
+class _Server:
+    """Stands in for the wizard or review server; records how it was used."""
 
-    def generate(
-        self,
-        *,
-        model: str,
-        api_key: str,
-        body: dict[str, Any],
-    ) -> dict[str, Any]:
-        self.calls += 1
-        return {
-            "candidates": [{"content": {"parts": [{"text": json.dumps(self.payload)}]}}]
-        }
+    made: list[_Server] = []
+    token: str | None = "tok-123"
+    interrupt = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.args = args
+        self.kwargs = kwargs
+        self.calls: list[str] = []
+        _Server.made.append(self)
+
+    def start(self) -> str:
+        self.calls.append("start")
+        return "http://127.0.0.1:9"
+
+    def wait(self) -> None:
+        self.calls.append("wait")
+        if self.interrupt:
+            raise KeyboardInterrupt
+
+    def stop(self) -> None:
+        self.calls.append("stop")
 
 
-def test_store_gemini_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    import os
+@pytest.fixture
+def servers(monkeypatch: pytest.MonkeyPatch) -> type[_Server]:
+    _Server.made = []
+    monkeypatch.setattr("super_processor.cli.WizardServer", _Server)
+    monkeypatch.setattr("super_processor.cli.ReviewServer", _Server)
+    return _Server
 
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    path = store_gemini_api_key("abc123")
-    assert os.environ["GEMINI_API_KEY"] == "abc123"
-    assert path.is_file()
 
-
-def test_run_review_starts_wizard(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_review_without_a_job_serves_the_wizard_and_prints_its_token(
+    tmp_path: Path,
+    servers: type[_Server],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    store = JobStore(tmp_path)
-    store.ensure_root()
-
-    class _Immediate:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            self.started = False
-
-        token = "t"
-
-        def start(self) -> str:
-            self.started = True
-            return "http://127.0.0.1:9"
-
-        def wait(self) -> None:
-            return
-
-        def stop(self) -> None:
-            return
-
-    monkeypatch.setattr("super_processor.cli.WizardServer", _Immediate)
-    code = run_review_command(argparse.Namespace(jobs_dir=tmp_path, job_id=None))
+    jobs = tmp_path / "jobs"
+    code = run_review_command(argparse.Namespace(jobs_dir=jobs, job_id=None))
     assert code == 0
+    (server,) = servers.made
+    assert server.args == (jobs,)
+    assert server.calls == ["start", "wait"]
+    # The jobs root exists before the wizard writes its session there.
+    assert jobs.is_dir()
+    assert capsys.readouterr().out.splitlines() == [
+        "http://127.0.0.1:9",
+        "wizard token: tok-123",
+    ]
 
 
-def test_run_review_with_job_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_review_of_a_job_serves_that_job(
+    tmp_path: Path,
+    servers: type[_Server],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     store = JobStore(tmp_path)
     source = tmp_path / "a.mp4"
     source.write_bytes(b"x")
-    manifest = store.create(source)
-
-    class _Immediate:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        token = None
-
-        def start(self) -> str:
-            return "http://127.0.0.1:9"
-
-        def wait(self) -> None:
-            return
-
-        def stop(self) -> None:
-            return
-
-    monkeypatch.setattr("super_processor.cli.ReviewServer", _Immediate)
-    code = run_review_command(
-        argparse.Namespace(jobs_dir=tmp_path, job_id=manifest.job_id)
-    )
+    job_id = store.create(source).job_id
+    monkeypatch.setattr(_Server, "token", None)
+    code = run_review_command(argparse.Namespace(jobs_dir=tmp_path, job_id=job_id))
     assert code == 0
+    (server,) = servers.made
+    assert server.args == (store.job_dir(job_id),)
+    assert server.kwargs == {"jobs_dir": store.root, "job_id": job_id}
+    # A split review page has no token to print.
+    assert capsys.readouterr().out.splitlines() == ["http://127.0.0.1:9"]
 
 
-def test_render_get_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from super_processor.gemini import GeminiClient
+def test_review_of_an_unknown_job_fails_before_serving(
+    tmp_path: Path, servers: type[_Server]
+) -> None:
+    with pytest.raises(JobError):
+        run_review_command(argparse.Namespace(jobs_dir=tmp_path, job_id="nope"))
+    assert servers.made == []
 
-    payload = {
-        "highlights": [],
-        "layouts": [
-            {
-                "segment_count": 1,
-                "summary": "one",
-                "segments": [
-                    {
-                        "start_s": 0,
-                        "end_s": 10,
-                        "label": "x",
-                        "issues": ["noisy"],
-                    }
-                ],
-            }
-        ],
-    }
-    transport = _FakeTransport(payload)
-    gemini = GeminiClient(api_key="k", transport=transport)
-    controller = WizardController(tmp_path, gemini=gemini)
 
-    def _noop_render() -> None:
-        state = WizardState(step=WizardStep.DONE)
-        save_session_state(tmp_path, state)
+def test_ctrl_c_stops_the_server_cleanly(
+    tmp_path: Path, servers: type[_Server], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_Server, "interrupt", True)
+    code = run_review_command(argparse.Namespace(jobs_dir=tmp_path, job_id=None))
+    assert code == 0
+    (server,) = servers.made
+    assert server.calls == ["start", "wait", "stop"]
 
-    monkeypatch.setattr(controller, "run_render", _noop_render)
+
+def test_render_run_link_starts_the_render_only_on_the_render_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = WizardController(tmp_path)
+    renders: list[WizardStep] = []
+
+    def _fake_render() -> None:
+        renders.append(controller.current_state().step)
+        save_session_state(tmp_path, WizardState(step=WizardStep.DONE))
+
+    monkeypatch.setattr(controller, "run_render", _fake_render)
     server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
+        # The removed enhance step's run link is gone.
         with pytest.raises(HTTPError) as retired:
             urlopen(base + f"/enhance?run=1&token={TOKEN}")
         assert retired.value.code == 404
         retired.value.close()
-        state = WizardState(step=WizardStep.RENDERING)
-        save_session_state(tmp_path, state)
+        # On any other step the link only shows the page.
+        save_session_state(tmp_path, WizardState(step=WizardStep.PICK_FILE))
+        with urlopen(base + f"/render?run=1&token={TOKEN}") as response:
+            response.read()
+        assert controller.wait_idle(timeout=10) and renders == []
+        save_session_state(tmp_path, WizardState(step=WizardStep.RENDERING))
         with urlopen(base + f"/render?run=1&token={TOKEN}") as response:
             response.read()
         assert controller.wait_idle(timeout=10)
+        assert renders == [WizardStep.RENDERING]
         with urlopen(base + "/") as response:
-            assert "Done" in response.read().decode()
+            assert "<h1>Done</h1>" in response.read().decode()
     finally:
         server.stop()
-
-
-def test_result_revise_returns_to_split(tmp_path: Path) -> None:
-    controller = WizardController(tmp_path)
-    source = tmp_path / "x.mp4"
-    source.write_bytes(b"x")
-    manifest = controller.store.create(source)
-    job_dir = controller.store.job_dir(manifest.job_id)
-    state = WizardState(step=WizardStep.RESULT, job_id=manifest.job_id)
-    save_job_wizard_state(job_dir, state)
-    save_session_state(tmp_path, state)
-    controller.handle_post("/result", {"mood": ["revise"]})
-    assert controller.current_state().step is WizardStep.RESULT
-    assert controller.current_state().error

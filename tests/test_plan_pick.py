@@ -47,10 +47,13 @@ def test_one_look_group_shares_a_single_treatment() -> None:
 
 
 def test_a_large_timeline_still_returns_distinct_plans() -> None:
+    # 3**8 assignments is past the enumeration limit, so this takes the
+    # hill-climb path.
     segments = [_segment(index, "low_light", index) for index in range(8)]
     plans = choose_plans(segments)
     assert len(plans) == 5
     assert len({_ids(plan) for plan in plans}) == 5
+    assert assignment_score(segments, plans[0]) == 8.0
     first = _ids(plans[0])
     second = _ids(plans[1])
     assert all(left != right for left, right in zip(first, second, strict=True))
@@ -60,3 +63,21 @@ def test_a_look_group_with_two_problems_is_refused() -> None:
     segments = [_segment(0, "low_light", 0), _segment(1, "noisy", 0)]
     with pytest.raises(TreatmentError, match="more than one problem"):
         choose_plans(segments)
+
+
+def test_the_hill_climb_keeps_look_groups_together() -> None:
+    # Nine groups of two: 3**9 assignments, so the bounded search runs.
+    segments = [_segment(index, "low_light", index // 2) for index in range(18)]
+    plans = choose_plans(segments)
+    assert len(plans) == 5
+    for plan in plans:
+        for left in range(0, 18, 2):
+            assert plan[left].treatment_id == plan[left + 1].treatment_id
+
+
+def test_plan_limit_and_empty_timeline() -> None:
+    segments = [_segment(0, "noisy", 0), _segment(1, "low_contrast", 1)]
+    assert len(choose_plans(segments, limit=2)) == 2
+    assert choose_plans([]) == []
+    with pytest.raises(TreatmentError, match="positive"):
+        choose_plans(segments, limit=0)

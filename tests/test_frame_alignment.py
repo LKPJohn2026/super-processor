@@ -288,11 +288,24 @@ def test_releasing_the_gpu_returns_freed_heap(monkeypatch: pytest.MonkeyPatch) -
 
 def test_no_libc_trim_is_fine(monkeypatch: pytest.MonkeyPatch) -> None:
     import ctypes
+    import ctypes.util
+    import sys
 
     import super_processor.upscale as up
 
+    tried: list[str] = []
+
     def missing(name: str) -> object:
+        tried.append(name)
         raise OSError("no libc here")
 
+    # On Linux, so the trim is really attempted (and fails) on every runner.
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: "libc.so.6")
     monkeypatch.setattr(ctypes, "CDLL", missing)
     up._release_gpu(None)
+    assert tried == ["libc.so.6"]
+    # Elsewhere there is nothing to trim, and nothing is loaded.
+    monkeypatch.setattr(sys, "platform", "darwin")
+    up._release_gpu(None)
+    assert tried == ["libc.so.6"]

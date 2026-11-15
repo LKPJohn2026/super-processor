@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from super_processor.gemini import (
+    GeminiClient,
     GeminiError,
     config_dir,
     credentials_path,
@@ -90,6 +91,39 @@ def test_empty_or_unsavable_key_is_refused(
     with pytest.raises(GeminiError, match="could not save the API key"):
         store_gemini_api_key("AIza-key")
     assert "GEMINI_API_KEY" not in os.environ
+
+
+def test_a_failed_save_keeps_the_old_key_and_no_half_file(
+    _own_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    path = store_gemini_api_key("AIza-old-key")
+    monkeypatch.delenv("GEMINI_API_KEY")
+
+    def full_disk(_src: object, _dst: object) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr("super_processor.gemini.os.replace", full_disk)
+    with pytest.raises(GeminiError, match="No space left"):
+        store_gemini_api_key("AIza-new-key")
+    # The saved key is untouched, the temporary file is gone, and this
+    # process does not start using a key that was never saved.
+    assert [p.name for p in _own_config_dir.iterdir()] == ["credentials.json"]
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "gemini_api_key": "AIza-old-key"
+    }
+    assert "GEMINI_API_KEY" not in os.environ
+
+
+def test_the_client_uses_the_saved_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(GeminiError, match="paste a key"):
+        GeminiClient()
+    store_gemini_api_key("AIza-saved")
+    monkeypatch.delenv("GEMINI_API_KEY")
+    assert GeminiClient().api_key == "AIza-saved"
+    monkeypatch.setenv("GEMINI_API_KEY", " AIza-env ")
+    assert GeminiClient().api_key == "AIza-env"
 
 
 @pytest.mark.parametrize(

@@ -42,3 +42,22 @@ def test_short_frame_is_refused() -> None:
 
     with pytest.raises(SegmentError, match="short frame"):
         sample_from_reader(5.0, read_frame)
+
+
+def test_a_row_reads_clipping_and_the_upper_third_from_the_frame() -> None:
+    # Top third white, the rest black, then bytes past the frame that the
+    # sampler must ignore.
+    upper = SAMPLE_WIDTH * (SAMPLE_HEIGHT // 3)
+    frame = b"\xff" * upper + b"\x00" * (PIXELS - upper) + b"\x80" * 500
+
+    def read_frame(_time_s: float) -> tuple[bytes, tuple[float, float, float]]:
+        return frame, (100.0, 100.0, 100.0)
+
+    (row, *_rest) = sample_from_reader(5.0, read_frame)
+    assert row.upper_luma == pytest.approx(255.0)
+    assert row.luma_mean == pytest.approx(85.0)
+    assert row.clip_high == pytest.approx(1 / 3)
+    assert row.clip_low == pytest.approx(2 / 3)
+    assert (row.luma_p05, row.luma_p95) == (0.0, 255.0)
+    # Neutral gray means no blue-red cast.
+    assert row.rb_cast == 0.0

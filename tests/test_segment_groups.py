@@ -26,3 +26,9 @@ def test_a_different_problem_or_context_starts_a_new_group() -> None:
 
 def test_empty_label_list() -> None:
     assert look_group_ids([]) == []
+
+
+def test_a_look_that_comes_back_later_gets_a_new_group() -> None:
+    # Groups are runs of neighbours: a returning look is graded on its own.
+    labels = [("indoor", "noisy"), ("outdoor", "too_warm"), ("indoor", "noisy")]
+    assert look_group_ids(labels) == [0, 1, 2]

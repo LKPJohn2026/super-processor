@@ -59,7 +59,11 @@ class SampleRow:
                     raise SegmentError(f"sample missing {key}")
                 return default
             value = data[key]
-            if isinstance(value, bool) or not isinstance(value, int | float):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+            ):
                 raise SegmentError(f"sample {key} must be numeric")
             return float(value)
 
@@ -369,7 +373,10 @@ def load_samples(job_dir: Path) -> list[SampleRow]:
     path = samples_path(job_dir)
     if not path.is_file():
         raise SegmentError(f"samples not found: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise SegmentError(f"samples file is not valid JSON: {path}") from exc
     if not isinstance(data, dict):
         raise SegmentError("samples root must be an object")
     raw_rows = data.get("samples")
@@ -495,8 +502,14 @@ class TimelineSegment:
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> TimelineSegment:
         def num(key: str) -> float:
+            if key not in data:
+                raise SegmentError(f"segment missing {key}")
             value = data[key]
-            if isinstance(value, bool) or not isinstance(value, int | float):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+            ):
                 raise SegmentError(f"segment {key} must be numeric")
             return float(value)
 
@@ -640,7 +653,10 @@ def load_segments(job_dir: Path) -> list[TimelineSegment]:
     path = segments_path(job_dir)
     if not path.is_file():
         raise SegmentError(f"segments not found: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise SegmentError(f"segments file is not valid JSON: {path}") from exc
     if not isinstance(data, dict):
         raise SegmentError("segments root must be an object")
     if data.get("kind") == WIZARD_SEGMENTS_KIND:

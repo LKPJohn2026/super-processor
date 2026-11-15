@@ -71,6 +71,38 @@ def test_look_filters_follow_the_fixed_order() -> None:
     assert "[mix]" not in blend_filter(320, 180, 0.5)
 
 
+def test_look_values_scale_the_filter_settings() -> None:
+    # The filter numbers are the contract with FFmpeg: a slider at 1.0 is
+    # the strongest allowed setting, at 0.5 half of it.
+    full = ShotLook(deblock=1.0, denoise=1.0)
+    assert full.clean_filter() == (
+        "deblock=filter=strong:block=8:alpha=0.2000:beta=0.1300"
+        ":gamma=0.1300:delta=0.1300,hqdn3d=6.000:4.500:6.000:4.500"
+    )
+    assert ShotLook(denoise=0.5).clean_filter() == "hqdn3d=3.000:2.250:3.000:2.250"
+    assert ShotLook(saturation=0.8).finish_filter() == (
+        "eq=contrast=1.0000:brightness=0.0000:saturation=0.8000:gamma=1.0000,"
+        "format=yuv420p,limiter=min=16:max=235:planes=1,"
+        "limiter=min=16:max=240:planes=6"
+    )
+    assert (
+        ShotLook(grain=1.0)
+        .finish_filter()
+        .startswith("noise=alls=12:allf=t:all_seed=1,")
+    )
+    # Grain that rounds to zero strength changes nothing, so no filters at all.
+    assert ShotLook(grain=0.04).finish_filter() == ""
+
+
+def test_look_bounds_are_inclusive_and_numbers_are_stored_as_floats() -> None:
+    edge = ShotLook(contrast=1.3, brightness=-0.1, saturation=0.7, gamma=1.25)
+    assert edge.contrast == 1.3 and edge.gamma == 1.25
+    whole = ShotLook(contrast=1, deblock=1)
+    assert isinstance(whole.contrast, float) and isinstance(whole.deblock, float)
+    assert ShotLook(contrast=1).is_neutral()
+    assert ShotLook.from_dict(whole.to_dict()) == whole
+
+
 def test_span_stores_its_look_and_old_plans_still_load(tmp_path: Path) -> None:
     span = UpscaleSpan(0, 4, look=BRIGHT)
     assert UpscaleSpan.from_dict(span.to_dict()) == span

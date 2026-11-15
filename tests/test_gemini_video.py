@@ -6,6 +6,9 @@ import json
 import shutil
 import subprocess
 import sys
+import time
+from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +131,7 @@ def test_a_scale_not_offered_is_dropped(answer: Any) -> None:
     assert out["scale_reason"] == ""
 
 
-def test_stills_alone_ask_no_scale() -> None:
+def test_segments_need_the_video_or_stills_before_any_call() -> None:
     transport = _Transport(
         {"segments": [{"start_s": 0, "end_s": 9, "label": "x", "contains": []}]}
     )
@@ -163,15 +166,96 @@ def test_each_shot_gets_its_stretch_of_the_video(tmp_path: Path) -> None:
     assert "stretch of the video" in parts[0]["text"]
 
 
+def test_a_shot_without_an_end_is_watched_to_the_end(tmp_path: Path) -> None:
+    still = tmp_path / "s.jpg"
+    still.write_bytes(b"\xff\xd8jpeg")
+    transport = _Transport({"scale": 2, "shots": []})
+    client = GeminiClient(api_key="k", transport=transport)
+    client.propose_looks(
+        shots=[{"index": 0, "start_s": 4.0}],
+        stills=[still],
+        bounds={"denoise": (0.0, 1.0, 0.0)},
+        scales=(1, 2),
+        protected_strength=0.25,
+        video=VIDEO,
+    )
+    parts = transport.bodies[-1]["contents"][-1]["parts"]
+    clip = next(part for part in parts if "fileData" in part)
+    assert clip["videoMetadata"] == {"fps": 1.0, "startOffset": "4.000s"}
+    assert "denoise 0 to 1 (no change at 0)" in parts[0]["text"]
+    assert "capped at strength 0.25" in parts[0]["text"]
+    assert "from [1, 2]" in parts[0]["text"]
+
+
+def test_looks_without_the_video_send_only_stills(tmp_path: Path) -> None:
+    still = tmp_path / "s.jpg"
+    still.write_bytes(b"\xff\xd8jpeg")
+    transport = _Transport({"scale": 2, "shots": []})
+    client = GeminiClient(api_key="k", transport=transport)
+    client.propose_looks(
+        shots=[{"index": 0}],
+        stills=[still],
+        bounds={},
+        scales=(2,),
+        protected_strength=0.3,
+        job_dir=tmp_path,
+    )
+    body = transport.bodies[-1]
+    assert not _has_video(body)
+    assert "stretch of the video" not in body["contents"][-1]["parts"][0]["text"]
+    turns = json.loads((tmp_path / "gemini_chat.json").read_text())["turns"]
+    assert [turn["role"] for turn in turns] == ["user", "model"]
+
+
+def test_looks_refuse_a_missing_still_and_an_empty_reply(tmp_path: Path) -> None:
+    still = tmp_path / "s.jpg"
+    still.write_bytes(b"\xff\xd8jpeg")
+    transport = _Transport({"scale": 2})
+    client = GeminiClient(api_key="k", transport=transport)
+    ask: dict[str, Any] = {"bounds": {}, "scales": (2,), "protected_strength": 0.3}
+    with pytest.raises(GeminiError, match="one still per shot"):
+        client.propose_looks(shots=[{}, {}], stills=[still], **ask)
+    assert not transport.bodies
+    with pytest.raises(GeminiError, match="no shot recipes"):
+        client.propose_looks(shots=[{}], stills=[still], job_dir=tmp_path, **ask)
+    # A reply without recipes is not kept for the next call to replay.
+    assert not (tmp_path / "gemini_chat.json").exists()
+
+
+def test_a_lost_upload_is_not_alive() -> None:
+    class _Gone(_Transport):
+        def get_file(self, *, api_key: str, name: str) -> Any:
+            raise GeminiError("Gemini HTTP 404: not found", status=404)
+
+    assert not GeminiClient(api_key="k", transport=_Gone({})).video_alive(VIDEO)
+    still_processing = _Transport({}, states=["PROCESSING"])
+    assert not GeminiClient(api_key="k", transport=still_processing).video_alive(VIDEO)
+
+
+def test_an_upload_without_an_address_is_an_error(tmp_path: Path) -> None:
+    class _NoUri(_Transport):
+        def _file(self) -> dict[str, Any]:
+            return {"name": "files/abc", "state": "ACTIVE"}
+
+    client = GeminiClient(api_key="k", transport=_NoUri({}))
+    with pytest.raises(GeminiError, match="without a name or address"):
+        client.upload_video(tmp_path / "copy.mp4")
+
+
 def test_upload_waits_until_the_file_is_active(tmp_path: Path) -> None:
     copy = tmp_path / "copy.mp4"
     copy.write_bytes(b"video")
     transport = _Transport({}, states=["PROCESSING", "PROCESSING", "ACTIVE"])
     client = GeminiClient(api_key="k", transport=transport)
     naps: list[float] = []
-    video = client.upload_video(copy, sleep=naps.append)
+    seen: list[float] = []
+    video = client.upload_video(copy, sleep=naps.append, on_progress=seen.append)
+    assert transport.uploaded == [copy]
+    assert seen == [0.5, 1.0]
+    assert video.name == "files/abc"
     assert video.uri == "https://example.test/files/abc"
-    assert len(naps) == 2
+    # One poll per PROCESSING answer, each after the poll interval.
+    assert naps == [2.0, 2.0]
     assert video.expires_at == pytest.approx(
         _parse_expiry("2026-11-14T10:00:00.123456Z")
     )
@@ -204,11 +288,47 @@ def test_a_transport_without_files_cannot_upload(tmp_path: Path) -> None:
 def test_video_parts_and_expiry_helpers() -> None:
     assert video_part(VIDEO, start_s=-1.0)["videoMetadata"]["startOffset"] == "0.000s"
     assert _parse_expiry("not a time") == 0.0
+    assert _parse_expiry("2026-11-14T10:00:00Z") - _parse_expiry(
+        "2026-11-14T09:00:00Z"
+    ) == pytest.approx(3600)
     assert _parse_expiry(None) == 0.0
     assert GeminiVideo.from_dict(VIDEO.to_dict()) == VIDEO
     assert GeminiVideo.from_dict({"name": 1}) is None
     assert VIDEO.usable(now=2e9 - 7200)
     assert not VIDEO.usable(now=2e9 - 60)
+
+
+@pytest.fixture
+def _chicago_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Local time six hours behind UTC, so a dropped time zone shows."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("needs time.tzset")
+    monkeypatch.setenv("TZ", "America/Chicago")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.usefixtures("_chicago_time")
+def test_an_expiry_without_fractions_is_read_as_utc() -> None:
+    utc = datetime(2026, 11, 14, 10, tzinfo=timezone.utc).timestamp()
+    assert _parse_expiry("2026-11-14T10:00:00Z") == utc
+
+
+@pytest.mark.usefixtures("_chicago_time")
+def test_gemini_s_nanosecond_expiry_is_read_as_utc() -> None:
+    utc = datetime(2026, 11, 14, 10, tzinfo=timezone.utc).timestamp()
+    assert _parse_expiry("2026-11-14T10:00:00.123456789Z") == pytest.approx(
+        utc + 0.123456
+    )
+
+
+@pytest.mark.usefixtures("_chicago_time")
+def test_a_fractional_expiry_keeps_its_offset() -> None:
+    utc = datetime(2026, 11, 14, 10, tzinfo=timezone.utc).timestamp()
+    assert _parse_expiry("2026-11-14T15:30:00.5+05:30") == pytest.approx(utc + 0.5)
+    assert _parse_expiry("2026-11-14T04:00:00.25-06:00") == pytest.approx(utc + 0.25)
 
 
 def _clip(path: Path, size: str = "320x180", audio: bool = True) -> Path:

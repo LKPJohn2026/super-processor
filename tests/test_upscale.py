@@ -98,19 +98,34 @@ def test_a_plan_saved_at_4x_renders_at_2x(tmp_path: Path) -> None:
         UpscaleSpan.from_dict(old | {"scale": 3})
 
 
-def test_plan_roundtrip_and_chunks(tmp_path: Path) -> None:
+def test_a_saved_plan_loads_back_unchanged(tmp_path: Path) -> None:
     span = default_span(12)
-    assert span.scale == 2
-    assert span.strength == 0.5
-    plan = UpscalePlan(spans=(span,))
+    assert span == UpscaleSpan(0.0, 12.0, scale=2, strength=0.5)
+    plan = UpscalePlan(
+        spans=(
+            UpscaleSpan(0, 4, look=ShotLook(denoise=0.4), use_upscale=False),
+            UpscaleSpan(4, 12, scale=2, strength=0.8),
+        ),
+        pending=UpscaleSpan(4, 12, strength=0.8),
+    )
     save_upscale_plan(tmp_path, plan)
-    loaded = load_upscale_plan(tmp_path)
-    assert loaded is not None
-    assert loaded.spans[0].end_s == 12
-    chunks = planned_chunks(20)
-    assert len(chunks) >= 2
-    assert chunks[0].end_s - chunks[0].start_s <= 8.05
-    assert chunks[-1].end_s == 20
+    # Every field survives, the look and the pass-through flag included.
+    assert load_upscale_plan(tmp_path) == plan
+
+
+def test_long_clips_split_into_overlapping_eight_second_chunks() -> None:
+    def edges(duration: float) -> list[tuple[float, float]]:
+        return [(span.start_s, span.end_s) for span in planned_chunks(duration)]
+
+    assert edges(4) == [(0.0, 4.0)]
+    assert edges(8) == [(0.0, 8.0)]
+    # 7.5 s steps, so each chunk shares half a second with the one before.
+    assert edges(20) == [(0.0, 8.0), (7.5, 15.5), (15.0, 20.0)]
+    # A last chunk would be under 0.05 s: the one before already reaches it.
+    assert edges(15.55) == [(0.0, 8.0), (7.5, 15.5)]
+    assert {span.strength for span in planned_chunks(20, strength=0.2)} == {0.2}
+    with pytest.raises(UpscaleError, match="no duration"):
+        planned_chunks(0)
 
 
 def test_latest_revision_roundtrip_and_legacy_plans(tmp_path: Path) -> None:
@@ -148,27 +163,74 @@ def test_latest_revision_is_requested_patch_not_render_sentinel(
         assert (updated.pending.start_s, updated.pending.end_s) == (0, 6)
 
 
-def test_replace_overlapping_keeps_scale_and_range() -> None:
-    plan = UpscalePlan(spans=(default_span(12),))
-    updated = replace_overlapping(plan, UpscaleSpan(2, 5, scale=2, strength=0.2), 12)
+def test_a_patch_over_the_whole_clip_replaces_every_shot() -> None:
+    plan = UpscalePlan(spans=(UpscaleSpan(0, 5), UpscaleSpan(5, 12, strength=0.9)))
+    # Past the end: clamped to the clip, so it covers all of it.
+    full = replace_overlapping(plan, UpscaleSpan(0, 99, scale=1, strength=0.4), 12)
+    assert full.spans == (UpscaleSpan(0, 12, scale=1, strength=0.4),)
+    assert full.pending == full.spans[0]
+    assert clamp_span(UpscaleSpan(0, 99), 12) == UpscaleSpan(0, 12)
+    # A start past the end keeps a tenth of a second inside the clip.
+    assert clamp_span(UpscaleSpan(50, 99), 12) == UpscaleSpan(11.9, 12)
+
+
+def test_a_result_note_inside_one_shot_splices_that_shots_own_look() -> None:
+    bright = ShotLook(brightness=0.05)
+    plan = UpscalePlan(
+        spans=(UpscaleSpan(0, 3, look=bright), UpscaleSpan(3, 6, strength=0.3))
+    )
+    updated = replace_overlapping(
+        plan, UpscaleSpan(1, 2, strength=0.9), 6, preserve_shot_settings=True
+    )
+    # Only the strength changes; the range keeps the look of the shot under it,
+    # so the splice is not rendered with the note's neutral look.
+    assert updated.pending == UpscaleSpan(1, 2, strength=0.9, look=bright)
+    assert sorted((s.start_s, s.end_s, s.strength, s.look) for s in updated.spans) == [
+        (0.0, 1.0, 0.5, bright),
+        (1.0, 2.0, 0.9, bright),
+        (2.0, 3.0, 0.5, bright),
+        (3.0, 6.0, 0.3, ShotLook()),
+    ]
+
+
+def test_a_result_note_across_shots_renders_every_shot_again() -> None:
+    plan = UpscalePlan(spans=(UpscaleSpan(0, 3), UpscaleSpan(3, 6, strength=0.3)))
+    updated = replace_overlapping(
+        plan, UpscaleSpan(2, 4, strength=0.9), 6, preserve_shot_settings=True
+    )
+    # Two recipes cannot go through one range splice.
     assert updated.pending is not None
-    assert updated.pending.strength == 0.2
-    full = replace_overlapping(plan, UpscaleSpan(0, 12, scale=1, strength=0.4), 12)
-    assert full.spans[0].scale == 1
-    clamped = clamp_span(UpscaleSpan(0, 99, scale=2, strength=0.5), 12)
-    assert clamped.end_s == 12
+    assert (updated.pending.start_s, updated.pending.end_s) == (0.0, 6.0)
+    assert [(s.start_s, s.end_s, s.strength) for s in updated.spans] == [
+        (0.0, 2.0, 0.5),
+        (4.0, 6.0, 0.3),
+        (2.0, 3.0, 0.9),
+        (3.0, 4.0, 0.9),
+    ]
 
 
-def test_release_gpu_moves_the_pipeline_to_cpu() -> None:
+def test_a_result_note_outside_every_shot_is_refused() -> None:
+    plan = UpscalePlan(spans=(UpscaleSpan(0, 3),))
+    with pytest.raises(UpscaleError, match="does not overlap the plan"):
+        replace_overlapping(plan, UpscaleSpan(4, 5), 6, preserve_shot_settings=True)
+
+
+def test_release_gpu_moves_the_model_to_cpu() -> None:
     moved: list[str] = []
 
-    class _Pipe:
-        def to(self, device: str) -> _Pipe:
+    class _Model:
+        def to(self, device: str) -> _Model:
             moved.append(device)
             return self
 
-    _release_gpu(_Pipe())
+    class _Stuck:
+        def to(self, device: str) -> None:
+            raise RuntimeError("CUDA error: device lost")
+
+    _release_gpu(_Model())
     assert moved == ["cpu"]
+    # A model that cannot move still lets the release finish.
+    _release_gpu(_Stuck())
 
 
 def test_bad_plan_and_span_shapes() -> None:
@@ -209,32 +271,37 @@ def _tiny(path: Path, seconds: int = 6) -> None:
 
 
 @needs_ffmpeg
-def test_fake_engine_range_splice(tmp_path: Path) -> None:
+def test_a_revise_reports_the_keyframe_range_it_splices(tmp_path: Path) -> None:
     source = tmp_path / "in.mp4"
     _tiny(source, seconds=6)
     engine = FakeUpscaleEngine()
     output = tmp_path / "output.mp4"
-    span = default_span(6)
-    apply_range_revise(
-        source,
-        output,
-        span,
-        output,
-        engine=engine,
-        duration_s=6,
-    )
-    assert output.is_file()
-    revised = UpscaleSpan(2, 4, scale=2, strength=0.2)
-    apply_range_revise(
-        source,
-        output,
-        revised,
-        output,
-        engine=engine,
-        duration_s=6,
-    )
-    assert output.is_file()
-    assert output.stat().st_size > 0
+    ranges: list[tuple[float, float]] = []
+
+    def revise(span: UpscaleSpan) -> None:
+        apply_range_revise(
+            source,
+            output,
+            span,
+            output,
+            engine=engine,
+            duration_s=6,
+            on_revise_range=lambda start, end: ranges.append((start, end)),
+        )
+
+    # No output yet: a full render, which has no range to report.
+    revise(UpscaleSpan(2.3, 3.6))
+    assert ranges == []
+    assert video_stream_facts(output) == (60, "10/1")
+    revise(UpscaleSpan(2.3, 3.6, strength=0.2))
+    # Widened out to the keyframes the delivery puts every second.
+    assert ranges == [(2.0, 4.0)]
+    # A range that runs to the end reports the clip's end, not None.
+    revise(UpscaleSpan(4.5, 5.9, strength=0.2))
+    assert ranges[-1] == (4.0, 6.0)
+    assert video_stream_facts(output) == (60, "10/1")
+    assert _frame_size_of(output) == (320, 180)
+    assert is_delivery(output)
 
 
 def test_scale_change_on_a_range_rerenders_the_whole_clip() -> None:
@@ -266,7 +333,15 @@ def test_snap_to_keyframes_widens_outward() -> None:
     keys = [0.0, 1.0, 2.0, 3.0, 4.0]
     assert snap_to_keyframes(keys, 1.4, 2.6, 5.0) == (1.0, 3.0)
     assert snap_to_keyframes(keys, 2.0, 3.0, 5.0) == (2.0, 3.0)
+    # A key a hair after the asked time still counts (timestamps are rounded).
+    assert snap_to_keyframes(keys, 1.99, 3.01, 5.0) == (2.0, 3.0)
     assert snap_to_keyframes(keys, 0.02, 4.5, 5.0) == (0.0, None)
+    # A keyframe at the very end is the end: there is no tail to copy.
+    assert snap_to_keyframes([*keys, 4.98], 1.5, 4.5, 5.0) == (1.0, None)
+    # A first keyframe a few ms in is the start: there is no head to copy.
+    assert snap_to_keyframes([0.04, 1.0, 2.0], 0.5, 1.5, 5.0) == (0.0, 2.0)
+    # No keyframe info at all: the whole clip.
+    assert snap_to_keyframes([], 1.5, 2.5, 5.0) == (0.0, None)
 
 
 def _moving(path: Path, seconds: int = 12) -> None:
@@ -890,13 +965,6 @@ def test_many_blocks_keep_the_frame_order(
     assert all(a < b for a, b in zip(seen, seen[1:], strict=False))
 
 
-def test_blocks_hold_a_fixed_number_of_input_bytes() -> None:
-    assert upscale.block_frames(640, 480) == 291
-    assert upscale.block_frames(1440, 1080) == 57
-    # A frame larger than a block still goes one at a time.
-    assert upscale.block_frames(100_000, 1000) == 1
-
-
 @needs_ffmpeg
 def test_the_decoder_applies_the_clean_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -984,7 +1052,7 @@ def test_span_output_is_a_delivery_the_caller_only_renames(
     assert _frame_hashes(final) == before
 
 
-def test_a_version_1_delivery_is_not_a_delivery(tmp_path: Path) -> None:
+def test_a_marker_from_an_older_version_is_not_a_delivery(tmp_path: Path) -> None:
     video = tmp_path / "out.mp4"
     video.write_bytes(b"picture")
     marker = upscale.delivery_marker_path(video)
@@ -995,9 +1063,16 @@ def test_a_version_1_delivery_is_not_a_delivery(tmp_path: Path) -> None:
     old = {key: value for key, value in current.items() if key != "preset"}
     marker.write_text(json.dumps(old | {"version": 1}), encoding="utf-8")
     assert not is_delivery(video)
+    # Version 2 had every key version 3 has, so only the version tells.
+    marker.write_text(json.dumps(current | {"version": 2}), encoding="utf-8")
+    assert not is_delivery(video)
     marker.write_text("[]", encoding="utf-8")
     assert not is_delivery(video)
     marker.write_text("{broken", encoding="utf-8")
+    assert not is_delivery(video)
+    # A marker whose video is gone marks nothing.
+    marker.write_text(json.dumps(current), encoding="utf-8")
+    video.unlink()
     assert not is_delivery(video)
 
 
@@ -1468,3 +1543,156 @@ def test_rendered_scale_reads_the_sizes(tmp_path: Path) -> None:
         check=True,
     )  # fmt: skip
     assert rendered_scale(source, odd) is None
+
+
+@needs_ffmpeg
+def test_joined_shots_with_a_frame_missing_leave_the_output_alone(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "in.mp4"
+    _moving(source, seconds=6)
+    output = tmp_path / "out" / "output.mp4"
+    output.parent.mkdir()
+    output.write_bytes(b"previous render")
+    # Two shots that do not coalesce, each two frames short from the engine.
+    with pytest.raises(
+        UpscaleError,
+        match="joined shots have 140 frames instead of 144; the previous output",
+    ):
+        upscale.render_shots(
+            source,
+            output,
+            (UpscaleSpan(0, 3), UpscaleSpan(3, 6, strength=0.2)),
+            engine=_ShortEngine(),
+            duration_s=6,
+        )
+    assert output.read_bytes() == b"previous render"
+
+
+def _script(path: Path, body: str) -> str:
+    """A stand-in tool: a shell script that ignores its arguments."""
+    path.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
+needs_sh = pytest.mark.skipif(
+    sys.platform == "win32", reason="the stand-in tools are sh scripts"
+)
+
+
+@needs_ffmpeg
+def test_probes_of_a_file_that_is_not_a_video_raise_upscale_errors(
+    tmp_path: Path,
+) -> None:
+    junk = tmp_path / "junk.mp4"
+    junk.write_bytes(b"not a video")
+    with pytest.raises(UpscaleError, match="could not count the frames of .*junk"):
+        video_stream_facts(junk)
+    with pytest.raises(UpscaleError, match=r"\S"):
+        upscale.keyframe_times(junk)
+    missing = str(tmp_path / "no-ffprobe")
+    with pytest.raises(UpscaleError, match="failed to start ffprobe"):
+        video_stream_facts(junk, ffprobe_bin=missing)
+    with pytest.raises(UpscaleError, match="failed to start ffprobe"):
+        upscale.keyframe_times(junk, ffprobe_bin=missing)
+
+
+@needs_sh
+def test_keyframe_times_skip_lines_that_are_not_times(tmp_path: Path) -> None:
+    # ffprobe prints N/A for a frame without a timestamp, and a trailing comma
+    # with some builds; duplicates come from a stream listed twice.
+    lines = "1.500000,\\nN/A\\n\\n2.000000\\n0.000000\\nbad\\n2.0\\n"
+    probe = _script(tmp_path / "ffprobe", f"printf '{lines}'")
+    assert upscale.keyframe_times(tmp_path / "any.mp4", ffprobe_bin=probe) == [
+        0.0,
+        1.5,
+        2.0,
+    ]
+
+
+@needs_sh
+@pytest.mark.parametrize("watched", [False, True])
+def test_a_failed_ffmpeg_run_reports_its_own_error(
+    tmp_path: Path, watched: bool
+) -> None:
+    seen: list[float] = []
+
+    def run(command: list[str]) -> None:
+        if watched:
+            upscale._run_ffmpeg(command, on_progress=seen.append, total_frames=10)
+        else:
+            upscale._run_ffmpeg(command)
+
+    broken = _script(
+        tmp_path / "ffmpeg", "echo frame=5; echo 'Invalid data found' >&2; exit 1"
+    )
+    with pytest.raises(UpscaleError, match="^Invalid data found$"):
+        run([broken, "-i", "x"])
+    # Progress is read from FFmpeg's -progress lines while it runs.
+    assert seen == ([0.5] if watched else [])
+    with pytest.raises(UpscaleError, match="^ffmpeg failed$"):
+        run([_script(tmp_path / "quiet", "exit 3")])
+    with pytest.raises(UpscaleError, match="failed to start ffmpeg"):
+        run([str(tmp_path / "no-ffmpeg")])
+
+
+def _piped(width: int = 64, height: int = 48, frames: int = 3) -> upscale.FramesIn:
+    def feed(pipe: Any) -> None:
+        pipe.write(bytes(upscale.yuv420_frame_bytes(width, height) * frames))
+
+    return (width, height, "10/1", feed)
+
+
+@needs_sh
+def test_an_encoder_that_fails_after_its_input_publishes_nothing(
+    tmp_path: Path,
+) -> None:
+    # It reads every frame, then fails while finishing the file.
+    ffmpeg = _script(
+        tmp_path / "ffmpeg",
+        # A shell loop, not cat, drains stdin: CI's no-ffmpeg run has no PATH.
+        "while read -r _; do :; done; echo 'moov atom failed' >&2; exit 1",
+    )
+    dest = tmp_path / "out" / "clip.mp4"
+    dest.parent.mkdir()
+    dest.write_bytes(b"previous")
+    marker = upscale.delivery_marker_path(dest)
+    marker.write_text("{}", encoding="utf-8")
+    with pytest.raises(
+        UpscaleError, match="^encoding SPAN frames failed: moov atom failed$"
+    ):
+        encode_delivery(
+            None, dest, ffmpeg_bin=ffmpeg, blend_with=dest, frames_in=_piped()
+        )
+    assert dest.read_bytes() == b"previous"
+    # The old marker is gone, so nothing splices into a half-replaced file.
+    assert not marker.exists()
+    assert not list(dest.parent.glob("*.encoding.mp4"))
+    with pytest.raises(UpscaleError, match="failed to start ffmpeg"):
+        encode_delivery(
+            None,
+            dest,
+            ffmpeg_bin=str(tmp_path / "no-ffmpeg"),
+            blend_with=dest,
+            frames_in=_piped(),
+        )
+
+
+@needs_ffmpeg
+def test_a_piped_encode_is_a_delivery_with_every_frame(tmp_path: Path) -> None:
+    dest = tmp_path / "clip.mp4"
+    look = ShotLook(grain=0.2)
+    encode_delivery(
+        None,
+        dest,
+        blend_with=tmp_path / "base.mp4",
+        strength=0.4,
+        look=look,
+        frames_in=_piped(frames=12),
+    )
+    assert video_stream_facts(dest) == (12, "10/1")
+    assert is_delivery(dest)
+    marker = json.loads(upscale.delivery_marker_path(dest).read_text("utf-8"))
+    assert marker["blend"] == upscale._blend_record(0.4, ())
+    assert marker["look"] == look.to_dict()

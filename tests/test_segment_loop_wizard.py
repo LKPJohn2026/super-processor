@@ -202,10 +202,35 @@ def test_analyze_without_approved_segments_goes_back_to_pick(tmp_path: Path) -> 
     assert state.error is not None and "approved segments" in state.error
 
 
-def test_workers_start_only_on_their_steps(tmp_path: Path) -> None:
-    controller = WizardController(tmp_path / "jobs")
-    assert controller.start_segmenting() is False
-    assert controller.start_analyze() is False
+class _Crashing(_Gemini):
+    """A bug in the client: not a GeminiError, so nothing below catches it."""
+
+    def propose_segments(self, **kwargs: Any) -> list[dict[str, Any]]:
+        raise KeyError("segments")
+
+
+@needs_ffmpeg
+def test_a_crash_while_finding_segments_fails_the_job_and_goes_back_to_pick(
+    tmp_path: Path,
+) -> None:
+    from super_processor.jobs import JobState
+
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Crashing(),  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
+    controller.handle_post("/pick", {"path": [str(_clip(tmp_path / "in.mp4"))]})
+    job_id = controller.current_state().job_id
+    assert job_id
+    state = _run(controller, "start_segmenting")
+    # Not left on "Finding the segments" with a page that refreshes forever.
+    assert (state.step, state.job_id) == (WizardStep.PICK_FILE, None)
+    assert state.error == "Finding the segments failed: 'segments'"
+    assert state.progress is None
+    assert controller.store.load(job_id).state is JobState.FAILED
+    assert "Finding the segments failed" in controller.render()
 
 
 def test_old_shot_flow_states_go_back_to_pick() -> None:

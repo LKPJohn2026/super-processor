@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
 import subprocess
 from http.client import HTTPConnection
 from pathlib import Path
@@ -15,7 +16,11 @@ from urllib.request import Request, urlopen
 import pytest
 
 from super_processor.gemini import GeminiClient
-from super_processor.review import WizardServer, form_fields_from_body
+from super_processor.review import (
+    MAX_UPLOAD_BYTES,
+    WizardServer,
+    form_fields_from_body,
+)
 from super_processor.upscale import FakeUpscaleEngine
 from super_processor.wizard import WizardController, WizardError, WizardStep
 
@@ -329,5 +334,57 @@ def test_html_post_still_redirects(tmp_path: Path) -> None:
         with urlopen(request) as response:
             html = response.read().decode()
         assert "What type of LLM" in html
+    finally:
+        server.stop()
+
+
+def _upload(
+    base: str, headers: dict[str, str], body: bytes = b""
+) -> tuple[int, dict[str, Any]]:
+    connection = _connection(base)
+    connection.request("POST", "/api/upload", body=body, headers=headers)
+    response = connection.getresponse()
+    return response.status, json.loads(response.read().decode())
+
+
+def test_upload_refusals_save_nothing(tmp_path: Path) -> None:
+    controller = WizardController(tmp_path)
+    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
+    base = server.start()
+    named = {"X-Wizard-Token": TOKEN, "X-File-Name": "clip.mp4"}
+    uploads = tmp_path / "uploads"
+    try:
+        status, data = _upload(base, {**named, "Content-Length": "0"})
+        assert (status, data["error"]) == (411, "the upload needs a Content-Length")
+        # Refused from the header alone: the body is never read.
+        too_big = {**named, "Content-Length": str(MAX_UPLOAD_BYTES + 1)}
+        status, data = _upload(base, too_big)
+        assert (status, data["error"]) == (413, "the file is too large to upload")
+        # The token must be a header: a dropped file has no form to carry it.
+        status, _data = _upload(base, {"X-File-Name": "clip.mp4"}, b"x")
+        assert status == 403
+        with controller._work_lock:
+            status, data = _upload(base, named, b"x")
+        assert (status, data["error"]) == (409, "the last step is still running")
+
+        # A connection that ends early leaves no half file behind.
+        address = _connection(base)
+        with socket.create_connection((address.host, address.port)) as raw:
+            raw.sendall(
+                b"POST /api/upload HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                + f"X-Wizard-Token: {TOKEN}\r\n".encode()
+                + b"X-File-Name: clip.mp4\r\n"
+                b"Content-Length: 1000\r\n\r\n"
+                b"only ten b"
+            )
+            raw.shutdown(socket.SHUT_WR)
+            reply = b""
+            while chunk := raw.recv(65536):
+                reply += chunk
+        assert reply.split(b"\r\n", 1)[0].endswith(b" 400 Bad Request")
+        assert b"the upload stopped before the end" in reply
+        assert not uploads.exists() or list(uploads.iterdir()) == []
+        assert controller.current_state().step is WizardStep.INTRO
     finally:
         server.stop()

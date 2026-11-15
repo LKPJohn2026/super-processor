@@ -48,6 +48,12 @@ def test_heavy_denoise_beside_sharpen_is_penalized() -> None:
     ]
     assert chosen[0].steps[0].as_dict()["strength"] >= 0.5
     assert assignment_score(segments, chosen) == 1.5
+    # The clash counts whichever side the sharpen is on.
+    flipped = [_segment(0, "low_contrast", 0), _segment(1, "noisy", 1)]
+    assert assignment_score(flipped, chosen[::-1]) == 1.5
+    # Light denoise beside sharpen is fine.
+    gentle = [treatments_for("noisy")[0], chosen[1]]
+    assert assignment_score(segments, gentle) == 2.0
 
 
 def test_cooling_one_warm_neighbor_and_not_the_other_is_penalized() -> None:
@@ -61,6 +67,9 @@ def test_cooling_one_warm_neighbor_and_not_the_other_is_penalized() -> None:
         ),
     )
     assert assignment_score(segments, [cooled, untouched]) == 1.5
+    # Cooling both warm neighbors, even by different amounts, is consistent.
+    mild = treatments_for("too_warm")[1]
+    assert assignment_score(segments, [cooled, mild]) == 2.0
 
 
 def test_a_look_group_must_share_one_treatment() -> None:
@@ -68,3 +77,10 @@ def test_a_look_group_must_share_one_treatment() -> None:
     options = treatments_for("low_light")
     with pytest.raises(TreatmentError, match="look group"):
         assignment_score(segments, [options[0], options[1]])
+
+
+def test_a_treatment_for_another_problem_scores_nothing() -> None:
+    segments = [_segment(0, "noisy", 0)]
+    assert assignment_score(segments, [treatments_for("low_light")[0]]) == 0.0
+    with pytest.raises(TreatmentError, match="does not match"):
+        assignment_score(segments, [])

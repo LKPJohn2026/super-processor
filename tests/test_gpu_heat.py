@@ -69,7 +69,13 @@ def test_falls_back_to_the_older_field_names(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.parametrize(
-    "out", ["", "83, 498.5\n", "[N/A], 498.5, Active, Active, Active\n"]
+    "out",
+    [
+        "",
+        "83, 498.5\n",
+        "[N/A], 498.5, Active, Active, Active\n",
+        "83, [N/A], Active, Active, Active\n",
+    ],
 )
 def test_unreadable_answers_give_no_reading(
     monkeypatch: pytest.MonkeyPatch, out: str
@@ -79,6 +85,20 @@ def test_unreadable_answers_give_no_reading(
         {"clocks_event_reasons": (0, out), "clocks_throttle_reasons": (0, out)},
     )
     assert read_gpu_heat() is None
+
+
+def test_a_tool_that_refuses_both_field_names_gives_no_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked = _smi(
+        monkeypatch,
+        {
+            "clocks_event_reasons": (6, "No devices were found\n"),
+            "clocks_throttle_reasons": (6, "No devices were found\n"),
+        },
+    )
+    assert read_gpu_heat() is None
+    assert asked == ["clocks_event_reasons", "clocks_throttle_reasons"]
 
 
 def test_no_nvidia_tool_gives_no_reading(tmp_path: Path) -> None:
@@ -97,6 +117,7 @@ def test_a_hung_tool_gives_no_reading(monkeypatch: pytest.MonkeyPatch) -> None:
     ("recent", "heat", "noted"),
     [
         (0.8, HOT, True),  # exactly 20% slower at exactly 80 C
+        (0.5, GpuHeat(HOT_C - 0.1, 500.0, False), False),  # just under 80 C
         (0.5, THROTTLED, True),  # the driver slows a cooler GPU for heat
         (0.81, HOT, False),  # 19% slower is within the scene-to-scene spread
         (0.5, COOL, False),  # slower but cool: something else slowed it
@@ -114,25 +135,28 @@ def test_a_render_with_no_baseline_speed_is_never_slower() -> None:
     assert not slowing_from_heat(-0.1, -0.5, THROTTLED)
 
 
-def _render(watch: SlowdownWatch, start: float, stop: float, rate: float) -> float:
+def _render(
+    watch: SlowdownWatch, start: float, stop: float, rate: float, done: float
+) -> float:
     """Feed progress every 5 s from ``start`` to ``stop`` seconds at ``rate``
-    of the render per second, continuing from the last share done."""
-    done = getattr(watch, "_done", WARMUP_DONE)
+    of the render per second, from ``done``; the share done after."""
     now = start
     while now <= stop:
         watch.progress(now, done)
         done += rate * 5
         now += 5
-    watch._done = done  # type: ignore[attr-defined]
     return done
 
 
 def test_notes_once_when_the_render_slows_while_hot() -> None:
     watch = SlowdownWatch()
     watch.heat(HOT)
-    _render(watch, 0, WINDOW_S * 2, 0.001)
+    done = _render(watch, 0, WINDOW_S * 2, 0.001, WARMUP_DONE)
     assert watch.note() is None  # steady speed
-    _render(watch, WINDOW_S * 2 + 5, WINDOW_S * 4, 0.0007)
+    assert watch.recent_rate() == pytest.approx(0.001)
+    _render(watch, WINDOW_S * 2 + 5, WINDOW_S * 4, 0.0007, done)
+    # The recent speed is the last minute's alone, not the whole render's.
+    assert watch.recent_rate() == pytest.approx(0.0007)
     assert watch.note() == UNDERVOLT_NOTE
     assert watch.note() is None  # only once per render
 
@@ -143,8 +167,8 @@ def test_no_note_while_the_gpu_is_cool_or_unread() -> None:
     cool.heat(COOL)
     cool.heat(None)  # a failed reading keeps the last good one
     for watch in (unread, cool):
-        _render(watch, 0, WINDOW_S * 2, 0.001)
-        _render(watch, WINDOW_S * 2 + 5, WINDOW_S * 4, 0.0005)
+        done = _render(watch, 0, WINDOW_S * 2, 0.001, WARMUP_DONE)
+        _render(watch, WINDOW_S * 2 + 5, WINDOW_S * 4, 0.0005, done)
         assert watch.note() is None
 
 
@@ -155,9 +179,22 @@ def test_warm_up_and_a_short_render_set_no_baseline() -> None:
     watch.progress(0.0, 0.0)
     watch.progress(1.0, WARMUP_DONE / 2)
     assert watch.recent_rate() is None
-    _render(watch, 2, WINDOW_S / 2, 0.001)
+    _render(watch, 2, WINDOW_S / 2, 0.001, WARMUP_DONE)
     assert watch.note() is None  # under a minute: no baseline, no recent speed
     assert watch.recent_rate() is None
+
+
+def test_the_baseline_is_the_first_minute_after_warm_up() -> None:
+    # A render that starts slowly while hot (a cold cache, say) and stays
+    # at that speed has not slowed down; only a drop from its own first
+    # minute counts, so a later fast stretch does not raise the bar.
+    watch = SlowdownWatch()
+    watch.heat(THROTTLED)
+    done = _render(watch, 0, WINDOW_S, 0.0005, WARMUP_DONE)
+    done = _render(watch, WINDOW_S + 5, WINDOW_S * 3, 0.001, done)
+    _render(watch, WINDOW_S * 3 + 5, WINDOW_S * 5, 0.0005, done)
+    assert watch.recent_rate() == pytest.approx(0.0005)
+    assert watch.note() is None
 
 
 def test_the_wizard_shows_the_note_under_the_render_progress(tmp_path: Path) -> None:

@@ -14,3 +14,11 @@ def test_known_phrases_become_faults() -> None:
 def test_an_unmatched_sentence_is_unused() -> None:
     assert faults_from_sentence("make it cinematic") == []
     assert faults_from_sentence("   ") == []
+
+
+def test_a_sentence_can_name_several_faults_in_the_fixed_order() -> None:
+    # Case and runs of whitespace do not hide a phrase.
+    assert faults_from_sentence("TOO   warm and\nnot sharp") == [
+        "not-sharp",
+        "too-warm",
+    ]

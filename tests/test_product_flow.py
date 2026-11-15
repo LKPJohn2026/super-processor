@@ -70,7 +70,8 @@ def test_models_and_show_commands(
     assert cli.main(["--jobs-dir", str(jobs_dir), "show", "abcd1234abcd1234"]) == 0
     shown = json.loads(capsys.readouterr().out)
     assert shown["manifest"]["job_id"] == "abcd1234abcd1234"
-    assert "artifacts" in shown
+    # Only the job exists so far: no step has written its file yet.
+    assert set(shown["artifacts"].values()) == {False}
 
 
 def test_diagnose_plan_preview_flow(
@@ -130,7 +131,12 @@ def test_diagnose_plan_preview_flow(
         == 0
     )
     dry = json.loads(capsys.readouterr().out)
-    assert "steps" in dry
+    assert dry["mode"] == "preview"
+    assert dry["steps"][-1]["name"] == "encode"
+    assert dry["output_path"].endswith("preview.mp4")
+    # A dry run writes no preview and leaves the job validated.
+    assert not (store.job_dir("abcd1234abcd1234") / "preview.mp4").exists()
+    assert store.load("abcd1234abcd1234").state is JobState.VALIDATED
 
     assert (
         cli.main(
@@ -146,7 +152,10 @@ def test_diagnose_plan_preview_flow(
     capsys.readouterr()
     assert store.load("abcd1234abcd1234").state is JobState.PREVIEWED
     assert (store.job_dir("abcd1234abcd1234") / "preview.mp4").is_file()
-    assert (store.job_dir("abcd1234abcd1234") / "qa_report.json").is_file()
+    qa = json.loads(
+        (store.job_dir("abcd1234abcd1234") / "qa_report.json").read_text("utf-8")
+    )
+    assert qa["ok"] is True
 
     assert (
         cli.main(

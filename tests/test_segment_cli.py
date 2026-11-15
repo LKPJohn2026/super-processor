@@ -14,6 +14,8 @@ from super_processor.segments import (
     SAMPLE_WIDTH,
     FrameReader,
     SampleRow,
+    load_samples,
+    load_segments,
     write_samples,
 )
 
@@ -118,6 +120,8 @@ def test_segment_samples_when_rows_are_missing(
     assert main(["--jobs-dir", str(store.root), "segment", JOB_ID]) == 0
     assert "0  0-60s" in capsys.readouterr().out
     assert store.load(JOB_ID).state is JobState.SPLIT_PROPOSED
+    # The rows are kept, so a later note re-splits without sampling again.
+    assert load_samples(store.job_dir(JOB_ID)) == _timeline()
 
 
 def test_segment_note_resplits_and_stays_proposed(
@@ -141,6 +145,14 @@ def test_segment_note_resplits_and_stays_proposed(
     assert "1  60-95s" in output
     assert "2  95-130s" in output
     assert store.load(JOB_ID).state is JobState.SPLIT_PROPOSED
+    # The new split is saved, with a fresh still for each segment.
+    saved = load_segments(store.job_dir(JOB_ID))
+    assert [(item.start_s, item.end_s) for item in saved] == [
+        (0.0, 60.0),
+        (60.0, 95.0),
+        (95.0, 130.0),
+    ]
+    assert all((store.job_dir(JOB_ID) / item.still_path).is_file() for item in saved)
 
 
 def test_accept_marks_the_split_and_a_second_accept_is_a_no_op(
@@ -182,3 +194,30 @@ def test_segment_refuses_a_job_that_is_not_probed(
 
     assert main(["--jobs-dir", str(store.root), "segment", JOB_ID]) == 1
     assert "must be probed" in capsys.readouterr().out
+
+
+def test_a_note_before_a_proposal_is_refused(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _probed_job(tmp_path)
+    command = ["--jobs-dir", str(store.root), "segment", JOB_ID]
+    assert main([*command, "--note", "too few cuts"]) == 1
+    assert "before a note" in capsys.readouterr().out
+    assert store.load(JOB_ID).state is JobState.PROBED
+
+
+def test_a_note_and_accept_together_are_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _probed_job(tmp_path)
+    write_samples(store.job_dir(JOB_ID), _timeline())
+    monkeypatch.setattr("super_processor.cli.ffmpeg_frame_reader", _reader)
+    command = ["--jobs-dir", str(store.root), "segment", JOB_ID]
+    assert main(command) == 0
+    capsys.readouterr()
+    assert main([*command, "--note", "too few cuts", "--accept"]) == 1
+    assert "either --note or --accept" in capsys.readouterr().out
+    assert store.load(JOB_ID).state is JobState.SPLIT_PROPOSED

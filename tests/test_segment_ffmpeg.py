@@ -37,5 +37,8 @@ def test_sample_media_reads_one_row_per_second(tmp_path: Path) -> None:
     )
     rows = sample_media(source, 6.0)
     assert [row.time_s for row in rows] == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
-    assert all(row.luma_mean > 0 for row in rows)
-    assert rows[0].rb_cast > 0
+    # A still blue frame: dark, flat, motionless, and strongly blue. The
+    # bounds are loose so another FFmpeg's colour conversion still passes.
+    assert all(15.0 < row.luma_mean < 45.0 for row in rows)
+    assert all(row.variance < 1.0 and row.motion < 1.0 for row in rows)
+    assert all(row.rb_cast > 1.0 for row in rows)

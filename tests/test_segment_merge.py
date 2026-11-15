@@ -45,3 +45,14 @@ def test_cap_refuses_a_merge_that_would_pass_two_minutes() -> None:
     pieces_in = [(index * 100.0, (index + 1) * 100.0) for index in range(16)]
     with pytest.raises(SegmentError, match="cannot merge"):
         merge_short_and_cap(pieces_in, scores=[1.0] * 1600)
+
+
+def test_a_short_middle_between_equal_boundaries_joins_the_earlier_piece() -> None:
+    # Without scores both boundaries tie; the earlier piece takes the sliver.
+    pieces = merge_short_and_cap([(0.0, 40.0), (40.0, 43.0), (43.0, 90.0)])
+    assert pieces == [pytest.approx((0.0, 43.0)), pytest.approx((43.0, 90.0))]
+
+
+def test_a_short_first_piece_joins_the_next_one() -> None:
+    pieces = merge_short_and_cap([(0.0, 3.0), (3.0, 50.0)])
+    assert pieces == [pytest.approx((0.0, 50.0))]

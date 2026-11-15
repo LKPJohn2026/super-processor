@@ -46,8 +46,6 @@ def _job_with_output(tmp_path: Path, payload: bytes) -> WizardController:
     manifest = controller.store.create(source)
     job_dir = controller.store.job_dir(manifest.job_id)
     (job_dir / "output.mp4").write_bytes(payload)
-    (job_dir / "previews").mkdir()
-    (job_dir / "previews" / "p.mp4").write_bytes(payload[:1000])
     save_session_state(
         controller.jobs_dir,
         WizardState(step=WizardStep.RESULT, job_id=manifest.job_id),
@@ -103,10 +101,6 @@ def test_output_is_streamed_with_ranges(tmp_path: Path) -> None:
         assert body == b""
         assert headers["Content-Length"] == str(len(payload))
 
-        # Previews belonged to the removed enhance step.
-        status, _headers, _body = _request(base, "GET", "/previews/p.mp4")
-        assert status == 404
-
         status, _headers, _body = _request(base, "GET", "/previews/../../src.mp4")
         assert status == 404
         status, _headers, _body = _request(base, "HEAD", "/missing.mp4")
@@ -139,7 +133,12 @@ def test_input_limit_error() -> None:
     assert "1080p" in (input_limit_error(_facts(1920, 1200, 60)) or "")
     assert "1080p" in (input_limit_error(_facts(1200, 1920, 60)) or "")
     assert "30 minutes" in (input_limit_error(_facts(1920, 1080, 1801)) or "")
-    assert "duration" in (input_limit_error(_facts(1920, 1080, 0)) or "")
+    assert input_limit_error(_facts(1920, 1080, 0)) == (
+        "could not read the video duration"
+    )
+    assert input_limit_error(_facts(0, 1080, 60)) == (
+        "could not read the video resolution"
+    )
     no_video = _facts(1920, 1080, 60)
     no_video.has_video = False
     no_video.streams = []
@@ -193,45 +192,49 @@ def _top_level_boxes(path: Path) -> list[str]:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-def test_final_output_is_fast_start(tmp_path: Path) -> None:
+@pytest.mark.parametrize("audio", [True, False], ids=["aac", "silent"])
+def test_final_output_is_fast_start(tmp_path: Path, audio: bool) -> None:
+    """The browser plays the result while it loads: moov comes before mdat.
+
+    Both the first render and a range revise spliced into it must keep it,
+    with or without a sound track to mux.
+    """
     from super_processor.upscale import (
         FakeUpscaleEngine,
+        UpscaleSpan,
         apply_range_revise,
         default_span,
     )
 
     source = tmp_path / "in.mp4"
+    sound = ["-f", "lavfi", "-i", "sine=duration=3", "-c:a", "aac"] if audio else []
     subprocess.run(
         [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x90:rate=10:duration=3",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=duration=3",
-            "-c:v",
-            "libx264",
-            "-c:a",
-            "aac",
-            "-shortest",
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=3",
+            *sound, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-shortest",
             str(source),
         ],
         check=True,
-    )
+    )  # fmt: skip
     output = tmp_path / "output.mp4"
+    engine = FakeUpscaleEngine()
+    apply_range_revise(
+        source, output, default_span(3), output, engine=engine, duration_s=3
+    )
+    first = _top_level_boxes(output)
+    assert first.index("moov") < first.index("mdat")
+    revised: list[tuple[float, float]] = []
     apply_range_revise(
         source,
         output,
-        default_span(3),
+        UpscaleSpan(1.0, 2.0, strength=0.2),
         output,
-        engine=FakeUpscaleEngine(),
+        engine=engine,
         duration_s=3,
+        on_revise_range=lambda start, end: revised.append((start, end)),
     )
-    boxes = _top_level_boxes(output)
-    assert boxes.index("moov") < boxes.index("mdat")
+    # A splice, not a second full render.
+    assert len(revised) == 1 and revised[0] != (0.0, 3.0)
+    spliced = _top_level_boxes(output)
+    assert spliced.index("moov") < spliced.index("mdat")

@@ -73,9 +73,20 @@ def test_region_shapes() -> None:
     ):
         with pytest.raises(RegionError):
             Region.from_dict(bad)
-    many = [FACE.to_dict()] * (MAX_REGIONS + 2) + [{"kind": "x"}, 3]
-    assert regions_from_dicts(many) == (FACE,) * MAX_REGIONS
+    # Malformed entries are dropped before the cap, so they do not use up
+    # places that good boxes after them need; order is kept.
+    hand = Region("hands", 0.5, 0.5, 0.9, 0.9)
+    many = [{"kind": "x"}, 3, *[FACE.to_dict()] * (MAX_REGIONS - 1), hand.to_dict()]
+    assert regions_from_dicts(many) == (*(FACE,) * (MAX_REGIONS - 1), hand)
+    extra = [FACE.to_dict()] * MAX_REGIONS + [hand.to_dict()]
+    assert regions_from_dicts(extra) == (FACE,) * MAX_REGIONS
     assert regions_from_dicts(None) == ()
+    assert regions_from_dicts({"kind": "faces"}) == ()
+    # Integer corners are accepted; stored corners are rounded to 4 places.
+    whole = Region("text", 0, 0, 1, 1)
+    assert (whole.x0, whole.x1) == (0.0, 1.0) and isinstance(whole.x1, float)
+    fine = Region("faces", 0.123456, 0.2, 0.654321, 0.5)
+    assert (fine.x0, fine.x1) == (0.1235, 0.6543)
 
 
 def test_region_from_model_pads_and_clamps() -> None:

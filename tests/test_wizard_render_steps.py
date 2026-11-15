@@ -6,7 +6,6 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -39,21 +38,22 @@ def _seed_job(tmp_path: Path) -> tuple[WizardController, str, Path]:
 
 def test_render_each_wizard_step(tmp_path: Path) -> None:
     controller, job_id, job_dir = _seed_job(tmp_path)
+    # Each step's own heading, so a step that rendered another's page fails.
     steps = [
-        (WizardStep.INTRO, "Super Processor"),
-        (WizardStep.LLM_CHOICE, "local LLM"),
-        (WizardStep.LOCAL_LLM_STUB, "Local LLM"),
-        (WizardStep.SETUP, "Gemini"),
-        (WizardStep.PICK_FILE, "Pick"),
-        (WizardStep.SAMPLING, "Finding the segments"),
-        (WizardStep.PROPOSING, "Finding the segments"),
+        (WizardStep.INTRO, '<p class="brand-hero">Super Processor</p>'),
+        (WizardStep.LLM_CHOICE, "<h1>What type of LLM do you have now?</h1>"),
+        (WizardStep.LOCAL_LLM_STUB, "<h1>Local LLM setup</h1>"),
+        (WizardStep.SETUP, "<h1>Gemini API setup</h1>"),
+        (WizardStep.PICK_FILE, "<h1>Pick a video file</h1>"),
+        (WizardStep.SAMPLING, "<h1>Finding the segments</h1>"),
+        (WizardStep.PROPOSING, "<h1>Finding the segments</h1>"),
         (WizardStep.SEGMENTS, "<h1>Segments</h1>"),
-        (WizardStep.ANALYZING, "Segment 1 of"),
-        (WizardStep.PREVIEW_SEGMENT, "Segment preview"),
-        (WizardStep.READY_TO_RENDER, "Render the whole video"),
-        (WizardStep.RENDERING, "Upscaling"),
-        (WizardStep.RESULT, "Result"),
-        (WizardStep.DONE, "Done"),
+        (WizardStep.ANALYZING, "<title>Segment 1 of 0 · Super Processor</title>"),
+        (WizardStep.PREVIEW_SEGMENT, "<title>Segment preview · Super Processor"),
+        (WizardStep.READY_TO_RENDER, "<h1>Ready to render</h1>"),
+        (WizardStep.RENDERING, "<h1>Upscaling</h1>"),
+        (WizardStep.RESULT, "<h1>Result</h1>"),
+        (WizardStep.DONE, "<h1>Done</h1>"),
     ]
     assert {step for step, _needle in steps} == set(WizardStep)
     for step, needle in steps:
@@ -116,31 +116,6 @@ def test_segment_loop_state_round_trips(tmp_path: Path) -> None:
     loaded = WizardState.from_dict(raw)
     assert loaded.step is WizardStep.SEGMENTS
     assert (loaded.segment_index, loaded.progress) == (0, None)
-
-
-def test_wizard_server_serves_output_only(tmp_path: Path) -> None:
-    controller, job_id, job_dir = _seed_job(tmp_path)
-    (job_dir / "output.mp4").write_bytes(b"\x00\x00\x00\x18ftyp")
-    (job_dir / "segment_stills").mkdir()
-    (job_dir / "segment_stills" / "seg_00.ppm").write_bytes(b"P5")
-    state = WizardState(step=WizardStep.RESULT, job_id=job_id)
-    save_job_wizard_state(job_dir, state)
-    save_session_state(tmp_path, state)
-    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
-    base = server.start()
-    try:
-        with urlopen(base + "/output.mp4") as response:
-            assert response.read()[:4] == b"\x00\x00\x00\x18"
-        for retired in ("/segment_stills/seg_00.ppm", "/segment_stills/seg_00.bmp"):
-            try:
-                urlopen(base + retired)
-            except HTTPError as exc:
-                assert exc.code == 404
-                exc.close()
-            else:
-                raise AssertionError(f"{retired} should be gone")
-    finally:
-        server.stop()
 
 
 class _BrokenEngine:
@@ -245,14 +220,20 @@ def test_start_new_job_from_done_and_result(
         fresh = controller.current_state()
         assert fresh.step is WizardStep.PICK_FILE
         assert fresh.job_id is None
+        # The finished job is left exactly as it was, to reopen later.
         assert (job_dir / "output.mp4").read_bytes() == b"result"
+        kept = load_job_wizard_state(job_dir)
+        assert kept is not None and (kept.step, kept.job_id) == (step, job_id)
     monkeypatch.setattr("super_processor.wizard.resolve_gemini_api_key", lambda: None)
     controller.handle_post("/new", {})
     assert controller.current_state().step is WizardStep.SETUP
 
 
-def test_start_new_job_over_the_api(tmp_path: Path) -> None:
-    controller, job_id, job_dir = _seed_job(tmp_path)
+def test_start_new_job_over_the_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("super_processor.wizard.resolve_gemini_api_key", lambda: "k")
+    controller, job_id, _job_dir = _seed_job(tmp_path)
     save_session_state(tmp_path, WizardState(step=WizardStep.DONE, job_id=job_id))
     server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
@@ -265,7 +246,7 @@ def test_start_new_job_over_the_api(tmp_path: Path) -> None:
         )
         with urlopen(request) as response:
             view = json.loads(response.read().decode())
-        assert view["step"] in {"pick_file", "setup"}
-        assert view["job_id"] is None
+        assert (view["step"], view["job_id"]) == ("pick_file", None)
+        assert controller.current_state().step is WizardStep.PICK_FILE
     finally:
         server.stop()

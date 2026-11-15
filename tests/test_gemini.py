@@ -1,4 +1,4 @@
-"""Tests for Gemini structured schemas, sampling, and chat persistence."""
+"""The Gemini client: model choice and failover, replies, and the saved chat."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from super_processor.gemini import (
+    MAX_CANDIDATE_MODELS,
     ChatTurn,
     GeminiClient,
     GeminiError,
@@ -25,17 +26,18 @@ from super_processor.gemini import (
 )
 
 
-def test_chat_round_trip(tmp_path: Path) -> None:
+def test_the_chat_survives_a_save_and_load(tmp_path: Path) -> None:
     turns = [
         ChatTurn(role="user", text="hello", frame_refs=["a.jpg"]),
         ChatTurn(role="model", text="{}", structured={"ok": True}),
     ]
-    save_chat(tmp_path, turns)
-    loaded = load_chat(tmp_path)
-    assert loaded[0].text == "hello"
-    assert loaded[1].structured == {"ok": True}
-    append_chat_turn(tmp_path, ChatTurn(role="user", text="more"))
-    assert len(load_chat(tmp_path)) == 3
+    path = save_chat(tmp_path, turns)
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 1
+    assert load_chat(tmp_path) == turns
+    appended = append_chat_turn(tmp_path, ChatTurn(role="user", text="more"))
+    assert load_chat(tmp_path) == appended == [*turns, ChatTurn("user", "more")]
+    # The write goes through a temporary file that is moved into place.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["gemini_chat.json"]
 
 
 def test_contents_from_chat_alternates_roles() -> None:
@@ -77,29 +79,6 @@ def test_client_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     with pytest.raises(GeminiError, match="GEMINI_API_KEY"):
         GeminiClient(api_key="")
-
-
-def _sample_enhance_payload(*, label: str = "lift") -> dict[str, Any]:
-    return {
-        "issues": ["low_light"],
-        "options": [
-            {
-                "id": "A",
-                "label": label,
-                "ops": [{"op": "contrast", "params": {"brightness": 0.1}}],
-            },
-            {
-                "id": "B",
-                "label": "denoise",
-                "ops": [{"op": "denoise", "params": {"strength": 0.3}}],
-            },
-            {
-                "id": "C",
-                "label": "sharpen",
-                "ops": [{"op": "sharpen", "params": {"luma_amount": 0.5}}],
-            },
-        ],
-    }
 
 
 def test_parse_model_info_rpm_fraction() -> None:
@@ -184,11 +163,11 @@ def test_select_candidate_models_filters_and_orders() -> None:
             rpm_used=1,
         ),
     ]
-    names = select_candidate_models(models, preferred="gemini-2.5-flash")
-    assert names[0] == "gemini-2.5-flash"
-    assert "gemini-3.8-flash" in names
-    assert "gemini-2.0-flash" not in names
-    assert "text-embedding-004" not in names
+    names = select_candidate_models(models, preferred="models/gemini-2.5-flash")
+    # Preferred first, once; then the rest in listed order. Embeddings and a
+    # model with an RPM limit of 0 never become candidates.
+    assert names == ["gemini-2.5-flash", "gemini-3.8-flash"]
+    assert select_candidate_models(models) == ["gemini-3.8-flash", "gemini-2.5-flash"]
 
 
 class _FailoverTransport:
@@ -499,9 +478,9 @@ def test_candidate_models_honors_env_list(
         transport=ListTransport(),
     )
     names = client.candidate_models(refresh=True)
-    assert names[0] == "gemini-3.8-flash"
-    assert "gemini-2.5-flash" in names
-    assert "gemini-2.5-pro" in names
+    # The configured model, then the extra names in the order given, with
+    # their ``models/`` prefix gone.
+    assert names == ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
 
 
 def _segment_stills(job_dir: Path, count: int) -> list[Path]:
@@ -683,4 +662,224 @@ def test_failover_groups_models_that_failed_the_same_way(tmp_path: Path) -> None
     assert str(failed.value) == (
         "All candidate Gemini models failed: "
         "gemini-gone, gemini-3.8-flash: Gemini HTTP 404: retired"
+    )
+
+
+def _reply(text: str) -> dict[str, Any]:
+    return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
+
+
+class _Scripted:
+    """No ``models.list``; answers each model from ``script`` in turn."""
+
+    def __init__(self, *answers: dict[str, Any] | GeminiError) -> None:
+        self.answers = list(answers)
+        self.calls: list[str] = []
+
+    def generate(
+        self, *, model: str, api_key: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        del api_key, body
+        self.calls.append(model)
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, GeminiError):
+            raise answer
+        return answer
+
+
+def test_an_exhausted_model_is_not_tried_again_this_session(tmp_path: Path) -> None:
+    transport = _FailoverTransport(_UPSCALE_REPLY, fail_models={"gemini-gone"})
+    client = GeminiClient(api_key="k", model="gemini-gone", transport=transport)
+    _revise(client, tmp_path)
+    assert transport.calls == ["gemini-gone", "gemini-3.8-flash"]
+    transport.calls.clear()
+    # The retired model answered 404 once; later calls go straight past it.
+    _revise(client, tmp_path)
+    assert transport.calls == ["gemini-3.8-flash"]
+    assert client.candidate_models() == ["gemini-3.8-flash"]
+
+
+def test_a_model_that_stays_busy_is_left_after_its_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SUPER_PROCESSOR_GEMINI_CANDIDATES", "gemini-2.5-flash")
+    sleeps: list[float] = []
+    monkeypatch.setattr("super_processor.gemini.time.sleep", sleeps.append)
+    busy = GeminiError("Gemini HTTP 503: high demand", status=503)
+    transport = _Scripted(busy, busy, busy, _reply(json.dumps(_UPSCALE_REPLY)))
+    client = GeminiClient(api_key="k", model="gemini-3.8-flash", transport=transport)
+    assert client._generate_with_failover({"contents": []}) == _reply(
+        json.dumps(_UPSCALE_REPLY)
+    )
+    # Three tries of the busy model (two retries), then the next one.
+    assert transport.calls == ["gemini-3.8-flash"] * 3 + ["gemini-2.5-flash"]
+    assert sleeps == [1.5, 3.0]
+    assert client.model == "gemini-2.5-flash"
+    # Busy is not gone: the model stays a candidate for later calls.
+    assert "gemini-3.8-flash" in client.candidate_models()
+
+
+def test_without_models_list_only_the_configured_model_is_tried() -> None:
+    transport = _Scripted(GeminiError("Gemini HTTP 429: quota used up", status=429))
+    client = GeminiClient(api_key="k", model="gemini-3.8-flash", transport=transport)
+    assert client.candidate_models() == ["gemini-3.8-flash"]
+    with pytest.raises(GeminiError) as failed:
+        client._generate_with_failover({"contents": []})
+    assert str(failed.value) == (
+        "All candidate Gemini models failed: "
+        "gemini-3.8-flash: Gemini HTTP 429: quota used up"
+    )
+
+
+def test_a_model_name_that_cannot_watch_video_leaves_no_candidates() -> None:
+    # An image-generation model set in the environment is never called.
+    transport = _Scripted(_reply("{}"))
+    client = GeminiClient(
+        api_key="k", model="gemini-2.5-flash-image", transport=transport
+    )
+    with pytest.raises(GeminiError, match="models failed: no candidates$"):
+        client._generate_with_failover({"contents": []})
+    assert transport.calls == []
+
+
+def test_candidates_are_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    names = [f"gemini-{n}-flash" for n in range(20)]
+    monkeypatch.setenv("SUPER_PROCESSOR_GEMINI_CANDIDATES", ",".join(names))
+    client = GeminiClient(api_key="k", model=names[0], transport=_Scripted({}))
+    assert client.candidate_models() == names[:MAX_CANDIDATE_MODELS]
+
+
+def test_the_working_model_leads_the_candidates_after_a_probe() -> None:
+    transport = _FailoverTransport({"ok": True}, fail_models=set())
+    transport.list_models = lambda *, api_key: [  # type: ignore[method-assign]
+        {"name": f"models/{name}", "supportedGenerationMethods": ["generateContent"]}
+        for name in ("gemini-a-flash", "gemini-b-flash", "gemini-c-flash")
+    ]
+    original = transport.generate
+
+    def slow_first(*, model: str, api_key: str, body: dict[str, Any]) -> Any:
+        if model == "gemini-a-flash":
+            transport.calls.append(model)
+            raise GeminiError("Gemini request failed: The read operation timed out")
+        return original(model=model, api_key=api_key, body=body)
+
+    transport.generate = slow_first  # type: ignore[method-assign]
+    client = GeminiClient(api_key="k", model="gemini-a-flash", transport=transport)
+    assert client.pick_working_model() == "gemini-b-flash"
+    # The slow model is kept, but later calls start with the one that answered.
+    assert client.candidate_models() == [
+        "gemini-b-flash",
+        "gemini-a-flash",
+        "gemini-c-flash",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ({"candidates": []}, "unexpected Gemini response shape"),
+        ({"candidates": [{"content": {}}]}, "unexpected Gemini response shape"),
+        ({"candidates": [{"content": {"parts": [{}]}}]}, "returned no text"),
+        (_reply("not json"), "JSON parse failed"),
+        (_reply("[1, 2]"), "must be an object"),
+    ],
+)
+def test_an_unreadable_reply_is_an_error_not_a_result(
+    tmp_path: Path, response: dict[str, Any], message: str
+) -> None:
+    client = GeminiClient(api_key="k", transport=_Scripted(response))
+    with pytest.raises(GeminiError, match=message):
+        _revise(client, tmp_path)
+    # Nothing half-read goes into the chat that later calls replay.
+    assert load_chat(tmp_path) == []
+
+
+def test_a_reply_split_over_parts_is_joined() -> None:
+    halves = {
+        "candidates": [{"content": {"parts": [{"text": '{"ok"'}, {"text": ": 1}"}]}}]
+    }
+    client = GeminiClient(api_key="k", transport=_Scripted(halves))
+    assert client._generate(contents=[], schema={}, system="s") == {"ok": 1}
+
+
+def test_revise_offers_only_the_scales_there_are(tmp_path: Path) -> None:
+    transport = _FakeTransport(_UPSCALE_REPLY)
+    client = GeminiClient(api_key="k", transport=transport)
+    assert _revise(client, tmp_path) == _UPSCALE_REPLY
+    assert transport.last_body is not None
+    prompt = transport.last_body["contents"][-1]["parts"][0]["text"]
+    assert "scale (only one of: 1, 2;" in prompt
+    assert "Keep scale=2 unless" in prompt
+    assert "4" not in prompt.split("scale (only one of:")[1].split(";")[0]
+    turns = load_chat(tmp_path)
+    assert [t.role for t in turns] == ["user", "model"]
+    assert turns[1].structured == _UPSCALE_REPLY
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("{", "cannot read gemini_chat.json"),
+        ('{"turns": {"0": {}}}', "turns must be a list"),
+        ('{"turns": [{"role": "user", "frame_refs": "a.jpg"}]}', "frame_refs"),
+        ('{"turns": [{"role": "model", "structured": [1]}]}', "structured"),
+    ],
+)
+def test_a_damaged_chat_file_is_reported(
+    tmp_path: Path, content: str, message: str
+) -> None:
+    (tmp_path / "gemini_chat.json").write_text(content, encoding="utf-8")
+    with pytest.raises(GeminiError, match=message):
+        load_chat(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("[1]", "root must be an object"),
+        ('"turns"', "root must be an object"),
+        ('{"turns": [{"text": "x"}]}', "needs a role"),
+    ],
+)
+def test_a_chat_file_of_the_wrong_shape_is_a_gemini_error(
+    tmp_path: Path, content: str, message: str
+) -> None:
+    (tmp_path / "gemini_chat.json").write_text(content, encoding="utf-8")
+    with pytest.raises(GeminiError, match=message):
+        load_chat(tmp_path)
+
+
+def test_a_missing_chat_is_empty(tmp_path: Path) -> None:
+    assert load_chat(tmp_path / "new-job") == []
+
+
+def test_an_unreadable_still_is_an_error(tmp_path: Path) -> None:
+    client = GeminiClient(api_key="k", transport=_FakeTransport({"segments": []}))
+    with pytest.raises(GeminiError, match="could not read gone.jpg"):
+        client.propose_segments(
+            stills=[tmp_path / "gone.jpg"],
+            times=[0.0],
+            duration_s=1.0,
+            job_dir=tmp_path,
+        )
+
+
+def test_a_short_retry_hint_reads_in_seconds() -> None:
+    body = json.dumps({"error": {"details": [{"retryDelay": "41.4s"}]}})
+    assert summarize_gemini_error(429, body) == "quota used up; try again in 41 s"
+
+
+def test_rpm_text_and_bad_numbers() -> None:
+    info = parse_model_info(
+        {"name": "gemini-x-flash", "rpm": "15", "rpm_used": None, "RPM": 1}
+    )
+    assert (info.rpm_limit, info.rpm_used, info.rpm_remaining) == (15, None, None)
+    nested = parse_model_info(
+        {"name": "gemini-x", "rateLimits": {"RPM": {"used": "x", "limit": 9}}}
+    )
+    assert (nested.rpm_used, nested.rpm_limit) == (None, None)
+    # Unknown RPM is worth a probe; an exhausted one is not.
+    assert model_has_usable_rpm(ModelInfo(name="gemini-x-flash"))
+    assert not model_accepts_text_or_video(
+        ModelInfo(name="gemini-x-flash", methods=("countTokens",))
     )

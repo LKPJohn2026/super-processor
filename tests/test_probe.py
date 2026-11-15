@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -113,8 +114,40 @@ def test_probe_file_uses_ffprobe(
     monkeypatch.setattr("super_processor.probe.subprocess.run", fake_run)
 
     facts = probe_file(source)
-    assert facts.format_name is not None
-    assert "mp4" in facts.format_name
+    assert facts.format_name == "mov,mp4,m4a,3gp,3g2,mj2"
+    assert facts.duration_s == 12.5
+    assert facts.has_video is True
+    assert facts.has_audio is True
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "message"),
+    [
+        (1, "", "clip.mp4: Invalid data found", "ffprobe exited 1: clip.mp4: Invalid"),
+        (0, "{truncated", "", "ffprobe returned invalid JSON"),
+        (0, "[]", "", "JSON root must be an object"),
+    ],
+    ids=["exit-code", "bad-json", "not-an-object"],
+)
+def test_a_broken_ffprobe_answer_is_a_probe_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    message: str,
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    answer = SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(
+        "super_processor.probe.shutil.which", lambda _: str(tmp_path / "ffprobe")
+    )
+    monkeypatch.setattr(
+        "super_processor.probe.subprocess.run", lambda *_a, **_k: answer
+    )
+    with pytest.raises(ProbeError, match=message):
+        probe_file(source)
 
 
 def test_probe_file_missing_ffprobe(

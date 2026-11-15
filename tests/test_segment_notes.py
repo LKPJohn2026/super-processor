@@ -54,3 +54,27 @@ def test_relabel_context_or_problem() -> None:
 def test_unknown_or_mixed_notes_ask_for_a_rephrase(text: str) -> None:
     with pytest.raises(SegmentError, match="rephrase"):
         parse_split_note(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "note"),
+    [
+        (
+            "The bright part starts 2.5 sec earlier.",
+            SplitNote(intent="move_boundary", delta_s=-2.5, problem="low_contrast"),
+        ),
+        (
+            "segment 3 starts later",
+            SplitNote(intent="move_boundary", segment_index=3, delta_s=5.0),
+        ),
+        ("call this LOW   LIGHT.", SplitNote(intent="relabel", problem="low_light")),
+        (
+            "segment 0 this is off-center",
+            SplitNote(intent="relabel", segment_index=0, problem="off_center"),
+        ),
+    ],
+)
+def test_notes_are_read_whatever_the_case_spacing_or_full_stop(
+    text: str, note: SplitNote
+) -> None:
+    assert parse_split_note(text) == note

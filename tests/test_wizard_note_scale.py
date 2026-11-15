@@ -313,17 +313,6 @@ def test_a_4x_note_renders_nothing_and_says_so(
 
 
 @needs_ffmpeg
-def test_the_offered_scales_reach_the_prompt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    controller, transport, _job_dir = _render(
-        tmp_path, monkeypatch, size="1000x90", ready_scale="2", revise_scale=2
-    )
-    controller.handle_post("/result", {"note": ["less contrast"]})
-    assert "only one of: 1, 2;" in transport.revise_prompts[-1]
-
-
-@needs_ffmpeg
 def test_note_may_still_change_to_an_allowed_scale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -340,10 +329,12 @@ def test_note_may_still_change_to_an_allowed_scale(
 def test_reply_ignored_for_a_plain_note_is_reported_after_the_render(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    controller, _transport, job_dir = _render(
+    controller, transport, job_dir = _render(
         tmp_path, monkeypatch, size="160x90", ready_scale="2", revise_scale=1
     )
     controller.handle_post("/result", {"note": ["less contrast from 1s to 3s"]})
+    # Gemini is still offered both sizes; only its answer is overruled.
+    assert "only one of: 1, 2;" in transport.revise_prompts[-1]
     state = controller.current_state()
     assert state.step is WizardStep.RENDERING and state.error is None
     controller.run_render()

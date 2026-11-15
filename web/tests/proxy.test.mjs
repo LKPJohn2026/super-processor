@@ -8,7 +8,9 @@ import { build, createServer, preview } from "vite";
 
 // Exercise the real config and actual HTTP forwarding, including range headers.
 test("dev and preview proxy API, output, stills and previews to VITE_PROXY_TARGET", async (t) => {
+  const forwarded = [];
   const target = httpServer((request, response) => {
+    forwarded.push(request.url);
     const isVideo = request.url.endsWith(".mp4");
     response.writeHead(isVideo ? 206 : 200, {
       "Content-Type": isVideo ? "video/mp4" : request.url.endsWith(".jpg") ? "image/jpeg" : "application/json",
@@ -51,6 +53,13 @@ test("dev and preview proxy API, output, stills and previews to VITE_PROXY_TARGE
         });
         if (path.endsWith(".mp4")) assert.equal(result.headers.get("Content-Range"), "bytes 0-3/4");
       }
+      // The UI itself is served locally (dev at "/", preview at the Pages
+      // base); only the wizard's own paths reach the backend.
+      const before = forwarded.length;
+      const page = await fetch(`${origin}${mode === "dev" ? "/" : "/super-processor/"}`);
+      assert.equal(page.status, 200, `${mode}: page`);
+      assert.match(await page.text(), mode === "dev" ? /src="\/src\/main\.tsx"/ : /proxy regression/);
+      assert.deepEqual(forwarded.slice(before), [], `${mode}: page was proxied`);
     } finally {
       await vite.close();
     }

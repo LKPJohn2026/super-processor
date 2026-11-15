@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +22,12 @@ from super_processor.shots import (
     ShotMetrics,
     apply_labels,
     detect_cuts,
+    extract_still,
     find_shots,
     load_shots,
+    measure_range,
     merge_with_next,
+    merged_metrics,
     parse_metadata_log,
     save_shots,
     shot_ranges,
@@ -82,6 +86,150 @@ def test_shot_ranges_fold_short_shots_and_cap_the_count() -> None:
     assert all(a[1] == b[0] for a, b in zip(capped, capped[1:], strict=False))
     with pytest.raises(ShotError):
         shot_ranges([], 0)
+
+
+def test_the_shortest_shot_joins_its_shorter_neighbour() -> None:
+    # (5, 6.5) and (6.5, 8) tie for shortest; the first one joins the shorter
+    # side, which is the 1.5s shot after it, not the 5s one before.
+    assert shot_ranges([5.0, 6.5, 8.0], 20.0, max_shots=3) == [
+        (0.0, 5.0),
+        (5.0, 8.0),
+        (8.0, 20.0),
+    ]
+    # Cuts at or outside the clip, and repeated cuts, add no empty shots.
+    assert shot_ranges([-1.0, 0.0, 4.0, 4.0, 10.0, 12.0], 10.0) == [
+        (0.0, 4.0),
+        (4.0, 10.0),
+    ]
+    assert shot_ranges([4.0], 10.0, max_shots=0) == [(0.0, 10.0)]
+
+
+def _log(*frames: dict[str, float]) -> str:
+    lines = []
+    for number, values in enumerate(frames):
+        lines.append(
+            f"[Parsed_metadata_9 @ 0xabc] frame:{number} pts:{number} "
+            f"pts_time:{number * 0.5}"
+        )
+        lines.extend(
+            f"[Parsed_metadata_9 @ 0xabc] {key}={value}"
+            for key, value in values.items()
+        )
+    return "\n".join(lines)
+
+
+def test_measure_range_takes_medians_and_scales_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = _log(
+        {
+            "lavfi.block": 10.0,
+            "lavfi.psnr.mse.y": 9.0,
+            "lavfi.signalstats.YAVG": 51.0,
+            "lavfi.signalstats.YLOW": 16.0,
+            "lavfi.signalstats.YHIGH": 118.0,
+        },
+        {"lavfi.block": 30.0, "lavfi.psnr.mse.y": 16.0, "lavfi.blur": 4.0},
+        {"lavfi.block": 20.0, "lavfi.psnr.mse.y": 25.0},
+    )
+    commands: list[list[str]] = []
+
+    def run(command: list[str]) -> str:
+        commands.append(command)
+        return log
+
+    monkeypatch.setattr("super_processor.shots._run", run)
+    metrics = measure_range(Path("clip.mp4"), 2.0, 2.01)
+    assert metrics.blockiness == 20.0
+    # Noise is the RMS difference from the denoised copy: sqrt(median MSE).
+    assert metrics.noise == pytest.approx(4.0)
+    assert metrics.blur == 4.0
+    assert metrics.brightness == pytest.approx(0.2)
+    assert metrics.contrast == pytest.approx(0.4)
+    # A shot shorter than one sample still measures a minimum span.
+    command = commands[0]
+    assert command[command.index("-ss") + 1] == "2.000000"
+    assert command[command.index("-t") + 1] == "0.050000"
+    monkeypatch.setattr("super_processor.shots._run", lambda _command: "no frames")
+    assert measure_range(Path("clip.mp4"), 0.0, 1.0) == ShotMetrics()
+
+
+def test_detect_cuts_returns_unique_later_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def frame(at: float, *values: str) -> list[str]:
+        head = f"[Parsed_metadata_9 @ 0x1] frame:0 pts:0 pts_time:{at}"
+        return [head, *(f"[Parsed_metadata_9 @ 0x1] {v}" for v in values)]
+
+    log = "\n".join(
+        [
+            # A scene change on the first frame starts the first shot.
+            *frame(0.0, "lavfi.scd.score=50", "lavfi.scd.time=0"),
+            *frame(4.25, "lavfi.scd.score=40", "lavfi.scd.time=4.25"),
+            *frame(2.0, "lavfi.scd.score=30", "lavfi.scd.time=2"),
+            *frame(2.0000001, "lavfi.scd.score=30", "lavfi.scd.time=2"),
+            # A frame without values printed is not a cut.
+            *frame(3.0),
+        ]
+    )
+    monkeypatch.setattr("super_processor.shots._run", lambda _command: log)
+    assert detect_cuts(Path("clip.mp4")) == [2.0, 4.25]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a shell script as ffmpeg")
+def test_ffmpeg_failures_become_shot_errors(tmp_path: Path) -> None:
+    missing = str(tmp_path / "no-ffmpeg")
+    with pytest.raises(ShotError, match="failed to start ffmpeg"):
+        detect_cuts(tmp_path / "clip.mp4", ffmpeg_bin=missing)
+    script = tmp_path / "ffmpeg"
+    script.write_text(
+        "#!/bin/sh\necho one >&2\necho two >&2\necho 'bad input' >&2\nexit 1\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    # The last lines of FFmpeg's log explain the failure.
+    with pytest.raises(ShotError, match="ffmpeg failed: one two bad input"):
+        detect_cuts(tmp_path / "clip.mp4", ffmpeg_bin=str(script))
+    quiet = tmp_path / "quiet"
+    quiet.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    quiet.chmod(0o755)
+    with pytest.raises(ShotError, match="could not save a still"):
+        extract_still(
+            tmp_path / "clip.mp4", 1.0, tmp_path / "s.jpg", ffmpeg_bin=str(quiet)
+        )
+
+
+def test_saved_shots_load_defensively() -> None:
+    with pytest.raises(ShotError, match="must be an object"):
+        Shot.from_dict([0, 1])
+    with pytest.raises(ShotError, match="needs start_s and end_s"):
+        Shot.from_dict({"start_s": 0})
+    with pytest.raises(ShotError, match="needs start_s and end_s"):
+        Shot.from_dict({"start_s": "zero", "end_s": 1})
+    with pytest.raises(ShotError, match="list of shots"):
+        ShotList.from_dict({"shots": {}})
+    shot = Shot.from_dict(
+        {
+            "start_s": "1.5",
+            "end_s": 3,
+            "issues": [" Noisy ", "NOISY", "melted"],
+            "contains": "faces",
+        }
+    )
+    assert (shot.start_s, shot.end_s) == (1.5, 3.0)
+    # Names are matched loosely, kept once, and unknown ones dropped.
+    assert shot.issues == ("noisy",)
+    assert shot.contains == ()
+    assert ShotList.from_dict({"shots": [], "label_error": ""}).label_error is None
+
+
+def test_merged_metrics_weigh_by_duration() -> None:
+    a = ShotMetrics(blur=2.0, brightness=0.2)
+    b = ShotMetrics(blur=8.0, brightness=0.8)
+    mixed = merged_metrics(a, 3.0, b, 1.0)
+    assert mixed.blur == pytest.approx(3.5)
+    assert mixed.brightness == pytest.approx(0.35)
+    assert merged_metrics(a, 0.0, b, 0.0) == a
 
 
 def test_metric_hints() -> None:

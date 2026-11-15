@@ -132,6 +132,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The 1280 px limit on upscaled sources and the Ready screen's notes about
   source size and GPU memory.
 
+### Fixed
+
+- Look estimation measured noise as the whole picture's brightness variance,
+  which is mostly contrast, so it asked for full-strength denoise on nearly
+  every clip, clean ones included. It now measures grain as the median
+  difference between neighbouring pixels, across and down, on a square of
+  up to 256 px cut from the middle of the picture at the source's own pixels
+  (scaling to 160x90 first averaged the grain away). On three SD archive
+  films and four 480p and smaller modern clips the old measure asked for
+  strength 0.22-1.0 every time; the new one leaves them all alone (grain
+  sigma 0-1.9), and asks for denoise only on clips with heavy grain or phone
+  sensor noise (sigma 5-5.5, strength about 0.45).
+- A damaged file now gives a clear error instead of a traceback: invalid,
+  non-UTF-8 or too deeply nested JSON, or an unknown step, in a wizard state
+  file; a truncated `samples.json` or segments file; a segment missing
+  `index`, `start_s`, `end_s`, `keyframe_s` or `look_group`, or holding
+  `NaN`, `Infinity` or an out-of-range number; and a Gemini chat file whose
+  root is not an object or whose turn has no role.
+- Gemini's file expiry (nanoseconds with a `Z` zone) was read as local time;
+  it is now read as UTC, and an offset such as `+05:30` is kept.
+- A shot check with index `true` was applied to shot 2; it is now refused.
+- The pick page said videos are upscaled up to 1280 px on the long edge; it
+  now states the wizard's real limit, up to 1080p and 30 minutes.
+
 ## [3.7.0] - 2026-11-12
 
 ### Added

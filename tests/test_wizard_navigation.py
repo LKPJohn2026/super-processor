@@ -316,16 +316,27 @@ def test_pick_page_offers_dialog_drop_and_path() -> None:
 
 
 @needs_ffmpeg
-def test_editor_can_turn_upscaling_off_for_a_segment(tmp_path: Path) -> None:
-    controller = _controller(tmp_path)
-    job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
+def test_reapproving_finished_segments_goes_straight_to_ready(
+    tmp_path: Path,
+) -> None:
+    engine = _CountingEngine()
+    controller = _controller(tmp_path, engine)
+    to_ready(controller, _clip(tmp_path / "in.mp4"))
+    rendered = engine.calls
+    assert rendered > 0
     controller.handle_post("/goto", {"to": ["segments"]})
     controller.handle_post("/segments", {"action": ["approve"]})
     state = analyze(controller)
-    assert state.step is WizardStep.READY_TO_RENDER
+    # The approved previews are kept: nothing is planned or rendered again.
+    assert state.step is WizardStep.READY_TO_RENDER, state.error
+    assert state.segment_index == 2
+    assert engine.calls == rendered
 
-    controller = _controller(tmp_path / "again")
-    pick_and_segment(controller, _clip(tmp_path / "in2.mp4"))
+
+@needs_ffmpeg
+def test_editor_can_turn_upscaling_off_for_a_segment(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    pick_and_segment(controller, _clip(tmp_path / "in.mp4"))
     controller.handle_post("/segments", {"action": ["approve"]})
     analyze(controller)
     shot = preview(controller)["shot"]
@@ -340,7 +351,6 @@ def test_editor_can_turn_upscaling_off_for_a_segment(tmp_path: Path) -> None:
     page = controller.render()
     assert "You chose: this segment skips upscaling" in page
     assert "Use upscaling for this segment" in page
-    assert job_dir.is_dir()
 
 
 @needs_ffmpeg

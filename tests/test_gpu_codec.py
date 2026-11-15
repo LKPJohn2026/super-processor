@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -73,10 +74,11 @@ def test_the_encoder_follows_the_probe_and_the_size(
     assert asked == ["/opt/ffmpeg"]
     assert delivery_encoder() == NVENC
     # NVENC refuses frames this small or this large: those stay on x264.
-    for size in ((128, 96), (320, 48), (4098, 2160), (5120, 2880), (3840, 4098)):
+    # Each is one pixel past a limit in one direction only.
+    for size in ((144, 360), (640, 48), (4097, 2160), (3840, 4097), (128, 96)):
         assert delivery_encoder("ffmpeg", size) == X264
-    assert delivery_encoder("ffmpeg", (145, 49)) == NVENC
-    assert delivery_encoder("ffmpeg", (4096, 4096)) == NVENC
+    for size in ((145, 49), (4096, 4096), (145, 4096), (4096, 49)):
+        assert delivery_encoder("ffmpeg", size) == NVENC
 
 
 def _fake_run(
@@ -189,6 +191,24 @@ def test_one_output_sees_one_encoder_while_the_probe_changes(
     # Outside, every call asks.
     assert delivery_encoder("ffmpeg") == NVENC
     assert len(asked) == 3
+
+
+def test_another_thread_decides_its_own_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A preview on one wizard thread must not pin the encoder a render on
+    # another thread sees: the pin belongs to the thread that set it.
+    answers = iter([False, True])
+    monkeypatch.setattr(
+        upscale, "nvenc_works", lambda ffmpeg_bin="ffmpeg": next(answers)
+    )
+    seen: list[str] = []
+    with upscale.one_encoder():
+        assert delivery_encoder() == X264
+        other = threading.Thread(target=lambda: seen.append(delivery_encoder()))
+        other.start()
+        other.join()
+    assert seen == [NVENC]
 
 
 @needs_ffmpeg
@@ -354,9 +374,27 @@ def test_odd_sizes_stream_in_ffmpegs_layout(
     assert fake.firsts[0] == _decoded(source)[: upscale.yuv420_frame_bytes(65, 47)]
 
 
+def _without_nvdec(command: list[str]) -> list[str]:
+    """``command`` with ``-hwaccel cuda`` taken out: CI has no CUDA device."""
+    if "-hwaccel" not in command:
+        return command
+    at = command.index("-hwaccel")
+    return [*command[:at], *command[at + 2 :]]
+
+
+def _asks_for_nvdec(command: list[str]) -> bool:
+    """True when ``command`` decodes its input on NVDEC."""
+    if "-hwaccel" not in command:
+        return False
+    at = command.index("-hwaccel")
+    # FFmpeg applies -hwaccel to the input that follows it.
+    return command[at + 1] == "cuda" and at < command.index("-i")
+
+
 @needs_ffmpeg
-def test_the_decoder_asks_for_nvdec_when_it_works(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("nvdec", [True, False])
+def test_spans_decoder_uses_nvdec_only_when_it_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nvdec: bool
 ) -> None:
     fake_span(tmp_path, monkeypatch)
     source = tmp_path / "in.mp4"
@@ -365,18 +403,38 @@ def test_the_decoder_asks_for_nvdec_when_it_works(
 
     def software(command: list[str]) -> list[str]:
         commands.append(command)
-        # Run it without: CI has no CUDA device to open.
-        at = command.index("-hwaccel")
-        return [*command[:at], *command[at + 2 :]]
+        return _without_nvdec(command)
 
-    monkeypatch.setattr(upscale, "cuda_decode_works", lambda ffmpeg_bin="ffmpeg": True)
+    monkeypatch.setattr(upscale, "cuda_decode_works", lambda ffmpeg_bin="ffmpeg": nvdec)
     _swap_decoder(monkeypatch, software)
     SpanEngine().upscale(UpscaleRequest(source, tmp_path / "out" / "clip.mp4"))
-    assert len(commands) == 1
-    hw = commands[0].index("-hwaccel")
-    assert commands[0][hw : hw + 2] == ["-hwaccel", "cuda"]
-    assert hw < commands[0].index("-i")
-    assert commands[0][-4:] == ["rawvideo", "-pix_fmt", "yuv420p", "-"]
+    [command] = commands
+    assert _asks_for_nvdec(command) is nvdec
+    assert command[-4:] == ["rawvideo", "-pix_fmt", "yuv420p", "-"]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("nvdec", [True, False])
+def test_the_plain_resize_uses_nvdec_only_when_it_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nvdec: bool
+) -> None:
+    source = tmp_path / "in.mp4"
+    _tiny(source, seconds=1)
+    monkeypatch.setattr(upscale, "cuda_decode_works", lambda ffmpeg_bin="ffmpeg": nvdec)
+    real = upscale._run_ffmpeg
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> None:
+        commands.append(command)
+        real(_without_nvdec(command), **kwargs)
+
+    monkeypatch.setattr(upscale, "_run_ffmpeg", run)
+    dest = tmp_path / "out" / "plain.mp4"
+    output = upscale.plain_delivery(UpscaleRequest(source, dest), dest)
+    [command] = commands
+    assert _asks_for_nvdec(command) is nvdec
+    assert _frame_size_of(output) == (320, 180)
+    assert is_delivery(output)
 
 
 @pytest.mark.gpu

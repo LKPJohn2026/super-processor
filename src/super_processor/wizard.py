@@ -281,10 +281,19 @@ def _read_state_file(path: Path, what: str) -> WizardState | None:
             if attempt == _STATE_RETRIES - 1:
                 raise
             time.sleep(_STATE_RETRY_S)
-    data = json.loads(text)
+        except UnicodeDecodeError as exc:
+            raise WizardError(f"corrupt {what}") from exc
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise WizardError(f"corrupt {what}") from exc
     if not isinstance(data, dict):
         raise WizardError(f"corrupt {what}")
-    return WizardState.from_dict(data)
+    try:
+        return WizardState.from_dict(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        # An unknown step, say from a newer build's state file.
+        raise WizardError(f"corrupt {what}") from exc
 
 
 def _write_state_file(path: Path, state: WizardState) -> None:

@@ -33,6 +33,7 @@ from super_processor.shot_plan import (
     apply_proposals,
     fallback_recipe,
     finish,
+    keep_editor_choices,
     load_plan,
     look_from_model,
     new_plan,
@@ -41,9 +42,10 @@ from super_processor.shot_plan import (
     render_previews,
     request_redo,
     save_plan,
+    set_upscale,
     shots_payload,
 )
-from super_processor.shots import Shot, ShotList, ShotMetrics
+from super_processor.shots import Shot, ShotError, ShotList, ShotMetrics
 from super_processor.upscale import (
     FakeUpscaleEngine,
     load_upscale_plan,
@@ -511,3 +513,136 @@ def test_a_plan_saved_at_4x_renders_at_2x() -> None:
     old = ShotPlan.from_dict({"scale": 4, "recipes": [ShotRecipe().to_dict()]})
     assert old.scale == 2
     assert ShotPlan.from_dict({"scale": 1, "recipes": []}).scale == 1
+
+
+def test_editor_choices_survive_a_fresh_recipe() -> None:
+    old = ShotRecipe(
+        strength=0.2,
+        rev=3,
+        note="less grain",
+        preview_start=12.5,
+        upscale_override=False,
+        use_upscale=False,
+    )
+    fresh = ShotRecipe(strength=0.8, look=ShotLook(denoise=0.3), reason="new")
+    kept = keep_editor_choices(fresh, old)
+    # The new settings come in; the editor's count, window, note and choice stay.
+    assert (kept.strength, kept.look, kept.reason) == (0.8, fresh.look, "new")
+    assert (kept.rev, kept.note, kept.preview_start) == (3, "less grain", 12.5)
+    assert kept.use_upscale is False and kept.upscale_override is False
+    # Without an editor choice, the fresh recipe's own upscale decision wins.
+    free = keep_editor_choices(replace(fresh, use_upscale=False), ShotRecipe())
+    assert free.use_upscale is False and free.upscale_override is None
+
+
+def test_the_editors_upscale_choice_beats_gemini_and_the_fallback() -> None:
+    shots = _shots()
+    plan = new_plan(shots, 2)
+    plan = set_upscale(plan, 0, False)
+    plan = set_upscale(plan, 2, False)
+    merged = apply_proposals(
+        plan,
+        shots,
+        # Gemini asks to upscale shot 0 and says nothing about shot 2.
+        [{"index": 0, "strength": 0.4, "look": {}, "use_upscale": True}],
+        [0, 2],
+    )
+    assert merged.recipes[0].use_upscale is False
+    assert merged.recipes[0].strength == 0.4
+    assert merged.recipes[2].use_upscale is False
+    assert "measurements" in merged.recipes[2].reason
+
+
+def test_set_upscale_redoes_one_shot_and_clears_its_note() -> None:
+    shots = _shots()
+    plan = finish(new_plan(shots, 2), [0, 1, 2])
+    plan = request_redo(plan, 1, "too sharp")
+    plan.error = "old error"
+    toggled = set_upscale(plan, 1, False)
+    recipe = toggled.recipes[1]
+    assert (recipe.use_upscale, recipe.upscale_override) == (False, False)
+    assert recipe.stale is True and recipe.note == ""
+    assert toggled.stale_indexes() == [1]
+    assert toggled.error is None
+    restored = ShotRecipe.from_dict(recipe.to_dict())
+    assert restored.upscale_override is False and restored.use_upscale is False
+    with pytest.raises(ShotPlanError, match="no such shot"):
+        set_upscale(plan, 3, True)
+
+
+def test_a_failed_check_keeps_the_look_it_did_not_change_and_the_face_cap() -> None:
+    shots = _shots()
+    look = ShotLook(denoise=0.4)
+    plan = ShotPlan(scale=2, recipes=[ShotRecipe(strength=0.5, look=look)] * 3)
+    checked, changed = apply_checks(
+        plan,
+        shots,
+        # Shot 1 has unboxed faces: a higher strength from the check is capped.
+        [{"index": 1, "ok": False, "problems": ["too_soft"], "strength": 0.9}],
+        [0, 1, 2],
+    )
+    assert changed == [1]
+    assert checked.recipes[1].strength == PROTECTED_STRENGTH
+    assert checked.recipes[1].look == look
+    # Shots without a verdict are left as they were.
+    assert checked.recipes[0] == plan.recipes[0]
+    assert checked.recipes[2] == plan.recipes[2]
+
+
+def test_a_check_with_a_boolean_index_is_ignored() -> None:
+    shots = _shots()
+    plan = ShotPlan(scale=2, recipes=[ShotRecipe(strength=0.5) for _ in range(3)])
+    checked, changed = apply_checks(
+        plan, shots, [{"index": True, "ok": False, "strength": 0.1}], [0, 1, 2]
+    )
+    assert changed == []
+    assert checked.recipes[1] == plan.recipes[1]
+
+
+def test_saved_booleans_are_not_read_as_a_revision_or_a_scale() -> None:
+    # bool is an int: a JSON true must not load as rev 1 or as 1x.
+    assert ShotRecipe.from_dict({"rev": True}).rev == 0
+    assert ShotRecipe.from_dict({"rev": "3"}).rev == 0
+    assert ShotRecipe.from_dict({"rev": -2}).rev == 0
+    assert ShotRecipe.from_dict({"rev": 3}).rev == 3
+    plan = ShotPlan.from_dict({"scale": True, "recipes": []})
+    assert plan.scale == 2 and type(plan.scale) is int
+    assert type(ShotPlan.from_dict({"scale": 1.0, "recipes": []}).scale) is int
+
+
+def test_saved_recipes_load_defensively() -> None:
+    with pytest.raises(ShotPlanError, match="must be an object"):
+        ShotRecipe.from_dict(["strength", 0.5])
+    loaded = ShotRecipe.from_dict(
+        {
+            "strength": 3.0,
+            "look": {"denoise": 9, "sharpen": 1},
+            "shimmer": True,
+            "preview_start": "4",
+            "upscale_override": "no",
+            "check": {"ok": "yes", "problems": ["halos", "nope"], "adjusted": 1},
+        }
+    )
+    assert loaded.strength == 1.0
+    assert loaded.look == ShotLook(denoise=1.0)
+    assert loaded.shimmer is None and loaded.preview_start is None
+    assert loaded.upscale_override is None
+    # Only a real boolean counts as a verdict, and only True as adjusted.
+    assert loaded.check == ShotCheck(ok=None, problems=("halos",), adjusted=False)
+    assert ShotRecipe.from_dict({"strength": math.nan}).strength == 0.5
+    assert ShotCheck.from_dict("passed") == ShotCheck()
+
+
+def test_payload_shows_current_settings_only_once_a_shot_has_a_recipe() -> None:
+    shots = _shots()
+    plan = new_plan(shots, 2)
+    assert "current" not in shots_payload(shots, plan, [0])[0]
+    planned = apply_proposals(
+        plan, shots, [{"index": 0, "strength": 0.3, "look": {}, "reason": "r"}], [0]
+    )
+    item = shots_payload(shots, planned, [0])[0]
+    assert item["current"] == {"strength": 0.3, "look": ShotLook().to_dict()}
+    assert item["protected_boxes"] == []
+    assert shots_payload(shots, None, [2])[0]["contains"] == ["text"]
+    with pytest.raises(ShotError, match="no shots"):
+        new_plan(ShotList(shots=[]), 2)

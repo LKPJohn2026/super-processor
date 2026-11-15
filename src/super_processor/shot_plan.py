@@ -155,7 +155,7 @@ class ShotRecipe:
             look=look_from_model(data.get("look")),
             reason=str(data.get("reason", "")),
             check=ShotCheck.from_dict(data.get("check")),
-            rev=int(data.get("rev", 0)),
+            rev=_count(data.get("rev")),
             stale=bool(data.get("stale", True)),
             note=str(data.get("note", "")),
             shimmer=_optional_number(data.get("shimmer")),
@@ -195,7 +195,8 @@ class ShotPlan:
         return cls(
             # 1 is the editor's "do not upscale" from the ready screen.
             # A plan saved at 4x, before 4x was removed, renders at 2x.
-            scale=scale if scale in (1, 2) else 2,
+            # ``True == 1``, so a JSON true is turned away before ``in``.
+            scale=int(scale) if not isinstance(scale, bool) and scale in (1, 2) else 2,
             recipes=[ShotRecipe.from_dict(item) for item in data["recipes"]],
             error=str(error) if error else None,
         )
@@ -238,6 +239,12 @@ def _optional_number(raw: Any) -> float | None:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
     return float(raw)
+
+
+def _count(raw: Any) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
 
 
 def _clamp(raw: Any, low: float, high: float, default: float) -> float:
@@ -467,7 +474,9 @@ def apply_checks(
     by_index = {
         item.get("index"): item
         for item in checks
-        if isinstance(item, dict) and isinstance(item.get("index"), int)
+        if isinstance(item, dict)
+        and isinstance(item.get("index"), int)
+        and not isinstance(item.get("index"), bool)
     }
     for index in indexes:
         item = by_index.get(index)

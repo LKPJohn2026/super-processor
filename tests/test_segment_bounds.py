@@ -36,3 +36,20 @@ def test_shorter_than_one_segment_is_refused() -> None:
 def test_non_positive_duration_is_refused() -> None:
     with pytest.raises(SegmentError, match="positive"):
         legal_segment_counts(0.0)
+
+
+@pytest.mark.parametrize(
+    ("duration", "counts"),
+    [
+        # Exactly one 5 s segment fits.
+        (5.0, (1, 1)),
+        # One segment can still be two minutes long.
+        (120.0, (1, 15)),
+        # Just past two minutes needs a second segment.
+        (120.5, (2, 15)),
+    ],
+)
+def test_the_segment_limits_hold_at_their_edges(
+    duration: float, counts: tuple[int, int]
+) -> None:
+    assert legal_segment_counts(duration) == counts

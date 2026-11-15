@@ -13,8 +13,9 @@ from urllib.request import Request, urlopen
 import pytest
 
 from super_processor.gemini import GeminiClient
+from super_processor.probe import probe_file
 from super_processor.review import WizardServer
-from super_processor.upscale import FakeUpscaleEngine
+from super_processor.upscale import FakeUpscaleEngine, load_upscale_plan
 from super_processor.wizard import WizardController, WizardStep
 
 TOKEN = "test-token"
@@ -216,7 +217,8 @@ def test_wizard_website_full_flow_intro_to_done(
         job_id = controller.current_state().job_id
         assert job_id
         output = controller.store.job_dir(job_id) / "output.mp4"
-        assert output.is_file()
+        primary = probe_file(output).primary_video()
+        assert primary is not None and (primary.width, primary.height) == (320, 180)
         with urlopen(base + "/output.mp4") as response:
             assert response.headers.get_content_type() == "video/mp4"
             assert len(response.read()) > 0
@@ -233,8 +235,17 @@ def test_wizard_website_full_flow_intro_to_done(
         assert controller.wait_idle(timeout=60)
         revised = _get(base)
         assert "<h1>Result</h1>" in revised
-        assert "strength 0.20" in revised
-        assert (controller.store.job_dir(job_id) / "output.mp4").is_file()
+        # Gemini's 0.20 covers 2-5 s only; the rest keeps the approved 0.40.
+        assert "strength 0.20–0.40" in revised
+        plan = load_upscale_plan(controller.store.job_dir(job_id))
+        assert plan is not None
+        assert sorted((s.start_s, s.end_s, s.strength) for s in plan.spans) == [
+            (0.0, 2.0, 0.4),
+            (2.0, 5.0, 0.2),
+            (5.0, 12.0, 0.4),
+        ]
+        primary = probe_file(output).primary_video()
+        assert primary is not None and (primary.width, primary.height) == (320, 180)
 
         done = _post(base, "/result", {"mood": "happy"})
         assert "<h1>Done</h1>" in done
@@ -243,7 +254,6 @@ def test_wizard_website_full_flow_intro_to_done(
         server.stop()
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_wizard_website_local_llm_stub_then_gemini_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -254,6 +264,9 @@ def test_wizard_website_local_llm_stub_then_gemini_path(
     base = server.start()
     try:
         _post(base, "/intro", {})
+        unsure = _post(base, "/llm", {"choice": "both"})
+        assert "pick how you want to run the LLM" in unsure
+        assert controller.current_state().step is WizardStep.LLM_CHOICE
         stub = _post(base, "/llm", {"choice": "local"})
         assert "Local LLM setup" in stub
         assert "not wired yet" in stub

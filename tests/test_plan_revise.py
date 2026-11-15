@@ -45,3 +45,12 @@ def test_segment_index_outside_the_timeline_is_refused() -> None:
     base = [treatments_for("noisy")[0]]
     with pytest.raises(TreatmentError, match="outside"):
         revise_plans(segments, base, 3, "not-sharp")
+
+
+def test_a_base_that_does_not_cover_the_timeline_is_refused() -> None:
+    segments = [_segment(0, "noisy", 0), _segment(1, "noisy", 1)]
+    base = [treatments_for("noisy")[0]]
+    with pytest.raises(TreatmentError, match="does not match"):
+        revise_plans(segments, base, 0, "not-sharp")
+    with pytest.raises(TreatmentError, match="outside"):
+        revise_plans(segments, base * 2, -1, "not-sharp")

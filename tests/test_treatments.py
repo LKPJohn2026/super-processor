@@ -10,8 +10,10 @@ from super_processor.treatments import (
     Treatment,
     TreatmentError,
     TreatmentStep,
+    filter_treatments,
     iter_treatments,
     require_legal_treatment,
+    treatment_by_id,
     treatments_for,
 )
 from super_processor.validator import PARAM_BOUNDS
@@ -115,3 +117,46 @@ def test_out_of_order_steps_are_rejected() -> None:
 def test_unknown_problem_is_refused() -> None:
     with pytest.raises(TreatmentError, match="no treatments"):
         treatments_for("face_swap")
+
+
+def _ids(treatments: tuple[Treatment, ...]) -> list[str]:
+    return [item.treatment_id for item in treatments]
+
+
+def test_every_catalog_id_finds_its_treatment_and_unknown_ids_are_refused() -> None:
+    # Saved plans store only ids; loading one must give back the same steps.
+    for treatment in iter_treatments():
+        assert treatment_by_id(treatment.treatment_id) == treatment
+    with pytest.raises(TreatmentError, match="unknown treatment"):
+        treatment_by_id("noisy.retired")
+
+
+def test_too_warm_keeps_every_treatment_that_cools() -> None:
+    # Every too_warm option raises the temperature above daylight (6500K).
+    assert _ids(filter_treatments("too_warm", "too-warm")) == _ids(
+        treatments_for("too_warm")
+    )
+
+
+def test_too_dark_keeps_every_treatment_that_lifts_shadows() -> None:
+    assert _ids(filter_treatments("silhouette", "too-dark")) == _ids(
+        treatments_for("silhouette")
+    )
+    # Nothing in the noisy list brightens, so the first treatment stays.
+    assert _ids(filter_treatments("noisy", "too-dark")) == ["noisy.light"]
+
+
+def test_too_much_contrast_keeps_every_tie_at_the_mildest_contrast() -> None:
+    assert _ids(filter_treatments("low_contrast", "too-much-contrast")) == [
+        "low_contrast.mild",
+        "low_contrast.contrast_sharpen",
+    ]
+    # A treatment without a contrast step counts as contrast 1.0.
+    assert _ids(filter_treatments("noisy", "too-much-contrast")) == [
+        "noisy.light",
+        "noisy.medium",
+    ]
+
+
+def test_bad_trim_without_a_trim_treatment_keeps_the_first() -> None:
+    assert _ids(filter_treatments("shaky", "bad-trim")) == ["shaky.mild"]

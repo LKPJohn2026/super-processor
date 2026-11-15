@@ -335,6 +335,8 @@ def test_range_revise_can_pass_through(tmp_path: Path) -> None:
     )
     assert engine.calls == calls
     assert video_stream_facts(output)[0] == 60
+    # Resized to its neighbours' size, so the splice is one picture size.
+    assert _streams(output)["video"] == (320, 180)
 
 
 @needs_ffmpeg
@@ -556,7 +558,14 @@ def test_pass_through_is_one_encode_straight_from_the_source(
     assert "scale=320:180:flags=lanczos" in picture
     assert picture.endswith(look.finish_filter())
     assert "gblur" not in picture and "lut2" not in picture
-    assert command.count("-c:v") == 1 and "veryfast" not in command
+    # Encoded once, straight into the settings every delivery part shares.
+    encoder = upscale.delivery_encoder("ffmpeg", (320, 180))
+    codec = upscale._delivery_codec(
+        encoder, (320, 180), "10/1" if encoder == upscale.NVENC else None
+    )
+    at = command.index("-c:v")
+    assert command[at : at + len(codec)] == codec
+    assert command.count("-c:v") == 1
     assert not (tmp_path / "unused.mp4").exists()
     marker = json.loads(upscale.delivery_marker_path(dest).read_text())
     assert marker["blend"] == upscale._blend_record(0.0, regions)

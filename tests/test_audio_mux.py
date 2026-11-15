@@ -3,6 +3,7 @@ it, encoded to AAC otherwise."""
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -69,17 +70,31 @@ def _audio_args(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return seen
 
 
+def _can_encode(encoder: str) -> bool:
+    listed = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return f" {encoder} " in listed
+
+
 @needs_ffmpeg
-def test_aac_audio_is_copied_not_encoded_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("audio", "codec"), [("aac", "aac"), ("libmp3lame", "mp3")])
+def test_aac_and_mp3_audio_are_copied_not_encoded_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, audio: str, codec: str
 ) -> None:
-    source = _source(tmp_path / "in.mp4", "aac")
+    if not _can_encode(audio):
+        pytest.skip(f"this FFmpeg has no {audio} encoder")
+    source = _source(tmp_path / "in.mp4", audio)
     video = _picture(tmp_path / "up.mp4")
     seen = _audio_args(monkeypatch)
     mux_source_audio(video, source)
     assert seen == ["copy"]
     # Encoding again would change the decoded samples; a copy keeps them.
     assert _audio(video) == _audio(source)
+    assert _audio(video)[0] == codec
     assert video_stream_facts(video)[0] == 60
 
 
@@ -158,6 +173,9 @@ def test_aac_that_changes_format_partway_is_encoded(
     assert not video.with_suffix(".mux.mp4").exists()
 
 
+# Windows cannot run a shell script as ffprobe, and Python 3.10's which()
+# there accepts any existing path, so it cannot be the guard.
+@pytest.mark.skipif(os.name == "nt", reason="needs a shell script as ffprobe")
 def test_odd_bytes_from_ffprobe_keep_the_codec(tmp_path: Path) -> None:
     fake = tmp_path / "ffprobe"
     # stderr holds a path in UTF-8 (Đ) plus a byte no codec decodes.
@@ -165,8 +183,6 @@ def test_odd_bytes_from_ffprobe_keep_the_codec(tmp_path: Path) -> None:
         b"#!/bin/sh\nprintf 'aac\\n'\nprintf '\\xc4\\x90\\xff: bad\\n' >&2\n"
     )
     fake.chmod(0o755)
-    if shutil.which(str(fake)) is None:  # pragma: no cover - Windows
-        pytest.skip("needs a shell script as ffprobe")
     source = tmp_path / "in.mkv"
     source.touch()
     assert upscale._audio_codec(source, ffprobe_bin=str(fake)) == "aac"
@@ -191,3 +207,43 @@ def test_no_ffprobe_gives_no_audio_codec(tmp_path: Path) -> None:
     source.touch()
     missing = str(tmp_path / "no-ffprobe")
     assert upscale._audio_codec(source, ffprobe_bin=missing) is None
+
+
+@needs_ffmpeg
+def test_a_mux_that_changes_the_frame_count_keeps_the_picture_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path / "in.mp4", "aac")
+    video = _picture(tmp_path / "up.mp4")
+    before = video.read_bytes()
+    real = upscale.video_stream_facts
+
+    def one_short(path: Path, **kwargs: Any) -> tuple[int, str]:
+        frames, rate = real(path, **kwargs)
+        return (frames - 1, rate) if path.name.endswith(".mux.mp4") else (frames, rate)
+
+    # A muxer that drops a frame: every frame matters more than the audio.
+    monkeypatch.setattr(upscale, "video_stream_facts", one_short)
+    assert mux_source_audio(video, source) == video
+    assert video.read_bytes() == before
+    assert not video.with_suffix(".mux.mp4").exists()
+
+
+@needs_ffmpeg
+def test_when_no_mux_works_the_picture_is_kept_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path / "in.mp4", "aac")
+    video = _picture(tmp_path / "up.mp4")
+    before = video.read_bytes()
+    tried: list[str] = []
+
+    def refuses(_video: Path, _source: Path, codec: str, *args: Any, **kw: Any) -> Any:
+        tried.append(codec)
+        return None
+
+    monkeypatch.setattr(upscale, "_mux_audio", refuses)
+    assert mux_source_audio(video, source) == video
+    # The copy was tried first, then an AAC encode, and neither replaced it.
+    assert tried == ["copy", "aac"]
+    assert video.read_bytes() == before

@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import histogram_u8, mean_luma, percentile_u8, sad_u8, variance_u8
+from . import histogram_u8, mean_luma, percentile_u8, sad_u8
 from .doctor import check_ffmpeg_capability, which
 from .encoders import HARDWARE_DECODERS, decoder_input_args
 from .probe import MediaFacts
@@ -170,8 +170,13 @@ def extract_gray_frame(
     height: int = 90,
     ffmpeg_bin: str | None = None,
     decoder: str | None = None,
+    crop: bool = False,
 ) -> bytes:
-    """Decode one grayscale frame near ``at_s`` as packed 8-bit luma."""
+    """Decode one grayscale frame near ``at_s`` as packed 8-bit luma.
+
+    The frame is scaled to ``width`` x ``height``, or with ``crop`` the
+    centre ``width`` x ``height`` is cut out at the source's own pixels.
+    """
     binary = ffmpeg_bin or _ffmpeg_bin()
     expected = width * height
     last_detail = ""
@@ -189,7 +194,7 @@ def extract_gray_frame(
             "-frames:v",
             "1",
             "-vf",
-            f"scale={width}:{height},format=gray",
+            f"{'crop' if crop else 'scale'}={width}:{height},format=gray",
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -367,20 +372,67 @@ def _estimate_white_balance(
     return suggestion, {"wb_r": r, "wb_g": g, "wb_b": b, "wb_cast": cast}
 
 
-def _estimate_denoise(frames: list[bytes]) -> tuple[OpSuggestion, dict[str, float]]:
-    # High-frequency proxy: variance of local luma in flat-ish frames.
-    variances = [variance_u8(frame) for frame in frames]
-    noise = sum(variances) / len(variances)
-    # Map variance onto [0,1] strength; quiet studio ~ <80, noisy phone >> 400.
-    strength = max(0.0, min(1.0, (math.sqrt(noise) - 8.0) / 25.0))
+def _noise_residual(frame: bytes, width: int = 160) -> float:
+    """Estimate the grain in one packed 8-bit luma frame, ``width`` pixels
+    per row, on the same scale as a pixel variance: about 0 for a clean
+    picture however much contrast it has, and about the noise variance for
+    a grainy one.
+
+    The whole-frame variance measures contrast, so a clean gradient looks
+    as noisy as grain. Grain differs from neighbour to neighbour; a picture
+    mostly does not.
+
+    Uses the median of the absolute differences to the right and lower
+    neighbours, so the picture's edges, a minority of pixels, do not count.
+    For grain of variance s², a neighbour difference has variance 2s², and
+    its absolute value has median 0.6745·s·√2.
+    """
+    height = len(frame) // width
+    if width < 2 or height < 2:
+        return 0.0
+    diffs: list[int] = []
+    for row in range(height - 1):
+        start = row * width
+        line = frame[start : start + width]
+        below = frame[start + width : start + 2 * width]
+        diffs.extend(abs(a - b) for a, b in zip(line, line[1:], strict=False))
+        diffs.extend(abs(a - b) for a, b in zip(line, below, strict=True))
+    diffs.sort()
+    median = diffs[len(diffs) // 2]
+    return (median / (0.6745 * math.sqrt(2.0))) ** 2
+
+
+# Side of the square cut from the middle of the picture to measure grain.
+# Scaling down first would average the grain away.
+GRAIN_CROP = 256
+
+
+def grain_crop_side(facts: MediaFacts) -> int | None:
+    """The grain crop's side for this source, or None when its size is not
+    known. Square, so a rotated picture fits it too."""
+    video = facts.primary_video()
+    if video is None or not video.width or not video.height:
+        return None
+    return min(GRAIN_CROP, video.width, video.height)
+
+
+def _estimate_denoise(
+    frames: list[bytes], width: int = 160
+) -> tuple[OpSuggestion, dict[str, float]]:
+    residuals = [_noise_residual(frame, width) for frame in frames]
+    noise = sum(residuals) / len(residuals)
+    # Grain sigma at the source's own pixels. Clean and compressed footage,
+    # old SD transfers included, measures sigma 0-2; visible grain or phone
+    # sensor noise measures 5 and up.
+    strength = max(0.0, min(1.0, (math.sqrt(noise) - 2.5) / 6.0))
     enabled = strength >= 0.18
     suggestion = OpSuggestion(
         enabled=enabled,
         confidence=min(1.0, strength * 1.4),
         params={"strength": round(strength if enabled else 0.0, 3)},
-        reason=f"luma_variance={noise:.1f}",
+        reason=f"noise_residual={noise:.1f}",
     )
-    return suggestion, {"luma_variance": noise, "denoise_strength": strength}
+    return suggestion, {"noise_residual": noise, "denoise_strength": strength}
 
 
 def _estimate_shake(
@@ -437,8 +489,21 @@ def estimate_look(
     rgb_means: list[tuple[float, float, float]] = []
     pair_frames: list[tuple[bytes, bytes]] = []
 
+    side = grain_crop_side(facts)
+    grain_frames: list[bytes] = []
     for window in windows:
         frame_a = extract_gray_frame(source, at_s=window.start_s, ffmpeg_bin=ffmpeg_bin)
+        if side is not None:
+            grain_frames.append(
+                extract_gray_frame(
+                    source,
+                    at_s=window.start_s,
+                    width=side,
+                    height=side,
+                    ffmpeg_bin=ffmpeg_bin,
+                    crop=True,
+                )
+            )
         pair_at = min(
             max(0.0, duration - 0.05),
             window.start_s + min(0.12, window.duration_s),
@@ -454,7 +519,10 @@ def estimate_look(
 
     contrast, contrast_metrics = _estimate_contrast(gray_frames)
     white_balance, wb_metrics = _estimate_white_balance(rgb_means)
-    denoise, denoise_metrics = _estimate_denoise(gray_frames)
+    if side is None:
+        denoise, denoise_metrics = _estimate_denoise(gray_frames)
+    else:
+        denoise, denoise_metrics = _estimate_denoise(grain_frames, side)
     stabilize, shake_metrics = _estimate_shake(pair_frames)
 
     metrics = {}
