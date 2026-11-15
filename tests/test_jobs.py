@@ -178,5 +178,7 @@ def test_the_jobs_root_follows_the_environment(
     monkeypatch.setenv(DEFAULT_JOBS_DIR_ENV, str(tmp_path / "custom"))
     assert default_jobs_root() == (tmp_path / "custom").resolve()
     monkeypatch.delenv(DEFAULT_JOBS_DIR_ENV)
+    # Path.home() reads HOME on POSIX and USERPROFILE on Windows.
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     assert default_jobs_root() == (tmp_path / "home/.super-processor/jobs").resolve()
