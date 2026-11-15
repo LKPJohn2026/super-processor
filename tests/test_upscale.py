@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1238,6 +1239,74 @@ def test_a_gpu_error_partway_stops_the_stream(
     assert len(calls) == 3
     assert list(output.parent.iterdir()) == []
     assert all(process.poll() is not None for process in started)
+
+
+@needs_ffmpeg
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in launcher is sh")
+def test_a_failed_stream_ends_ffmpeg_behind_a_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chocolatey's ffmpeg.exe on Windows is a shim that starts the real one.
+    Killing the shim left the real encoder running with its output open
+    (WinError 32 on the delete). Here ``ffmpeg`` is a launcher that starts the
+    real one as a child, and the stream must still end both."""
+    real = shutil.which("ffmpeg")
+    assert real is not None
+    children = tmp_path / "children.txt"
+    shim = tmp_path / "bin" / "ffmpeg"
+    shim.parent.mkdir()
+    # An explicit <&0 keeps the pipe as the child's stdin; sh would otherwise
+    # give a background job /dev/null.
+    shim.write_text(
+        f'#!/bin/sh\n"{real}" "$@" <&0 &\necho "$! $*" >> "{children}"\nwait $!\n'
+    )
+    shim.chmod(0o755)
+    fake_span(tmp_path, monkeypatch)
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", 64 * 48 * 3 * 4)
+    source = tmp_path / "numbered.mp4"
+    _numbered(source)
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    upscale_frames = span_sr.upscale_frames
+    calls: list[int] = []
+
+    def third_fails(model: str, frames: Any, *, batch: int = 0) -> Any:
+        calls.append(batch)
+        if len(calls) == 3:
+            raise RuntimeError("illegal memory access")
+        return upscale_frames(model, frames, batch=batch)
+
+    monkeypatch.setattr(span_sr, "upscale_frames", third_fails)
+    # Windows refuses to delete a file a live process has open: note any
+    # FFmpeg behind the launcher still running when the output is deleted.
+    held_open: list[int] = []
+    unlink = Path.unlink
+
+    def watched_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.name.endswith(".encoding.mp4") and children.exists():
+            # Only the FFmpeg writing this file holds it open.
+            for line in children.read_text().splitlines():
+                pid, _, args = line.partition(" ")
+                if path.name in args and _alive(int(pid)):
+                    held_open.append(int(pid))
+        unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", watched_unlink)
+    output = tmp_path / "out" / "clip.mp4"
+    failed = _within(60, lambda: SpanEngine().upscale(UpscaleRequest(source, output)))
+    assert str(failed) == "SPAN failed: illegal memory access"
+    assert list(output.parent.iterdir()) == []
+    # The decoder and the encoder both ran behind the launcher.
+    started = children.read_text()
+    assert "rgb24 -" in started and "clip.encoding.mp4" in started
+    assert held_open == []
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 @needs_ffmpeg

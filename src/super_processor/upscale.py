@@ -812,12 +812,33 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
                 frames_in=(width * SPAN_SCALE, height * SPAN_SCALE, rate, feed),
             )
         finally:
-            if decoder.poll() is None:
-                decoder.kill()
-            decoder.wait()
-            assert decoder.stdout is not None
-            decoder.stdout.close()
+            _stop_ffmpeg(decoder, decoder.stdout)
     return request.output
+
+
+# How long a streamed FFmpeg gets to end on its own once its pipe is closed
+# (an encoder still has a few frames to compress) before it is killed.
+_STOP_TIMEOUT_S = 30.0
+
+
+def _stop_ffmpeg(proc: subprocess.Popen[bytes], pipe: IO[bytes] | None) -> None:
+    """End an FFmpeg that frames stream through, even behind a launcher.
+
+    Closing its pipe ends it the way a finished stream would: an encoder
+    reads the end of its input, and a decoder fails to write and stops.
+    Killing is only the fallback. On Windows, Chocolatey's ffmpeg.exe is a
+    shim that starts the real one: killing the shim left the real encoder
+    running with its output open, so the failed output could not be deleted
+    (WinError 32).
+    """
+    if pipe is not None:
+        with contextlib.suppress(OSError):
+            pipe.close()
+    try:
+        proc.wait(timeout=_STOP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def _read_into(stream: IO[bytes], buffer: bytearray) -> int:
@@ -1367,11 +1388,7 @@ def _encode_piped(
         except BaseException:
             # A feeder that fails because the encoder died reports the
             # encoder's own error instead (a broken pipe says nothing).
-            encoder.kill()
-            encoder.wait()
-            # Its buffered bytes cannot reach a dead encoder.
-            with contextlib.suppress(OSError):
-                encoder.stdin.close()
+            _stop_ffmpeg(encoder, encoder.stdin)
             tmp.unlink(missing_ok=True)
             errors.seek(0)
             detail = errors.read().decode("utf-8", errors="replace").strip()
