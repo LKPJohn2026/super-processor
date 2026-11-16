@@ -34,6 +34,15 @@ lists. Models never write shell commands.
 
 ## Quick start
 
+Releases are on PyPI as `ancient-processor`; the command it installs is
+still `super-processor`:
+
+```bash
+python -m pip install ancient-processor        # add [gpu] for the upscale
+```
+
+From a checkout:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate

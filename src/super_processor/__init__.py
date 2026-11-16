@@ -23,7 +23,7 @@ from .probe import MediaFacts, ProbeError, StreamFacts, probe_file
 from .recipe import OpName, Recipe, RecipeError, empty_recipe
 
 try:
-    __version__ = version("super-processor")
+    __version__ = version("ancient-processor")
 except PackageNotFoundError:  # pragma: no cover - source tree without installation
     __version__ = "0+unknown"
 

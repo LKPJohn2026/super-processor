@@ -8,7 +8,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "super-processor"
+name = "ancient-processor"
 dynamic = ["version"]
 description = "Local-first AI-assisted video processing"
 readme = "README.md"

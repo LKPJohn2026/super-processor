@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Releases are published to PyPI as `ancient-processor`
+  (`pip install ancient-processor`). The installed command is still
+  `super-processor` and the Python package is still `super_processor`.
+  4.0.0 was only released on GitHub.
+
 ## [4.0.0] - 2026-11-15
 
 ### Added
