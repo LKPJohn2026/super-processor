@@ -7,7 +7,7 @@ import random
 import shutil
 import subprocess
 from array import array
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +179,7 @@ def _levels(black: int, white: int, black_share: float = 0.0) -> bytes:
 def _contrast_estimates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    frames: list[bytes | None],
+    frames: Sequence[bytes | None],
     facts: MediaFacts | None = None,
 ) -> LookEstimates:
     """Estimate with ``frames[i]`` at the i-th contrast sample time (None:
@@ -308,7 +308,7 @@ def test_no_sampled_frame_is_pushed_into_clipping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A faded print with one frame much brighter than the rest.
-    frames: list[bytes | None] = [_levels(60, 250)] + [_levels(60, 150)] * 8
+    frames: Sequence[bytes | None] = [_levels(60, 250)] + [_levels(60, 150)] * 8
     estimates = _contrast_estimates(tmp_path, monkeypatch, frames)
     assert estimates.metrics["luma_white"] == 150.0
     c, b = (
@@ -368,7 +368,9 @@ def test_one_dark_or_bright_frame_does_not_decide(
 ) -> None:
     faded = _levels(50, 180)
     # One title card on true black in a faded print: still faded.
-    frames: list[bytes | None] = [_levels(0, 255)] + [faded] * (CONTRAST_SAMPLES - 1)
+    frames: Sequence[bytes | None] = [_levels(0, 255)] + [faded] * (
+        CONTRAST_SAMPLES - 1
+    )
     one = _contrast_estimates(tmp_path, monkeypatch, frames)
     assert one.contrast.enabled
     assert one.metrics["luma_black"] == 50.0
