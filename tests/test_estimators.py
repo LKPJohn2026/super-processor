@@ -21,6 +21,7 @@ from super_processor import (
     variance_u8,
 )
 from super_processor.estimators import (
+    CONTRAST_SAMPLES,
     SHAKE_HEIGHT,
     SHAKE_RUN,
     SHAKE_WIDTH,
@@ -28,18 +29,22 @@ from super_processor.estimators import (
     LookEstimates,
     _global_shift,
     _noise_residual,
+    _picture_area,
     _run_shake,
     choose_sample_windows,
+    contrast_sample_times,
     ensure_decoder,
     estimate_look,
     extract_gray_frame,
     extract_gray_run,
     extract_rgb_means,
+    is_full_range,
     load_estimates,
+    media_duration,
     shake_stride,
     write_estimates,
 )
-from super_processor.probe import MediaFacts, StreamFacts
+from super_processor.probe import MediaFacts, StreamFacts, probe_file
 
 
 def test_histogram_and_percentile() -> None:
@@ -157,18 +162,388 @@ def test_a_well_exposed_still_picture_needs_no_correction(
     assert len(estimates.windows) == 3
 
 
-def test_a_compressed_dark_picture_asks_for_more_contrast_and_light(
+def _levels(black: int, white: int, black_share: float = 0.0) -> bytes:
+    """A frame spread evenly from ``black`` to ``white``, with at least 2% of
+    its pixels on each end (so ``black`` and ``white`` are its 1st and 99th
+    percentiles) and ``black_share`` at ``black``, like a dark background."""
+    low = int(PIXELS * max(0.02, black_share))
+    high = int(PIXELS * 0.02)
+    ramp = PIXELS - low - high
+    return (
+        bytes([black]) * low
+        + bytes(black + (i * (white - black)) // ramp for i in range(ramp))
+        + bytes([white]) * high
+    )
+
+
+def _contrast_estimates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    frames: list[bytes | None],
+    facts: MediaFacts | None = None,
+) -> LookEstimates:
+    """Estimate with ``frames[i]`` at the i-th contrast sample time (None:
+    that frame fails to decode). The grabs run side by side, so frames are
+    picked by time, not by call order."""
+    times = contrast_sample_times(30.0)
+    assert len(frames) == len(times)
+
+    def extract(*_args: Any, at_s: float, **_kwargs: Any) -> bytes:
+        if at_s in times:
+            frame = frames[times.index(at_s)]
+            if frame is None:
+                raise EstimatorError(f"ffmpeg frame extract failed at {at_s:g}s")
+            return frame
+        return _spread()
+
+    monkeypatch.setattr("super_processor.estimators.extract_gray_frame", extract)
+    monkeypatch.setattr(
+        "super_processor.estimators.extract_gray_run",
+        lambda *_args, **_kwargs: _shaky_run([(0, 0)] * SHAKE_RUN),
+    )
+    monkeypatch.setattr(
+        "super_processor.estimators.extract_rgb_means",
+        lambda *_args, **_kwargs: (120.0, 120.0, 120.0),
+    )
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    return estimate_look(source, facts or _facts(30.0, source=str(source)))
+
+
+def _eq_gray(
+    level: float, contrast: float, brightness: float, *, full_range: bool = False
+) -> float:
+    """Where FFmpeg's eq puts a grey level, as measured: on limited range,
+    black 16 and white 235 stretched to 0-255; on full range, as stored."""
+    if full_range:
+        return contrast * (level - 128.0) + 127.5 + 255.5 * brightness
+    k = 255.0 / 219.0
+    return contrast * level + k * (111.5 - 112.0 * contrast + 255.5 * brightness)
+
+
+def _faded(black: int, white: int) -> list[bytes | None]:
+    return [_levels(black, white)] * CONTRAST_SAMPLES
+
+
+def test_a_faded_print_gets_its_black_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Half the pixels at 40, half at 60: a narrow, dark span.
-    frame = bytes([40, 60]) * (PIXELS // 2)
-    estimates = _run_estimates(tmp_path, monkeypatch, lambda _n: frame)
-    assert estimates.contrast.enabled
-    assert estimates.contrast.params["contrast"] == 2.0  # clamped from 9.0
-    assert estimates.contrast.params["brightness"] == pytest.approx(
-        (128 - 50) / 255, abs=1e-3
+    # A faded print: no frame darker than 50, none brighter than 190.
+    frames: list[bytes | None] = [
+        _levels(50 + n % 3, 170 + 5 * (n % 5)) for n in range(CONTRAST_SAMPLES)
+    ]
+    estimates = _contrast_estimates(tmp_path, monkeypatch, frames)
+    contrast = estimates.contrast
+    assert contrast.enabled
+    assert estimates.metrics["luma_black"] == 50.0
+    assert estimates.metrics["luma_white"] == 185.0
+    # A fade toward grey 128 that lifted black by 46 squeezed the range by
+    # 82/128: undone, that is short of the 236/135 a full stretch would take.
+    c, b = contrast.params["contrast"], contrast.params["brightness"]
+    assert c == pytest.approx(128.0 / 82.0, abs=1e-3)
+    assert _eq_gray(50.0, c, b) == pytest.approx(4.0, abs=0.3)
+    # Whites come out brighter than they went in, and short of clipping.
+    assert 185.0 < _eq_gray(185.0, c, b) < 240.0
+    assert contrast.params["gamma"] == 1.0
+    assert contrast.confidence == pytest.approx(min(1.0, 40 / 30 + c - 1.0), abs=1e-3)
+    assert "lifted" in contrast.reason
+
+
+def test_mildly_lifted_black_gets_a_gentle_stretch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An old film transfer: black at 24, white at 220.
+    contrast = _contrast_estimates(tmp_path, monkeypatch, _faded(24, 220)).contrast
+    assert contrast.enabled
+    c, b = contrast.params["contrast"], contrast.params["brightness"]
+    assert c == pytest.approx(128.0 / 108.0, abs=1e-3)
+    assert _eq_gray(24.0, c, b) == pytest.approx(4.0, abs=0.3)
+    assert _eq_gray(220.0, c, b) == pytest.approx(236.3, abs=0.3)
+    assert contrast.confidence == pytest.approx(14 / 30 + c - 1.0, abs=1e-3)
+
+
+def test_black_just_on_the_line_brings_no_boost_to_dim_whites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Ordinary camera footage, black at 20 and a dim scene: the old rule
+    # stretched it 1.5 times. Black comes down; whites barely move.
+    contrast = _contrast_estimates(tmp_path, monkeypatch, _faded(20, 150)).contrast
+    assert contrast.enabled
+    c, b = contrast.params["contrast"], contrast.params["brightness"]
+    assert c == pytest.approx(128.0 / 112.0, abs=1e-3)
+    assert _eq_gray(20.0, c, b) == pytest.approx(4.0, abs=0.3)
+    assert 150.0 <= _eq_gray(150.0, c, b) <= 153.0
+
+
+def test_a_heavily_faded_print_is_restored_up_to_twice_its_contrast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A capped stretch that only pulled black down left the picture darker
+    # than before fading: whites now come up as well.
+    strong = _contrast_estimates(tmp_path, monkeypatch, _faded(45, 175)).contrast
+    c, b = strong.params["contrast"], strong.params["brightness"]
+    assert c == pytest.approx(128.0 / 87.0, abs=1e-3)
+    assert _eq_gray(45.0, c, b) == pytest.approx(4.0, abs=0.3)
+    assert _eq_gray(175.0, c, b) > 190.0
+    heavy = _contrast_estimates(tmp_path, monkeypatch, _faded(100, 200)).contrast
+    c, b = heavy.params["contrast"], heavy.params["brightness"]
+    assert c == 2.0
+    assert b < -0.2
+    assert _eq_gray(100.0, c, b) == pytest.approx(4.0, abs=0.3)
+
+
+def test_pulling_black_down_never_dims_the_whites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Black at 20, white at 250: the fade explains a 1.14 stretch, but that
+    # would clip; the whites stay at 250 instead of dropping to 246.
+    contrast = _contrast_estimates(tmp_path, monkeypatch, _faded(20, 250)).contrast
+    c, b = contrast.params["contrast"], contrast.params["brightness"]
+    assert c == pytest.approx(246.0 / 230.0, abs=1e-3)
+    assert _eq_gray(250.0, c, b) == pytest.approx(250.0, abs=0.3)
+    assert _eq_gray(20.0, c, b) == pytest.approx(4.0, abs=0.3)
+
+
+def test_no_sampled_frame_is_pushed_into_clipping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A faded print with one frame much brighter than the rest.
+    frames: list[bytes | None] = [_levels(60, 250)] + [_levels(60, 150)] * 8
+    estimates = _contrast_estimates(tmp_path, monkeypatch, frames)
+    assert estimates.metrics["luma_white"] == 150.0
+    c, b = (
+        estimates.contrast.params["contrast"],
+        estimates.contrast.params["brightness"],
     )
-    assert estimates.metrics["luma_mean"] == pytest.approx(50.0)
+    assert c == pytest.approx(246.0 / 190.0, abs=1e-3)
+    assert _eq_gray(250.0, c, b) == pytest.approx(250.0, abs=0.3)
+
+
+def test_white_is_the_second_brightest_frame_s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    whites = [230, 200, 180, 170, 170, 170, 170, 170, 170]
+    frames: list[bytes | None] = [_levels(40, w) for w in whites]
+    estimates = _contrast_estimates(tmp_path, monkeypatch, frames)
+    assert estimates.metrics["luma_white"] == 200.0
+
+
+@pytest.mark.parametrize(
+    ("black", "white", "black_share"),
+    [
+        (0, 90, 0.6),  # an interview lit against black: dark on purpose
+        (0, 150, 0.0),  # dim whites, true black: a dim tape or a night film
+        (0, 255, 0.4),  # bright and high contrast with big black areas
+        (16, 230, 0.0),  # clean video, black a little above zero
+        (19, 200, 0.0),  # just under the lifted line
+    ],
+    ids=["dark-interview", "dim-whites", "black-areas", "clean", "near-lifted"],
+)
+def test_a_picture_reaching_true_black_is_left_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    black: int,
+    white: int,
+    black_share: float,
+) -> None:
+    # The old estimate pushed every picture's average toward mid grey and
+    # called every black pixel clipped: a dark interview got contrast 2.0
+    # and +0.44 brightness, turning its black background milky grey.
+    frames: list[bytes | None] = [_levels(black, white, black_share)] * (
+        CONTRAST_SAMPLES
+    )
+    estimates = _contrast_estimates(tmp_path, monkeypatch, frames)
+    assert not estimates.contrast.enabled
+    assert estimates.contrast.confidence == 0.0
+    assert estimates.contrast.params == {
+        "contrast": 1.0,
+        "brightness": 0.0,
+        "gamma": 1.0,
+    }
+    assert "true black" in estimates.contrast.reason
+
+
+def test_one_dark_or_bright_frame_does_not_decide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    faded = _levels(50, 180)
+    # One title card on true black in a faded print: still faded.
+    frames: list[bytes | None] = [_levels(0, 255)] + [faded] * (CONTRAST_SAMPLES - 1)
+    one = _contrast_estimates(tmp_path, monkeypatch, frames)
+    assert one.contrast.enabled
+    assert one.metrics["luma_black"] == 50.0
+    assert one.metrics["luma_white"] == 180.0
+    # True black in two frames: the print is not faded, the rest is scene.
+    two = _contrast_estimates(
+        tmp_path, monkeypatch, [_levels(0, 255)] * 2 + [faded] * 7
+    )
+    assert not two.contrast.enabled
+
+
+def test_fades_and_frames_that_fail_are_left_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    faded = _levels(40, 200)
+    black_card = bytes(PIXELS)
+    frames: list[bytes | None] = [black_card, None, black_card, None] + [faded] * 5
+    estimates = _contrast_estimates(tmp_path, monkeypatch, frames)
+    assert estimates.contrast.enabled
+    assert estimates.metrics["luma_black"] == 40.0
+    assert "over 5 frames" in estimates.contrast.reason
+    # A frame spanning exactly 24 levels counts; 23 is a fade.
+    edge = _contrast_estimates(
+        tmp_path, monkeypatch, [_levels(30, 54)] * 2 + [_levels(30, 53)] * 7
+    )
+    assert "over 2 frames" in edge.contrast.reason
+    # One picture among fades and failures is too little to judge.
+    few = _contrast_estimates(tmp_path, monkeypatch, [faded] + [black_card] * 8)
+    assert not few.contrast.enabled
+    assert "too few frames" in few.contrast.reason
+    blank = _contrast_estimates(tmp_path, monkeypatch, [black_card] * 8 + [None])
+    assert not blank.contrast.enabled
+    assert blank.contrast.confidence == 0.0
+    assert "too few frames" in blank.contrast.reason
+    assert "luma_black" not in blank.metrics
+
+
+def test_black_at_the_lifted_line_counts_as_lifted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    on = _contrast_estimates(tmp_path, monkeypatch, _faded(20, 220)).contrast
+    assert on.enabled
+    assert on.confidence == pytest.approx(
+        10 / 30 + on.params["contrast"] - 1.0, abs=1e-3
+    )
+
+
+def _boxed(black: int, white: int, rows: int, cols: int) -> bytes:
+    """A 160x90 frame of ``_levels(black, white)`` content inside true-black
+    bars ``rows`` tall and ``cols`` wide."""
+    inner_w, inner_h = 160 - 2 * cols, 90 - 2 * rows
+    picture = _levels(black, white)
+    out = bytearray(PIXELS)
+    for y in range(inner_h):
+        out[(y + rows) * 160 + cols : (y + rows) * 160 + cols + inner_w] = picture[
+            y * inner_w : (y + 1) * inner_w
+        ]
+    return bytes(out)
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols"), [(11, 0), (0, 20), (6, 10)], ids=["letter", "pillar", "window"]
+)
+def test_a_faded_film_inside_black_bars_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rows: int, cols: int
+) -> None:
+    # Scope film inside 16:9, or 4:3 inside 16:9: the bars are true black
+    # whatever the print, so they are measured out first.
+    frames: list[bytes | None] = [_boxed(50, 190, rows, cols)] * CONTRAST_SAMPLES
+    estimates = _contrast_estimates(tmp_path, monkeypatch, frames)
+    assert estimates.contrast.enabled
+    assert estimates.metrics["luma_black"] >= 50.0
+    assert "inside bars" in estimates.contrast.reason
+
+
+def test_picture_area_leaves_unboxed_and_tiny_pictures_whole() -> None:
+    assert _picture_area([_levels(0, 255)], 160) is None
+    # A picture under a quarter of the frame is a dark scene, not bars.
+    assert _picture_area([_boxed(50, 190, 40, 0)], 160) is None
+    assert _picture_area([_boxed(50, 190, 11, 0)], 160) == (13, 76, 0, 159)
+    assert _picture_area([], 160) is None
+
+
+def test_full_range_video_gets_its_own_eq_brightness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.mp4"
+    facts = _facts(30.0, source=str(source))
+    facts.streams.append(StreamFacts(index=0, codec_type="video", pix_fmt="yuvj420p"))
+    assert is_full_range(facts)
+    full = _contrast_estimates(tmp_path, monkeypatch, _faded(50, 190), facts)
+    c, b = full.contrast.params["contrast"], full.contrast.params["brightness"]
+    assert _eq_gray(50.0, c, b, full_range=True) == pytest.approx(4.0, abs=0.3)
+    limited = _contrast_estimates(tmp_path, monkeypatch, _faded(50, 190))
+    assert limited.contrast.params["brightness"] != b
+    facts.streams[0] = StreamFacts(
+        index=0, codec_type="video", pix_fmt="yuv420p", color_range="pc"
+    )
+    assert is_full_range(facts)
+    facts.streams[0] = StreamFacts(index=0, codec_type="video", pix_fmt="yuv420p")
+    assert not is_full_range(facts)
+    assert not is_full_range(_facts(30.0, video=False))
+
+
+def test_contrast_needs_to_know_how_long_the_video_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.mkv"
+    facts = _facts(None, source=str(source))
+    facts.streams.append(StreamFacts(index=0, codec_type="video"))
+    estimates = _contrast_estimates(tmp_path, monkeypatch, _faded(50, 190), facts)
+    assert not estimates.contrast.enabled
+    assert "duration unknown" in estimates.contrast.reason
+    # A live-muxed file has no container duration, but its stream may say.
+    facts.streams[0] = StreamFacts(index=0, codec_type="video", duration_s=30.0)
+    assert media_duration(facts) == 30.0
+    facts.streams[0] = StreamFacts(
+        index=0, codec_type="video", nb_frames=750, avg_frame_rate="25/1"
+    )
+    assert media_duration(facts) == 30.0
+    assert media_duration(_facts(12.5)) == 12.5
+    assert media_duration(_facts(None, video=False)) is None
+
+
+def test_contrast_samples_spread_over_the_whole_video() -> None:
+    times = contrast_sample_times(900.0)
+    assert len(times) == CONTRAST_SAMPLES == 9
+    assert times[0] == pytest.approx(50.0) and times[-1] == pytest.approx(850.0)
+    assert all(
+        b - a == pytest.approx(100.0) for a, b in zip(times, times[1:], strict=False)
+    )
+    # A short clip keeps every seek clear of its last frame.
+    assert max(contrast_sample_times(1.2)) <= 0.95
+    assert all(0.0 <= t <= 0.25 for t in contrast_sample_times(0.1))
+    assert contrast_sample_times(0.2)[-1] == pytest.approx(0.25)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.parametrize("pix_fmt", ["yuv420p", "yuvj420p"])
+def test_a_real_faded_clip_is_restored_and_a_clean_one_left_alone(
+    tmp_path: Path, pix_fmt: str
+) -> None:
+    def clip(name: str, look: str) -> tuple[Path, MediaFacts]:
+        source = tmp_path / f"{name}.mp4"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
+             "testsrc2=size=320x240:rate=10:duration=3", "-vf",
+             f"drawbox=x=0:y=0:w=iw:h=ih/4:color=black:t=fill,"
+             f"scale=out_range={'pc' if pix_fmt == 'yuvj420p' else 'tv'},"
+             f"format={pix_fmt},{look}",
+             "-c:v", "libx264", "-crf", "12", str(source)],
+            check=True,
+        )  # fmt: skip
+        facts = probe_file(source)
+        assert is_full_range(facts) is (pix_fmt == "yuvj420p")
+        return source, facts
+
+    clean, clean_facts = clip("clean", "null")
+    assert not estimate_look(clean, clean_facts).contrast.enabled
+    faded, faded_facts = clip("faded", "eq=contrast=0.65:brightness=0.1")
+    contrast = estimate_look(faded, faded_facts).contrast
+    assert contrast.enabled
+    c, b = contrast.params["contrast"], contrast.params["brightness"]
+    # Apply the suggestion with FFmpeg itself and measure the result.
+    blacks = []
+    for at_s in contrast_sample_times(3.0):
+        out = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{at_s:g}", "-i", str(faded),
+             "-frames:v", "1", "-vf",
+             f"eq=contrast={c}:brightness={b},scale=160:90,format=gray",
+             "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            check=True, capture_output=True,
+        ).stdout  # fmt: skip
+        blacks.append(percentile_u8(out, 1.0))
+    assert sorted(blacks)[1] <= 8.0
 
 
 def test_a_warm_cast_gets_a_cooling_white_balance(

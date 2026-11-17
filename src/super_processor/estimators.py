@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import math
 import subprocess
-from array import array
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import histogram_u8, mean_luma, percentile_u8, sad_u8
+from . import mean_luma, percentile_u8, sad_u8
 from .doctor import check_ffmpeg_capability, which
 from .encoders import HARDWARE_DECODERS, decoder_input_args
 from .probe import MediaFacts, parse_frame_rate
@@ -360,51 +360,233 @@ def extract_rgb_means(
     return r_total / scale, g_total / scale, b_total / scale
 
 
-def _estimate_contrast(frames: list[bytes]) -> tuple[OpSuggestion, dict[str, float]]:
-    p05_vals: list[float] = []
-    p95_vals: list[float] = []
-    means: list[float] = []
-    clip_lows: list[float] = []
-    clip_highs: list[float] = []
-    hist = array("Q", [0]) * 256
+# Contrast is judged on frames spread over the whole video, so that one
+# dark or bright scene does not decide it for the rest.
+CONTRAST_SAMPLES = 9
+# A frame's black and white points: its 1st and 99th percentile, so a few
+# stray pixels (a logo, a scratch, a speck of dust) do not count.
+_BLACK_PCT = 1.0
+_WHITE_PCT = 99.0
+# A frame spanning fewer levels than this is a fade or a blank card.
+_BLANK_SPAN = 24.0
+# Rows and columns at the edge no brighter than this in every sampled frame
+# are letterbox or pillarbox bars, not picture. The scaled picture's own
+# edge bleeds into the bar, so 2 more pixels are dropped there.
+_BAR_LEVEL = 12
+_BAR_BLEED = 2
+# Where a faded picture's black and white are put back (8-bit grey, where
+# video black is 0 and video white 255). No sampled frame's white is
+# pushed past _CLIP_WHITE.
+_TARGET_BLACK = 4.0
+_TARGET_WHITE = 240.0
+_CLIP_WHITE = 250.0
+# Black at or above this level in nearly every frame is a faded print or a
+# lifted transfer. Clean and well-kept video measures 0-18 here.
+_LIFTED_BLACK = 20.0
+# Fading pulls the whole picture toward a grey: faded = a*picture +
+# (1-a)*grey, which lifts black by (1-a)*grey and squeezes the range by a.
+# Whites are stretched only as far as the black's lift explains, so a
+# barely lifted black does not bring a large boost to dim whites, which may
+# be the scene's own.
+_FADE_GREY = 128.0
+_MAX_STRETCH = 2.0
+# FFmpeg's eq works on the stored levels. On limited-range video (black 16,
+# white 235) a grey frame stretches those over 0-255; on full-range video
+# (yuvj, MJPEG, some phones) grey is the stored level itself. Its contrast
+# turns about level 127.5 + 0.5/(c-1) and its brightness adds 255.5 levels
+# per 1.0.
+_GRAY_PER_LEVEL = 255.0 / 219.0
 
-    for frame in frames:
-        histogram_u8(frame, memoryview(hist))
-        total = float(sum(hist))
-        p05_vals.append(percentile_u8(frame, 5.0))
-        p95_vals.append(percentile_u8(frame, 95.0))
-        means.append(mean_luma(frame))
-        clip_lows.append(hist[0] / total)
-        clip_highs.append(hist[255] / total)
 
-    p05 = sum(p05_vals) / len(p05_vals)
-    p95 = sum(p95_vals) / len(p95_vals)
-    mean = sum(means) / len(means)
-    span = max(1.0, p95 - p05)
-    # Map compressed spans toward a mild contrast boost.
-    contrast = max(0.5, min(2.0, 180.0 / span))
-    brightness = max(-0.5, min(0.5, (128.0 - mean) / 255.0))
-    clip = (sum(clip_lows) + sum(clip_highs)) / len(frames)
-    enabled = contrast > 1.08 or abs(brightness) > 0.04 or clip > 0.02
-    confidence = min(
-        1.0, abs(contrast - 1.0) * 2.0 + abs(brightness) * 2.0 + clip * 5.0
+def contrast_sample_times(
+    duration_s: float, count: int = CONTRAST_SAMPLES
+) -> list[float]:
+    """Evenly spread times to judge contrast at, clear of both ends: a seek
+    into the last frame's own time finds no frame to decode."""
+    duration = max(0.5, duration_s)
+    last = max(0.0, duration - 0.25)
+    return [min(last, duration * (index + 0.5) / count) for index in range(count)]
+
+
+def _eq_brightness(
+    contrast: float, black: float, target: float, *, full_range: bool = False
+) -> float:
+    """The eq brightness that puts grey level ``black`` at ``target`` after
+    eq scales it by ``contrast``."""
+    if full_range:
+        return (target - contrast * (black - 128.0) - 127.5) / 255.5
+    level = (target - contrast * black) / _GRAY_PER_LEVEL
+    return (level - 111.5 + 112.0 * contrast) / 255.5
+
+
+def is_full_range(facts: MediaFacts) -> bool:
+    """Whether the video stores full-range levels (0-255, not 16-235)."""
+    video = facts.primary_video()
+    if video is None:
+        return False
+    return video.color_range == "pc" or (video.pix_fmt or "").startswith("yuvj")
+
+
+def media_duration(facts: MediaFacts) -> float | None:
+    """The video's length: the container's, else the video stream's, else
+    its frame count over its frame rate. None when nothing says."""
+    if facts.duration_s:
+        return facts.duration_s
+    video = facts.primary_video()
+    if video is None:
+        return None
+    if video.duration_s:
+        return video.duration_s
+    rate = parse_frame_rate(video.avg_frame_rate) or parse_frame_rate(
+        video.r_frame_rate
     )
+    if video.nb_frames and rate:
+        return video.nb_frames / rate
+    return None
+
+
+def _centred(near: int, far: int) -> bool:
+    """Whether bars of ``near`` and ``far`` pixels are a matched pair."""
+    return near > 0 and far > 0 and abs(near - far) <= _BAR_BLEED
+
+
+def _picture_area(frames: list[bytes], width: int) -> tuple[int, int, int, int] | None:
+    """The rows and columns (top, bottom, left, right, inclusive) inside any
+    letterbox or pillarbox bars, or None when there are none."""
+    height = len(frames[0]) // width if frames and width else 0
+    if height < 4 or width < 4:
+        return None
+    row_max = [0] * height
+    col_max = [0] * width
+    for frame in frames:
+        for y in range(height):
+            row_max[y] = max(row_max[y], max(frame[y * width : (y + 1) * width]))
+        for x in range(width):
+            col_max[x] = max(col_max[x], max(frame[x : height * width : width]))
+    rows = [y for y, level in enumerate(row_max) if level > _BAR_LEVEL]
+    cols = [x for x, level in enumerate(col_max) if level > _BAR_LEVEL]
+    if not rows or not cols:
+        return None
+    top, bottom, left, right = rows[0], rows[-1], cols[0], cols[-1]
+    # Bars are centred: a dark band along one edge only is part of the
+    # picture (a night sky, a shadowed floor), and so is its true black.
+    if not _centred(top, height - 1 - bottom):
+        top, bottom = 0, height - 1
+    if not _centred(left, width - 1 - right):
+        left, right = 0, width - 1
+    if (top, bottom, left, right) == (0, height - 1, 0, width - 1):
+        return None
+    top += _BAR_BLEED if top else 0
+    bottom -= _BAR_BLEED if bottom < height - 1 else 0
+    left += _BAR_BLEED if left else 0
+    right -= _BAR_BLEED if right < width - 1 else 0
+    # Bars that leave less than a quarter of either side are not bars.
+    if bottom - top + 1 < height // 4 or right - left + 1 < width // 4:
+        return None
+    return top, bottom, left, right
+
+
+def _no_contrast(
+    reason: str, metrics: dict[str, float]
+) -> tuple[OpSuggestion, dict[str, float]]:
+    return (
+        OpSuggestion(
+            enabled=False,
+            confidence=0.0,
+            params={"contrast": 1.0, "brightness": 0.0, "gamma": 1.0},
+            reason=reason,
+        ),
+        metrics,
+    )
+
+
+def _estimate_contrast(
+    frames: list[bytes], width: int = 160, *, full_range: bool = False
+) -> tuple[OpSuggestion, dict[str, float]]:
+    """Restore the black of a faded picture, and leave every other alone.
+
+    How dark or bright a picture is belongs to its scene: a night shot, an
+    interview lit against black, a snowfield. A fault in the print or the
+    transfer instead shows in every frame, the dark ones too: a faded print
+    has no true black anywhere. So black is the second darkest frame's black
+    point, and white the second brightest frame's white point, which a
+    single title card or flash cannot move. Letterbox and pillarbox bars
+    are left out first: they are black whatever the print.
+
+    The black goes back to video black. The white is stretched only as far
+    as the black's lift explains, never ends up dimmer than it was, and no
+    sampled frame is pushed into clipping: from the picture alone, a dim
+    transfer cannot be told from a film shot dark on purpose.
+    """
+    area = _picture_area(frames, width)
+    if area is not None:
+        top, bottom, left, right = area
+        frames = [
+            b"".join(
+                frame[y * width + left : y * width + right + 1]
+                for y in range(top, bottom + 1)
+            )
+            for frame in frames
+        ]
+    blacks: list[float] = []
+    whites: list[float] = []
+    means: list[float] = []
+    for frame in frames:
+        low = percentile_u8(frame, _BLACK_PCT)
+        high = percentile_u8(frame, _WHITE_PCT)
+        means.append(mean_luma(frame))
+        if high - low >= _BLANK_SPAN:
+            blacks.append(low)
+            whites.append(high)
+    mean = sum(means) / len(means) if means else 0.0
+    metrics = {"luma_mean": mean}
+    if len(blacks) < 2:
+        return _no_contrast("too few frames with a picture to judge contrast", metrics)
+
+    black = sorted(blacks)[1]
+    white = sorted(whites)[-2]
+    metrics.update({"luma_black": black, "luma_white": white})
+    lifted = black >= _LIFTED_BLACK
+    contrast = 1.0
+    brightness = 0.0
+    if lifted:
+        span = max(1.0, white - black)
+        full = (_TARGET_WHITE - _TARGET_BLACK) / span
+        lift = min(_FADE_GREY - 1.0, black - _TARGET_BLACK)
+        explained = _FADE_GREY / (_FADE_GREY - lift)
+        contrast = min(full, explained)
+        # Pulling black down never leaves the whites dimmer than they were.
+        contrast = max(contrast, (white - _TARGET_BLACK) / span)
+        brightest = max(1.0, max(whites) - black)
+        contrast = min(contrast, (_CLIP_WHITE - _TARGET_BLACK) / brightest)
+        contrast = max(1.0, min(_MAX_STRETCH, contrast))
+        brightness = max(
+            -0.5,
+            min(
+                0.5,
+                _eq_brightness(contrast, black, _TARGET_BLACK, full_range=full_range),
+            ),
+        )
+    confidence = (
+        min(1.0, (black - _LIFTED_BLACK + 10.0) / 30.0 + (contrast - 1.0))
+        if lifted
+        else 0.0
+    )
+    state = "lifted" if lifted else "true black"
+    bars = " inside bars" if area is not None else ""
     suggestion = OpSuggestion(
-        enabled=enabled,
+        enabled=lifted,
         confidence=confidence,
         params={
-            "contrast": round(contrast if enabled else 1.0, 3),
-            "brightness": round(brightness if enabled else 0.0, 3),
+            "contrast": round(contrast, 3),
+            "brightness": round(brightness, 3),
             "gamma": 1.0,
         },
-        reason=(f"luma p05={p05:.1f} p95={p95:.1f} mean={mean:.1f} clip={clip:.3f}"),
+        reason=(
+            f"black={black:.0f} ({state}) white={white:.0f} "
+            f"over {len(blacks)} frames{bars}, mean={mean:.0f}"
+        ),
     )
-    metrics = {
-        "luma_p05": p05,
-        "luma_p95": p95,
-        "luma_mean": mean,
-        "clip_fraction": clip,
-    }
     return suggestion, metrics
 
 
@@ -737,7 +919,30 @@ def estimate_look(
             extract_rgb_means(source, at_s=window.start_s, ffmpeg_bin=ffmpeg_bin)
         )
 
-    contrast, contrast_metrics = _estimate_contrast(gray_frames)
+    # Each frame is its own ffmpeg process, so they decode side by side:
+    # nine seeks into 1080p video take 0.6 s instead of 1.6 s.
+    # A frame that will not decode is left out, as a blank one would be.
+    def contrast_frame(at_s: float) -> bytes | None:
+        try:
+            return extract_gray_frame(source, at_s=at_s, ffmpeg_bin=ffmpeg_bin)
+        except EstimatorError:
+            return None
+
+    length = media_duration(facts)
+    if length is None:
+        contrast, contrast_metrics = _no_contrast(
+            "duration unknown: cannot spread contrast samples", {}
+        )
+    else:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            contrast_frames = [
+                frame
+                for frame in pool.map(contrast_frame, contrast_sample_times(length))
+                if frame is not None
+            ]
+        contrast, contrast_metrics = _estimate_contrast(
+            contrast_frames, full_range=is_full_range(facts)
+        )
     white_balance, wb_metrics = _estimate_white_balance(rgb_means)
     if side is None:
         denoise, denoise_metrics = _estimate_denoise(gray_frames)

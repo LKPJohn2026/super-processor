@@ -99,6 +99,15 @@ def _op_map(recipe: Recipe) -> dict[OpName, RecipeOp]:
 def _look_filters(ops: dict[OpName, RecipeOp]) -> list[str]:
     filters: list[str] = []
 
+    # Levels first: the contrast estimate measured black and white on the
+    # source, and colortemperature moves them.
+    contrast = ops.get(OpName.CONTRAST)
+    if contrast is not None:
+        c = float(contrast.params.get("contrast", 1.0))
+        b = float(contrast.params.get("brightness", 0.0))
+        g = float(contrast.params.get("gamma", 1.0))
+        filters.append(f"eq=contrast={c:g}:brightness={b:g}:gamma={g:g}")
+
     wb = ops.get(OpName.WHITE_BALANCE)
     if wb is not None:
         temperature = float(wb.params.get("temperature", 6500.0))
@@ -108,13 +117,6 @@ def _look_filters(ops: dict[OpName, RecipeOp]) -> list[str]:
             # Map tint into a mild green/magenta colorbalance nudge.
             amount = max(-1.0, min(1.0, tint / 100.0)) * 0.25
             filters.append(f"colorbalance=gm={amount:g}")
-
-    contrast = ops.get(OpName.CONTRAST)
-    if contrast is not None:
-        c = float(contrast.params.get("contrast", 1.0))
-        b = float(contrast.params.get("brightness", 0.0))
-        g = float(contrast.params.get("gamma", 1.0))
-        filters.append(f"eq=contrast={c:g}:brightness={b:g}:gamma={g:g}")
 
     denoise = ops.get(OpName.DENOISE)
     if denoise is not None:

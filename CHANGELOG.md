@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `diagnose` suggested brightening and adding contrast to nearly every dark
+  video, turning black backgrounds milky grey and burning out whites. It
+  pushed each picture's average toward mid grey and counted every black
+  pixel as clipped: a 1990s documentary's interview lit against black got
+  contrast 2.0 and +0.44 brightness. It now judges 9 frames spread over
+  the whole video and corrects only a faded picture: one with no true
+  black in any frame but a title card or two (black at level 20 or above),
+  measured inside any letterbox or pillarbox bars. Its black goes back to
+  video black, and its whites are stretched as far as a fade of that lift
+  explains (at most 2 times), never dimmer than they were and with no
+  sampled frame pushed into clipping. A picture that reaches true black is
+  left alone however dark or dim it is, since a dim transfer cannot be told
+  from a film shot dark on purpose. Full-range video (yuvj, MJPEG) gets its
+  own brightness, levels are corrected before white balance, and a video
+  of unknown length is not judged from its first second. Four archive
+  films are now gently corrected, every modern clip and the documentary
+  are left alone, and faded copies come back close to their originals.
+  Still missed: a faded film whose samples land mostly on black title
+  cards. Diagnosing takes about 0.1 s longer at SD and 0.6 s at 1080p.
+
 ## [4.1.0] - 2026-11-16
 
 ### Fixed

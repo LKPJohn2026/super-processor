@@ -47,6 +47,9 @@ def test_build_plan_includes_filters_and_no_shell(tmp_path: Path) -> None:
     assert "eq=contrast=1.2" in plan.filter_graph
     assert "hqdn3d=" in plan.filter_graph
     assert "colorbalance=gm=" in plan.filter_graph
+    # Levels go first: the contrast estimate measured the source's own black
+    # and white, and colortemperature moves them.
+    assert plan.filter_graph.index("eq=") < plan.filter_graph.index("colortemperature=")
     # No shell metacharacters glued into a single string with paths.
     assert all(";" not in part for part in argv)
     assert "-crf" in argv
