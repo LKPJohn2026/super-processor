@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import shutil
 import subprocess
@@ -20,15 +21,22 @@ from super_processor import (
     variance_u8,
 )
 from super_processor.estimators import (
+    SHAKE_HEIGHT,
+    SHAKE_RUN,
+    SHAKE_WIDTH,
     EstimatorError,
     LookEstimates,
+    _global_shift,
     _noise_residual,
+    _run_shake,
     choose_sample_windows,
     ensure_decoder,
     estimate_look,
     extract_gray_frame,
+    extract_gray_run,
     extract_rgb_means,
     load_estimates,
+    shake_stride,
     write_estimates,
 )
 from super_processor.probe import MediaFacts, StreamFacts
@@ -101,12 +109,20 @@ def _run_estimates(
     monkeypatch: pytest.MonkeyPatch,
     gray: Callable[[int], bytes],
     rgb: tuple[float, float, float] = (120.0, 120.0, 120.0),
+    runs: Callable[[int], list[bytes]] | None = None,
 ) -> LookEstimates:
-    """Estimate from fake samples; ``gray`` gets the call number."""
+    """Estimate from fake samples; ``gray`` and ``runs`` get the call
+    number. Runs default to a still picture."""
     calls = iter(range(1000))
+    run_calls = iter(range(1000))
     monkeypatch.setattr(
         "super_processor.estimators.extract_gray_frame",
         lambda *_args, **_kwargs: gray(next(calls)),
+    )
+    still = _shaky_run([(0, 0)] * SHAKE_RUN)
+    monkeypatch.setattr(
+        "super_processor.estimators.extract_gray_run",
+        lambda *_args, **_kwargs: (runs or (lambda _n: still))(next(run_calls)),
     )
     monkeypatch.setattr(
         "super_processor.estimators.extract_rgb_means",
@@ -135,9 +151,9 @@ def test_a_well_exposed_still_picture_needs_no_correction(
     }
     assert not estimates.white_balance.enabled
     assert estimates.white_balance.params == {"temperature": 6500.0, "tint": 0.0}
-    # Identical frames in each pair: no motion, so no stabilising.
+    # A still picture: no motion, so no stabilising.
     assert not estimates.stabilize.enabled
-    assert estimates.metrics["shake_sad_norm"] == 0.0
+    assert estimates.metrics["shake_jitter_pct"] == 0.0
     assert len(estimates.windows) == 3
 
 
@@ -228,6 +244,10 @@ def _grain_estimates(
 
     monkeypatch.setattr("super_processor.estimators.extract_gray_frame", extract)
     monkeypatch.setattr(
+        "super_processor.estimators.extract_gray_run",
+        lambda *_args, **_kwargs: _shaky_run([(0, 0)] * SHAKE_RUN),
+    )
+    monkeypatch.setattr(
         "super_processor.estimators.extract_rgb_means",
         lambda *_args, **_kwargs: (120.0, 120.0, 120.0),
     )
@@ -301,19 +321,263 @@ def test_a_real_sd_clip_s_grain_decides_denoise(
     assert estimates.denoise.enabled is grainy
 
 
-def test_frames_that_jump_within_a_window_ask_for_stabilising(
+_W, _H = SHAKE_WIDTH, SHAKE_HEIGHT
+_PAD = 24
+
+
+def _scene(seed: int) -> bytes:
+    """A textured picture larger than a frame, to cut shifted frames from."""
+    rng = random.Random(seed)
+    width, height = _W + 2 * _PAD, _H + 2 * _PAD
+    stride = width // 4 + 2
+    coarse = [rng.randrange(256) for _ in range(stride * (height // 4 + 2))]
+    # Blocky but not flat, like film: 4x4 cells plus a little grain.
+    return bytes(
+        max(0, min(255, coarse[(y // 4) * stride + x // 4] + rng.randrange(-3, 4)))
+        for y in range(height)
+        for x in range(width)
+    )
+
+
+_SCENES: dict[int, bytes] = {}
+
+
+def _frame_at(dx: int, dy: int, seed: int = 1) -> bytes:
+    scene = _SCENES.setdefault(seed, _scene(seed))
+    width = _W + 2 * _PAD
+    rows = []
+    for y in range(_H):
+        start = (y + _PAD + dy) * width + _PAD + dx
+        rows.append(scene[start : start + _W])
+    return b"".join(rows)
+
+
+def _shaky_run(offsets: list[tuple[int, int]], seed: int = 1) -> list[bytes]:
+    """Frames of one picture, each with the camera at ``offsets[i]``."""
+    return [_frame_at(dx, dy, seed) for dx, dy in offsets]
+
+
+# A handheld camera: the aim wobbles back and forth from frame to frame.
+_HANDHELD = [(0, 0), (5, -3), (-2, 4), (6, 1), (-4, -4), (3, 5), (-5, 0), (4, -2)]
+# A pan: 3 px per frame, every frame.
+_PAN = [(3 * k - 12, 0) for k in range(SHAKE_RUN)]
+
+
+def test_whole_frame_shift_is_found_to_the_pixel() -> None:
+    # The camera moves 5 px right and 3 px up, so the picture moves the
+    # other way.
+    a, b = _frame_at(0, 0), _frame_at(5, -3)
+    dx, dy, left = _global_shift(a, b, _W, _H)
+    assert (round(dx), round(dy)) == (-5, 3)
+    assert abs(dx + 5) < 0.3 and abs(dy - 3) < 0.3
+    assert left < 3.0
+    # A flat picture gives nothing to align: it has not moved.
+    flat = bytes([90]) * (_W * _H)
+    assert _global_shift(flat, flat, _W, _H)[:2] == (0.0, 0.0)
+
+
+def test_a_handheld_camera_asks_for_stabilising_sized_to_the_shake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Each window samples a frame and one a moment later: make them differ.
-    frames = (bytes([60]) * PIXELS, bytes([120]) * PIXELS)
-    estimates = _run_estimates(tmp_path, monkeypatch, lambda n: frames[n % 2])
+    run = _shaky_run(_HANDHELD)
+    estimates = _run_estimates(
+        tmp_path, monkeypatch, lambda _n: _spread(), runs=lambda _n: run
+    )
     assert estimates.stabilize.enabled
-    assert estimates.metrics["shake_sad_norm"] == pytest.approx(60.0)
+    assert estimates.metrics["shake_jitter_pct"] > 2.0
+    params = estimates.stabilize.params
+    assert 6.0 <= params["shakiness"] <= 10.0
+    # The crop follows how far the picture strays, not a fixed 30%.
+    assert 3.0 <= params["max_crop_pct"] <= 15.0
+    assert 10.0 <= params["smoothing"] <= 30.0
+
+
+def test_light_shake_asks_for_a_lighter_touch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    light = _shaky_run([(dx // 3, dy // 3) for dx, dy in _HANDHELD])
+    strong = _shaky_run(_HANDHELD)
+    a = _run_estimates(
+        tmp_path, monkeypatch, lambda _n: _spread(), runs=lambda _n: light
+    )
+    b = _run_estimates(
+        tmp_path, monkeypatch, lambda _n: _spread(), runs=lambda _n: strong
+    )
+    assert a.stabilize.enabled
+    assert a.stabilize.params["shakiness"] < b.stabilize.params["shakiness"]
+    assert a.stabilize.params["max_crop_pct"] < b.stabilize.params["max_crop_pct"]
+
+
+def test_a_steady_pan_is_not_shake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _shaky_run(_PAN)
+    estimates = _run_estimates(
+        tmp_path, monkeypatch, lambda _n: _spread(), runs=lambda _n: run
+    )
+    assert not estimates.stabilize.enabled
+    assert estimates.metrics["shake_jitter_pct"] < 0.2
     assert estimates.stabilize.params == {
-        "shakiness": 10.0,
-        "smoothing": 50.0,
-        "max_crop_pct": 30.0,
+        "shakiness": 5.0,
+        "smoothing": 10.0,
+        "max_crop_pct": 10.0,
     }
+
+
+def test_a_cut_is_not_shake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A still shot, then a cut to another: the old measure called every cut
+    # and every moving subject maximum shake.
+    run = _shaky_run([(0, 0)] * 4) + _shaky_run([(0, 0)] * 4, seed=2)
+    estimates = _run_estimates(
+        tmp_path, monkeypatch, lambda _n: _spread(), runs=lambda _n: run
+    )
+    assert not estimates.stabilize.enabled
+    assert estimates.metrics["shake_jitter_pct"] == 0.0
+
+
+def test_frames_with_nothing_in_common_are_not_measured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = [_frame_at(0, 0, seed) for seed in range(10, 10 + SHAKE_RUN)]
+    estimates = _run_estimates(
+        tmp_path, monkeypatch, lambda _n: _spread(), runs=lambda _n: run
+    )
+    assert not estimates.stabilize.enabled
+    assert estimates.stabilize.confidence == 0.0
+    assert "no steady stretch" in estimates.stabilize.reason
+
+
+def test_one_shaky_sample_of_three_does_not_decide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs = [
+        _shaky_run(_HANDHELD),
+        _shaky_run(_PAN),
+        _shaky_run([(0, 0)] * SHAKE_RUN),
+    ]
+    estimates = _run_estimates(
+        tmp_path, monkeypatch, lambda _n: _spread(), runs=lambda n: runs[n]
+    )
+    assert not estimates.stabilize.enabled
+
+
+def _walk(fps: float, frames: int = SHAKE_RUN) -> list[tuple[int, int]]:
+    """A camera bobbing 2.5 times a second, sampled at ``fps``."""
+    return [
+        (round(9 * math.sin(2 * math.pi * 2.5 * k / fps)), 0) for k in range(frames)
+    ]
+
+
+def test_the_same_shake_reads_the_same_at_any_frame_rate() -> None:
+    # Between frames 1/24 s apart a wobble changes more than between frames
+    # 1/60 s apart; the jitter is scaled back to 30 fps.
+    readings = {}
+    for fps in (24.0, 30.0, 48.0):
+        run = _shaky_run(_walk(fps))
+        measured = _run_shake(run, _W, _H, fps)
+        assert measured is not None
+        readings[fps] = measured[0]
+    assert max(readings.values()) < 1.6 * min(readings.values())
+
+
+@pytest.mark.parametrize(
+    ("fps", "stride"),
+    [(None, 1), (23.976, 1), (30.0, 1), (50.0, 2), (59.94, 2), (120.0, 4)],
+)
+def test_fast_footage_is_read_every_few_frames(fps: float | None, stride: int) -> None:
+    assert shake_stride(fps) == stride
+
+
+def test_repeated_frames_do_not_make_a_pan_look_shaky() -> None:
+    # A 24p pan carried at 30p repeats every fourth frame: each repeat is a
+    # move of nothing between two moves of 6 px.
+    pan = [(6 * k - 21, 0) for k in range(7)]
+    carried = [pan[0], pan[1], pan[2], pan[3], pan[3], pan[4], pan[5], pan[6]]
+    measured = _run_shake(_shaky_run(carried), _W, _H, 30.0)
+    assert measured is not None
+    assert measured[0] < 0.2
+
+
+def test_shake_beyond_the_old_search_is_measured() -> None:
+    # Moves of up to 14 px a frame (4% of the width) used to be dropped as
+    # cuts, so the worst shake got the smallest crop, then none.
+    wild = [(0, 0), (12, -6), (-2, 6), (13, 2), (-8, -7), (6, 9), (-10, 0), (8, -4)]
+    measured = _run_shake(_shaky_run(wild, seed=3), _W, _H)
+    assert measured is not None
+    assert measured[0] > 5.0
+
+
+def test_with_two_samples_the_calmer_decides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One window is a cut and cannot be measured: of the two left, the still
+    # one decides, not the handheld insert.
+    nothing = [_frame_at(0, 0, seed) for seed in range(20, 20 + SHAKE_RUN)]
+    runs = [_shaky_run([(0, 0)] * SHAKE_RUN), nothing, _shaky_run(_HANDHELD)]
+    estimates = _run_estimates(
+        tmp_path, monkeypatch, lambda _n: _spread(), runs=lambda n: runs[n]
+    )
+    assert not estimates.stabilize.enabled
+
+
+def test_a_run_of_frames_is_one_ffmpeg_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+    size = 320 * 180
+
+    def run(cmd: list[str], **_kwargs: Any) -> _Completed:
+        seen.append(cmd)
+        return _Completed(0, bytes(size * 8))
+
+    monkeypatch.setattr("super_processor.estimators.subprocess.run", run)
+    frames = extract_gray_run(Path("clip.mp4"), at_s=2.0, ffmpeg_bin="ffmpeg")
+    assert len(frames) == 8 and all(len(f) == size for f in frames)
+    assert seen[0][seen[0].index("-frames:v") + 1] == "8"
+    assert seen[0][seen[0].index("-vf") + 1] == "scale=320:180,format=gray"
+    # Each decoded frame once: FFmpeg must not repeat one to fill time.
+    assert seen[0][seen[0].index("-fps_mode") + 1] == "passthrough"
+    extract_gray_run(Path("clip.mp4"), at_s=2.0, ffmpeg_bin="ffmpeg", stride=2)
+    assert seen[1][seen[1].index("-vf") + 1] == (
+        "select=not(mod(n\\,2)),scale=320:180,format=gray"
+    )
+    # Near the end of a clip fewer frames come back; a part frame is dropped.
+    monkeypatch.setattr(
+        "super_processor.estimators.subprocess.run",
+        lambda *_a, **_k: _Completed(0, bytes(size * 3 + 100)),
+    )
+    assert len(extract_gray_run(Path("clip.mp4"), at_s=2.0, ffmpeg_bin="ffmpeg")) == 3
+    # One frame cannot show movement.
+    monkeypatch.setattr(
+        "super_processor.estimators.subprocess.run",
+        lambda *_a, **_k: _Completed(0, bytes(size)),
+    )
+    with pytest.raises(EstimatorError, match="short frame buffer"):
+        extract_gray_run(Path("clip.mp4"), at_s=2.0, ffmpeg_bin="ffmpeg")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.parametrize(
+    ("crop", "shaky"),
+    [
+        ("crop=600:450:x='20+9*sin(n*2.1)':y='15+7*cos(n*1.9)'", True),
+        ("crop=600:450:x='mod(n*2,40)':y=15", False),
+        ("crop=600:450:x=20:y=15", False),
+    ],
+    ids=["handheld", "pan", "still"],
+)
+def test_a_real_sd_clip_s_shake_decides_stabilising(
+    tmp_path: Path, crop: str, shaky: bool
+) -> None:
+    source = tmp_path / "sd.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
+         "testsrc2=size=640x480:rate=30:duration=3",
+         "-vf", f"{crop.replace(',', chr(92) + ',')},scale=640:480",
+         "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(source)],
+        check=True,
+    )  # fmt: skip
+    facts = _sized(640, 480, source)
+    facts.duration_s = 3.0
+    assert estimate_look(source, facts).stabilize.enabled is shaky
 
 
 def test_estimation_needs_a_readable_video(tmp_path: Path) -> None:
@@ -461,7 +725,7 @@ def test_estimate_look_roundtrip(tmp_path: Path) -> None:
     estimates = estimate_look(source, facts)
     assert isinstance(estimates, LookEstimates)
     assert set(estimates.contrast.params) == {"contrast", "brightness", "gamma"}
-    assert {"luma_mean", "wb_cast", "noise_residual", "shake_sad_norm"} <= set(
+    assert {"luma_mean", "wb_cast", "noise_residual", "shake_jitter_pct"} <= set(
         estimates.metrics
     )
     # testsrc is full of colour bars, nowhere near black or white on average.

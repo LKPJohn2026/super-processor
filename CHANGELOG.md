@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `diagnose` suggested stabilising, at its strongest setting and a 30%
+  zoom, for nearly every video. It measured how much the picture changed
+  between two frames, so any movement, fade or cut counted as shake: 11 of
+  12 test clips came out at the maximum. It now reads 8 frames in a row at
+  each sample point (every second frame at 50-60 fps), finds the
+  whole-frame shift between neighbours up to 5% of the width, skips cuts
+  and repeated frames (24p film carried at 30p), and measures how much the
+  shift changes from frame to frame, scaled to 30 fps, so a steady pan
+  scores nothing and the same shake reads the same at 24, 30 or 60 fps.
+  The zoom follows how far the picture strays (1-15%), and vid.stab's
+  shakiness is rounded instead of cut down. Every real test clip now stays
+  off; simulated handheld shake on a 1947 film, on 360p and on 25-60 fps
+  video is caught. Slow sway under about 1 Hz and a subject filling half
+  the frame are not told apart from a still camera. Diagnosing takes about
+  0.3 s longer.
+
 ## [4.0.1] - 2026-11-16
 
 ### Changed

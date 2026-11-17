@@ -88,6 +88,31 @@ def test_stabilize_uses_two_vidstab_passes_or_falls_back_to_deshake(
         assert plan.filter_graph == "deshake"
 
 
+@pytest.mark.parametrize(
+    ("given", "used"), [(1.84, 2), (0.2, 1), (9.6, 10), (14.0, 10)]
+)
+def test_stabilise_shakiness_is_rounded_into_vidstab_s_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, given: float, used: int
+) -> None:
+    monkeypatch.setattr(
+        "super_processor.templates.ffmpeg_has_filter", lambda _name, **_kwargs: True
+    )
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    recipe = empty_recipe("abcd1234abcd1234", str(source.resolve()))
+    for op in recipe.ops:
+        if op.op is OpName.STABILIZE:
+            op.enabled = True
+            op.params = {"shakiness": given, "smoothing": 12, "max_crop_pct": 8}
+    plan = build_ffmpeg_plan(
+        recipe, output_path=tmp_path / "out.mp4", work_dir=tmp_path, ffmpeg_bin="ffmpeg"
+    )
+    detect = plan.steps[0].argv
+    assert detect[detect.index("-vf") + 1].startswith(
+        f"vidstabdetect=shakiness={used}:"
+    )
+
+
 def test_a_preview_encodes_only_the_preview_window(tmp_path: Path) -> None:
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"fake")

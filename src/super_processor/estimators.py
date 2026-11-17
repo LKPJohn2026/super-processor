@@ -13,7 +13,7 @@ from typing import Any
 from . import histogram_u8, mean_luma, percentile_u8, sad_u8
 from .doctor import check_ffmpeg_capability, which
 from .encoders import HARDWARE_DECODERS, decoder_input_args
-from .probe import MediaFacts
+from .probe import MediaFacts, parse_frame_rate
 
 ESTIMATES_FILE_NAME = "estimates.json"
 ESTIMATES_SCHEMA_VERSION = 1
@@ -177,8 +177,66 @@ def extract_gray_frame(
     The frame is scaled to ``width`` x ``height``, or with ``crop`` the
     centre ``width`` x ``height`` is cut out at the source's own pixels.
     """
+    return _gray_frames(
+        source,
+        at_s=at_s,
+        width=width,
+        height=height,
+        count=1,
+        least=1,
+        ffmpeg_bin=ffmpeg_bin,
+        decoder=decoder,
+        crop=crop,
+    )
+
+
+def extract_gray_run(
+    source: Path,
+    *,
+    at_s: float,
+    count: int = 8,
+    width: int = 320,
+    height: int = 180,
+    ffmpeg_bin: str | None = None,
+    decoder: str | None = None,
+    stride: int = 1,
+) -> list[bytes]:
+    """Decode up to ``count`` consecutive grayscale frames from ``at_s``,
+    every ``stride``-th one, scaled to ``width`` x ``height``. Near the end
+    of a clip fewer may come back, but never fewer than two."""
+    frame = width * height
+    data = _gray_frames(
+        source,
+        at_s=at_s,
+        width=width,
+        height=height,
+        count=count,
+        least=2,
+        ffmpeg_bin=ffmpeg_bin,
+        decoder=decoder,
+        crop=False,
+        stride=stride,
+    )
+    return [data[i : i + frame] for i in range(0, len(data), frame)]
+
+
+def _gray_frames(
+    source: Path,
+    *,
+    at_s: float,
+    width: int,
+    height: int,
+    count: int,
+    least: int,
+    ffmpeg_bin: str | None,
+    decoder: str | None,
+    crop: bool,
+    stride: int = 1,
+) -> bytes:
+    """Up to ``count`` whole frames, packed; at least ``least`` of them."""
     binary = ffmpeg_bin or _ffmpeg_bin()
-    expected = width * height
+    frame = width * height
+    expected = frame * least
     last_detail = ""
     for attempt in _decoder_attempts(decoder):
         cmd = [
@@ -192,9 +250,13 @@ def extract_gray_frame(
             "-i",
             str(source),
             "-frames:v",
-            "1",
+            str(count),
             "-vf",
-            f"{'crop' if crop else 'scale'}={width}:{height},format=gray",
+            (f"select=not(mod(n\\,{stride}))," if stride > 1 else "")
+            + f"{'crop' if crop else 'scale'}={width}:{height},format=gray",
+            # Each decoded frame once: no repeats to fill gaps in time.
+            "-fps_mode",
+            "passthrough",
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -229,7 +291,8 @@ def extract_gray_frame(
                 f"short frame buffer at {at_s:g}s "
                 f"({len(completed.stdout)} < {expected} bytes)"
             )
-        return completed.stdout[:expected]
+        whole = min(count, len(completed.stdout) // frame)
+        return completed.stdout[: whole * frame]
     raise EstimatorError(
         f"ffmpeg frame extract failed at {at_s:g}s"
         + (f": {last_detail}" if last_detail else "")
@@ -435,39 +498,193 @@ def _estimate_denoise(
     return suggestion, {"noise_residual": noise, "denoise_strength": strength}
 
 
+# Shake is measured on runs of consecutive frames, scaled to this size.
+SHAKE_RUN = 8
+SHAKE_WIDTH = 320
+SHAKE_HEIGHT = 180
+# Shake is compared at this frame rate: faster footage reads every second
+# (or third) frame, and the jitter is scaled to what it would be at 30 fps.
+SHAKE_FPS = 30.0
+# Largest whole-frame shift searched between neighbouring frames, in pixels
+# of the scaled frame (5% of the width).
+_SHIFT_RADIUS = 16
+# Mean absolute difference, after the best alignment, above which two
+# neighbouring frames are not one picture moved: a cut or a flash.
+_CUT_COST = 12.0
+# Below this difference, with no move, the frame is a repeat (a 24p film
+# carried at 30p, or a frame FFmpeg duplicated) and is skipped.
+_REPEAT_COST = 0.5
+# Jitter, in % of the frame per frame at 30 fps, from which stabilising is
+# suggested.
+_SHAKE_ON_PCT = 0.5
+
+
+def shake_stride(fps: float | None) -> int:
+    """Read every n-th frame so the run's frame rate is near 30 fps."""
+    if not fps or fps <= 0:
+        return 1
+    return max(1, round(fps / SHAKE_FPS))
+
+
+def _match_cost(
+    a: bytes, b: bytes, width: int, height: int, dx: int, dy: int, margin: int
+) -> float:
+    """Mean absolute difference between ``a`` and ``b`` moved by (dx, dy),
+    over the middle of the frame."""
+    span = width - 2 * margin
+    total = 0
+    for y in range(margin, height - margin):
+        row = y * width + margin
+        other = (y + dy) * width + margin + dx
+        total += sad_u8(a[row : row + span], b[other : other + span])
+    return total / (span * (height - 2 * margin))
+
+
+def _vertex(left: float, mid: float, right: float) -> float:
+    """Where a parabola through three equally spaced costs bottoms out,
+    from -0.5 to 0.5 around the middle one."""
+    curve = left - 2.0 * mid + right
+    if curve <= 0.0:
+        return 0.0
+    return max(-0.5, min(0.5, (left - right) / (2.0 * curve)))
+
+
+def _global_shift(
+    a: bytes, b: bytes, width: int, height: int, radius: int = _SHIFT_RADIUS
+) -> tuple[float, float, float]:
+    """How far the picture moved from ``a`` to ``b`` as (dx, dy) in pixels,
+    to a fraction of a pixel, and the mean difference left after lining
+    them up."""
+    margin = radius + 2
+    costs: dict[tuple[int, int], float] = {}
+
+    def cost(dx: int, dy: int) -> float:
+        if (dx, dy) not in costs:
+            costs[dx, dy] = _match_cost(a, b, width, height, dx, dy, margin)
+        return costs[dx, dy]
+
+    def rank(shift: tuple[int, int]) -> tuple[float, int]:
+        # On a tie, the smaller shift: a flat picture has not moved.
+        return cost(*shift), abs(shift[0]) + abs(shift[1])
+
+    coarse = range(-radius, radius + 1, 2)
+    bx, by = min(((dx, dy) for dy in coarse for dx in coarse), key=rank)
+    bx, by = min(((bx + i, by + j) for j in (-1, 0, 1) for i in (-1, 0, 1)), key=rank)
+    mid = cost(bx, by)
+    fx = _vertex(cost(bx - 1, by), mid, cost(bx + 1, by))
+    fy = _vertex(cost(bx, by - 1), mid, cost(bx, by + 1))
+    return bx + fx, by + fy, mid
+
+
+def _run_moves(
+    run: list[bytes], width: int, height: int
+) -> tuple[list[tuple[float, float] | None], int]:
+    """The picture's move between each pair of frames in % of the frame,
+    None across a cut, with repeated frames left out; and how many repeats
+    there were."""
+    moves: list[tuple[float, float] | None] = []
+    repeats = 0
+    for a, b in zip(run, run[1:], strict=False):
+        dx, dy, left = _global_shift(a, b, width, height)
+        moved = round(dx) != 0 or round(dy) != 0
+        if not moved and left <= _REPEAT_COST:
+            repeats += 1
+        elif left > _CUT_COST:
+            moves.append(None)
+        else:
+            moves.append((100.0 * dx / width, 100.0 * dy / height))
+    return moves, repeats
+
+
+def _run_shake(
+    run: list[bytes], width: int, height: int, fps: float = SHAKE_FPS
+) -> tuple[float, float] | None:
+    """Jitter and peak excursion of one run of frames, each in % of the
+    frame, or None when no two neighbouring moves can be compared.
+
+    Jitter is how much the picture's move changes from one frame to the
+    next, scaled to 30 fps: a steady pan moves the same each frame and has
+    none. The excursion is how far the picture strays from a steady path,
+    which is what a stabiliser has to crop away. ``fps`` is the run's own
+    frame rate."""
+    moves, repeats = _run_moves(run, width, height)
+    if not moves and repeats:
+        return 0.0, 0.0  # every frame a repeat: a still picture
+    steps = [
+        math.hypot(m2[0] - m1[0], m2[1] - m1[1])
+        for m1, m2 in zip(moves, moves[1:], strict=False)
+        if m1 is not None and m2 is not None
+    ]
+    if not steps:
+        return None
+    # The move changes more between frames further apart, by the square of
+    # the time between them; repeated frames were dropped, so the frames
+    # left are further apart.
+    pairs = len(run) - 1
+    rate = fps * (pairs - repeats) / pairs
+    jitter = sum(steps) / len(steps) * (rate / SHAKE_FPS) ** 2
+    # The longest stretch without a cut, as positions from its first frame.
+    best: list[tuple[float, float]] = []
+    stretch: list[tuple[float, float]] = []
+    for move in [*moves, None]:
+        if move is None:
+            best = max(best, stretch, key=len)
+            stretch = []
+        else:
+            stretch.append(move)
+    x = y = 0.0
+    path = [(0.0, 0.0)]
+    for mx, my in best:
+        x, y = x + mx, y + my
+        path.append((x, y))
+    n = len(path) - 1
+    excursion = max(
+        math.hypot(px - x * k / n, py - y * k / n) for k, (px, py) in enumerate(path)
+    )
+    return jitter, excursion
+
+
 def _estimate_shake(
-    frame_pairs: list[tuple[bytes, bytes]],
+    runs: list[list[bytes]],
+    width: int = SHAKE_WIDTH,
+    height: int = SHAKE_HEIGHT,
+    fps: float = SHAKE_FPS,
 ) -> tuple[OpSuggestion, dict[str, float]]:
-    if not frame_pairs:
+    measured = [m for m in (_run_shake(run, width, height, fps) for run in runs) if m]
+    if not measured:
         suggestion = OpSuggestion(
             enabled=False,
             confidence=0.0,
             params={"shakiness": 5.0, "smoothing": 10.0, "max_crop_pct": 10.0},
-            reason="insufficient frames for shake estimate",
+            reason="no steady stretch of frames to measure shake on",
         )
-        return suggestion, {"shake_sad_norm": 0.0}
+        return suggestion, {"shake_jitter_pct": 0.0, "shake_excursion_pct": 0.0}
 
-    norms: list[float] = []
-    for left, right in frame_pairs:
-        sad = float(sad_u8(left, right))
-        norms.append(sad / max(1.0, float(len(left))))
-    shake = sum(norms) / len(norms)
-    # Normalized SAD per pixel; still content motion, so keep threshold moderate.
-    shakiness = max(1.0, min(10.0, shake * 12.0))
-    smoothing = max(1.0, min(50.0, 8.0 + shake * 40.0))
-    max_crop = max(0.0, min(30.0, 5.0 + shake * 20.0))
-    enabled = shake >= 0.35
+    # The middle window, or the calmer of the middle two, so one handheld
+    # insert or one cut does not decide.
+    jitters = sorted(j for j, _ in measured)
+    jitter = jitters[(len(jitters) - 1) // 2]
+    excursion = max(e for _, e in measured)
+    enabled = jitter >= _SHAKE_ON_PCT
+    shakiness = max(1.0, min(10.0, jitter * 3.0))
+    smoothing = max(10.0, min(30.0, 10.0 + 2.0 * shakiness))
+    # Crop away the stray on both sides, with half again for the parts of
+    # the shot the sample did not see.
+    max_crop = max(1.0, min(15.0, 3.0 * excursion))
     suggestion = OpSuggestion(
         enabled=enabled,
-        confidence=min(1.0, shake / 1.2),
+        confidence=min(1.0, jitter / (2.0 * _SHAKE_ON_PCT)) * len(measured) / len(runs),
         params={
             "shakiness": round(shakiness if enabled else 5.0, 2),
             "smoothing": round(smoothing if enabled else 10.0, 2),
             "max_crop_pct": round(max_crop if enabled else 10.0, 2),
         },
-        reason=f"mean_sad_norm={shake:.3f}",
+        reason=f"jitter={jitter:.2f}% excursion={excursion:.2f}% of the frame",
     )
-    return suggestion, {"shake_sad_norm": shake}
+    return suggestion, {
+        "shake_jitter_pct": jitter,
+        "shake_excursion_pct": excursion,
+    }
 
 
 def estimate_look(
@@ -484,12 +701,18 @@ def estimate_look(
         raise EstimatorError("look estimation requires a video stream")
 
     windows = choose_sample_windows(facts)
-    duration = max(facts.duration_s or 1.0, 0.5)
     gray_frames: list[bytes] = []
     rgb_means: list[tuple[float, float, float]] = []
-    pair_frames: list[tuple[bytes, bytes]] = []
+    runs: list[list[bytes]] = []
 
     side = grain_crop_side(facts)
+    video = facts.primary_video()
+    fps = None
+    if video is not None:
+        fps = parse_frame_rate(video.avg_frame_rate) or parse_frame_rate(
+            video.r_frame_rate
+        )
+    stride = shake_stride(fps)
     grain_frames: list[bytes] = []
     for window in windows:
         frame_a = extract_gray_frame(source, at_s=window.start_s, ffmpeg_bin=ffmpeg_bin)
@@ -504,15 +727,12 @@ def estimate_look(
                     crop=True,
                 )
             )
-        pair_at = min(
-            max(0.0, duration - 0.05),
-            window.start_s + min(0.12, window.duration_s),
+        runs.append(
+            extract_gray_run(
+                source, at_s=window.start_s, ffmpeg_bin=ffmpeg_bin, stride=stride
+            )
         )
-        if abs(pair_at - window.start_s) < 0.03:
-            pair_at = min(duration - 0.05, window.start_s + 0.08)
-        frame_b = extract_gray_frame(source, at_s=pair_at, ffmpeg_bin=ffmpeg_bin)
         gray_frames.append(frame_a)
-        pair_frames.append((frame_a, frame_b))
         rgb_means.append(
             extract_rgb_means(source, at_s=window.start_s, ffmpeg_bin=ffmpeg_bin)
         )
@@ -523,7 +743,9 @@ def estimate_look(
         denoise, denoise_metrics = _estimate_denoise(gray_frames)
     else:
         denoise, denoise_metrics = _estimate_denoise(grain_frames, side)
-    stabilize, shake_metrics = _estimate_shake(pair_frames)
+    stabilize, shake_metrics = _estimate_shake(
+        runs, fps=(fps / stride) if fps else SHAKE_FPS
+    )
 
     metrics = {}
     metrics.update(contrast_metrics)

@@ -1,6 +1,7 @@
 # Super Processor
 
 [![CI](https://github.com/LKPJohn2026/super-processor/actions/workflows/ci.yml/badge.svg)](https://github.com/LKPJohn2026/super-processor/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/ancient-processor)](https://pypi.org/project/ancient-processor/)
 
 Local-first AI video restoration: SPAN 2x upscaling, with a strength
 control for how much new detail it adds.

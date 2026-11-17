@@ -140,7 +140,7 @@ def _stabilize_detect(
     if not ffmpeg_has_filter("vidstabdetect", ffmpeg_bin=ffmpeg_bin):
         # Homebrew/Chocolatey builds often omit vid.stab; deshake is single-pass.
         return None
-    shakiness = int(float(stabilize.params.get("shakiness", 5.0)))
+    shakiness = max(1, min(10, round(float(stabilize.params.get("shakiness", 5.0)))))
     return (
         f"vidstabdetect=shakiness={shakiness}:accuracy=15:"
         f"result={_escape_filter_path(transforms)}"
