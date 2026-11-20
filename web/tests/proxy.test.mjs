@@ -7,7 +7,7 @@ import test from "node:test";
 import { build, createServer, preview } from "vite";
 
 // Exercise the real config and actual HTTP forwarding, including range headers.
-test("dev and preview proxy API, output, stills and previews to VITE_PROXY_TARGET", async (t) => {
+test("dev and preview proxy API, output, stills, previews and job media to VITE_PROXY_TARGET", async (t) => {
   const forwarded = [];
   const target = httpServer((request, response) => {
     forwarded.push(request.url);
@@ -44,7 +44,11 @@ test("dev and preview proxy API, output, stills and previews to VITE_PROXY_TARGE
     const http = vite.httpServer;
     try {
       const origin = `http://127.0.0.1:${http.address().port}`;
-      for (const path of ["/api/state", "/output.mp4", "/segment_stills/000.jpg", "/shot_stills/000.jpg", "/previews/000.mp4"]) {
+      for (const path of [
+        "/api/state", "/output.mp4", "/segment_stills/000.jpg", "/shot_stills/000.jpg", "/previews/000.mp4",
+        // Any job's files, by its id: thumbnail, output and kept versions.
+        "/jobs/0123456789ab/thumb.jpg", "/jobs/0123456789ab/output.mp4", "/jobs/0123456789ab/outputs/v001.mp4",
+      ]) {
         const result = await fetch(`${origin}${path}`, { headers: { Range: "bytes=0-3" } });
         assert.equal(result.status, path.endsWith(".mp4") ? 206 : 200, `${mode}: ${path}`);
         assert.match(result.headers.get("Content-Type"), path.endsWith(".mp4") ? /video\/mp4/ : path.endsWith(".jpg") ? /image\/jpeg/ : /application\/json/);

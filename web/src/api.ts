@@ -21,6 +21,8 @@ export type Segment = {
   note: string;
   contains: string[];
   still_url?: string | null;
+  // Its place in the list, as edits by hand name it.
+  index?: number;
 };
 
 export type SegmentList = {
@@ -32,6 +34,15 @@ export type SegmentList = {
   scale_reason?: string;
   // Why Gemini worked from stills, when it could not watch the video.
   video_problem?: string;
+  // Sent back with each change by hand (and approve), so a page showing an
+  // older list is refused instead of changing scenes it did not show.
+  revision?: number;
+  approved?: boolean;
+  // The last scene's end, which is the video's length.
+  duration_s?: number | null;
+  // The limits a change by hand must keep (3 s, 10 scenes).
+  min_segment_s?: number;
+  max_segments?: number;
 };
 
 export type Progress = {
@@ -136,12 +147,94 @@ export type Looks = {
 
 export type Navigation = { setup: boolean; file: boolean; segments: boolean };
 
+// The next scene's preview made in the background (``--prefetch`` only).
+export type PrefetchNext = { index: number; ready: boolean; running: boolean };
+
 export type SegmentPreview = {
   index: number;
   count: number;
   scale: number | null;
   error: string | null;
   shot: LookShot | null;
+  next?: PrefetchNext | null;
+};
+
+export type RunKind = "segmenting" | "analyze" | "render";
+export type RunOutcome = "running" | "done" | "failed" | "stopped";
+
+/** The run in progress, else the last one, with server times in epoch seconds. */
+export type RunRecord = {
+  id: string;
+  kind: RunKind;
+  job_id: string | null;
+  started_at: number;
+  finished_at: number | null;
+  outcome: RunOutcome;
+};
+
+export type StageKey = "file" | "segments" | "scenes" | "render" | "result";
+export type StageStatus = "done" | "current" | "pending";
+
+export type JobScene = {
+  index: number;
+  start_s: number;
+  end_s: number;
+  label: string;
+  still_url: string | null;
+  status: "approved" | "current" | "pending";
+  // Previewed as it is now, so reopening it needs no new analysis.
+  previewed: boolean;
+  // POST /api/scene may open it now.
+  reopenable: boolean;
+};
+
+/** The open job, for the stepper and the scene strip. */
+export type JobSummary = {
+  job_id: string;
+  title: string;
+  stage: StageKey | null;
+  stages: { key: StageKey; status: StageStatus }[];
+  scene_count: number;
+  approved_count: number;
+  current_index: number | null;
+  scenes: JobScene[];
+  error: string | null;
+};
+
+/** One kept result of the job, oldest first. */
+export type OutputVersion = {
+  number: number;
+  name: string;
+  url: string;
+  kind: "render" | "earlier" | "recovered" | string;
+  created_at: string | null;
+  note: string | null;
+  size: number;
+  scale: number | null;
+  strength: number | null;
+  strength_summary: string | null;
+  // The version the job's output.mp4 is now.
+  current: boolean;
+};
+
+/** One row of GET /api/jobs. */
+export type JobEntry = {
+  job_id: string;
+  title: string;
+  file_name: string | null;
+  step: WizardStep | null;
+  stage: StageKey | null;
+  status: "running" | "running_elsewhere" | "result" | "failed" | "paused" | string;
+  // Epoch seconds.
+  updated_at: number | null;
+  // Left on a run step: opening it asks Resume or Stop.
+  resumes_work: boolean;
+  interrupted: boolean;
+  // The job this window has open.
+  open: boolean;
+  thumb_url: string | null;
+  output_url: string | null;
+  error: string | null;
 };
 
 export type WizardView = {
@@ -168,7 +261,16 @@ export type WizardView = {
   // to /resume, or /cancel to stop it; ?run=1 does not start it.
   interrupted?: boolean;
   running_elsewhere?: boolean;
+  // A stop can be asked for now (POST /api/cancel).
   cancellable?: boolean;
+  // A stop was asked for and the run has not landed it yet ("Stopping…").
+  cancel_requested?: boolean;
+  // When the editor last stopped a run on this job (ISO time), else null.
+  stopped?: string | null;
+  run?: RunRecord | null;
+  job?: JobSummary | null;
+  // Every kept result of this job, oldest first (result and done only).
+  versions?: OutputVersion[];
   token?: string;
 };
 
@@ -373,14 +475,42 @@ async function runUntilDone(
 ): Promise<WizardView> {
   // These starts are idempotent: the backend checks its step and worker lock.
   // Sampling goes on to proposing in the same worker, so both count.
-  let view = await requestWithRetry(origin, `/api/${route}?run=1`);
+  const start = `/api/${route}?run=1`;
+  let view = await requestWithRetry(origin, start);
+  let idlePolls = 0;
   // An interrupted step never starts: hand it back so the page can ask.
-  while (steps.includes(view.step) && !view.interrupted) {
+  while (steps.includes(view.step) && !handsBack(view)) {
     onProgress(view);
     await sleep(POLL_MS);
     view = await requestWithRetry(origin, "/api/state");
+    idlePolls = isIdleOnStep(view, steps) ? idlePolls + 1 : 0;
+    if (idlePolls >= IDLE_POLLS_BEFORE_RESTART) {
+      // The step still waits but nothing works on it (say the worker that
+      // ran the step before ended, and none started this one): start it.
+      // Idempotent like the first start; an interrupted step never gets here.
+      idlePolls = 0;
+      view = await requestWithRetry(origin, start);
+    }
   }
   return view;
+}
+
+// Polls in a row showing a run step that nothing works on before ?run=1 is
+// sent again.
+const IDLE_POLLS_BEFORE_RESTART = 2;
+
+/** The page must choose (Resume or Stop) or wait on another window: never run it. */
+export function handsBack(view: WizardView): boolean {
+  return Boolean(view.interrupted || view.running_elsewhere);
+}
+
+/**
+ * True when the view is on one of `steps` with no worker running and nothing
+ * stopping it from starting. An older server that says nothing of `busy`
+ * never counts as idle.
+ */
+export function isIdleOnStep(view: WizardView, steps: readonly WizardView["step"][]): boolean {
+  return steps.includes(view.step) && view.busy === false && !handsBack(view);
 }
 
 function once(
@@ -443,4 +573,111 @@ export function outputSrc(origin: string, outputUrl: string | null): string | nu
     return outputUrl;
   }
   return `${origin}${outputUrl}`;
+}
+
+/** `fields` plus the job the page shows, so a stale tab cannot act on another job. */
+export function withJob(
+  view: Pick<WizardView, "job_id">,
+  fields: Record<string, string> = {},
+): Record<string, string> {
+  return view.job_id && !("job_id" in fields) ? { ...fields, job_id: view.job_id } : { ...fields };
+}
+
+/**
+ * The body of a stop. `run_id` names the run the page shows working, so a
+ * late click never stops a newer run; a step left interrupted has no run
+ * working, and the server refuses a `run_id` then, so none is sent.
+ */
+export function cancelFields(
+  view: Pick<WizardView, "job_id" | "busy" | "run">,
+): Record<string, string> {
+  const fields = withJob(view);
+  if (view.busy && view.run && view.run.outcome === "running") fields.run_id = view.run.id;
+  return fields;
+}
+
+/** Stop the scan or render in progress, or one left interrupted. */
+export function cancelRun(origin: string, view: WizardView): Promise<WizardView> {
+  return postAction(origin, "cancel", cancelFields(view));
+}
+
+/** Let an interrupted step's work start; the runner then starts it with ?run=1. */
+export function resumeRun(origin: string, view: WizardView): Promise<WizardView> {
+  return postAction(origin, "resume", withJob(view));
+}
+
+/** Open an approved scene (or the next to approve) again, by its index. */
+export function reopenScene(origin: string, view: WizardView, index: number): Promise<WizardView> {
+  return postAction(origin, "scene", withJob(view, { index: String(index) }));
+}
+
+export type SegmentEdit =
+  | { action: "move"; index: number; at: number }
+  | { action: "split"; index: number; at: number }
+  | { action: "merge"; index: number }
+  | { action: "approve" }
+  | { action: "note"; note: string };
+
+/**
+ * The body of a change to the segments. `revision` is the list the page
+ * shows; a change by hand needs it, and the server refuses an older one.
+ * Cut times go to the millisecond, as the server saves them.
+ */
+export function segmentFields(view: WizardView, edit: SegmentEdit): Record<string, string> {
+  const fields: Record<string, string> = { action: edit.action };
+  if (edit.action === "move" || edit.action === "split" || edit.action === "merge") {
+    fields.index = String(edit.index);
+  }
+  if (edit.action === "move" || edit.action === "split") {
+    fields.at = String(Math.round(edit.at * 1000) / 1000);
+  }
+  if (edit.action === "note") fields.note = edit.note;
+  const revision = view.segments?.revision;
+  if (typeof revision === "number") fields.revision = String(revision);
+  return withJob(view, fields);
+}
+
+export function editSegments(
+  origin: string,
+  view: WizardView,
+  edit: SegmentEdit,
+): Promise<WizardView> {
+  return postAction(origin, "segments", segmentFields(view, edit));
+}
+
+function isJobEntry(value: unknown): value is JobEntry {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    typeof (value as { job_id?: unknown }).job_id === "string"
+  );
+}
+
+/** Every job, most recently changed first; throws when the server cannot say. */
+export async function loadJobs(origin: string): Promise<JobEntry[]> {
+  const response = await fetch(`${origin}/api/jobs`, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const data: unknown = await response.json().catch(() => null);
+    throw new Error(
+      data && typeof data === "object" && "error" in data
+        ? String((data as { error: unknown }).error)
+        : `Could not list the jobs (${response.status}).`,
+    );
+  }
+  const data: unknown = await response.json();
+  const jobs = data && typeof data === "object" ? (data as { jobs?: unknown }).jobs : null;
+  if (!Array.isArray(jobs)) throw new Error("The server did not return a job list.");
+  return jobs.filter(isJobEntry);
+}
+
+/**
+ * Show another job in this window, where it was left. A job left mid-step
+ * opens interrupted; nothing runs until Resume.
+ */
+export function openJob(origin: string, jobId: string): Promise<WizardView> {
+  // `job` is the one to open; any window may switch jobs, so no job_id.
+  return postAction(origin, "jobs/open", { job: jobId });
 }

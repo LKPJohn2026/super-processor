@@ -3,7 +3,7 @@ import { defineConfig } from "vite";
 
 const proxyTarget = process.env.VITE_PROXY_TARGET || "http://127.0.0.1:45143";
 const proxy = Object.fromEntries(
-  ["/api", "/output.mp4", "/segment_stills", "/shot_stills", "/previews"].map(
+  ["/api", "/output.mp4", "/segment_stills", "/shot_stills", "/previews", "/jobs/"].map(
     (prefix) => [prefix, { target: proxyTarget, changeOrigin: true }],
   ),
 );

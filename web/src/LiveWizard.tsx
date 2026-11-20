@@ -19,6 +19,7 @@ import {
   type Navigation,
   type SegmentPreview,
   uploadVideo,
+  withJob,
   type WizardView,
 } from "./api";
 
@@ -92,7 +93,11 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     setBusy(true);
     setLocalError(null);
     try {
-      onView(await postAction(origin, action, fields));
+      // Every POST names the job this page shows, so a tab left open on an
+      // older job is refused (409) instead of acting on the current one.
+      // Opening a job is the exception: any window may switch jobs.
+      const body = action === "jobs/open" ? fields : withJob(view, fields);
+      onView(await postAction(origin, action, body));
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : "Request failed");
     } finally {

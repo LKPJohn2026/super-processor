@@ -507,3 +507,176 @@ test("a failed upload says why, without trusting a non-wizard reply", async (t) 
   assert.equal(made[0].method, "POST");
   assert.equal(made[0].body, file, "the file itself is the body");
 });
+
+test("a run step nothing works on is started again after two idle polls", async (t) => {
+  const calls = [];
+  // The first start lands while the earlier worker still holds the step, so
+  // nothing starts; polls then show "analyzing" with no worker.
+  const queue = [
+    state("analyzing", { busy: true }),
+    state("analyzing", { busy: false }),
+    state("analyzing", { busy: false }),
+    state("analyzing", { busy: true }),
+    state("preview_segment", { busy: false }),
+  ];
+  const api = await fixture(t, async (url) => {
+    calls.push(url);
+    return Response.json(queue.shift());
+  });
+  const run = api.runAnalyze("http://a.test", () => {});
+  await flush();
+  await advance(t, 2000);
+  assert.equal(calls.filter((url) => url.includes("run=1")).length, 1, "one idle poll is not enough");
+  await advance(t, 2000);
+  assert.deepEqual(calls, [
+    "http://a.test/api/analyze?run=1",
+    "http://a.test/api/state",
+    "http://a.test/api/state",
+    "http://a.test/api/analyze?run=1",
+  ]);
+  await advance(t, 2000);
+  assert.equal((await run).step, "preview_segment");
+  assert.equal(calls.filter((url) => url.includes("run=1")).length, 2);
+});
+
+test("idle polls must be in a row, and an older server without busy is never restarted", async (t) => {
+  const calls = [];
+  const queue = [
+    state("rendering", { busy: true }),
+    state("rendering", { busy: false }),
+    state("rendering", { busy: true }),
+    state("rendering", { busy: false }),
+    state("rendering"),
+    state("rendering"),
+    state("result"),
+  ];
+  const api = await fixture(t, async (url) => {
+    calls.push(url);
+    return Response.json(queue.shift());
+  });
+  const run = api.runRender("http://a.test", () => {});
+  await flush();
+  for (let i = 0; i < 6; i += 1) await advance(t, 2000);
+  assert.equal((await run).step, "result");
+  assert.equal(calls.filter((url) => url.includes("run=1")).length, 1);
+});
+
+test("an interrupted step never sends ?run=1 again, even when idle", async (t) => {
+  const calls = [];
+  // Interrupted after a stop elsewhere / a restart: busy is false, but the
+  // page must ask Resume or Stop instead of starting GPU or Gemini work.
+  const queue = [
+    state("rendering", { busy: true }),
+    state("rendering", { busy: false }),
+    state("rendering", { busy: false, interrupted: true }),
+  ];
+  const api = await fixture(t, async (url) => {
+    calls.push(url);
+    return Response.json(queue.shift() ?? state("rendering", { busy: false, interrupted: true }));
+  });
+  const run = api.runRender("http://a.test", () => {});
+  await flush();
+  await advance(t, 2000);
+  await advance(t, 2000);
+  assert.equal(await outcome(run), "fulfilled");
+  assert.equal((await run).interrupted, true);
+  await advance(t, 20000);
+  assert.deepEqual(calls, [
+    "http://a.test/api/render?run=1",
+    "http://a.test/api/state",
+    "http://a.test/api/state",
+  ]);
+  assert.equal(api.isIdleOnStep(state("rendering", { busy: false, interrupted: true }), ["rendering"]), false);
+  assert.equal(api.isIdleOnStep(state("rendering", { busy: false, running_elsewhere: true }), ["rendering"]), false);
+  assert.equal(api.isIdleOnStep(state("rendering", { busy: false }), ["rendering"]), true);
+  assert.equal(api.isIdleOnStep(state("result", { busy: false }), ["rendering"]), false);
+});
+
+test("helpers POST the right bodies, with the job the page shows", async (t) => {
+  const calls = [];
+  const api = await fixture(t, async (url, options) => {
+    calls.push([url.replace("http://a.test", ""), JSON.parse(options.body)]);
+    return response("segments");
+  });
+  const running = state("rendering", {
+    job_id: "job1",
+    busy: true,
+    run: { id: "run9", kind: "render", job_id: "job1", started_at: 1, finished_at: null, outcome: "running" },
+  });
+  await api.cancelRun("http://a.test", running);
+  // Interrupted: no run works, and the server refuses a run_id then.
+  await api.cancelRun("http://a.test", { ...running, busy: false, interrupted: true });
+  await api.cancelRun("http://a.test", { ...running, run: { ...running.run, outcome: "done" } });
+  await api.resumeRun("http://a.test", running);
+  const preview = state("preview_segment", { job_id: "job1" });
+  await api.reopenScene("http://a.test", preview, 2);
+  const segments = state("segments", { job_id: "job1", segments: { segments: [], error: null, note: "", revision: 4 } });
+  await api.editSegments("http://a.test", segments, { action: "move", index: 1, at: 12.34567 });
+  await api.editSegments("http://a.test", segments, { action: "split", index: 0, at: 5 });
+  await api.editSegments("http://a.test", segments, { action: "merge", index: 3 });
+  await api.editSegments("http://a.test", segments, { action: "approve" });
+  await api.editSegments("http://a.test", segments, { action: "note", note: "fewer scenes" });
+  await api.openJob("http://a.test", "job2");
+  assert.deepEqual(calls, [
+    ["/api/cancel", { job_id: "job1", run_id: "run9" }],
+    ["/api/cancel", { job_id: "job1" }],
+    ["/api/cancel", { job_id: "job1" }],
+    ["/api/resume", { job_id: "job1" }],
+    ["/api/scene", { index: "2", job_id: "job1" }],
+    ["/api/segments", { action: "move", index: "1", at: "12.346", revision: "4", job_id: "job1" }],
+    ["/api/segments", { action: "split", index: "0", at: "5", revision: "4", job_id: "job1" }],
+    ["/api/segments", { action: "merge", index: "3", revision: "4", job_id: "job1" }],
+    ["/api/segments", { action: "approve", revision: "4", job_id: "job1" }],
+    ["/api/segments", { action: "note", note: "fewer scenes", revision: "4", job_id: "job1" }],
+    // Any window may switch jobs: only the job to open is sent.
+    ["/api/jobs/open", { job: "job2" }],
+  ]);
+  // withJob keeps a job_id the caller set and adds none without a job.
+  assert.deepEqual(api.withJob({ job_id: "job1" }, { job_id: "other", a: "1" }), { job_id: "other", a: "1" });
+  assert.deepEqual(api.withJob({ job_id: null }, { a: "1" }), { a: "1" });
+});
+
+test("a 409 from a stale tab is reported, not retried", async (t) => {
+  let count = 0;
+  const api = await fixture(t, async () => {
+    count += 1;
+    return Response.json({ error: "this job is no longer open in this window" }, { status: 409 });
+  });
+  await assert.rejects(api.resumeRun("http://a.test", state("rendering", { job_id: "old" })), {
+    message: "this job is no longer open in this window",
+  });
+  await advance(t, 60000);
+  assert.equal(count, 1);
+});
+
+test("loadJobs lists the jobs and says why when it cannot", async (t) => {
+  const replies = [
+    () => Response.json({ jobs: [{ job_id: "a1", title: "Holiday", interrupted: true }, { nope: 1 }] }),
+    () => Response.json({ error: "the jobs folder cannot be read" }, { status: 400 }),
+    () => new Response("<html>", { status: 502 }),
+    () => Response.json({ step: "intro" }),
+  ];
+  const urls = [];
+  const api = await fixture(t, async (url) => {
+    urls.push(url);
+    return replies.shift()();
+  });
+  const jobs = await api.loadJobs("http://a.test");
+  assert.deepEqual(jobs, [{ job_id: "a1", title: "Holiday", interrupted: true }]);
+  assert.equal(urls[0], "http://a.test/api/jobs");
+  await assert.rejects(api.loadJobs("http://a.test"), { message: "the jobs folder cannot be read" });
+  await assert.rejects(api.loadJobs("http://a.test"), { message: "Could not list the jobs (502)." });
+  await assert.rejects(api.loadJobs("http://a.test"), { message: "The server did not return a job list." });
+});
+
+test("a view with every new key is still a wizard view, and so is one without them", async (t) => {
+  const full = state("preview_segment", {
+    run: null, cancellable: false, cancel_requested: false, stopped: null, interrupted: false,
+    running_elsewhere: false, versions: [], job: null,
+    segment_preview: { index: 0, count: 2, scale: 2, error: null, shot: null, next: { index: 1, ready: false, running: true } },
+  });
+  const replies = [full, state("intro")];
+  const api = await fixture(t, async () => Response.json(replies.shift()));
+  assert.deepEqual(await api.loadState("http://a.test"), full);
+  assert.equal((await api.loadState("http://a.test")).step, "intro");
+});

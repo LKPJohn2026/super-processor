@@ -126,6 +126,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process tree) within moments instead of leaving it encoding, removes its
   half-written `.encoding.mp4` or part file, and releases the GPU, so the
   next preview or render can start at once.
+- The web app no longer waits forever on "Finding the segments", a scene
+  preview or the render when the step was saved but its work never began:
+  after two checks that show nothing working on it, it starts the work
+  again. A job left interrupted is never started this way; it still waits
+  for Resume or Stop. Every action from the web app now names the job the
+  page shows, so a tab left open on an old job cannot change another one.
 
 ## [4.1.1] - 2026-11-17
 
