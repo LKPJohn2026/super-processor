@@ -152,3 +152,20 @@ def test_running_pages_offer_stop_while_it_can_still_stop() -> None:
     shown = '<p class="notice" role="status">You &lt;b&gt;stopped&lt;/b&gt; it.</p>'
     assert shown in marked
     assert with_notice(render_pick(), None) == render_pick()
+
+
+def test_preview_posters_keep_the_plan_generation() -> None:
+    shot = {
+        "index": 0,
+        "start_s": 0,
+        "end_s": 4,
+        "strength": 0.4,
+        "look": {},
+        "check": {},
+        "after_url": "/previews/shot_000_r1_after.mp4?g=ab12",
+        "before_url": "/previews/shot_000_r1_before.mp4?g=ab12",
+    }
+    page = render_preview_segment({"index": 0, "count": 1, "scale": 2, "shot": shot})
+    assert 'src="/previews/shot_000_r1_after.mp4?g=ab12"' in page
+    assert 'poster="/previews/shot_000_r1_after.jpg?g=ab12"' in page
+    assert 'poster="/previews/shot_000_r1_before.jpg?g=ab12"' in page

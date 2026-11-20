@@ -194,8 +194,9 @@ def test_wizard_website_full_flow_intro_to_done(
         assert "strength 0.40 · deblock 0.20 · contrast 1.05" in looks
         assert "Flat card; light deblock" in looks
         assert "Check passed. Cleaner, nothing invented." in looks
-        assert 'src="/previews/shot_000_r1_after.mp4"' in looks
-        assert 'poster="/previews/shot_000_r1_after.jpg"' in looks
+        # The plan's generation keeps a cached preview of an older plan away.
+        assert 'src="/previews/shot_000_r1_after.mp4?g=' in looks
+        assert 'poster="/previews/shot_000_r1_after.jpg?g=' in looks
         with urlopen(base + "/previews/shot_000_r1_after.jpg") as response:
             assert response.headers.get_content_type() == "image/jpeg"
 

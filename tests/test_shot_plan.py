@@ -39,6 +39,7 @@ from super_processor.shot_plan import (
     new_plan,
     preview_window,
     random_preview_start,
+    remove_previews,
     render_previews,
     request_redo,
     save_plan,
@@ -417,12 +418,12 @@ def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
     second = preview(controller)["shot"]
     assert second["strength"] == 0.4
     assert second["check"]["problems"] == ["fake_texture"]
-    assert second["after_url"].endswith("shot_001_r2_after.mp4")
+    assert second["after_url"].partition("?")[0].endswith("shot_001_r2_after.mp4")
     assert "Check found: fake texture. grain turned to worms." in controller.render()
 
     approve_preview(controller)
     third = preview(controller)["shot"]
-    assert third["after_url"].endswith("shot_002_r1_after.mp4")
+    assert third["after_url"].partition("?")[0].endswith("shot_002_r1_after.mp4")
     controller.handle_post("/preview", {"action": ["redo"], "note": [""]})
     assert controller.current_state().error
     assert controller.current_state().step is WizardStep.PREVIEW_SEGMENT
@@ -435,7 +436,7 @@ def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
     assert planner.proposals[-1][0]["editor_note"] == "keep the sign crisp"
     third = preview(controller)["shot"]
     assert third["strength"] == 0.3
-    assert third["after_url"].endswith("shot_002_r2_after.mp4")
+    assert third["after_url"].partition("?")[0].endswith("shot_002_r2_after.mp4")
 
     controller.handle_post("/preview", {"action": ["dance"]})
     assert "unknown action" in (controller.current_state().error or "")
@@ -677,3 +678,56 @@ def test_save_plan_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert loaded is not None
     assert loaded.to_dict() == new.to_dict()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["shot_plan.json"]
+
+
+def test_each_new_plan_has_its_own_generation_and_copies_keep_it(
+    tmp_path: Path,
+) -> None:
+    shots = ShotList(shots=[Shot(0.0, 4.0), Shot(4.0, 8.0)])
+    first, second = new_plan(shots, 2), new_plan(shots, 2)
+    assert first.generation and second.generation
+    assert first.generation != second.generation
+    save_plan(tmp_path, first)
+    loaded = load_plan(tmp_path)
+    assert loaded is not None and loaded.generation == first.generation
+    # Changing a scene's settings is the same plan, so its URLs stay put.
+    assert set_upscale(first, 0, False).generation == first.generation
+    assert request_redo(first, 1, "softer").generation == first.generation
+    # It goes into a URL: anything but the hex it was made as is dropped.
+    for bad in ("../x", "a&b=1", True, 7, "A" * 3, "f" * 65):
+        data = first.to_dict()
+        data["generation"] = bad
+        assert ShotPlan.from_dict(data).generation == ""
+    data.pop("generation")
+    assert ShotPlan.from_dict(data).generation == ""
+
+
+def test_remove_previews_leaves_what_the_disk_will_not_let_go(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "previews"
+    (folder / "work").mkdir(parents=True)
+    names = [
+        "shot_000_r1_before.mp4",
+        "shot_000_r1_after.mp4",
+        "shot_000_r1_after.mp4.delivery.json",
+        "shot_001_r2_after.jpg",
+    ]
+    for name in names:
+        (folder / name).write_bytes(b"x")
+    (folder / "notes.txt").write_bytes(b"keep")
+    real_unlink = Path.unlink
+
+    def held(self: Path, missing_ok: bool = False) -> None:
+        if self.name == "shot_000_r1_after.mp4":
+            raise PermissionError(13, "a browser is playing it")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", held)
+    remove_previews(tmp_path)
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "notes.txt",
+        "shot_000_r1_after.mp4",
+        "work",
+    ]
+    remove_previews(tmp_path / "no job")

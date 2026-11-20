@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -24,15 +25,20 @@ from super_processor.segment_loop import (
     SegmentList,
     SegmentLoopError,
     SegmentStill,
+    check_coverage,
     extract_segment_stills,
     load_segment_list,
     load_segment_stills,
     make_gemini_copy,
+    merge_segments,
+    move_cut,
     repair_coverage,
     sample_times,
     save_segment_list,
     shots_from_segments,
+    split_segment,
     still_name,
+    whole_video,
 )
 from super_processor.segments import (
     SEGMENTS_FILE_NAME,
@@ -609,3 +615,166 @@ def test_a_stopped_gemini_copy_ends_ffmpeg_and_removes_the_part_file(
         os.kill(int(pid_file.read_text(encoding="utf-8")), 0)
     assert not (tmp_path / "gemini_upload.part.mp4").exists()
     assert previous.read_bytes() == b"earlier copy"
+
+
+# Edits by hand -------------------------------------------------------------
+
+
+def test_segment_list_revision_round_trips_and_old_files_start_at_zero(
+    tmp_path: Path,
+) -> None:
+    saved = _two_segments()
+    saved.revision = 3
+    save_segment_list(tmp_path, saved)
+    loaded = load_segment_list(tmp_path)
+    assert loaded is not None and loaded.revision == 3
+    data = saved.to_dict()
+    for old in (None, True, -1, "2", 1.5):
+        if old is None:
+            data.pop("revision")
+        else:
+            data["revision"] = old
+        assert SegmentList.from_dict(data).revision == 0
+
+
+def test_whole_video_is_rounded_like_every_other_cut() -> None:
+    assert whole_video(12.3456789) == LoopSegment(0.0, 12.346, label="whole video")
+    assert repair_coverage([], 12.3456789) == [whole_video(12.3456789)]
+    # A clip shorter than the rounding keeps its length.
+    assert whole_video(0.0004).end_s == 0.0004
+
+
+def _twelve_seconds() -> list[LoopSegment]:
+    return [
+        LoopSegment(0.0, 5.0, label="kitchen", note="keep grain", contains=("faces",)),
+        LoopSegment(5.0, 12.0, label="street", contains=("text", "faces")),
+    ]
+
+
+def test_move_cut_moves_only_the_cut_between_two_scenes() -> None:
+    segments = _twelve_seconds()
+    moved = move_cut(segments, 0, 6.12345)
+    assert [(s.start_s, s.end_s) for s in moved] == [(0.0, 6.123), (6.123, 12.0)]
+    assert [s.label for s in moved] == ["kitchen", "street"]
+    assert moved[0].note == "keep grain"
+    # Pure: the list it was given is left as it was.
+    assert segments == _twelve_seconds()
+
+
+def test_merge_keeps_the_longer_scene_name_and_what_both_contain() -> None:
+    merged = merge_segments(_twelve_seconds(), 0)
+    assert merged == [
+        LoopSegment(0.0, 12.0, label="street", contains=("faces", "text"))
+    ]
+    # The shorter scene's note is not joined onto the longer one's.
+    longer_first = [
+        LoopSegment(0.0, 8.0, label="a", note="mine"),
+        LoopSegment(8.0, 12.0, label="b", note="theirs"),
+    ]
+    assert merge_segments(longer_first, 0)[0].note == "mine"
+
+
+def test_split_cuts_one_scene_in_two_that_both_keep_what_it_had() -> None:
+    split = split_segment(_twelve_seconds(), 1, 8.5)
+    assert [(s.start_s, s.end_s, s.label) for s in split] == [
+        (0.0, 5.0, "kitchen"),
+        (5.0, 8.5, "street"),
+        (8.5, 12.0, "street"),
+    ]
+    assert split[1].contains == split[2].contains == ("text", "faces")
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        (lambda s: move_cut(s, 1, 8.0), "no cut after"),
+        (lambda s: move_cut(s, -1, 8.0), "no cut after"),
+        (lambda s: move_cut(s, 0, 12.0), "cannot move past"),
+        (lambda s: move_cut(s, 0, 0.0), "cannot move past"),
+        (lambda s: move_cut(s, 0, 2.999), "at least 3 seconds"),
+        (lambda s: move_cut(s, 0, 9.001), "at least 3 seconds"),
+        (lambda s: move_cut(s, 0, math.nan), "number of seconds"),
+        (lambda s: move_cut(s, 0, math.inf), "number of seconds"),
+        (lambda s: merge_segments(s, 1), "no next scene"),
+        (lambda s: split_segment(s, 2, 8.0), "no such scene"),
+        (lambda s: split_segment(s, 0, 2.0), "at least 3 seconds"),
+        (lambda s: split_segment(s, 1, 5.0), "inside the scene"),
+        (lambda s: split_segment(s, 1, 12.0), "inside the scene"),
+    ],
+)
+def test_edits_refuse_what_breaks_the_rules(edit: Any, message: str) -> None:
+    segments = _twelve_seconds()
+    with pytest.raises(SegmentLoopError, match=message):
+        edit(segments)
+    assert segments == _twelve_seconds()
+
+
+def test_cut_limits_are_the_same_as_for_gemini_proposals() -> None:
+    # Exactly 3 seconds is allowed; the times are rounded before the check.
+    assert move_cut(_twelve_seconds(), 0, 3.0001)[0].end_s == 3.0
+    assert MIN_LOOP_SEGMENT_S == 3.0 and MAX_LOOP_SEGMENTS == 10
+    ten = [LoopSegment(i * 3.0, (i + 1) * 3.0) for i in range(10)]
+    check_coverage(ten, 30.0)
+    wide = [*ten[:-1], LoopSegment(27.0, 40.0)]
+    with pytest.raises(SegmentLoopError, match="at most 10 scenes"):
+        split_segment(wide, 9, 33.0)
+    # Joining two scenes makes room for a split again.
+    assert len(split_segment(merge_segments(wide, 0), 8, 33.0)) == 10
+
+
+def test_check_coverage_names_each_broken_rule() -> None:
+    check_coverage([LoopSegment(0.0, 1.5)], 1.5)  # a short clip is one scene
+    cases = [
+        ([], 4.0, "at least one"),
+        ([LoopSegment(0.5, 4.0)], 4.0, "start where"),
+        ([LoopSegment(0.0, 4.0), LoopSegment(4.5, 8.0)], 8.0, "start where"),
+        ([LoopSegment(0.0, 4.0), LoopSegment(4.0, 8.0)], 9.0, "where the video"),
+        ([LoopSegment(0.0, 2.0), LoopSegment(2.0, 8.0)], 8.0, "at least 3"),
+        ([LoopSegment(float(i), i + 1.0) for i in range(11)], 11.0, "at most"),
+    ]
+    for segments, duration, message in cases:
+        with pytest.raises(SegmentLoopError, match=message):
+            check_coverage(segments, duration)
+    # Compared to the millisecond, as the times are saved.
+    check_coverage([LoopSegment(0.0, 12.3456789)], 12.346)
+
+
+def test_random_edits_always_keep_the_rules() -> None:
+    """Thousands of random edits on random lists: each one either keeps
+    every rule or is refused and changes nothing."""
+    rng = random.Random(20261120)
+    for _ in range(200):
+        duration = round(rng.uniform(3.0, 60.0), 3)
+        segments = repair_coverage(
+            [
+                {"start_s": rng.uniform(0, duration), "end_s": rng.uniform(0, duration)}
+                for _ in range(rng.randint(0, 14))
+            ],
+            duration,
+        )
+        check_coverage(segments, duration)
+        for _ in range(20):
+            index = rng.randint(-1, len(segments))
+            at = rng.choice(
+                [rng.uniform(-1.0, duration + 1.0), rng.choice([math.nan, 0.0])]
+            )
+            kind = rng.choice(["move", "merge", "split"])
+            before = list(segments)
+            try:
+                if kind == "move":
+                    edited = move_cut(segments, index, at)
+                elif kind == "merge":
+                    edited = merge_segments(segments, index)
+                else:
+                    edited = split_segment(segments, index, at)
+            except SegmentLoopError:
+                assert segments == before
+                continue
+            check_coverage(edited, duration)
+            assert all(
+                s.start_s == round(s.start_s, 3) and s.end_s == round(s.end_s, 3)
+                for s in edited
+            )
+            expected = {"move": 0, "merge": -1, "split": 1}[kind]
+            assert len(edited) == len(segments) + expected
+            segments = edited

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import subprocess
+import threading
 from http.client import HTTPConnection
 from pathlib import Path
 from urllib.parse import urlparse
@@ -28,6 +30,7 @@ from super_processor.segment_loop import (
 )
 from super_processor.wizard import (
     WizardController,
+    WizardError,
     WizardState,
     WizardStep,
     save_job_wizard_state,
@@ -370,3 +373,58 @@ def test_stopping_a_run_needs_the_token_and_an_allowed_origin(
         assert status == 400 and b"nothing running to stop" in body
     finally:
         server.stop()
+
+
+def test_two_edits_at_once_apply_one_and_refuse_the_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two windows change the same scenes at the same moment, both from the
+    list they show (revision 0): one change lands, the other is told the
+    scenes changed, and nothing is half-saved."""
+    from super_processor import wizard as wizard_module
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    controller = WizardController(tmp_path / "jobs")
+    job_id = controller.store.create(source).job_id
+    job_dir = controller.store.job_dir(job_id)
+    save_segment_list(
+        job_dir,
+        SegmentList(segments=[LoopSegment(0.0, 6.0), LoopSegment(6.0, 12.0)]),
+    )
+    controller._save(WizardState(step=WizardStep.SEGMENTS, job_id=job_id))
+    real_load = load_segment_list
+    both_in = threading.Barrier(2, timeout=0.5)
+
+    def slow_load(path: Path) -> SegmentList | None:
+        # Each POST reads the list; wait until both have tried to start, so
+        # without the POST lock both would read revision 0.
+        with contextlib.suppress(threading.BrokenBarrierError):
+            both_in.wait()
+        return real_load(path)
+
+    monkeypatch.setattr(wizard_module, "load_segment_list", slow_load)
+    outcomes: list[str] = []
+
+    def edit(at: str) -> None:
+        try:
+            controller.handle_post(
+                "/segments",
+                {"action": ["move"], "index": ["0"], "at": [at], "revision": ["0"]},
+            )
+            outcomes.append(f"applied {at}")
+        except WizardError as exc:
+            outcomes.append(str(exc))
+
+    threads = [threading.Thread(target=edit, args=(at,)) for at in ("4", "8")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert len(outcomes) == 2
+    applied = [o for o in outcomes if o.startswith("applied")]
+    assert len(applied) == 1
+    assert any("scenes changed" in o for o in outcomes)
+    found = real_load(job_dir)
+    assert found is not None and found.revision == 1
+    assert found.segments[0].end_s == float(applied[0].split()[1])

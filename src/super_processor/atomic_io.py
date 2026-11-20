@@ -63,6 +63,22 @@ def read_text_retrying(path: Path) -> str:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+def unlink_retrying(path: Path) -> None:
+    """Remove a file if it is there, retrying a PermissionError.
+
+    The last error is raised as it is, so a file that must go and will not
+    is never mistaken for one that went.
+    """
+    for attempt in range(RETRIES):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if attempt == RETRIES - 1:
+                raise
+            time.sleep(RETRY_S)
+
+
 def unlink_quietly(path: Path) -> None:
     """Remove a file if it is there; a file that will not go is left."""
     with suppress(OSError):

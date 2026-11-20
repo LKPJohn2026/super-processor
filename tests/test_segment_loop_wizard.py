@@ -15,7 +15,21 @@ import pytest
 from loop_driver import to_ready
 
 from super_processor.review import WizardServer
-from super_processor.shot_plan import load_plan
+from super_processor.segment_loop import (
+    LoopSegment,
+    SegmentList,
+    SegmentLoopError,
+    load_segment_list,
+    save_segment_list,
+)
+from super_processor.shot_plan import (
+    ShotPlan,
+    ShotRecipe,
+    load_plan,
+    plan_path,
+    save_plan,
+)
+from super_processor.shots import Shot, ShotList, load_shots, save_shots, shots_path
 from super_processor.upscale import (
     FakeUpscaleEngine,
     UpscaleError,
@@ -143,6 +157,8 @@ def test_segment_loop_end_to_end(
     assert controller.current_state().step is WizardStep.PROPOSING
     assert _run(controller, "start_segmenting").step is WizardStep.SEGMENTS
     assert gemini.notes == ["", "cut at the zoom"]
+    # The new proposal is a new list: a page showing the first one is stale.
+    assert controller.api_view()["segments"]["revision"] == 1
 
     controller.handle_post("/segments", {"action": ["approve"]})
     state = _run(controller, "start_analyze")
@@ -153,7 +169,7 @@ def test_segment_loop_end_to_end(
     page = controller.render()
     assert "Segment 1 of 2" in page and "Preview a different part" in page
     assert preview["shot"]["after_url"] in page
-    assert preview["shot"]["after_url"].endswith("_r1_after.mp4")
+    assert preview["shot"]["after_url"].partition("?")[0].endswith("_r1_after.mp4")
     assert state.job_id
     job_dir = controller.store.job_dir(state.job_id)
     plan = load_plan(job_dir)
@@ -354,6 +370,7 @@ def test_result_note_can_restart_from_the_segments(tmp_path: Path) -> None:
         upscale_engine=FakeUpscaleEngine(),
     )
     job_dir = to_ready(controller, clip)
+    first_url = controller.api_view()["looks"]["shots"][0]["after_url"]
     append_chat_turn(job_dir, ChatTurn(role="model", text='{"segments": []}'))
     controller.handle_post("/ready", {"action": ["render"]})
     controller.run_render()
@@ -391,6 +408,14 @@ def test_result_note_can_restart_from_the_segments(tmp_path: Path) -> None:
     assert len(gemini.chats) == 2
     assert any("too sharp, faces look fake" in text for text in gemini.chats[-1])
     assert len(gemini.chats[-1]) == len(gemini.chats[0]) + 2
+
+    # The new plan's first preview has the same file name as the old one's;
+    # its URL is still new, so a browser cannot show the cached old one.
+    controller.handle_post("/segments", {"action": ["approve"]})
+    assert _run(controller, "start_analyze").step is WizardStep.PREVIEW_SEGMENT
+    again = controller.api_view()["segment_preview"]["shot"]["after_url"]
+    assert again.partition("?")[0] == first_url.partition("?")[0]
+    assert again != first_url
 
 
 def test_restart_leaves_symlinked_folders_alone(tmp_path: Path) -> None:
@@ -697,3 +722,319 @@ def test_a_failure_after_the_output_is_written_keeps_the_new_plan(
     kept = load_upscale_plan(job_dir)
     assert kept is not None and kept.pending is None
     assert kept.spans == revised.spans
+
+
+# Scene edits by hand ---------------------------------------------------------
+
+
+@needs_ffmpeg
+def test_new_segments_from_a_note_get_new_preview_urls(tmp_path: Path) -> None:
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Gemini(),  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    save_session_state(controller.jobs_dir, WizardState(step=WizardStep.PICK_FILE))
+    controller.handle_post("/pick", {"path": [str(_clip(tmp_path / "in.mp4"))]})
+    assert _run(controller, "start_segmenting").step is WizardStep.SEGMENTS
+    controller.handle_post("/segments", {"action": ["approve"]})
+    assert _run(controller, "start_analyze").step is WizardStep.PREVIEW_SEGMENT
+    first = controller.api_view()["segment_preview"]["shot"]
+    controller.handle_post("/goto", {"to": ["segments"]})
+    controller.handle_post("/segments", {"action": ["note"], "note": ["cut later"]})
+    assert _run(controller, "start_segmenting").step is WizardStep.SEGMENTS
+    controller.handle_post("/segments", {"action": ["approve"]})
+    assert _run(controller, "start_analyze").step is WizardStep.PREVIEW_SEGMENT
+    again = controller.api_view()["segment_preview"]["shot"]
+    for side in ("before_url", "after_url"):
+        assert again[side].partition("?")[0] == first[side].partition("?")[0]
+        assert again[side] != first[side]
+    # The page's poster still is the one of the same plan.
+    assert again["after_url"].replace("_after.mp4?", "_after.jpg?") in (
+        controller.render()
+    )
+
+
+def _segments_job(
+    tmp_path: Path, segments: list[LoopSegment], *, approved: bool = False
+) -> tuple[WizardController, Path]:
+    """A job on the Segments screen with ``segments`` saved; no FFmpeg."""
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"not a real video")
+    controller = WizardController(tmp_path / "jobs", gemini=_Gemini())  # type: ignore[arg-type]
+    job_id = controller.store.create(source).job_id
+    job_dir = controller.store.job_dir(job_id)
+    save_segment_list(job_dir, SegmentList(segments=segments, approved=approved))
+    controller._save(WizardState(step=WizardStep.SEGMENTS, job_id=job_id))
+    return controller, job_dir
+
+
+def _twelve_seconds() -> list[LoopSegment]:
+    return [
+        LoopSegment(0.0, 5.0, label="kitchen"),
+        LoopSegment(5.0, 12.0, label="street"),
+    ]
+
+
+def _saved(job_dir: Path) -> SegmentList:
+    found = load_segment_list(job_dir)
+    assert found is not None
+    return found
+
+
+def test_scenes_can_be_moved_split_and_joined_by_hand(tmp_path: Path) -> None:
+    controller, job_dir = _segments_job(tmp_path, _twelve_seconds())
+    view = controller.api_view()["segments"]
+    assert (view["revision"], view["approved"], view["duration_s"]) == (0, False, 12.0)
+    assert (view["min_segment_s"], view["max_segments"]) == (3.0, 10)
+    assert [item["index"] for item in view["segments"]] == [0, 1]
+
+    post = controller.handle_post
+    post(
+        "/segments",
+        {"action": ["move"], "index": ["0"], "at": ["6"], "revision": ["0"]},
+    )
+    post(
+        "/segments",
+        {"action": ["split"], "index": ["1"], "at": ["9"], "revision": ["1"]},
+    )
+    found = _saved(job_dir)
+    assert [(s.start_s, s.end_s) for s in found.segments] == [
+        (0.0, 6.0),
+        (6.0, 9.0),
+        (9.0, 12.0),
+    ]
+    assert found.revision == 2
+    post("/segments", {"action": ["merge"], "index": ["0"], "revision": ["2"]})
+    found = _saved(job_dir)
+    assert [(s.start_s, s.end_s, s.label) for s in found.segments] == [
+        (0.0, 9.0, "kitchen"),
+        (9.0, 12.0, "street"),
+    ]
+    assert (found.revision, controller.current_state().error) == (3, None)
+    assert controller.api_view()["segments"]["revision"] == 3
+
+
+def test_an_edit_the_rules_refuse_shows_why_and_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    controller, job_dir = _segments_job(tmp_path, _twelve_seconds())
+    before = (job_dir / "segments.json").read_text(encoding="utf-8")
+    for fields in (
+        {"action": ["split"], "index": ["0"], "at": ["2"]},
+        {"action": ["move"], "index": ["0"], "at": ["10"]},
+        {"action": ["move"], "index": ["0"], "at": ["soon"]},
+        {"action": ["merge"], "index": ["1"]},
+    ):
+        controller.handle_post("/segments", {**fields, "revision": ["0"]})
+        state = controller.current_state()
+        assert state.step is WizardStep.SEGMENTS and state.error, fields
+    assert (job_dir / "segments.json").read_text(encoding="utf-8") == before
+    # An index the page could not have sent is refused outright.
+    for raw in ("-1", "1e2", "٣", "1000", ""):
+        with pytest.raises(WizardError, match="pick one of the scenes"):
+            controller.handle_post(
+                "/segments", {"action": ["merge"], "index": [raw], "revision": ["0"]}
+            )
+
+
+def test_an_edit_from_a_page_showing_older_scenes_is_refused(tmp_path: Path) -> None:
+    controller, job_dir = _segments_job(tmp_path, _twelve_seconds())
+    move = {"action": ["move"], "index": ["0"], "at": ["6"]}
+    # A change by hand must say which list it changes.
+    for revision in ([], [""], ["x"], ["1"]):
+        with pytest.raises(WizardError, match="scenes changed"):
+            controller.handle_post("/segments", {**move, "revision": revision})
+    controller.handle_post("/segments", {**move, "revision": ["0"]})
+    with pytest.raises(WizardError, match="scenes changed"):
+        controller.handle_post("/segments", {**move, "revision": ["0"]})
+    # Approve checks the revision too, when the page sends one, but does not
+    # change it.
+    with pytest.raises(WizardError, match="scenes changed"):
+        controller.handle_post("/segments", {"action": ["approve"], "revision": ["0"]})
+    assert not _saved(job_dir).approved
+    controller.handle_post("/segments", {"action": ["approve"], "revision": ["1"]})
+    found = _saved(job_dir)
+    assert (found.approved, found.revision) == (True, 1)
+
+
+def test_a_stale_revision_over_the_api_is_a_400(tmp_path: Path) -> None:
+    controller, _job_dir = _segments_job(tmp_path, _twelve_seconds())
+    server = WizardServer(controller.jobs_dir, token=TOKEN, controller=controller)
+    base = server.start()
+    try:
+        parsed = urlparse(base)
+        connection = HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port)
+        for revision, status in ((0, 200), (0, 400)):
+            body = json.dumps(
+                {"action": "move", "index": 0, "at": 6.5, "revision": revision}
+            ).encode()
+            connection.request(
+                "POST",
+                "/api/segments",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Wizard-Token": TOKEN,
+                },
+            )
+            response = connection.getresponse()
+            answer = json.loads(response.read().decode())
+            assert response.status == status, answer
+        assert "scenes changed" in answer["error"]
+    finally:
+        server.stop()
+
+
+def _planned_job(tmp_path: Path) -> tuple[WizardController, Path]:
+    """Approved scenes with their shots, plan, and previews on disk."""
+    controller, job_dir = _segments_job(tmp_path, _twelve_seconds(), approved=True)
+    save_shots(
+        job_dir, ShotList(shots=[Shot(0.0, 5.0, label="kitchen"), Shot(5.0, 12.0)])
+    )
+    save_plan(
+        job_dir, ShotPlan(scale=2, recipes=[ShotRecipe(rev=1), ShotRecipe(rev=1)])
+    )
+    previews = job_dir / "previews"
+    previews.mkdir()
+    for name in ("shot_000_r1_after.mp4", "shot_000_r1_before.mp4"):
+        (previews / name).write_bytes(b"x")
+    for name in ("upscale_plan_before_note.json", "render_report.json"):
+        (job_dir / name).write_text("{}", encoding="utf-8")
+    return controller, job_dir
+
+
+def test_an_edit_that_changes_nothing_keeps_the_approval(tmp_path: Path) -> None:
+    controller, job_dir = _planned_job(tmp_path)
+    state = controller.current_state()
+    state.segment_index = state.approved_count = 1
+    controller._save(state)
+    # The cut is already at 5 s.
+    controller.handle_post(
+        "/segments",
+        {"action": ["move"], "index": ["0"], "at": ["5.0001"], "revision": ["0"]},
+    )
+    found = _saved(job_dir)
+    assert (found.approved, found.revision) == (True, 0)
+    controller.handle_post("/segments", {"action": ["approve"], "revision": ["0"]})
+    state = controller.current_state()
+    assert (state.step, state.segment_index, state.approved_count) == (
+        WizardStep.ANALYZING,
+        1,
+        1,
+    )
+    assert shots_path(job_dir).is_file() and plan_path(job_dir).is_file()
+
+
+def test_approving_edited_scenes_clears_the_old_plan_even_with_a_preview_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, job_dir = _planned_job(tmp_path)
+    controller.handle_post(
+        "/segments",
+        {"action": ["move"], "index": ["0"], "at": ["6"], "revision": ["0"]},
+    )
+    assert not _saved(job_dir).approved
+    real_unlink = Path.unlink
+
+    def held(self: Path, missing_ok: bool = False) -> None:
+        # Windows: a browser still plays the old preview.
+        if self.name == "shot_000_r1_after.mp4":
+            raise PermissionError(13, "the file is open in another program")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", held)
+    controller.handle_post("/segments", {"action": ["approve"], "revision": ["1"]})
+    state = controller.current_state()
+    assert (state.step, state.error) == (WizardStep.ANALYZING, None)
+    assert _saved(job_dir).approved
+    for name in (
+        "shots.json",
+        "shot_plan.json",
+        "previews/shot_000_r1_before.mp4",
+        "upscale_plan_before_note.json",
+        "render_report.json",
+    ):
+        assert not (job_dir / name).exists(), name
+    assert (job_dir / "previews" / "shot_000_r1_after.mp4").is_file()
+
+
+def test_approving_is_refused_while_the_old_plan_cannot_be_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("super_processor.atomic_io.RETRY_S", 0)
+    controller, job_dir = _planned_job(tmp_path)
+    controller.handle_post(
+        "/segments",
+        {"action": ["move"], "index": ["0"], "at": ["6"], "revision": ["0"]},
+    )
+    real_unlink = Path.unlink
+
+    def held(self: Path, missing_ok: bool = False) -> None:
+        if self.name == "shots.json":
+            raise PermissionError(13, "the file is open in another program")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", held)
+    with pytest.raises(WizardError, match="could not clear"):
+        controller.handle_post("/segments", {"action": ["approve"]})
+    # Never approved over shots measured from the old cut.
+    assert not _saved(job_dir).approved
+    assert controller.current_state().step is WizardStep.SEGMENTS
+
+
+def _approved_whole_video(
+    tmp_path: Path, segment_end: float, shot_end: float
+) -> tuple[WizardController, Path]:
+    controller, job_dir = _segments_job(
+        tmp_path, [LoopSegment(0.0, segment_end, label="whole video")], approved=True
+    )
+    save_shots(job_dir, ShotList(shots=[Shot(0.0, shot_end, label="whole video")]))
+    save_plan(job_dir, ShotPlan(scale=2, recipes=[ShotRecipe(rev=1, stale=False)]))
+    state = controller.current_state()
+    state.step = WizardStep.ANALYZING
+    controller._save(state)
+    return controller, job_dir
+
+
+@pytest.mark.parametrize(
+    ("segment_end", "shot_end"), [(12.3456789, 12.346), (12.346, 12.3456789)]
+)
+def test_a_whole_video_segment_is_not_measured_again_over_rounding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    segment_end: float,
+    shot_end: float,
+) -> None:
+    # segments.json from before the fallback was rounded, or shots.json
+    # measured from it: the same span to the millisecond.
+    def measured(*args: Any, **kwargs: Any) -> ShotList:
+        raise AssertionError("the segment was measured again")
+
+    monkeypatch.setattr("super_processor.wizard.shots_from_segments", measured)
+    controller, job_dir = _approved_whole_video(tmp_path, segment_end, shot_end)
+    controller.run_analyze()
+    state = controller.current_state()
+    assert state.step is WizardStep.PREVIEW_SEGMENT, state.error
+    shots = load_shots(job_dir)
+    assert shots is not None
+    assert shots.shots[0].end_s == pytest.approx(shot_end, abs=1e-6)
+
+
+def test_shots_measured_from_other_scenes_are_measured_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    measured: list[list[tuple[float, float]]] = []
+
+    def measure(
+        source: Path, job_dir: Path, segments: list[LoopSegment], **kwargs: Any
+    ) -> ShotList:
+        measured.append([(s.start_s, s.end_s) for s in segments])
+        raise SegmentLoopError("measured again")
+
+    monkeypatch.setattr("super_processor.wizard.shots_from_segments", measure)
+    controller, _job_dir = _approved_whole_video(tmp_path, 12.0, 9.0)
+    controller.run_analyze()
+    assert measured == [[(0.0, 12.0)]]
+    state = controller.current_state()
+    assert state.error is not None and "measured again" in state.error

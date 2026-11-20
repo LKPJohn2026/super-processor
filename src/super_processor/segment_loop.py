@@ -17,7 +17,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -292,11 +292,15 @@ class SegmentList:
     # None when it gave none (the plan then starts at 2x).
     scale: int | None = None
     scale_reason: str = ""
+    # Goes up by one each time the list itself changes (a new proposal or an
+    # edit by hand), so a page that shows an older list cannot change this one.
+    revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SEGMENT_LIST_SCHEMA_VERSION,
             "kind": SEGMENT_LIST_KIND,
+            "revision": self.revision,
             "approved": self.approved,
             "error": self.error,
             "note": self.note,
@@ -322,6 +326,15 @@ class SegmentList:
         chosen = (
             isinstance(scale, int) and not isinstance(scale, bool) and scale in (1, 2)
         )
+        raw_revision = data.get("revision")
+        # Lists saved before revisions existed start at 0.
+        revision = (
+            raw_revision
+            if isinstance(raw_revision, int)
+            and not isinstance(raw_revision, bool)
+            and raw_revision >= 0
+            else 0
+        )
         return cls(
             segments=[LoopSegment.from_dict(item) for item in raw],
             approved=bool(data.get("approved", False)),
@@ -329,6 +342,7 @@ class SegmentList:
             note=str(data.get("note", "")),
             scale=scale if chosen else None,
             scale_reason=str(data.get("scale_reason") or "") if chosen else "",
+            revision=revision,
         )
 
 
@@ -441,7 +455,7 @@ def repair_coverage(raw: list[dict[str, Any]], duration_s: float) -> list[LoopSe
         raise SegmentLoopError("the video has no duration to segment")
     spans = _proposed_spans(raw, duration_s)
     if not spans:
-        return [LoopSegment(0.0, duration_s, label="whole video")]
+        return [whole_video(duration_s)]
     pieces = _pieces(spans, duration_s)
 
     def length(index: int) -> float:
@@ -463,6 +477,135 @@ def repair_coverage(raw: list[dict[str, Any]], duration_s: float) -> list[LoopSe
         LoopSegment(round(start, 3), round(end, 3), label=label, contains=contains)
         for start, end, label, contains in pieces
     ]
+
+
+def whole_video(duration_s: float) -> LoopSegment:
+    """One segment for the whole clip, its end rounded like every other cut."""
+    # A clip under half a millisecond would round to nothing; keep it as is.
+    return LoopSegment(0.0, round(duration_s, 3) or duration_s, label="whole video")
+
+
+# Edits by hand ------------------------------------------------------------
+#
+# The editor moves a cut, joins two neighbouring scenes, or splits one. Each
+# edit is a pure function: it returns a new list and leaves the one it was
+# given alone, and it refuses (SegmentLoopError) anything that would break
+# the rules Gemini's proposals keep (see :func:`check_coverage`).
+
+
+def check_coverage(segments: list[LoopSegment], duration_s: float) -> None:
+    """Refuse segments that do not cover 0 to ``duration_s`` once, in order.
+
+    The rules are the ones :func:`repair_coverage` holds Gemini to: at most
+    :data:`MAX_LOOP_SEGMENTS` segments, each one starting where the one
+    before it ends, the last ending at ``duration_s``, and none shorter than
+    :data:`MIN_LOOP_SEGMENT_S` unless it is the only one. Times are compared
+    to the millisecond, the precision they are saved at.
+    """
+    if not segments:
+        raise SegmentLoopError("there must be at least one scene")
+    if len(segments) > MAX_LOOP_SEGMENTS:
+        raise SegmentLoopError(f"there can be at most {MAX_LOOP_SEGMENTS} scenes")
+    reach = 0.0
+    for segment in segments:
+        if round(segment.start_s, 3) != round(reach, 3):
+            raise SegmentLoopError("each scene must start where the one before ends")
+        reach = segment.end_s
+    if round(reach, 3) != round(duration_s, 3):
+        raise SegmentLoopError("the last scene must end where the video ends")
+    if len(segments) > 1 and any(
+        round(segment.end_s - segment.start_s, 3) < MIN_LOOP_SEGMENT_S
+        for segment in segments
+    ):
+        raise SegmentLoopError(
+            f"each scene must be at least {MIN_LOOP_SEGMENT_S:g} seconds long"
+        )
+
+
+def rounded_segments(segments: list[LoopSegment]) -> list[LoopSegment]:
+    """The same segments with their times rounded to the millisecond."""
+    return [
+        replace(
+            segment, start_s=round(segment.start_s, 3), end_s=round(segment.end_s, 3)
+        )
+        for segment in segments
+    ]
+
+
+def _edit_time(at_s: float) -> float:
+    at = float(at_s)
+    if not math.isfinite(at):
+        raise SegmentLoopError("the time must be a number of seconds")
+    return round(at, 3)
+
+
+def _checked(edited: list[LoopSegment], before: list[LoopSegment]) -> list[LoopSegment]:
+    # An edit never moves the end of the video.
+    check_coverage(edited, before[-1].end_s)
+    return edited
+
+
+def move_cut(segments: list[LoopSegment], index: int, at_s: float) -> list[LoopSegment]:
+    """Move the cut between scene ``index`` and the next one to ``at_s``."""
+    if not 0 <= index < len(segments) - 1:
+        raise SegmentLoopError("there is no cut after that scene")
+    at = _edit_time(at_s)
+    pieces = rounded_segments(segments)
+    first, second = pieces[index], pieces[index + 1]
+    if not first.start_s < at < second.end_s:
+        raise SegmentLoopError("a cut cannot move past the cuts on either side")
+    pieces[index : index + 2] = [
+        replace(first, end_s=at),
+        replace(second, start_s=at),
+    ]
+    return _checked(pieces, segments)
+
+
+def merge_segments(segments: list[LoopSegment], index: int) -> list[LoopSegment]:
+    """Join scene ``index`` and the next one into one scene.
+
+    The longer of the two names it and keeps its note; what either contains
+    stays protected.
+    """
+    if not 0 <= index < len(segments) - 1:
+        raise SegmentLoopError("there is no next scene to join that one with")
+    pieces = rounded_segments(segments)
+    first, second = pieces[index], pieces[index + 1]
+    longer = (
+        first
+        if first.end_s - first.start_s >= second.end_s - second.start_s
+        else second
+    )
+    pieces[index : index + 2] = [
+        LoopSegment(
+            first.start_s,
+            second.end_s,
+            label=longer.label,
+            note=longer.note,
+            contains=tuple(dict.fromkeys((*first.contains, *second.contains))),
+        )
+    ]
+    return _checked(pieces, segments)
+
+
+def split_segment(
+    segments: list[LoopSegment], index: int, at_s: float
+) -> list[LoopSegment]:
+    """Cut scene ``index`` in two at ``at_s``; both halves keep what it had."""
+    if not 0 <= index < len(segments):
+        raise SegmentLoopError("there is no such scene")
+    if len(segments) >= MAX_LOOP_SEGMENTS:
+        raise SegmentLoopError(f"there can be at most {MAX_LOOP_SEGMENTS} scenes")
+    at = _edit_time(at_s)
+    pieces = rounded_segments(segments)
+    whole = pieces[index]
+    if not whole.start_s < at < whole.end_s:
+        raise SegmentLoopError("the split must be inside the scene")
+    pieces[index : index + 1] = [
+        replace(whole, end_s=at),
+        replace(whole, start_s=at),
+    ]
+    return _checked(pieces, segments)
 
 
 def shots_from_segments(

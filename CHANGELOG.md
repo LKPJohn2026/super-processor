@@ -31,8 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for just before the wizard was closed still applies when it restarts,
   and a job left mid-step can be stopped without starting its work again.
   `/api/state` has `cancellable`, `cancel_requested` and `stopped`.
+- The scenes can be changed by hand on the Segments step: move the cut
+  after a scene, join a scene with the next one, or split one
+  (`/api/segments` with `action` `move`, `merge` or `split`, the scene's
+  `index`, and `at` in seconds). The limits are the same as for Gemini's
+  proposals: at least 3 seconds a scene and at most 10 scenes. Each change
+  sends the `revision` the page shows, so a second window showing older
+  scenes is refused instead of overwriting them. A change that leaves the
+  scenes as they were keeps their approval. `/api/state` shows the
+  segments' `revision`, `approved`, `duration_s`, `min_segment_s`,
+  `max_segments` and each scene's `index`.
 
 ### Fixed
+
+- After new scenes are approved (a note to Gemini, a manual edit, or
+  starting over from the result), the previews no longer show the old
+  scenes' cached video: preview URLs now carry the plan's generation.
 
 - "Ready to render" refuses to start while a scene has changes that have
   not been previewed yet, and says which scene.

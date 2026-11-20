@@ -406,7 +406,7 @@ def test_planning_fails_a_crawling_preview_even_when_gemini_passes_it(
     assert "flicker" in shot["check"]["problems"]
     assert shot["check"]["adjusted"] is True
     assert shot["strength"] == pytest.approx(0.8 - SHIMMER_STEP)
-    assert shot["after_url"].endswith("_r2_after.mp4")
+    assert shot["after_url"].partition("?")[0].endswith("_r2_after.mp4")
     assert shot["shimmer"] is not None
     page = controller.render()
     assert "Check found: flicker." in page

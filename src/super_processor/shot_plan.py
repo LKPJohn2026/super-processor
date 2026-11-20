@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import random
 import re
+import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -72,6 +74,7 @@ CHECK_PROBLEMS = (
 )
 # How far strength drops when the measured shimmer flags a preview.
 SHIMMER_STEP = 0.15
+_GENERATION = re.compile(r"[0-9a-f]{1,64}")
 PREVIEW_NAME = re.compile(r"shot_(\d{3})_r(\d+)_(before|after)\.(mp4|jpg)")
 
 
@@ -177,6 +180,10 @@ class ShotPlan:
     scale: int
     recipes: list[ShotRecipe]
     error: str | None = None
+    # New for each plan made from scratch. Preview names restart at r1 in a
+    # new plan, so the preview URLs carry this to keep a browser from
+    # showing the old plan's cached preview of the same name.
+    generation: str = ""
     schema_version: int = PLAN_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -184,6 +191,7 @@ class ShotPlan:
             "schema_version": self.schema_version,
             "scale": self.scale,
             "error": self.error,
+            "generation": self.generation,
             "recipes": [recipe.to_dict() for recipe in self.recipes],
         }
 
@@ -193,6 +201,7 @@ class ShotPlan:
             raise ShotPlanError("shot_plan.json must hold a list of recipes")
         scale = data.get("scale")
         error = data.get("error")
+        generation = data.get("generation")
         return cls(
             # 1 is the editor's "do not upscale" from the ready screen.
             # A plan saved at 4x, before 4x was removed, renders at 2x.
@@ -200,6 +209,10 @@ class ShotPlan:
             scale=int(scale) if not isinstance(scale, bool) and scale in (1, 2) else 2,
             recipes=[ShotRecipe.from_dict(item) for item in data["recipes"]],
             error=str(error) if error else None,
+            # It goes into a URL, so only the hex it was made as is kept.
+            generation=generation
+            if isinstance(generation, str) and _GENERATION.fullmatch(generation)
+            else "",
         )
 
     def stale_indexes(self) -> list[int]:
@@ -463,7 +476,7 @@ def apply_proposals(
     if missing:
         listed = ", ".join(str(i + 1) for i in missing)
         error = f"Gemini gave no recipe for shot {listed}; those use the measurements."
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=error)
+    return replace(plan, recipes=recipes, error=error)
 
 
 def apply_checks(
@@ -500,7 +513,7 @@ def apply_checks(
                 )
                 changed.append(index)
         recipes[index] = recipe
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error), changed
+    return replace(plan, recipes=recipes, error=plan.error), changed
 
 
 def shots_payload(
@@ -667,12 +680,28 @@ def render_previews(
                 ffmpeg_bin=ffmpeg_bin,
                 width=CHECK_STILL_WIDTH,
             )
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
+    return replace(plan, recipes=recipes, error=plan.error)
 
 
 def _middle_s(shot: Shot, start_s: float | None = None) -> float:
     start, end = preview_window(shot, start_s)
     return (end - start) / 2
+
+
+def remove_previews(job_dir: Path) -> None:
+    """Remove every scene's previews, as far as the disk lets us.
+
+    Best effort: a preview a browser still has open (Windows refuses to
+    remove it) stays, and the next plan's previews are told apart by
+    :attr:`ShotPlan.generation`.
+    """
+    folder = job_dir / PREVIEWS_DIR
+    if folder.is_symlink() or not folder.is_dir():
+        return
+    for old in folder.glob("shot_*"):
+        if PREVIEW_NAME.fullmatch(old.name.removesuffix(".delivery.json")):
+            with suppress(OSError):
+                old.unlink(missing_ok=True)
 
 
 def _remove_old_previews(folder: Path, index: int) -> None:
@@ -705,7 +734,7 @@ def measure_shimmer(
         recipes[index] = replace(
             recipes[index], shimmer=None if value is None else round(value, 2)
         )
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
+    return replace(plan, recipes=recipes, error=plan.error)
 
 
 def guard_shimmer(
@@ -743,7 +772,7 @@ def guard_shimmer(
             check=replace(check, adjusted=True),
         )
         changed.append(index)
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error), changed
+    return replace(plan, recipes=recipes, error=plan.error), changed
 
 
 def check_stills(job_dir: Path, plan: ShotPlan, index: int) -> tuple[Path, Path]:
@@ -760,7 +789,7 @@ def finish(plan: ShotPlan, indexes: list[int]) -> ShotPlan:
     recipes = list(plan.recipes)
     for index in indexes:
         recipes[index] = replace(recipes[index], stale=False, note="")
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
+    return replace(plan, recipes=recipes, error=plan.error)
 
 
 def request_redo(
@@ -779,7 +808,7 @@ def request_redo(
     recipes[index] = replace(recipes[index], stale=True, note=text[:500])
     if resample:
         recipes[index] = replace(recipes[index], preview_start=None)
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=None)
+    return replace(plan, recipes=recipes, error=None)
 
 
 def keep_editor_choices(fresh: ShotRecipe, old: ShotRecipe) -> ShotRecipe:
@@ -809,10 +838,14 @@ def set_upscale(plan: ShotPlan, index: int, on: bool) -> ShotPlan:
     recipes[index] = replace(
         recipes[index], use_upscale=on, upscale_override=on, stale=True, note=""
     )
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=None)
+    return replace(plan, recipes=recipes, error=None)
 
 
 def new_plan(shots: ShotList, scale: int) -> ShotPlan:
     if not shots.shots:
         raise ShotError("there are no shots to plan")
-    return ShotPlan(scale=scale, recipes=[ShotRecipe() for _ in shots.shots])
+    return ShotPlan(
+        scale=scale,
+        recipes=[ShotRecipe() for _ in shots.shots],
+        generation=uuid.uuid4().hex,
+    )

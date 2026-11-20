@@ -158,10 +158,10 @@ def test_segment_posts_refuse_unknown_actions_and_missing_files(
     with pytest.raises(WizardError, match="cannot read segments.json"):
         controller.handle_post("/segments", {"action": ["approve"]})
     _segments(job_dir, approved=False)
-    controller.handle_post("/segments", {"action": ["split"]})
+    controller.handle_post("/segments", {"action": ["shuffle"]})
     state = controller.current_state()
     assert state.step is WizardStep.SEGMENTS
-    assert state.error == "unknown action 'split'"
+    assert state.error == "unknown action 'shuffle'"
 
 
 # Analyze -------------------------------------------------------------------

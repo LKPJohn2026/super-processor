@@ -9,7 +9,7 @@ import shutil
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from fractions import Fraction
@@ -20,6 +20,7 @@ from .atomic_io import (
     read_text_retrying,
     rmtree_quietly,
     unlink_quietly,
+    unlink_retrying,
     write_text_atomic,
 )
 from .cancel import Cancelled
@@ -52,10 +53,15 @@ from .segment_loop import (
     load_segment_list,
     load_segment_stills,
     make_gemini_copy,
+    merge_segments,
+    move_cut,
     repair_coverage,
+    rounded_segments,
     sample_times,
     save_segment_list,
     shots_from_segments,
+    split_segment,
+    whole_video,
 )
 from .segments import MAX_DURATION_S
 from .shot_plan import (
@@ -81,6 +87,7 @@ from .shot_plan import (
     note_scale,
     plan_path,
     random_preview_start,
+    remove_previews,
     render_previews,
     reply_scale,
     request_redo,
@@ -90,6 +97,7 @@ from .shot_plan import (
 )
 from .shots import (
     CONTENTS,
+    Shot,
     ShotError,
     ShotList,
     load_shots,
@@ -431,6 +439,54 @@ def save_job_wizard_state(job_dir: Path, state: WizardState) -> None:
     _write_state_file(job_state_path(job_dir), state)
 
 
+_SEGMENT_EDITS = ("move", "merge", "split")
+_REVISION = re.compile(r"\d{1,9}", re.ASCII)
+_SCENE_INDEX = re.compile(r"\d{1,3}", re.ASCII)
+_STALE_SEGMENTS = (
+    "the scenes changed since this page showed them; look at them again "
+    "before changing them"
+)
+
+
+def _check_revision(
+    found: SegmentList, fields: dict[str, list[str]], *, required: bool
+) -> None:
+    """Refuse a POST made from a page that shows an older segment list."""
+    raw = (fields.get("revision") or [""])[0].strip()
+    if not raw and not required:
+        return
+    if not _REVISION.fullmatch(raw) or int(raw) != found.revision:
+        raise WizardError(_STALE_SEGMENTS)
+
+
+def _edit_segments(
+    segments: list[LoopSegment], action: str, fields: dict[str, list[str]]
+) -> list[LoopSegment]:
+    """The segments after one change by hand.
+
+    A change the rules refuse raises SegmentLoopError, shown on the page; a
+    scene index the page could not have sent raises WizardError.
+    """
+    raw = fields.get("index", [""])[0].strip()
+    if not _SCENE_INDEX.fullmatch(raw):
+        raise WizardError("pick one of the scenes shown")
+    index = int(raw)
+    if action == "merge":
+        return merge_segments(segments, index)
+    try:
+        at = float(fields.get("at", [""])[0].strip())
+    except ValueError:
+        raise SegmentLoopError("say where to cut, in seconds") from None
+    if action == "move":
+        return move_cut(segments, index, at)
+    return split_segment(segments, index, at)
+
+
+def _spans(items: Sequence[Shot | LoopSegment]) -> list[tuple[float, float]]:
+    """Start and end of each shot or segment, to the millisecond saved."""
+    return [(round(item.start_s, 3), round(item.end_s, 3)) for item in items]
+
+
 def _fallback_plan(plan: ShotPlan, shots: ShotList, indexes: list[int]) -> ShotPlan:
     """Recipes from the measurements, keeping each shot's preview count."""
     recipes = list(plan.recipes)
@@ -438,7 +494,7 @@ def _fallback_plan(plan: ShotPlan, shots: ShotList, indexes: list[int]) -> ShotP
         recipes[index] = keep_editor_choices(
             fallback_recipe(shots.shots[index]), recipes[index]
         )
-    return ShotPlan(scale=plan.scale, recipes=recipes, error=plan.error)
+    return replace(plan, recipes=recipes)
 
 
 RENDER_REPORT_FILE = "render_report.json"
@@ -1812,11 +1868,14 @@ class WizardController:
         if shots is None or plan is None:
             return {"scale": None, "error": None, "shots": []}
         items: list[dict[str, Any]] = []
+        # A new plan starts its preview names at r1 again; the generation
+        # keeps a browser from showing the last plan's cached r1.
+        query = f"?g={plan.generation}" if plan.generation else ""
         for index, (shot, recipe) in enumerate(
             zip(shots.shots, plan.recipes, strict=False)
         ):
             before, after = (
-                f"/previews/{name}"
+                f"/previews/{name}{query}"
                 for name in (
                     f"shot_{index:03d}_r{recipe.rev}_before.mp4",
                     f"shot_{index:03d}_r{recipe.rev}_after.mp4",
@@ -1965,14 +2024,19 @@ class WizardController:
             error = (
                 f"Gemini could not propose segments ({exc}); the whole video is one."
             )
-            segments = [LoopSegment(0.0, duration, label="whole video")]
+            segments = [whole_video(duration)]
         # From here on the new segments are saved and the stop is refused.
         if self._run is not None:
             self._run.commit()
         save_segment_list(
             job_dir,
             SegmentList(
-                segments=segments, error=error, scale=scale, scale_reason=reason
+                segments=segments,
+                error=error,
+                scale=scale,
+                scale_reason=reason,
+                # A page still showing the earlier list cannot change this one.
+                revision=earlier.revision + 1 if earlier else 0,
             ),
         )
         self._clear_stopped_note(state.job_id)
@@ -2150,8 +2214,9 @@ class WizardController:
             return {"segments": [], "error": None, "note": ""}
         stills = load_segment_stills(job_dir)
         items: list[dict[str, Any]] = []
-        for segment in found.segments:
+        for index, segment in enumerate(found.segments):
             item = segment.to_dict()
+            item["index"] = index
             # The sampled still nearest the middle stands for the segment.
             item["still_url"] = _nearest_still_url(
                 stills, segment.start_s, segment.end_s
@@ -2165,10 +2230,27 @@ class WizardController:
             "scale_reason": found.scale_reason,
             # Why Gemini worked from the stills, when it could not watch.
             "video_problem": self._video_problem(job_dir),
+            # For editing by hand: send ``revision`` back with each change.
+            "revision": found.revision,
+            "approved": found.approved,
+            # The segments always cover the whole video, so the last end is
+            # where it ends.
+            "duration_s": found.segments[-1].end_s if found.segments else None,
+            "min_segment_s": MIN_LOOP_SEGMENT_S,
+            "max_segments": MAX_LOOP_SEGMENTS,
         }
 
     def _segments_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
-        """Approve the segments, or send them back to Gemini with a note."""
+        """Approve the segments, change them by hand, or send them back to
+        Gemini with a note.
+
+        By hand, the editor moves the cut after a scene (``move``), joins a
+        scene with the next one (``merge``), or splits one (``split``), at
+        ``at`` seconds. Each change sends the ``revision`` the page shows; a
+        page showing an older list is refused, so two windows cannot both
+        change the scenes. A change that leaves the scenes as they were
+        keeps their approval.
+        """
         if state.step is not WizardStep.SEGMENTS or not state.job_id:
             raise WizardError("there are no segments to change")
         job_dir = self.store.job_dir(state.job_id)
@@ -2179,13 +2261,15 @@ class WizardController:
         if found is None:
             raise WizardError("the segments are missing; pick the file again")
         action = fields.get("action", [""])[0]
+        # Approve and note predate revisions, so older pages may leave it
+        # out; a change by hand always says which list it changes.
+        _check_revision(found, fields, required=action in _SEGMENT_EDITS)
         if action == "approve":
             if not found.approved:
                 # New segments: plan them from the start.
+                self._clear_old_plan(job_dir)
                 found.approved = True
                 save_segment_list(job_dir, found)
-                shots_path(job_dir).unlink(missing_ok=True)
-                plan_path(job_dir).unlink(missing_ok=True)
                 state.segment_index = state.approved_count = 0
             state.step = WizardStep.ANALYZING
         elif action == "note":
@@ -2197,9 +2281,44 @@ class WizardController:
                 found.approved = False
                 save_segment_list(job_dir, found)
                 self._enter_running_step(state, WizardStep.PROPOSING)
+        elif action in _SEGMENT_EDITS:
+            try:
+                edited = _edit_segments(found.segments, action, fields)
+            except SegmentLoopError as exc:
+                state.error = str(exc)
+            else:
+                # Compared as saved, to the millisecond: moving a cut to
+                # where it already is changes nothing.
+                if edited != rounded_segments(found.segments):
+                    found.segments = edited
+                    found.revision += 1
+                    found.approved = False
+                    # Gemini's word on its proposal no longer describes it.
+                    found.error = None
+                    save_segment_list(job_dir, found)
         else:
             state.error = f"unknown action {action!r}"
         self._save(state)
+
+    def _clear_old_plan(self, job_dir: Path) -> None:
+        """Forget the plan of the segments approved before, before new ones are.
+
+        The segments are still saved as not approved while this runs, so a
+        stop part way leaves nothing that looks approved. The shots and the
+        plan must go (the next analysis builds them from the new segments);
+        old previews, the plan the output was rendered from, and the seam
+        report are removed as far as the disk lets us.
+        """
+        try:
+            unlink_retrying(shots_path(job_dir))
+            unlink_retrying(plan_path(job_dir))
+        except OSError as exc:
+            raise WizardError(
+                f"could not clear the settings of the old scenes: {exc}"
+            ) from exc
+        remove_previews(job_dir)
+        unlink_quietly(job_dir / _PLAN_BEFORE_NOTE)
+        unlink_quietly(job_dir / RENDER_REPORT_FILE)
 
     def run_analyze(self) -> None:
         with self._running("analyze") as run:
@@ -2224,6 +2343,10 @@ class WizardController:
             return
         shots = load_shots(job_dir)
         plan = load_plan(job_dir)
+        if shots is not None and _spans(shots.shots) != _spans(found.segments):
+            # Shots measured from other segments (an approval that could not
+            # clear them): measure the approved ones again.
+            shots = None
         if shots is None or plan is None:
             self._progress(state, "analyzing", 5, "Measuring the segments")
             try:

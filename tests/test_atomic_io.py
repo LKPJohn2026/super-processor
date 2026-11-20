@@ -12,6 +12,7 @@ from super_processor.atomic_io import (
     read_text_retrying,
     rmtree_quietly,
     unlink_quietly,
+    unlink_retrying,
     write_text_atomic,
 )
 
@@ -163,4 +164,34 @@ def test_quiet_removals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr(Path, "unlink", refused)
     unlink_quietly(held)
+    assert held.is_file()
+
+
+def test_unlink_retrying_rides_out_a_held_file_and_says_when_it_gives_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unlink_retrying(tmp_path / "missing.json")
+    held = tmp_path / "shots.json"
+    held.write_text("{}", encoding="utf-8")
+    real_unlink = Path.unlink
+    calls = {"unlink": 0}
+
+    def flaky(self: Path, missing_ok: bool = False) -> None:
+        calls["unlink"] += 1
+        if calls["unlink"] < 3:
+            raise PermissionError(13, "file is open in another thread")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", flaky)
+    unlink_retrying(held)
+    assert not held.exists() and calls["unlink"] == 3
+
+    held.write_text("{}", encoding="utf-8")
+
+    def refused(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(13, "file is open in another program")
+
+    monkeypatch.setattr(Path, "unlink", refused)
+    with pytest.raises(PermissionError):
+        unlink_retrying(held)
     assert held.is_file()

@@ -1130,8 +1130,12 @@ def _protected_line(regions: list[object], contains: list[object]) -> str:
 
 
 def _poster(video_url: str) -> str:
-    """Each preview has a still of the same name, saved for the check."""
-    return video_url.removesuffix(".mp4") + ".jpg"
+    """Each preview has a still of the same name, saved for the check.
+
+    The query (the plan's generation) stays on the still's URL too.
+    """
+    path, mark, query = video_url.partition("?")
+    return path.removesuffix(".mp4") + ".jpg" + mark + query
 
 
 def _items(shot: dict[str, object], key: str) -> list[object]:

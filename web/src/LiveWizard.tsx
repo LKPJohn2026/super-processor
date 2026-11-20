@@ -1012,8 +1012,9 @@ function SeamNote({
 }
 
 function poster(videoUrl: string | null): string | null {
-  // Each preview has a still of the same name, saved for the check.
-  return videoUrl ? videoUrl.replace(/\.mp4$/, ".jpg") : null;
+  // Each preview has a still of the same name, saved for the check. The
+  // query (the plan's generation) stays on the still's URL too.
+  return videoUrl ? videoUrl.replace(/\.mp4(\?|$)/, ".jpg$1") : null;
 }
 
 function checkSummary(check: LookShot["check"]): string {
