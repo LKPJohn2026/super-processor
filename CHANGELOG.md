@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A render now replaces `output.mp4` once, with a finished file that
+  already has its audio. A render that failed while copying the audio (or
+  a whole-video revise that failed partway) used to leave a silent new
+  picture, or an old picture no longer marked for fast revises; the
+  previous output is now kept exactly as it was.
 - The wizard's scene list, shot list, plan and Gemini chat are now saved
   the same safe way as its state: through a temp file of their own that
   replaces the old file in one step, retried while Windows briefly holds

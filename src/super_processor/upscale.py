@@ -23,6 +23,7 @@ Delivery video is always H.264: NVENC where this machine has it (see
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import importlib
 import json
 import os
@@ -1836,6 +1837,59 @@ def _frame_size(video: Path) -> tuple[int, int] | None:
     return stream.width, stream.height
 
 
+class RenderControl(Protocol):
+    """What a caller can install around a render to stop it (see
+    :func:`render_control`)."""
+
+    def commit(self) -> None:
+        """Called once, just before ``output`` is replaced. Raising here
+        (the user stopped the render) leaves the old output in place;
+        returning means the render can no longer be stopped."""
+
+
+_CONTROL: contextvars.ContextVar[RenderControl | None] = contextvars.ContextVar(
+    "super_processor_render_control", default=None
+)
+
+
+@contextlib.contextmanager
+def render_control(control: RenderControl) -> Iterator[None]:
+    """Install ``control`` for renders run on this thread inside the block."""
+    token = _CONTROL.set(control)
+    try:
+        yield
+    finally:
+        _CONTROL.reset(token)
+
+
+def _commit() -> None:
+    """The point of no return before a render replaces its output."""
+    control = _CONTROL.get()
+    if control is not None:
+        control.commit()
+
+
+def _commit_output(
+    work_file: Path, output: Path, source: Path, *, ffmpeg_bin: str
+) -> Path:
+    """Finish ``work_file`` (its marker already beside it) and put it in place.
+
+    The audio is muxed into the work file first, so ``output`` is replaced
+    once, by a complete file: it is always either the old output or the new
+    one, never a new picture still waiting for its audio. Anything that fails
+    before the replace leaves the old output and its marker as they were.
+    """
+    mux_source_audio(work_file, source, ffmpeg_bin=ffmpeg_bin)
+    _commit()
+    work_file.replace(output)
+    marker = delivery_marker_path(work_file)
+    if marker.is_file():
+        marker.replace(delivery_marker_path(output))
+    else:
+        delivery_marker_path(output).unlink(missing_ok=True)
+    return output
+
+
 @one_encoder()
 def _upscale_full(
     source: Path,
@@ -1847,7 +1901,7 @@ def _upscale_full(
     ffmpeg_bin: str,
     on_progress: ProgressFn | None = None,
 ) -> Path:
-    restore_to_delivery(
+    delivery = restore_to_delivery(
         engine,
         UpscaleRequest(
             source,
@@ -1858,12 +1912,11 @@ def _upscale_full(
             regions=span.regions,
             on_progress=on_progress,
         ),
-        output,
+        work / "full_delivery.mp4",
         use_upscale=span.use_upscale,
         ffmpeg_bin=ffmpeg_bin,
     )
-    mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
-    return output
+    return _commit_output(delivery, output, source, ffmpeg_bin=ffmpeg_bin)
 
 
 @one_encoder()
@@ -1967,10 +2020,8 @@ def apply_range_revise(
             f"the revised output would have {after} frames instead of {before}; "
             "the previous output is left unchanged"
         )
-    silent.replace(output)
-    _write_marker(output, delivery_encoder(ffmpeg_bin, _frame_size(output)))
-    mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
-    return output
+    _write_marker(silent, delivery_encoder(ffmpeg_bin, _frame_size(silent)))
+    return _commit_output(silent, output, source, ffmpeg_bin=ffmpeg_bin)
 
 
 def render_plan(
@@ -2203,10 +2254,8 @@ def render_shots(
             f"the joined shots have {have} frames instead of {want}; "
             "the previous output is left unchanged"
         )
-    silent.replace(output)
-    _write_marker(output, delivery_encoder(ffmpeg_bin, _frame_size(output)))
-    mux_source_audio(output, source, ffmpeg_bin=ffmpeg_bin)
-    return output
+    _write_marker(silent, delivery_encoder(ffmpeg_bin, _frame_size(silent)))
+    return _commit_output(silent, output, source, ffmpeg_bin=ffmpeg_bin)
 
 
 def mux_source_audio(

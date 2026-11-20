@@ -699,6 +699,132 @@ def test_splice_refuses_to_change_the_frame_count(tmp_path: Path) -> None:
     assert _frame_hashes(output) == before
 
 
+def _render_into(
+    entry: str, source: Path, output: Path, engine: upscale.UpscaleEngine
+) -> Path:
+    """Render ``source`` into ``output`` by one of the three commit points."""
+    if entry == "full":
+        return upscale.render_shots(
+            source, output, (default_span(6),), engine=engine, duration_s=6
+        )
+    if entry == "shots":
+        return upscale.render_shots(
+            source,
+            output,
+            (UpscaleSpan(0, 3), UpscaleSpan(3, 6, strength=0.2)),
+            engine=engine,
+            duration_s=6,
+        )
+    return apply_range_revise(
+        source, output, UpscaleSpan(2, 4), output, engine=engine, duration_s=6
+    )
+
+
+def _delivered(tmp_path: Path) -> tuple[Path, Path, bytes, bytes]:
+    """A source, a finished delivery of it, and that delivery's bytes and marker."""
+    source = tmp_path / "in.mp4"
+    _moving(source, seconds=6)
+    output = tmp_path / "out" / "output.mp4"
+    output.parent.mkdir()
+    apply_range_revise(
+        source,
+        output,
+        default_span(6),
+        output,
+        engine=FakeUpscaleEngine(),
+        duration_s=6,
+    )
+    assert is_delivery(output)
+    marker = upscale.delivery_marker_path(output)
+    return source, output, output.read_bytes(), marker.read_bytes()
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("entry", ["full", "shots", "revise"])
+def test_a_failed_audio_mux_leaves_the_old_output_and_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    source, output, before, marker_before = _delivered(tmp_path)
+
+    def broken_mux(video: Path, _source: Path, **_kwargs: Any) -> Path:
+        # The audio goes onto the finished work file, never onto the output.
+        assert video != output
+        raise UpscaleError("mux failed")
+
+    monkeypatch.setattr(upscale, "mux_source_audio", broken_mux)
+    with pytest.raises(UpscaleError, match="mux failed"):
+        _render_into(entry, source, output, FakeUpscaleEngine())
+    assert output.read_bytes() == before
+    assert upscale.delivery_marker_path(output).read_bytes() == marker_before
+
+
+class _Control:
+    """A render control that records what the output held at the commit."""
+
+    def __init__(self, output: Path, *, refuse: bool = False) -> None:
+        self.output = output
+        self.refuse = refuse
+        self.seen: list[bytes] = []
+
+    def commit(self) -> None:
+        self.seen.append(self.output.read_bytes())
+        if self.refuse:
+            raise UpscaleError("stopped")
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("entry", ["full", "shots", "revise"])
+def test_the_output_is_replaced_once_after_the_commit(
+    tmp_path: Path, entry: str
+) -> None:
+    source, output, before, marker_before = _delivered(tmp_path)
+    refused = _Control(output, refuse=True)
+    with upscale.render_control(refused), pytest.raises(UpscaleError, match="stop"):
+        _render_into(entry, source, output, FakeUpscaleEngine())
+    # Stopped at the commit: the old output and its marker were never touched.
+    assert refused.seen == [before]
+    assert output.read_bytes() == before
+    assert upscale.delivery_marker_path(output).read_bytes() == marker_before
+
+    control = _Control(output)
+    with upscale.render_control(control):
+        _render_into(entry, source, output, _TextureEngine())
+    # One commit, while the output was still the old file; then the new one
+    # is in place, complete, with its own marker.
+    assert control.seen == [before]
+    assert output.read_bytes() != before
+    assert is_delivery(output)
+    assert video_stream_facts(output)[0] == video_stream_facts(source)[0]
+    # No control is left installed after the block.
+    assert upscale._CONTROL.get() is None
+
+
+class _FailingEngine(FakeUpscaleEngine):
+    def upscale(self, request: UpscaleRequest) -> Path:
+        raise UpscaleError("the GPU went away")
+
+
+@needs_ffmpeg
+def test_a_failed_full_cover_revise_keeps_the_output_a_delivery(
+    tmp_path: Path,
+) -> None:
+    source, output, before, marker_before = _delivered(tmp_path)
+    with pytest.raises(UpscaleError, match="GPU went away"):
+        apply_range_revise(
+            source,
+            output,
+            default_span(6),
+            output,
+            engine=_FailingEngine(),
+            duration_s=6,
+        )
+    # The whole-file restore works in its own file, so the output's marker
+    # is not removed before the new picture exists.
+    assert is_delivery(output)
+    assert output.read_bytes() == before
+    assert upscale.delivery_marker_path(output).read_bytes() == marker_before
+
+
 _FAKE_WEIGHTS = b"not really SPAN"
 
 
