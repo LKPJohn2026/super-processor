@@ -102,6 +102,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and never starts work by itself. A job another window is working on,
   or any other job while a run works here, cannot be opened and says why.
   "Restore a new video" keeps the open job where it was.
+- The Result and Done pages list every kept version, newest first, with
+  when it was kept, its scale and size, the note that asked for it, and
+  Play and Download buttons; the one the result is now is marked
+  "Current". While the scenes are found or the render runs, "Notify me
+  when it's done" sends a desktop notification if the tab is in the
+  background when it finishes or fails (the browser asks permission only
+  when you tick it, and the choice is remembered). With `--prefetch`, a
+  scene preview says when the next scene is being prepared in the
+  background.
 
 ### Changed
 

@@ -25,6 +25,7 @@ import {
   runSegmenting,
   type JobEntry,
   type LookShot,
+  type OutputVersion,
   type Looks,
   type Progress,
   type Region,
@@ -55,6 +56,23 @@ import {
   stripSummary,
 } from "./jobView";
 import { newVideoRoute, sortJobs, startsOnJobs } from "./jobsList";
+import {
+  notifyPermission,
+  notifyToggle,
+  runNotice,
+  saveChoice,
+  savedChoice,
+  shouldNotify,
+} from "./runNotify";
+import {
+  downloadName,
+  prefetchNote,
+  versionLabel,
+  versionMeta,
+  versionNote,
+  versionsNewestFirst,
+  versionsSummary,
+} from "./versions";
 import { JobsHome } from "./JobsHome";
 import {
   STALE_SCENES_TEXT,
@@ -132,6 +150,33 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   const [jobsStatus, setJobsStatus] = useState("");
   const latestView = useRef(view);
   latestView.current = view;
+  // "Notify me when it's done": off until the editor turns it on, and the
+  // browser is asked only from that click (see NotifyToggle).
+  const [notifyOn, setNotifyOn] = useState(() => savedChoice(browserStorage));
+  const shownView = useRef<WizardView | null>(null);
+  const notified = useRef(new Set<string>());
+  useEffect(() => {
+    const before = shownView.current;
+    shownView.current = view;
+    const notice = runNotice(before, view);
+    if (!notice || notified.current.has(notice.tag)) return;
+    if (!shouldNotify(notice, notifyOn, notifyPermission(window), document.hidden)) return;
+    notified.current.add(notice.tag);
+    try {
+      const shown = new Notification(notice.title, { body: notice.body, tag: notice.tag });
+      shown.onclick = () => {
+        window.focus();
+        shown.close();
+      };
+    } catch {
+      // Some browsers (Chrome on Android) only notify from a service worker.
+    }
+  }, [view, notifyOn]);
+
+  function changeNotify(on: boolean) {
+    setNotifyOn(on);
+    saveChoice(browserStorage, on);
+  }
   const homeOn = home !== "off";
   useEffect(() => {
     if (!homeOn) return;
@@ -424,6 +469,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           onEditScenes={editScenes}
           onView={onView}
           overallShown={overallShown}
+          notify={<NotifyToggle on={notifyOn} onChange={changeNotify} />}
         />
         <SceneStrip
           origin={origin}
@@ -451,6 +497,67 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
 type SendAction = (action: string, fields: Record<string, string>) => Promise<boolean | void>;
 type EditScenes = (edit: SegmentEdit) => Promise<boolean>;
 type SteadyOverall = { key: string; value: number };
+
+function browserStorage(): Storage | null {
+  return typeof window === "undefined" ? null : window.localStorage;
+}
+
+/**
+ * "Notify me when it's done", while the scenes are found or the render runs.
+ * Turning it on asks the browser's permission, from this click only. Hidden
+ * where the browser has no notifications.
+ */
+function NotifyToggle({ on, onChange }: { on: boolean; onChange: (on: boolean) => void }) {
+  // The permission is read on every paint (the view polls), so a change made
+  // in the browser's settings shows up; `asked` repaints after a request.
+  const [, setAsked] = useState(0);
+  const [refused, setRefused] = useState(false);
+  const permission = notifyPermission(typeof window === "undefined" ? undefined : window);
+  const toggle = notifyToggle(on, permission);
+  if (!toggle.shown) return null;
+
+  async function change(checked: boolean) {
+    if (!checked) {
+      onChange(false);
+      return;
+    }
+    let answer: string = Notification.permission;
+    if (answer === "default") {
+      try {
+        // Older Safari answers through a callback, not a promise.
+        answer = await new Promise<string>((resolve) => {
+          const asked = Notification.requestPermission(resolve);
+          if (asked) void asked.then(resolve, () => resolve("default"));
+        });
+      } catch {
+        answer = "default";
+      }
+    }
+    setAsked((value) => value + 1);
+    setRefused(answer !== "granted");
+    onChange(answer === "granted");
+  }
+
+  const hint = toggle.hint ?? (refused ? "Notifications stay off: the browser was not allowed to show them." : null);
+  return (
+    <div className="notify-toggle">
+      <label htmlFor="notify-done" className="inline">
+        <input
+          id="notify-done"
+          type="checkbox"
+          checked={toggle.checked}
+          disabled={toggle.disabled}
+          aria-describedby="notify-hint"
+          onChange={(event) => void change(event.target.checked)}
+        />
+        Notify me when it’s done
+      </label>
+      <p id="notify-hint" className="muted notify-hint" role="status">
+        {hint}
+      </p>
+    </div>
+  );
+}
 
 /** The job's title and its stepper (or the plain rail before a job exists). */
 function JobHeader({ view, busy, onSend }: { view: WizardView; busy: boolean; onSend: SendAction }) {
@@ -621,6 +728,7 @@ function WizardStepView({
   onEditScenes,
   onView,
   overallShown,
+  notify,
 }: {
   origin: string;
   view: WizardView;
@@ -630,6 +738,8 @@ function WizardStepView({
   onEditScenes: EditScenes;
   onView: (view: WizardView) => void;
   overallShown: MutableRefObject<SteadyOverall | null>;
+  // "Notify me when it's done", for the long runs.
+  notify?: ReactNode;
 }) {
   if (view.step === "intro") {
     return (
@@ -733,6 +843,7 @@ function WizardStepView({
         overallShown={overallShown}
         message={message}
         stop={<StopButton view={view} busy={busy} onSend={onSend} />}
+        notify={notify}
       >
         A small copy of the video, without its sound, is uploaded to Gemini,
         which watches it at one frame a second and splits it where the light,
@@ -809,6 +920,7 @@ function WizardStepView({
         overallShown={overallShown}
         message={message}
         stop={<StopButton view={view} busy={busy} onSend={onSend} />}
+        notify={notify}
       >
         Restoring and upscaling on the local GPU. FFmpeg only trims, splices,
         and copies audio. This can take several minutes.
@@ -834,6 +946,7 @@ function WizardStepView({
             aria-label="Upscaled result"
           />
         ) : null}
+        <Versions origin={origin} view={view} />
         <div className="actions">
           <button
             type="button"
@@ -868,6 +981,7 @@ function Busy({
   overallShown,
   message,
   stop,
+  notify,
   children,
 }: {
   title: string;
@@ -878,6 +992,7 @@ function Busy({
   overallShown?: MutableRefObject<SteadyOverall | null>;
   message: string | null;
   stop?: ReactNode;
+  notify?: ReactNode;
   children: ReactNode;
 }) {
   const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
@@ -936,6 +1051,7 @@ function Busy({
         </p>
       ) : null}
       {message ? <Alert text={message} /> : null}
+      {notify}
       {stop}
     </>
   );
@@ -1249,6 +1365,7 @@ function ResultStep({
         <p>The result file is not ready yet.</p>
       )}
       <SeamNote seams={view.seams ?? []} error={view.seam_error ?? null} />
+      <Versions origin={origin} view={view} />
       <p className="lede">Are you happy, or do you want to say something?</p>
       {message ? <Alert text={message} /> : null}
       <div className="actions">
@@ -1297,6 +1414,92 @@ function ResultStep({
         </button>
       </div>
     </>
+  );
+}
+
+/**
+ * Every kept result of the job, newest first, each with a player that opens
+ * in place and a download link. The one the job's output is now is marked.
+ */
+function Versions({ origin, view }: { origin: string; view: WizardView }) {
+  const [open, setOpen] = useState<number | null>(null);
+  const list = versionsNewestFirst(view.versions);
+  if (!list.length) return null;
+  const now = Date.now();
+  return (
+    <section className="versions" aria-labelledby="versions-title">
+      <h2 id="versions-title">Versions</h2>
+      <p className="muted versions-summary">{versionsSummary(view.versions)}</p>
+      <ol className="versions-list">
+        {list.map((version) => (
+          <VersionRow
+            key={version.number}
+            origin={origin}
+            title={view.job?.title ?? null}
+            version={version}
+            now={now}
+            open={open === version.number}
+            onToggle={() => setOpen((shown) => (shown === version.number ? null : version.number))}
+          />
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+function VersionRow({
+  origin,
+  title,
+  version,
+  now,
+  open,
+  onToggle,
+}: {
+  origin: string;
+  title: string | null;
+  version: OutputVersion;
+  now: number;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const src = outputSrc(origin, version.url) ?? undefined;
+  const label = versionLabel(version);
+  const note = versionNote(version);
+  const playerId = `version-player-${version.number}`;
+  return (
+    <li className={`version-row${version.current ? " current" : ""}`}>
+      <div className="version-text">
+        <p className="version-name">
+          <strong>{label}</strong>
+          {version.current ? <span className="badge ok">Current</span> : null}
+        </p>
+        <p className="version-meta">{versionMeta(version, now)}</p>
+        {note ? <p className="version-note">{note}</p> : null}
+      </div>
+      <div className="version-actions">
+        <button
+          type="button"
+          className="secondary small"
+          aria-expanded={open}
+          aria-controls={playerId}
+          aria-label={`${open ? "Hide" : "Play"} ${label.toLowerCase()}`}
+          onClick={onToggle}
+        >
+          {open ? "Hide" : "Play"}
+        </button>
+        <a
+          className="button secondary small"
+          href={src}
+          download={downloadName(title, version)}
+          aria-label={`Download ${label.toLowerCase()}`}
+        >
+          Download
+        </a>
+      </div>
+      <div id={playerId} className="version-player" hidden={!open}>
+        {open ? <video controls preload="metadata" src={src} aria-label={label} /> : null}
+      </div>
+    </li>
   );
 }
 
@@ -2103,6 +2306,10 @@ function PreviewStep({
       {message ? <Alert text={message} /> : null}
       <Notice text={preview.error} />
       {preview.shot ? <LookCard origin={origin} shot={preview.shot} /> : null}
+      {/* Always in the page, so a change is read out; empty without --prefetch. */}
+      <p className="muted prefetch-note" role="status">
+        {prefetchNote(preview)}
+      </p>
       <div className="actions">
         <button
           type="button"

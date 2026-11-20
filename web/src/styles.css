@@ -1070,3 +1070,118 @@ button.small {
     text-align: left;
   }
 }
+
+/* "Notify me when it's done" under a long run. */
+.notify-toggle {
+  margin-top: 1rem;
+}
+
+.notify-toggle label.inline {
+  margin-top: 0;
+  font-weight: 600;
+}
+
+.notify-toggle input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  accent-color: var(--leaf);
+}
+
+.notify-hint {
+  margin: 0.25rem 0 0;
+  font-size: 0.9rem;
+}
+
+.notify-hint:empty,
+.prefetch-note:empty {
+  display: none;
+}
+
+.prefetch-note {
+  font-size: 0.9rem;
+  margin: 0.6rem 0 0;
+}
+
+/* Every kept result, newest first. */
+.versions {
+  margin-top: 1.5rem;
+}
+
+.versions h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.versions-summary {
+  margin: 0.2rem 0 0;
+  font-size: 0.9rem;
+}
+
+.versions-list {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.version-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.3rem 1rem;
+  align-items: center;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.version-row.current {
+  border-left: 3px solid var(--leaf);
+  padding-left: 0.7rem;
+}
+
+.version-text p {
+  margin: 0;
+}
+
+.version-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.version-meta,
+.version-note {
+  font-size: 0.88rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.version-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.version-actions .small {
+  margin-top: 0;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+  border-width: 1.5px;
+}
+
+.version-player {
+  grid-column: 1 / -1;
+}
+
+.version-player video {
+  display: block;
+  width: 100%;
+  max-height: 60vh;
+  margin-top: 0.4rem;
+  background: #000;
+}
+
+@media (max-width: 520px) {
+  .version-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
