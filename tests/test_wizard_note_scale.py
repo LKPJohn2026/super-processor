@@ -384,7 +384,7 @@ def test_output_url_changes_only_when_a_revise_replaces_the_file(
         tmp_path, monkeypatch, size="160x90", ready_scale="1", revise_scale=2
     )
     first = _output_url(controller)
-    assert first.startswith("/output.mp4?v=")
+    assert first.startswith(f"/jobs/{job_dir.name}/output.mp4?v=")
     assert f'src="{first}"' in controller.render()
     assert _output_url(controller) == first
 

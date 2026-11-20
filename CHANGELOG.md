@@ -41,6 +41,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scenes as they were keeps their approval. `/api/state` shows the
   segments' `revision`, `approved`, `duration_s`, `min_segment_s`,
   `max_segments` and each scene's `index`.
+- A list of every wizard job, newest first (`/api/jobs`): its title (the
+  name of the file as it was picked), a still from the video, whether it
+  has a result, was left mid-step, or is busy in another wizard window on
+  the same computer. `/api/jobs/open` with `job` opens one where it was
+  left. A job's result and stills can be fetched by its id
+  (`/jobs/<id>/output.mp4`, `/jobs/<id>/thumb.jpg`), and `output_url`
+  now names the job, so a page left open never plays another job's video.
+  A job is only shown as busy in another window while the process that
+  started its work still runs: a wizard that crashed, or a restart, never
+  leaves the job locked, even when its process id is later reused.
+
+### Changed
+
+- A job left mid-step (the wizard was closed while it found the segments,
+  looked at a scene or rendered, or the job was reopened from the list) no
+  longer starts that GPU or Gemini work again by itself. The page asks
+  first: Resume carries on, Stop goes back to the step before it.
+  `/api/state` says `interrupted`, `?run=1` waits until a POST to
+  `/api/resume`, and `/api/cancel` stops it instead.
 
 ### Fixed
 

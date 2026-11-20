@@ -398,6 +398,7 @@ def test_a_segmenting_worker_crash_fails_the_job_and_goes_back_to_pick(
     job_id = controller.current_state().job_id
     assert job_id
     controller.run_segmenting = _boom  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_segmenting() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
@@ -413,6 +414,7 @@ def test_a_segmenting_worker_crash_fails_the_job_and_goes_back_to_pick(
 def test_an_analyze_worker_crash_goes_back_to_the_segments(tmp_path: Path) -> None:
     controller = _job(tmp_path, WizardStep.ANALYZING, segment_index=1)
     controller.run_analyze = _boom  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_analyze() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
@@ -431,6 +433,7 @@ def test_a_sampling_crash_inside_the_run_is_landed_as_failed(
         raise RuntimeError("stills vanished")
 
     controller._sample = _crash  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_segmenting() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
@@ -453,6 +456,7 @@ def test_an_analyze_crash_inside_the_run_is_landed_as_failed(tmp_path: Path) -> 
         raise RuntimeError("stills vanished")
 
     controller._analyze = _crash  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_analyze() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
@@ -479,6 +483,7 @@ def test_while_a_worker_runs_navigation_is_off_and_progress_is_live(
         release.wait(5)
 
     controller._run_render = _slow  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     try:
         assert entered.wait(5)

@@ -18,11 +18,11 @@ from super_processor.wizard import (
 )
 
 
-def _get(base: str, path: str) -> tuple[int, str | None, bytes]:
+def _get(base: str, path: str, method: str = "GET") -> tuple[int, str | None, bytes]:
     parsed = urlparse(base)
     connection = HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port)
     try:
-        connection.request("GET", path)
+        connection.request(method, path)
         response = connection.getresponse()
         return response.status, response.getheader("Content-Type"), response.read()
     finally:
@@ -83,6 +83,109 @@ def test_media_routes_serve_only_the_current_jobs_named_files(
             "/wizard_state.json",
         ):
             assert _get(base, refused)[0] == 404, refused
+    finally:
+        server.stop()
+
+
+def test_job_scoped_routes_serve_any_jobs_files_by_its_id(tmp_path: Path) -> None:
+    controller = WizardController(tmp_path / "jobs")
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    shown = controller.store.create(source).job_id
+    other = controller.store.create(source).job_id
+    other_dir = controller.store.job_dir(other)
+    files = {
+        "output.mp4": b"other output",
+        "outputs/v001.mp4": b"first version",
+        "outputs/v002.mp4.part": b"half copied",
+        "segment_stills/t_00001000.jpg": b"early",
+        "segment_stills/t_00005000.jpg": b"middle",
+        "segment_stills/t_00009000.jpg": b"late",
+        "previews/shot_000_r1_after.mp4": b"after",
+    }
+    for name, payload in files.items():
+        (other_dir / name).parent.mkdir(parents=True, exist_ok=True)
+        (other_dir / name).write_bytes(payload)
+    outside = tmp_path / "secret.mp4"
+    outside.write_bytes(b"secret")
+    (other_dir / "outputs" / "v003.mp4").symlink_to(outside)
+    save_session_state(
+        controller.jobs_dir, WizardState(step=WizardStep.RESULT, job_id=shown)
+    )
+    server = WizardServer(controller.jobs_dir, controller=controller)
+    base = server.start()
+    try:
+        served = {
+            f"/jobs/{other}/output.mp4": ("video/mp4", b"other output"),
+            f"/jobs/{other}/outputs/v001.mp4": ("video/mp4", b"first version"),
+            # The still in the middle of the video stands for the job.
+            f"/jobs/{other}/thumb.jpg": ("image/jpeg", b"middle"),
+            f"/jobs/{other}/segment_stills/t_00001000.jpg": ("image/jpeg", b"early"),
+            f"/jobs/{other}/previews/shot_000_r1_after.mp4": ("video/mp4", b"after"),
+        }
+        for path, (kind, payload) in served.items():
+            assert _get(base, path) == (200, kind, payload), path
+            assert _get(base, path, "HEAD")[:2] == (200, kind), path
+        for refused in (
+            # The shown job has no output, and the bare route is its own.
+            f"/jobs/{shown}/output.mp4",
+            f"/jobs/{shown}/thumb.jpg",
+            "/output.mp4",
+            "/thumb.jpg",
+            f"/jobs/{other}/outputs/v002.mp4.part",
+            f"/jobs/{other}/outputs/v003.mp4",
+            f"/jobs/{other}/outputs/../output.mp4",
+            f"/jobs/{other}/manifest.json",
+            f"/jobs/{other}/wizard_state.json",
+            "/jobs/ffffffffffffffff/output.mp4",
+            "/jobs/NOT-AN-ID/output.mp4",
+            "/jobs/../output.mp4",
+        ):
+            assert _get(base, refused)[0] == 404, refused
+            assert _get(base, refused, "HEAD")[0] == 404, refused
+        # Removed after the page got its URL: a plain 404, for HEAD too.
+        (other_dir / "output.mp4").unlink()
+        assert _get(base, f"/jobs/{other}/output.mp4", "HEAD")[0] == 404
+        assert _get(base, f"/jobs/{other}/output.mp4")[0] == 404
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
+def test_a_file_that_cannot_be_opened_is_a_404(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[OSError]
+) -> None:
+    controller = WizardController(tmp_path / "jobs")
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    job_id = controller.store.create(source).job_id
+    (controller.store.job_dir(job_id) / "output.mp4").write_bytes(b"video")
+    server = WizardServer(controller.jobs_dir, controller=controller)
+    base = server.start()
+    real_open = Path.open
+
+    def locked(self: Path, *args: object, **kwargs: object) -> object:
+        # Removed (or locked by a Windows player) between the check and open.
+        if self.name == "output.mp4":
+            raise error("in use")
+        return real_open(self, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(Path, "open", locked)
+    try:
+        for method in ("GET", "HEAD"):
+            path = f"/jobs/{job_id}/output.mp4"
+            assert _get(base, path, method)[0] == 404, method
+    finally:
+        server.stop()
+
+
+def test_api_errors_are_json(tmp_path: Path) -> None:
+    server = WizardServer(tmp_path / "jobs")
+    base = server.start()
+    try:
+        status, kind, body = _get(base, "/api/nothing-here")
+        assert (status, kind) == (404, "application/json")
+        assert b"unknown endpoint" in body
     finally:
         server.stop()
 

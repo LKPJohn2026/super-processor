@@ -182,6 +182,30 @@ def test_reopened_wizard_uses_requested_job(
         server.stop()
 
 
+def test_a_job_reopened_mid_render_waits_to_be_resumed(tmp_path: Path) -> None:
+    (tmp_path / "clip.mp4").write_bytes(b"source")
+    store = JobStore(tmp_path / "jobs")
+    job_id = "aaaaaaaaaaaaaaaa"
+    store.create(tmp_path / "clip.mp4", job_id=job_id)
+    save_job_wizard_state(
+        store.job_dir(job_id), WizardState(step=WizardStep.RENDERING, job_id=job_id)
+    )
+    server = ReviewServer(store.job_dir(job_id), jobs_dir=store.root, job_id=job_id)
+    base = server.start()
+    try:
+        started = Request(
+            base + "/api/render?run=1", headers={"X-Wizard-Token": server.token or ""}
+        )
+        with urlopen(started) as response:
+            view = json.load(response)
+        assert view["interrupted"] is True and view["busy"] is False
+        assert view["step"] == "rendering"
+        with urlopen(base + "/") as response:
+            assert 'action="/resume"' in response.read().decode()
+    finally:
+        server.stop()
+
+
 def test_reopened_controller_can_start_a_new_session(tmp_path: Path) -> None:
     (tmp_path / "clip.mp4").write_bytes(b"source")
     store = JobStore(tmp_path / "jobs")

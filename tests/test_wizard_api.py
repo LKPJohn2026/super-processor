@@ -291,7 +291,8 @@ def test_json_api_drives_upscale_flow(
         assert result["step"] == "result"
         assert result["busy"] is False
         assert result["output_ready"] is True
-        assert result["output_url"].startswith("/output.mp4?v=")
+        job_id = result["job_id"]
+        assert result["output_url"].startswith(f"/jobs/{job_id}/output.mp4?v=")
         assert result["scale"] == 2
         assert result["strength"] == 0.5
         assert result["strength_summary"] == "strength 0.50"
@@ -369,6 +370,11 @@ def test_run_keeps_its_id_across_polls(tmp_path: Path) -> None:
     server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
+        # Left on the render by an earlier server: it waits to be resumed.
+        _status, waiting, _origin = _json_request(base, "GET", "/api/render?run=1")
+        assert waiting["interrupted"] is True and waiting["busy"] is False
+        assert not entered.is_set()
+        _json_request(base, "POST", "/api/resume", {})
         status, started, _origin = _json_request(base, "GET", "/api/render?run=1")
         assert status == 200
         assert entered.wait(5)

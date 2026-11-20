@@ -77,6 +77,33 @@ for (const [runner, initial, intermediate, final] of [
   });
 }
 
+test("an interrupted step is handed back at once instead of polled forever", async (t) => {
+  const calls = [];
+  const queue = [
+    state("rendering", { interrupted: true }),
+    state("rendering", { interrupted: false, busy: true }),
+    state("result"),
+  ];
+  const api = await fixture(t, async (url) => {
+    calls.push(url);
+    return Response.json(queue.shift());
+  });
+  const seen = [];
+  const first = await outcome(api.runRender("http://a.test", (v) => seen.push(v.step)));
+  assert.equal(first, "fulfilled", "an interrupted render must not wait on polls");
+  assert.deepEqual(calls, ["http://a.test/api/render?run=1"]);
+  assert.deepEqual(seen, []);
+  // After Resume the page runs it again, as a fresh start.
+  const resumed = api.runRender("http://a.test", (v) => seen.push(v.step));
+  await flush();
+  await advance(t, 2000);
+  await advance(t, 2000);
+  assert.equal(await outcome(resumed), "fulfilled");
+  assert.equal((await resumed).step, "result");
+  assert.deepEqual(seen, ["rendering"]);
+  assert.equal(calls.filter((url) => url.includes("run=1")).length, 2);
+});
+
 test("a step-change effect cleanup can re-subscribe after progress was delivered", async (t) => {
   const queue = ["sampling", "proposing", "segments"];
   const api = await fixture(t, async () => response(queue.shift()));

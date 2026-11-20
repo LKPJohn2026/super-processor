@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import Enum
 from fractions import Fraction
 from pathlib import Path
@@ -36,7 +40,7 @@ from .gemini import (
     store_gemini_api_key,
 )
 from .gpu_heat import GpuHeat, SlowdownWatch, read_gpu_heat
-from .jobs import JobError, JobState, JobStore, utc_now_iso
+from .jobs import JobError, JobManifest, JobState, JobStore, utc_now_iso
 from .look import LOOK_BOUNDS
 from .probe import MediaFacts, ProbeError, probe_file
 from .progress import StepClock, overall_pct
@@ -126,6 +130,7 @@ from .upscale import (
 from .wizard_pages import (
     render_analyzing,
     render_done,
+    render_interrupted,
     render_intro,
     render_llm_choice,
     render_local_llm_stub,
@@ -213,7 +218,7 @@ _SEGMENTING_STEPS = frozenset({WizardStep.SAMPLING, WizardStep.PROPOSING})
 RunKind = Literal["segmenting", "analyze", "render"]
 RunOutcome = Literal["running", "done", "failed", "stopped"]
 # The steps each kind of run works on. A run starts only on one of them.
-_RUN_STEPS: dict[str, frozenset[WizardStep]] = {
+_RUN_STEPS: dict[RunKind, frozenset[WizardStep]] = {
     "segmenting": _SEGMENTING_STEPS,
     "analyze": frozenset({WizardStep.ANALYZING}),
     "render": frozenset({WizardStep.RENDERING}),
@@ -241,6 +246,21 @@ _STOPPED_SEGMENTS_KEPT = (
 _STOPPED_SEGMENTS_NONE = (
     "You stopped finding the segments. Pick the file again to start over."
 )
+# Every step a run works on. Reopened on one of these (after the server
+# restarted, or from the job list) a job is "interrupted": its work waits
+# for the editor to resume it or stop it instead of starting by itself.
+_RESUME_STEPS = frozenset(step for steps in _RUN_STEPS.values() for step in steps)
+_STOPPED_ANALYZE = (
+    "You stopped before this scene was looked at. Your approved segments "
+    "are kept; approve them to carry on."
+)
+_RUNNING_ELSEWHERE = (
+    "this job is being worked on by another Super Processor window on this "
+    "computer; wait for it to finish there"
+)
+# Written in the job folder while a run works on it, so another server on
+# the same jobs folder can tell the job is busy (see jobs_view).
+WORKER_PID_FILE = "worker.pid"
 # How long starting a worker waits for a POST in progress to finish.
 _POST_WAIT_S = 30.0
 _JOB_CONFLICT_MESSAGE = "this job is no longer open in this window"
@@ -282,6 +302,181 @@ def _job_title(source_path: str) -> str:
     name = Path(source_path).name
     found = _UPLOAD_PREFIX.match(name)
     return name[found.end() :] if found and name[found.end() :] else name
+
+
+def _manifest_title(manifest: JobManifest) -> str:
+    """The title the pick saved for a job, or its file name before that."""
+    title = manifest.notes.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return _job_title(manifest.source_path)
+
+
+def _run_kind(step: WizardStep) -> RunKind | None:
+    """The kind of run that works on ``step``, or ``None``."""
+    for kind, steps in _RUN_STEPS.items():
+        if step in steps:
+            return kind
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this id runs on this computer."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_pid_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # It exists, owned by someone else.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _windows_pid_alive(pid: int) -> bool:  # pragma: no cover - Windows only
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    query_limited_information = 0x1000
+    still_active = 259
+    handle = kernel32.OpenProcess(query_limited_information, False, pid)
+    if not handle:
+        # Access denied means the process exists but is not ours to open.
+        return bool(kernel32.GetLastError() == 5)
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_start(pid: int) -> str | None:
+    """When the process with this id started, as text to compare, or ``None``.
+
+    A process id is reused once its process ends, so an id alone cannot
+    tell the run that wrote it from a later, unrelated process. ``None``
+    when the start cannot be read here.
+    """
+    if pid <= 0:
+        return None
+    if os.name == "nt":  # pragma: no cover - Windows only
+        return _windows_process_start(pid)
+    if sys.platform.startswith("linux"):
+        return _linux_process_start(pid)
+    return _ps_process_start(pid)  # pragma: no cover - macOS and BSD
+
+
+def _linux_process_start(pid: int) -> str | None:
+    """The boot and the clock tick since it that the process started at."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    # The command name sits in brackets and may hold spaces; the start
+    # time is the 22nd field, the 20th after the bracket.
+    fields = stat.rpartition(")")[2].split()
+    if len(fields) < 20 or not fields[19].isdigit():
+        return None
+    return f"{boot.strip()}:{fields[19]}"
+
+
+def _ps_process_start(pid: int) -> str | None:  # pragma: no cover - macOS/BSD
+    try:
+        done = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    started = " ".join(done.stdout.split())
+    return started if done.returncode == 0 and started else None
+
+
+def _windows_process_start(pid: int) -> str | None:  # pragma: no cover - Windows
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    query_limited_information = 0x1000
+    handle = kernel32.OpenProcess(query_limited_information, False, pid)
+    if not handle:
+        return None
+    try:
+        times = [ctypes.c_ulonglong() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return None
+        return str(times[0].value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _worker_pid_text() -> str:
+    """What a run writes to its job's pid file: its id and when it started."""
+    pid = os.getpid()
+    started = _process_start(pid)
+    return f"{pid} {started}\n" if started else f"{pid}\n"
+
+
+def worker_pid(job_dir: Path) -> int | None:
+    """The process a run on this job was started in, while it is alive.
+
+    ``None`` when no run works on the job, or the process that wrote the
+    file has gone (a crash leaves the file behind). The file also says
+    when that process started, so an unrelated process that was later
+    given the same id (after a restart, say) does not count.
+    """
+    try:
+        raw = (job_dir / WORKER_PID_FILE).read_text(encoding="utf-8").split()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not raw or not raw[0].isdigit():
+        return None
+    pid = int(raw[0])
+    if not _pid_alive(pid):
+        return None
+    if len(raw) > 1:
+        started = _process_start(pid)
+        if started is not None and started != " ".join(raw[1:]):
+            return None
+    return pid
+
+
+def running_elsewhere(job_dir: Path) -> bool:
+    """True while another process on this computer runs work on the job."""
+    pid = worker_pid(job_dir)
+    return pid is not None and pid != os.getpid()
+
+
+def job_thumb(job_dir: Path) -> Path | None:
+    """A still to show for the job in the job list, or ``None``.
+
+    The sampled still in the middle of the video: the first is often a
+    title card or black.
+    """
+    stills = load_segment_stills(job_dir)
+    if not stills:
+        return None
+    return job_dir / stills[len(stills) // 2].path
+
+
+def _updated_epoch(manifest: JobManifest, job_dir: Path) -> float:
+    """When the job last changed: the manifest's time or its wizard state's."""
+    times: list[float] = []
+    with contextlib.suppress(ValueError):
+        times.append(datetime.fromisoformat(manifest.updated_at).timestamp())
+    with contextlib.suppress(OSError):
+        times.append(job_state_path(job_dir).stat().st_mtime)
+    return max(times, default=0.0)
 
 
 def _nearest_still_url(
@@ -564,13 +759,14 @@ def _output_url(job_dir: Path) -> str | None:
 
     A revise replaces ``output.mp4``, and a browser's media layer can reuse what
     it buffered for an unchanged URL even with ``no-store``, so the URL changes
-    with the file.
+    with the file. The URL names the job, so a page left open on one job
+    never plays another job's result after the wizard moves on.
     """
     try:
         version = (job_dir / "output.mp4").stat().st_mtime_ns
     except OSError:
         return None
-    return f"/output.mp4?v={version}"
+    return f"/jobs/{job_dir.name}/output.mp4?v={version}"
 
 
 def _active_knobs(
@@ -737,6 +933,14 @@ class WizardController:
         # whichever run is current, so a helper left behind by a stop can
         # never save over the stopped screen or over a newer run.
         self._bound = threading.local()
+        # The job and kind of run a POST in this process last moved the
+        # wizard to (or the editor resumed). A run step not armed here was
+        # left by an earlier server, or reopened from the job list, and is
+        # "interrupted": its work starts only once the editor resumes it.
+        # Kept in memory on purpose, so a restart never resumes by itself.
+        self._armed: tuple[str, RunKind] | None = None
+        # The thread applying a POST, whose saves arm the step they move to.
+        self._posting: int | None = None
         # The running worker's time-left estimate, per measurable task.
         self._clock: StepClock | None = None
         self._clock_task = ""
@@ -809,8 +1013,11 @@ class WizardController:
             with self._worker_guard:
                 if self.busy():
                     return False
-                current = self._state().step
-                if current not in steps:
+                state = self._state()
+                current = state.step
+                if current not in steps or self.interrupted(state):
+                    return False
+                if state.job_id and running_elsewhere(self.store.job_dir(state.job_id)):
                     return False
                 worker = threading.Thread(
                     target=self._run_worker,
@@ -867,6 +1074,13 @@ class WizardController:
                 yield None
                 return
             self._begin_step()
+            # Best effort: without it another server only misses that the
+            # job is busy, as it did before the file existed.
+            with contextlib.suppress(OSError):
+                write_text_atomic(
+                    self.store.job_dir(run.job_id or "") / WORKER_PID_FILE,
+                    _worker_pid_text(),
+                )
             try:
                 if self._cancel_marker(run.job_id).is_file():
                     # A stop was asked for before this run began: while its
@@ -889,6 +1103,8 @@ class WizardController:
                     # Under the guard, so a stop asked for from here on finds
                     # no run and reads the step this run left behind.
                     self._drop_cancel_marker(run.job_id)
+                    if run.job_id:
+                        unlink_quietly(self.store.job_dir(run.job_id) / WORKER_PID_FILE)
                     self._last_run = replace(run)
                 self._run = None
             self._work_lock.release()
@@ -925,6 +1141,11 @@ class WizardController:
             state = self._state()
             if job_id and job_id != state.job_id:
                 raise WizardConflict(_JOB_CONFLICT_MESSAGE)
+            if state.step is WizardStep.ANALYZING and self.interrupted(state):
+                # A scene's analysis cannot be stopped while it runs, but one
+                # left interrupted can be dropped instead of resumed.
+                self._stop_interrupted_analyze(state)
+                return
             if state.step not in _CANCEL_STEPS or not state.job_id:
                 raise WizardError("there is nothing running to stop")
             marker = self._cancel_marker(state.job_id)
@@ -962,6 +1183,8 @@ class WizardController:
                 state = self._state()
                 if state.step not in _CANCEL_STEPS or not state.job_id:
                     raise WizardError("there is nothing running to stop")
+                if running_elsewhere(self.store.job_dir(state.job_id)):
+                    raise WizardError(_RUNNING_ELSEWHERE)
                 kind: RunKind = (
                     "render" if state.step is WizardStep.RENDERING else "segmenting"
                 )
@@ -973,6 +1196,209 @@ class WizardController:
                     self._last_run = replace(stopped)
             finally:
                 self._work_lock.release()
+
+    def interrupted(self, state: WizardState, busy: bool | None = None) -> bool:
+        """True when ``state`` is on a run step no POST here moved it to.
+
+        That is a job left mid-step by an earlier server, or one reopened
+        from the job list. Its work does not start by itself: ``?run=1``
+        and ``start_*`` refuse it until :meth:`resume` (or a stop).
+        """
+        if busy is None:
+            busy = self.busy()
+        kind = _run_kind(state.step)
+        if busy or kind is None or not state.job_id:
+            return False
+        return self._armed != (state.job_id, kind)
+
+    def _arm(self, state: WizardState) -> None:
+        """Remember the run step a POST here moved the wizard to."""
+        kind = _run_kind(state.step)
+        job_id = state.job_id
+        self._armed = (job_id, kind) if kind is not None and job_id else None
+
+    def resume(self, *, job_id: str = "") -> None:
+        """Let an interrupted step's work start again (see :meth:`interrupted`).
+
+        Only arms the step: the page then starts the work with ``?run=1``
+        as for any run. A stop asked for before the server went away is
+        dropped, since the editor has now chosen to carry on.
+        """
+        with self._post_lock:
+            if self.busy():
+                raise WizardError("the last step is still running; wait for it")
+            state = self._state()
+            if job_id and job_id != state.job_id:
+                raise WizardConflict(_JOB_CONFLICT_MESSAGE)
+            if not state.job_id or _run_kind(state.step) is None:
+                raise WizardError("there is nothing to resume")
+            if running_elsewhere(self.store.job_dir(state.job_id)):
+                raise WizardError(_RUNNING_ELSEWHERE)
+            self._drop_cancel_marker(state.job_id)
+            self._arm(state)
+            if state.error is not None or state.stopped is not None:
+                state.error = None
+                state.stopped = None
+                self._save(state)
+
+    def _stop_interrupted_analyze(self, state: WizardState) -> None:
+        """Drop an interrupted scene analysis: back to the approved segments.
+
+        Nothing is deleted: the segments stay approved, so approving them
+        again keeps the plan and carries on from the scene the editor was on.
+        """
+        if not self._work_lock.acquire(blocking=False):
+            raise WizardError("the last step is still running; wait for it")
+        try:
+            assert state.job_id
+            if running_elsewhere(self.store.job_dir(state.job_id)):
+                raise WizardError(_RUNNING_ELSEWHERE)
+            stopped = _Run(
+                kind="analyze", job_id=state.job_id, guard=self._cancel_guard
+            )
+            stopped.outcome = "stopped"
+            stopped.landed = True
+            state.error = None
+            state.progress = None
+            state.stopped = _STOPPED_ANALYZE
+            state.step = WizardStep.SEGMENTS
+            self._save(state)
+            stopped.finished_at = time.time()
+            with self._cancel_guard:
+                self._last_run = replace(stopped)
+        finally:
+            self._work_lock.release()
+
+    def open_job(self, job_id: str) -> None:
+        """Show another job in this window, where it was left.
+
+        A job left on a run step opens interrupted: its work waits for the
+        editor to resume or stop it. Refused while a run works here, and
+        while another server on the same folder works on that job.
+        """
+        with self._post_lock:
+            if self.busy():
+                raise WizardError("the last step is still running; wait for it")
+            try:
+                job_dir = self.store.job_dir(job_id)
+            except JobError as exc:
+                raise WizardError(str(exc)) from exc
+            if running_elsewhere(job_dir):
+                raise WizardError(_RUNNING_ELSEWHERE)
+            state = load_job_wizard_state(job_dir)
+            if state is None or not job_dir.is_dir():
+                raise WizardError(f"no wizard state for job {job_id}")
+            state.job_id = job_id
+            # A run that died here left its last progress behind; and the
+            # note a render was asked for belongs to that render alone.
+            state.progress = None
+            state.render_note = None
+            self._armed = None
+            self._save(state, arm=False)
+
+    def jobs_view(self) -> list[dict[str, Any]]:
+        """Every wizard job under the jobs folder, most recently changed first.
+
+        Read-only: it creates nothing, and a job that cannot be read is
+        listed with its ``error`` rather than breaking the list. Jobs the
+        command line made without the wizard are left out.
+
+        ``status`` is ``running`` (a run works on it here),
+        ``running_elsewhere`` (another server on this folder works on it),
+        ``result`` (it has a rendered video), ``failed`` or ``paused``.
+        ``resumes_work`` says it was left on a run step, and ``interrupted``
+        that opening it waits for the editor to resume or stop that work.
+        """
+        root = self.store.root
+        if not root.is_dir():
+            return []
+        current = self._state()
+        busy = self.busy()
+        with self._cancel_guard:
+            working = self._run.job_id if self._run is not None else None
+        if busy and working is None:
+            working = current.job_id
+        entries: list[tuple[float, dict[str, Any]]] = []
+        for child in root.iterdir():
+            try:
+                job_dir = self.store.job_dir(child.name)
+            except JobError:
+                continue
+            if not job_dir.is_dir() or not job_state_path(job_dir).is_file():
+                continue
+            entries.append(self._job_entry(child.name, job_dir, current, working))
+        entries.sort(key=lambda item: item[0], reverse=True)
+        return [entry for _updated, entry in entries]
+
+    def _job_entry(
+        self,
+        job_id: str,
+        job_dir: Path,
+        current: WizardState,
+        working: str | None,
+    ) -> tuple[float, dict[str, Any]]:
+        """One row of :meth:`jobs_view`, with the time it is sorted by."""
+        entry: dict[str, Any] = {
+            "job_id": job_id,
+            "title": job_id,
+            "file_name": None,
+            "step": None,
+            "stage": None,
+            "status": "paused",
+            "updated_at": None,
+            "resumes_work": False,
+            "interrupted": False,
+            "open": current.job_id == job_id,
+            "thumb_url": None,
+            "output_url": None,
+            "error": None,
+        }
+        try:
+            manifest = self.store.load(job_id)
+            state = (
+                current if current.job_id == job_id else load_job_wizard_state(job_dir)
+            )
+        except (WizardError, JobError, OSError, ValueError, KeyError, TypeError) as exc:
+            entry["error"] = str(exc) or type(exc).__name__
+            with contextlib.suppress(OSError):
+                updated = job_state_path(job_dir).stat().st_mtime
+                entry["updated_at"] = round(updated, 3)
+                return updated, entry
+            return 0.0, entry
+        updated = _updated_epoch(manifest, job_dir)
+        entry["title"] = _manifest_title(manifest)
+        entry["file_name"] = _job_title(manifest.source_path)
+        entry["updated_at"] = round(updated, 3)
+        with contextlib.suppress(OSError, SegmentLoopError):
+            if job_thumb(job_dir) is not None:
+                entry["thumb_url"] = f"/jobs/{job_id}/thumb.jpg"
+        entry["output_url"] = _output_url(job_dir)
+        has_versions = False
+        with contextlib.suppress(OSError):
+            has_versions = any((job_dir / "outputs").glob("v*.mp4"))
+        if state is None:
+            return updated, entry
+        entry["step"] = state.step.value
+        entry["stage"] = _STEP_STAGES.get(state.step)
+        entry["error"] = state.error
+        resumes = _run_kind(state.step) is not None
+        entry["resumes_work"] = resumes
+        elsewhere = running_elsewhere(job_dir)
+        if working == job_id:
+            entry["status"] = "running"
+        elif elsewhere:
+            entry["status"] = "running_elsewhere"
+        elif entry["output_url"] is not None or has_versions:
+            entry["status"] = "result"
+        elif manifest.state is JobState.FAILED:
+            entry["status"] = "failed"
+        if working != job_id and not elsewhere and resumes:
+            entry["interrupted"] = (
+                self.interrupted(state, busy=False)
+                if current.job_id == job_id
+                else True
+            )
+        return updated, entry
 
     def _land_cancel(self, run: _Run) -> None:
         """Save the screen a stopped run goes back to.
@@ -1047,6 +1473,9 @@ class WizardController:
             live = run is not None and run.cancellable and not run.cancel.is_set()
             asked = run is not None and run.cancel.is_set()
         on_step = state.step in _CANCEL_STEPS and bool(state.job_id)
+        if not on_step and state.step is WizardStep.ANALYZING:
+            # Only an interrupted analysis can be dropped (see cancel).
+            on_step = self.interrupted(state, busy)
         return on_step and (not busy or live), busy and asked
 
     def _mark_failed(self, run: _Run | None) -> None:
@@ -1203,7 +1632,11 @@ class WizardController:
             state.progress = None
             self._save(state)
 
-    def _save(self, state: WizardState) -> None:
+    def _save(self, state: WizardState, *, arm: bool = True) -> None:
+        # A POST that moves the wizard to a run step arms it, before the
+        # state is on disk, so no reader ever sees it as interrupted.
+        if arm and self._posting == threading.get_ident():
+            self._arm(state)
         save_session_state(self.jobs_dir, state)
         if state.job_id:
             save_job_wizard_state(self.store.job_dir(state.job_id), state)
@@ -1237,6 +1670,15 @@ class WizardController:
 
     def _render_page(self) -> str:
         state = self._state()
+        busy = self.busy()
+        if self.interrupted(state, busy):
+            assert state.job_id
+            can_stop, _stopping = self._cancel_view(state, busy)
+            return render_interrupted(
+                state.step.value,
+                can_stop=can_stop,
+                elsewhere=running_elsewhere(self.store.job_dir(state.job_id)),
+            )
         if state.step is WizardStep.INTRO:
             return render_intro()
         if state.step is WizardStep.LLM_CHOICE:
@@ -1311,6 +1753,11 @@ class WizardController:
         busy = self.busy()
         run = self._public_run(state)
         cancellable, cancel_requested = self._cancel_view(state, busy)
+        interrupted = self.interrupted(state, busy)
+        elsewhere = False
+        if interrupted and state.job_id:
+            elsewhere = running_elsewhere(self.store.job_dir(state.job_id))
+            cancellable = cancellable and not elsewhere
         output_ready = False
         output_url: str | None = None
         scale: int | None = None
@@ -1349,6 +1796,10 @@ class WizardController:
             "cancellable": cancellable,
             "cancel_requested": cancel_requested,
             "stopped": state.stopped,
+            # Left mid-step: ?run=1 is refused until a POST to /resume (or
+            # /cancel to stop it instead).
+            "interrupted": interrupted,
+            "running_elsewhere": elsewhere,
             "job": self._job_summary(state, busy),
             "navigation": self.navigation(),
             "segment_index": state.segment_index,
@@ -1373,22 +1824,35 @@ class WizardController:
         to another job since, :class:`WizardConflict` refuses the POST.
         """
         with self._post_lock:
-            if path == "/cancel":
-                # The one action meant for while a run works.
-                self.cancel(
-                    job_id=fields.get("job_id", [""])[0].strip(),
-                    run_id=fields.get("run_id", [""])[0].strip(),
-                )
-                return
-            if self.busy():
-                raise WizardError("the last step is still running; wait for it")
-            state = self._state()
-            sent_job = fields.get("job_id", [""])[0].strip()
-            if sent_job and sent_job != state.job_id:
-                raise WizardConflict(_JOB_CONFLICT_MESSAGE)
-            state.error = None
-            state.stopped = None
-            self._dispatch_post(path, fields, state)
+            outer = self._posting
+            self._posting = threading.get_ident()
+            try:
+                self._handle_post(path, fields)
+            finally:
+                self._posting = outer
+
+    def _handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
+        sent_job = fields.get("job_id", [""])[0].strip()
+        if path == "/cancel":
+            # The one action meant for while a run works.
+            self.cancel(job_id=sent_job, run_id=fields.get("run_id", [""])[0].strip())
+            return
+        if path == "/resume":
+            self.resume(job_id=sent_job)
+            return
+        if path == "/jobs/open":
+            # ``job`` is the job to open; ``job_id`` stays the one the page
+            # shows, so it is not checked here: any window may switch jobs.
+            self.open_job(fields.get("job", [""])[0].strip())
+            return
+        if self.busy():
+            raise WizardError("the last step is still running; wait for it")
+        state = self._state()
+        if sent_job and sent_job != state.job_id:
+            raise WizardConflict(_JOB_CONFLICT_MESSAGE)
+        state.error = None
+        state.stopped = None
+        self._dispatch_post(path, fields, state)
 
     def _dispatch_post(
         self, path: str, fields: dict[str, list[str]], state: WizardState
@@ -1631,10 +2095,15 @@ class WizardController:
     def pick_upload(self, path: Path, name: str) -> None:
         """Pick an uploaded file; it is removed again when the pick refuses it."""
         with self._post_lock:
-            state = self._state()
-            state.error = None
-            state.stopped = None
-            self._pick_file(state, str(path), shown_name=Path(name).name)
+            outer = self._posting
+            self._posting = threading.get_ident()
+            try:
+                state = self._state()
+                state.error = None
+                state.stopped = None
+                self._pick_file(state, str(path), shown_name=Path(name).name)
+            finally:
+                self._posting = outer
             if self._state().step is not WizardStep.SAMPLING:
                 path.unlink(missing_ok=True)
 
@@ -1657,7 +2126,11 @@ class WizardController:
                 return
             require_supported_timing(source, ffmpeg_bin=self.ffmpeg_bin)
             manifest = self.store.create(source)
-            self.store.transition(manifest.job_id, JobState.PROBED)
+            # The job list's title: the name the editor knows the file by.
+            title = _job_title(shown_name or source.name)
+            self.store.transition(
+                manifest.job_id, JobState.PROBED, notes={"title": title}
+            )
         except ProbeError:
             # FFprobe's own text names demuxers and internal paths; say what
             # the editor can act on.
@@ -2509,7 +2982,7 @@ class WizardController:
         errors: list[str] = []
         title = job_id
         try:
-            title = _job_title(self.store.load(job_id).source_path)
+            title = _manifest_title(self.store.load(job_id))
         except Exception as exc:  # noqa: BLE001 - shown in the summary
             errors.append(str(exc) or type(exc).__name__)
         found: SegmentList | None = None

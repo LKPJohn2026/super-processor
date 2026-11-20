@@ -216,6 +216,7 @@ def test_a_crash_while_analyzing_goes_back_to_the_segments(tmp_path: Path) -> No
     controller, job_dir = _job(tmp_path, WizardStep.ANALYZING)
     _segments(job_dir, approved=True)
     shots_path(job_dir).write_text("{", encoding="utf-8")
+    controller.resume()
     assert controller.start_analyze()
     assert controller.wait_idle(30)
     state = controller.current_state()
@@ -229,6 +230,7 @@ def test_finding_segments_on_an_unreadable_file_fails_the_job(tmp_path: Path) ->
     controller, job_dir = _job(tmp_path, WizardStep.PROPOSING)
     job_id = controller.current_state().job_id
     assert job_id
+    controller.resume()
     assert controller.start_segmenting()
     assert controller.wait_idle(30)
     state = controller.current_state()

@@ -154,6 +154,7 @@ def _slow_render(started: threading.Event) -> Any:
 def test_a_stop_while_gemini_proposes_goes_back_to_pick(tmp_path: Path) -> None:
     gemini = _Gemini(block=True)
     controller, job_id, job_dir = _job(tmp_path, WizardStep.PROPOSING, gemini)
+    controller.resume()
     assert controller.start_segmenting()
     assert gemini.entered.wait(5)
     view = controller.api_view()
@@ -204,6 +205,7 @@ def test_a_stopped_upload_never_saves_after_the_stop(
         return copy
 
     monkeypatch.setattr("super_processor.wizard.make_gemini_copy", fake_copy)
+    controller.resume()
     assert controller.start_segmenting()
     assert gemini.uploading.wait(5)
     controller.cancel()
@@ -241,6 +243,7 @@ def test_a_stopped_re_propose_keeps_the_segments(tmp_path: Path) -> None:
     assert controller.current_state().step is WizardStep.PROPOSING
     # Sending the note dropped the old stop, so the new run is not stopped.
     assert not (job_dir / CANCEL_MARKER).exists()
+    controller.resume()
     assert controller.start_segmenting()
     assert gemini.entered.wait(5)
     controller.cancel(job_id=job_id)
@@ -267,15 +270,16 @@ def test_a_stop_racing_the_segment_save_is_refused_and_leaves_no_marker(
     refused: list[str] = []
     real_save = controller._save
 
-    def hooked(state: WizardState) -> None:
+    def hooked(state: WizardState, *, arm: bool = True) -> None:
         if state.step is WizardStep.SEGMENTS and not refused:
             # The segments are committed; a stop now must not undo them.
             with pytest.raises(WizardError, match="can no longer be stopped") as info:
                 controller.cancel()
             refused.append(str(info.value))
-        real_save(state)
+        real_save(state, arm=arm)
 
     controller._save = hooked  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_segmenting()
     assert controller.wait_idle(5)
     assert refused
@@ -283,6 +287,29 @@ def test_a_stop_racing_the_segment_save_is_refused_and_leaves_no_marker(
     assert state.step is WizardStep.SEGMENTS and state.stopped is None
     assert not (job_dir / CANCEL_MARKER).exists()
     assert controller.api_view()["run"]["outcome"] == "done"
+
+
+def test_stopping_an_interrupted_analysis_keeps_the_scenes_approved(
+    tmp_path: Path,
+) -> None:
+    controller, job_id, job_dir = _job(tmp_path, WizardStep.ANALYZING)
+    segments = [LoopSegment(0.0, 4.0, label="a"), LoopSegment(4.0, 8.0, label="b")]
+    save_segment_list(job_dir, SegmentList(segments=segments, approved=True))
+    state = controller.current_state()
+    state.segment_index = state.approved_count = 1
+    save_job_wizard_state(job_dir, state)
+    save_session_state(controller.jobs_dir, state)
+    controller = WizardController(tmp_path / "jobs")
+    controller.handle_post("/cancel", {"job_id": [job_id]})
+    state = controller.current_state()
+    assert state.step is WizardStep.SEGMENTS
+    assert state.stopped is not None and "approve them" in state.stopped
+    assert controller.api_view()["run"]["outcome"] == "stopped"
+    # Approving the same segments again carries on from the scene it was on.
+    controller.handle_post("/segments", {"action": ["approve"]})
+    state = controller.current_state()
+    assert (state.step, state.segment_index) == (WizardStep.ANALYZING, 1)
+    assert state.approved_count == 1 and state.stopped is None
 
 
 # The render -------------------------------------------------------------
@@ -297,6 +324,7 @@ def test_a_stop_during_the_first_render_goes_back_to_ready(
     (job_dir / "shot_work").mkdir()
     (job_dir / "shot_work" / "half.mp4").write_bytes(b"x")
     monkeypatch.setattr(controller, "_approved_scene_count", lambda _job_dir: 3)
+    controller.resume()
     assert controller.start_render()
     assert started.wait(5)
     began = time.monotonic()
@@ -327,6 +355,7 @@ def test_a_stopped_revise_keeps_the_old_output_and_its_plan(
     (job_dir / _PLAN_BEFORE).write_text(json.dumps(old.to_dict()), encoding="utf-8")
     revised = replace(old, pending=replace(old.spans[0], strength=0.9))
     save_upscale_plan(job_dir, revised)
+    controller.resume()
     assert controller.start_render()
     assert started.wait(5)
     controller.cancel()
@@ -359,6 +388,7 @@ def test_a_stop_after_the_render_commits_is_refused(
     monkeypatch.setattr("super_processor.wizard.seam_candidates", lambda *a, **k: [])
     controller, _job_id, job_dir = _job(tmp_path, WizardStep.RENDERING)
     monkeypatch.setattr(controller, "_check_seams", lambda *_args: None)
+    controller.resume()
     assert controller.start_render()
     assert committed.wait(5)
     assert controller.api_view()["cancellable"] is False
@@ -399,6 +429,7 @@ def test_a_stop_as_the_worker_finishes_is_refused_and_leaves_no_marker(
         real_clear()
 
     controller._clear_progress = racing_clear  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render()
     assert controller.wait_idle(5)
     assert outcome == ["it has already finished"]
@@ -406,23 +437,48 @@ def test_a_stop_as_the_worker_finishes_is_refused_and_leaves_no_marker(
     assert controller.current_state().step is WizardStep.RESULT
 
 
-def test_a_stop_asked_before_a_restart_lands_when_the_run_starts(
+def test_a_stop_asked_before_a_restart_waits_for_the_editor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def never(*_args: Any, **_kwargs: Any) -> None:
-        raise AssertionError("a stopped render must not start rendering")
+        raise AssertionError("an interrupted render must not start by itself")
 
     monkeypatch.setattr("super_processor.wizard.render_plan", never)
     controller, job_id, job_dir = _job(tmp_path, WizardStep.RENDERING)
     (job_dir / CANCEL_MARKER).touch()
-    # A new server on the same folder starts the interrupted render.
-    assert controller.start_render()
-    assert controller.wait_idle(5)
+    # A new server on the same folder does not start the interrupted render.
+    assert controller.api_view()["interrupted"] is True
+    assert controller.start_render() is False
+    assert controller.current_state().step is WizardStep.RENDERING
+    # Stopping it lands the stop that was asked for.
+    controller.handle_post("/cancel", {"job_id": [job_id]})
     state = controller.current_state()
     assert (state.step, state.job_id) == (WizardStep.READY_TO_RENDER, job_id)
     assert state.stopped is not None
     assert not (job_dir / CANCEL_MARKER).exists()
     assert controller.api_view()["run"]["outcome"] == "stopped"
+
+
+def test_resuming_drops_a_stop_asked_before_the_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rendered = threading.Event()
+
+    def render(*_args: Any, **_kwargs: Any) -> None:
+        rendered.set()
+        raise RuntimeError("no GPU here")
+
+    monkeypatch.setattr("super_processor.wizard.render_plan", render)
+    controller, job_id, job_dir = _job(tmp_path, WizardStep.RENDERING)
+    (job_dir / CANCEL_MARKER).touch()
+    controller.handle_post("/resume", {"job_id": [job_id]})
+    assert not (job_dir / CANCEL_MARKER).exists()
+    assert controller.api_view()["interrupted"] is False
+    assert controller.start_render() is True
+    assert controller.wait_idle(5)
+    # The editor chose to carry on, so the render ran instead of stopping.
+    assert rendered.is_set()
+    assert controller.api_view()["run"]["outcome"] == "failed"
 
 
 def test_an_interrupted_run_can_be_stopped_without_a_worker(tmp_path: Path) -> None:
@@ -445,6 +501,7 @@ def test_a_double_stop_is_one_stop(
     started = threading.Event()
     monkeypatch.setattr("super_processor.wizard.render_plan", _slow_render(started))
     controller, _job_id, job_dir = _job(tmp_path, WizardStep.RENDERING)
+    controller.resume()
     assert controller.start_render()
     assert started.wait(5)
     # Holding the state lock keeps the stop from landing between the clicks.
@@ -468,6 +525,7 @@ def test_a_stop_names_the_run_and_job_it_is_for(
     started = threading.Event()
     monkeypatch.setattr("super_processor.wizard.render_plan", _slow_render(started))
     controller, job_id, _job_dir = _job(tmp_path, WizardStep.RENDERING)
+    controller.resume()
     assert controller.start_render()
     assert started.wait(5)
     run_id = controller.api_view()["run"]["id"]
@@ -482,7 +540,7 @@ def test_a_stop_names_the_run_and_job_it_is_for(
 
 
 def test_only_running_steps_can_be_stopped(tmp_path: Path) -> None:
-    for step in (WizardStep.SEGMENTS, WizardStep.ANALYZING, WizardStep.RESULT):
+    for step in (WizardStep.SEGMENTS, WizardStep.RESULT):
         controller, _job_id, job_dir = _job(tmp_path / step.value, step)
         assert controller.api_view()["cancellable"] is False
         with pytest.raises(WizardError, match="nothing running to stop"):

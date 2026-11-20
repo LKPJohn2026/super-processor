@@ -829,6 +829,52 @@ def render_analyzing(index: int, count: int, progress: object = None) -> str:
     )
 
 
+# What each run step was doing, and the step rail's phase, for a job that
+# was left on it.
+_INTERRUPTED: dict[str, tuple[str, str]] = {
+    "sampling": ("finding the segments", "segments"),
+    "proposing": ("finding the segments", "segments"),
+    "analyzing": ("looking at a scene", "previews"),
+    "rendering": ("the render", "result"),
+}
+
+
+def render_interrupted(step: str, *, can_stop: bool, elsewhere: bool = False) -> str:
+    """A job left mid-step: carry on with its work, or stop it.
+
+    Nothing starts until the editor chooses, so reopening a job never
+    spends GPU time or Gemini quota by itself. The page does not refresh.
+    """
+    what, phase = _INTERRUPTED.get(step, ("this step", "result"))
+    if elsewhere:
+        body = f"""
+<h1>Working in another window</h1>
+<p class="lede">Another Super Processor window on this computer is busy with
+{escape(what)} for this job. Wait for it to finish there, then reload.</p>
+"""
+        return _page("Working in another window", body, phase=phase)
+    stop = (
+        """<form method="post" action="/cancel">
+<button type="submit" class="secondary">Stop</button>
+</form>"""
+        if can_stop
+        else ""
+    )
+    body = f"""
+<h1>Carry on where you left off?</h1>
+<p class="lede">This job was interrupted during {escape(what)}. Nothing runs
+until you choose: Resume starts that work again, Stop goes back to the step
+before it.</p>
+<div class="actions">
+<form method="post" action="/resume">
+<button type="submit">Resume</button>
+</form>
+{stop}
+</div>
+"""
+    return _page("Carry on where you left off?", body, phase=phase)
+
+
 def _notice(text: object) -> str:
     return f'<p class="notice" role="status">{escape(str(text))}</p>' if text else ""
 

@@ -10,6 +10,7 @@ from super_processor.review import WizardServer
 from super_processor.wizard import WizardController, WizardStep
 from super_processor.wizard_pages import (
     render_done,
+    render_interrupted,
     render_llm_choice,
     render_local_llm_stub,
     render_pick,
@@ -169,3 +170,17 @@ def test_preview_posters_keep_the_plan_generation() -> None:
     assert 'src="/previews/shot_000_r1_after.mp4?g=ab12"' in page
     assert 'poster="/previews/shot_000_r1_after.jpg?g=ab12"' in page
     assert 'poster="/previews/shot_000_r1_before.jpg?g=ab12"' in page
+
+
+def test_an_interrupted_page_asks_before_resuming() -> None:
+    page = render_interrupted("rendering", can_stop=True)
+    assert '<form method="post" action="/resume">' in page
+    assert '<form method="post" action="/cancel">' in page
+    assert "during the render" in page
+    # Nothing runs by itself: no refresh to a ?run=1 link.
+    assert "http-equiv" not in page and "run=1" not in page
+    analyzing = render_interrupted("analyzing", can_stop=False)
+    assert 'action="/resume"' in analyzing and 'action="/cancel"' not in analyzing
+    elsewhere = render_interrupted("sampling", can_stop=True, elsewhere=True)
+    assert "<h1>Working in another window</h1>" in elsewhere
+    assert "<form" not in elsewhere

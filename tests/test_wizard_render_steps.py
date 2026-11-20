@@ -62,7 +62,20 @@ def test_render_each_wizard_step(tmp_path: Path) -> None:
         state = WizardState(step=step, job_id=job_id)
         save_job_wizard_state(job_dir, state)
         save_session_state(tmp_path, state)
+        if step in RUN_STEPS:
+            # Reopened there, as by an earlier server: interrupted.
+            controller.open_job(job_id)
+            assert "<h1>Carry on where you left off?</h1>" in controller.render()
+            controller.resume()
         assert needle in controller.render()
+
+
+RUN_STEPS = {
+    WizardStep.SAMPLING,
+    WizardStep.PROPOSING,
+    WizardStep.ANALYZING,
+    WizardStep.RENDERING,
+}
 
 
 def test_retired_steps_go_back_to_pick(tmp_path: Path) -> None:
@@ -277,6 +290,7 @@ def _fail_render(controller: WizardController) -> WizardState:
         raise UpscaleError("SPAN needs an NVIDIA GPU with CUDA")
 
     controller._run_render = _boom  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     assert controller.wait_idle(timeout=5)
     return controller.current_state()

@@ -26,6 +26,7 @@ from .wizard import (
     WizardController,
     WizardError,
     WizardStep,
+    job_thumb,
     load_job_wizard_state,
 )
 
@@ -479,7 +480,54 @@ _API_POSTS = {
     "/api/result": "/result",
     # Stops the segmenting or render in progress (see WizardController.cancel).
     "/api/cancel": "/cancel",
+    # Lets an interrupted step's work start again (WizardController.resume).
+    "/api/resume": "/resume",
+    # Shows another job, by its ``job`` field (WizardController.open_job).
+    "/api/jobs/open": "/jobs/open",
 }
+# Files of any job, by its id: /jobs/<id>/output.mp4, thumb.jpg, a kept
+# version under outputs/, and the stills and previews the current job has.
+_JOB_MEDIA = re.compile(r"/jobs/([a-z0-9]{8,32})(/.+)")
+_VERSION_URL = re.compile(r"/outputs/(v\d{3,6}\.mp4)")
+
+
+def _job_media(
+    job_dir: Path, path: str, *, scoped: bool = False
+) -> tuple[Path, str] | None:
+    """Map a media path inside one job to its file and type, or ``None``.
+
+    Only these named files are served, never one a symlink points out of the
+    job with. ``thumb.jpg`` and the kept versions are served by job id only.
+    """
+    if path == "/output.mp4":
+        output = job_dir / "output.mp4"
+        return (output, "video/mp4") if output.is_file() else None
+    if scoped and path == "/thumb.jpg":
+        thumb = job_thumb(job_dir)
+        return (thumb, "image/jpeg") if thumb is not None else None
+    version = _VERSION_URL.fullmatch(path) if scoped else None
+    if version is not None:
+        kept = job_dir / "outputs" / version.group(1)
+        usable = kept.is_file() and not kept.is_symlink()
+        return (kept, "video/mp4") if usable else None
+    still = _STILL_URL.fullmatch(path)
+    if still is not None:
+        image = job_dir / STILLS_DIR / still.group(1)
+        return (image, "image/jpeg") if image.is_file() else None
+    grid = _GRID_URL.fullmatch(path)
+    if grid is not None:
+        image = job_dir / STILLS_DIR_NAME / grid.group(1)
+        usable = image.is_file() and not image.is_symlink()
+        return (image, "image/jpeg") if usable else None
+    if path.startswith("/previews/"):
+        name = path.removeprefix("/previews/")
+        match = PREVIEW_NAME.fullmatch(name)
+        if match is None:
+            return None
+        preview = job_dir / PREVIEWS_DIR / name
+        kind = "video/mp4" if match.group(4) == "mp4" else "image/jpeg"
+        return (preview, kind) if preview.is_file() else None
+    return None
 
 
 def form_fields_from_body(raw: bytes, content_type: str) -> dict[str, list[str]]:
@@ -563,9 +611,22 @@ def _wizard_handler(
             self.end_headers()
             self.wfile.write(body)
 
+        def _not_found(self) -> None:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def _send_file(self, path: Path, content_type: str, *, head: bool) -> None:
-            """Serve a file with single-range support, streamed in chunks."""
-            with path.open("rb") as handle:
+            """Serve a file with single-range support, streamed in chunks.
+
+            A file removed (or locked, on Windows) since it was found is a 404.
+            """
+            try:
+                opened = path.open("rb")
+            except (FileNotFoundError, PermissionError, IsADirectoryError):
+                self._not_found()
+                return
+            with opened as handle:
                 size = os.fstat(handle.fileno()).st_size
                 try:
                     span = parse_byte_range(self.headers.get("Range"), size)
@@ -602,41 +663,34 @@ def _wizard_handler(
                     return
 
         def _media_file(self, path: str) -> tuple[Path, str] | None:
-            """Map a media URL to a file inside the job, or ``None``."""
+            """Map a media URL to a file inside a job, or ``None``.
+
+            ``/jobs/<id>/...`` names the job; a bare path is the current job's.
+            """
+            scoped = _JOB_MEDIA.fullmatch(path)
+            if scoped is not None:
+                try:
+                    job_dir = controller.store.job_dir(scoped.group(1))
+                except JobError:
+                    return None
+                if job_dir.is_symlink() or not job_dir.is_dir():
+                    return None
+                return _job_media(job_dir, scoped.group(2), scoped=True)
             state = controller.current_state()
             if not state.job_id:
                 return None
-            job_dir = controller.store.job_dir(state.job_id)
-            if path == "/output.mp4":
-                output = job_dir / "output.mp4"
-                return (output, "video/mp4") if output.is_file() else None
-            still = _STILL_URL.fullmatch(path)
-            if still is not None:
-                image = job_dir / STILLS_DIR / still.group(1)
-                return (image, "image/jpeg") if image.is_file() else None
-            grid = _GRID_URL.fullmatch(path)
-            if grid is not None:
-                image = job_dir / STILLS_DIR_NAME / grid.group(1)
-                usable = image.is_file() and not image.is_symlink()
-                return (image, "image/jpeg") if usable else None
-            if path.startswith("/previews/"):
-                name = path.removeprefix("/previews/")
-                match = PREVIEW_NAME.fullmatch(name)
-                if match is None:
-                    return None
-                preview = job_dir / PREVIEWS_DIR / name
-                kind = "video/mp4" if match.group(4) == "mp4" else "image/jpeg"
-                return (preview, kind) if preview.is_file() else None
-            return None
+            return _job_media(controller.store.job_dir(state.job_id), path)
 
         def do_HEAD(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
             if self._refused(path, state_changing=False):
                 return
-            media = self._media_file(path)
+            try:
+                media = self._media_file(path)
+            except (WizardError, OSError):
+                media = None
             if media is None:
-                self.send_response(404)
-                self.end_headers()
+                self._not_found()
                 return
             self._send_file(media[0], media[1], head=True)
 
@@ -780,6 +834,9 @@ def _wizard_handler(
                 if path == "/api/state":
                     self._json(self._view())
                     return
+                if path == "/api/jobs":
+                    self._json({"jobs": controller.jobs_view()})
+                    return
                 # Long passes run on the controller's worker thread. These
                 # GETs start one when none is running and return at once;
                 # callers poll /api/state (or the page refreshes).
@@ -814,9 +871,14 @@ def _wizard_handler(
                 if media is not None:
                     self._send_file(media[0], media[1], head=False)
                     return
-                self.send_response(404)
-                self.end_headers()
+                if path.startswith("/api/"):
+                    self._json({"error": f"unknown endpoint {path}"}, status=404)
+                    return
+                self._not_found()
             except (WizardError, ReviewError, OSError) as exc:
+                if path.startswith("/api/"):
+                    self._json({"error": str(exc)}, status=400)
+                    return
                 self._reject(str(exc))
 
     return Handler

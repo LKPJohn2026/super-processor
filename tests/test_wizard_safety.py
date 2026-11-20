@@ -192,6 +192,7 @@ def test_one_render_at_a_time(tmp_path: Path) -> None:
         )
 
     controller._run_render = _slow_render  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     assert entered.wait(5)
     assert controller.busy()
@@ -218,6 +219,7 @@ def test_worker_error_without_output_goes_back_to_pick(tmp_path: Path) -> None:
         tmp_path, WizardState(step=WizardStep.RENDERING, job_id="job00001")
     )
     controller._run_render = _boom  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
@@ -243,6 +245,7 @@ def test_worker_error_with_output_stays_on_result(tmp_path: Path) -> None:
         tmp_path, WizardState(step=WizardStep.RENDERING, job_id="job00001")
     )
     controller._run_render = _boom  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
@@ -265,6 +268,7 @@ def test_a_handled_render_failure_is_reported_as_failed(tmp_path: Path) -> None:
         controller._render_failed(controller.current_state(), "no GPU")
 
     controller._run_render = _caught  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     assert controller.wait_idle(timeout=5)
     assert controller.current_state().step is WizardStep.PICK_FILE
@@ -284,6 +288,7 @@ def test_a_failing_failure_screen_still_ends_the_run(tmp_path: Path) -> None:
         raise OSError("disk full")
 
     controller._render_failed = _broken  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
@@ -309,6 +314,7 @@ def test_a_run_off_its_step_records_nothing(tmp_path: Path) -> None:
         )
 
     controller._run_render = _done  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     assert controller.wait_idle(timeout=5)
     state = controller.current_state()
@@ -341,8 +347,8 @@ def test_the_result_is_saved_while_the_run_still_counts_as_busy(
     seen: list[tuple[bool, str | None]] = []
     real_save = controller._save
 
-    def _hooked(state: WizardState) -> None:
-        real_save(state)
+    def _hooked(state: WizardState, *, arm: bool = True) -> None:
+        real_save(state, arm=arm)
         if state.step is WizardStep.RESULT:
             run = controller._public_run(controller.current_state())
             seen.append((controller.busy(), None if run is None else run["outcome"]))
@@ -369,6 +375,7 @@ def test_the_result_is_saved_while_the_run_still_counts_as_busy(
     poller = threading.Thread(target=_poll)
     poller.start()
     try:
+        controller.resume()
         assert controller.start_render() is True
         assert controller.wait_idle(timeout=5)
     finally:
@@ -435,6 +442,7 @@ def test_a_post_is_refused_until_the_worker_thread_ends(tmp_path: Path) -> None:
 
     controller._clear_progress = _slow_clear  # type: ignore[method-assign]
     controller._run_render = lambda: None  # type: ignore[method-assign]
+    controller.resume()
     assert controller.start_render() is True
     assert cleaning.wait(5)
     assert not controller._work_lock.locked()

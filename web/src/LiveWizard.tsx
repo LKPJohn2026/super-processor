@@ -103,7 +103,8 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   useEffect(() => {
     const run = RUNNERS[view.step];
     setRunFailed(false);
-    if (!run) return;
+    // An interrupted step waits for Resume or Stop (see Interrupted).
+    if (!run || view.interrupted) return;
     let cancelled = false;
     const subscription = new AbortController();
     setLocalError(null);
@@ -128,7 +129,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
       cancelled = true;
       subscription.abort();
     };
-  }, [origin, view.step, onView, recovery]);
+  }, [origin, view.step, view.interrupted, onView, recovery]);
 
   const message = localError || view.error;
 
@@ -282,6 +283,10 @@ function WizardStepView({
         onView={onView}
       />
     );
+  }
+
+  if (view.interrupted && RUNNERS[view.step]) {
+    return <Interrupted view={view} busy={busy} message={message} onSend={onSend} />;
   }
 
   if (view.step === "sampling" || view.step === "proposing") {
@@ -1008,6 +1013,59 @@ function SeamNote({
       there and the source does not. To re-render across one in a single pass,
       write a note like “{example}”.
     </p>
+  );
+}
+
+function Interrupted({
+  view,
+  busy,
+  message,
+  onSend,
+}: {
+  view: WizardView;
+  busy: boolean;
+  message: string | null;
+  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+}) {
+  // Nothing runs until the editor chooses, so reopening a job never spends
+  // GPU time or Gemini quota by itself.
+  const fields: Record<string, string> = view.job_id ? { job_id: view.job_id } : {};
+  if (view.running_elsewhere) {
+    return (
+      <>
+        <h1>Working in another window</h1>
+        <p className="lede">
+          Another Super Processor window on this computer is working on this job.
+          Wait for it to finish there, then reload.
+        </p>
+        {message ? <Alert text={message} /> : null}
+      </>
+    );
+  }
+  return (
+    <>
+      <h1>Carry on where you left off?</h1>
+      <p className="lede">
+        This job was interrupted. Nothing runs until you choose: Resume starts
+        that work again, Stop goes back to the step before it.
+      </p>
+      <div className="actions">
+        <button type="button" disabled={busy} onClick={() => void onSend("resume", fields)}>
+          Resume
+        </button>
+        {view.cancellable ? (
+          <button
+            type="button"
+            className="secondary"
+            disabled={busy}
+            onClick={() => void onSend("cancel", fields)}
+          >
+            Stop
+          </button>
+        ) : null}
+      </div>
+      {message ? <Alert text={message} /> : null}
+    </>
   );
 }
 

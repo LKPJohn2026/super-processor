@@ -164,6 +164,11 @@ export type WizardView = {
   looks?: Looks | null;
   seams?: { time_s: number; score: number }[];
   seam_error?: string | null;
+  // Left mid-step (a restart, or a job reopened): its work waits for a POST
+  // to /resume, or /cancel to stop it; ?run=1 does not start it.
+  interrupted?: boolean;
+  running_elsewhere?: boolean;
+  cancellable?: boolean;
   token?: string;
 };
 
@@ -369,7 +374,8 @@ async function runUntilDone(
   // These starts are idempotent: the backend checks its step and worker lock.
   // Sampling goes on to proposing in the same worker, so both count.
   let view = await requestWithRetry(origin, `/api/${route}?run=1`);
-  while (steps.includes(view.step)) {
+  // An interrupted step never starts: hand it back so the page can ask.
+  while (steps.includes(view.step) && !view.interrupted) {
     onProgress(view);
     await sleep(POLL_MS);
     view = await requestWithRetry(origin, "/api/state");
