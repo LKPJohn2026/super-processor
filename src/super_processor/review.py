@@ -864,6 +864,12 @@ def _wizard_handler(
                     controller.start_analyze()
                     self._redirect("/")
                     return
+                # Preview the next scene in the background (``--prefetch``
+                # only); the view's segment_preview.next shows how it goes.
+                if path == "/api/prefetch" and runs:
+                    controller.start_prefetch()
+                    self._json(self._view())
+                    return
                 if path == "/":
                     self._html(controller.render())
                     return
@@ -895,15 +901,18 @@ class ReviewServer:
         job_id: str | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
+        prefetch: bool = False,
     ) -> None:
         self.job_dir = job_dir
         # Set when this job reopens in the wizard; the split page has none.
         self.token: str | None = None
+        self.controller: WizardController | None = None
         wizard_state = load_job_wizard_state(job_dir)
         if wizard_state is not None and wizard_state.step is not WizardStep.INTRO:
             controller = WizardController(
-                jobs_dir or job_dir.parent, job_id=job_dir.name
+                jobs_dir or job_dir.parent, job_id=job_dir.name, prefetch=prefetch
             )
+            self.controller = controller
             self.token = new_wizard_token()
             handler: type[BaseHTTPRequestHandler] = _wizard_handler(
                 controller, self.token
@@ -933,6 +942,8 @@ class ReviewServer:
         self._httpd.shutdown()
         self._thread.join(timeout=5)
         self._httpd.server_close()
+        if self.controller is not None:
+            self.controller.shutdown()
 
 
 class WizardServer:
@@ -946,8 +957,11 @@ class WizardServer:
         port: int = 0,
         controller: WizardController | None = None,
         token: str | None = None,
+        prefetch: bool = False,
     ) -> None:
-        self.controller = controller or WizardController(jobs_dir)
+        self.controller = controller or WizardController(jobs_dir, prefetch=prefetch)
+        if prefetch:
+            self.controller.prefetch = True
         self.token = token or new_wizard_token()
         self._httpd = ThreadingHTTPServer(
             (host, port),
@@ -972,3 +986,4 @@ class WizardServer:
         self._httpd.shutdown()
         self._thread.join(timeout=5)
         self._httpd.server_close()
+        self.controller.shutdown()

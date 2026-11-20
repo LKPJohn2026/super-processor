@@ -250,6 +250,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional job id; omit to start the wizard",
     )
+    review_cmd.add_argument(
+        "--prefetch",
+        action="store_true",
+        help=(
+            "preview the next scene in the background while you look at "
+            "this one (uses GPU time and Gemini quota on scenes you may skip)"
+        ),
+    )
 
     plans_cmd = subparsers.add_parser(
         "plans",
@@ -529,16 +537,19 @@ def run_review_command(arguments: argparse.Namespace) -> int:
     """Serve the Gemini wizard or a job review page until interrupted."""
     store = _store_from_args(arguments)
     job_id = getattr(arguments, "job_id", None)
+    # Off unless asked for: it spends GPU time and Gemini quota ahead.
+    prefetch = bool(getattr(arguments, "prefetch", False))
     if job_id:
         store.load(str(job_id))
         server: ReviewServer | WizardServer = ReviewServer(
             store.job_dir(str(job_id)),
             jobs_dir=store.root,
             job_id=str(job_id),
+            prefetch=prefetch,
         )
     else:
         store.ensure_root()
-        server = WizardServer(store.root)
+        server = WizardServer(store.root, prefetch=prefetch)
     print(server.start(), flush=True)
     if server.token:
         # For scripts: send it as X-Wizard-Token on posts and ?run=1 requests.

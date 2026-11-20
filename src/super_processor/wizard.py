@@ -35,6 +35,7 @@ from .gemini import (
     GeminiError,
     GeminiVideo,
     append_chat_turn,
+    append_chat_turns,
     gemini_api_key_source,
     resolve_gemini_api_key,
     store_gemini_api_key,
@@ -82,6 +83,7 @@ from .shot_plan import (
     UPSCALE_SCALES,
     ShotPlan,
     ShotPlanError,
+    ShotRecipe,
     apply_checks,
     apply_proposals,
     apply_regions,
@@ -100,6 +102,8 @@ from .shot_plan import (
     plan_path,
     random_preview_start,
     remove_previews,
+    remove_previews_after,
+    remove_work_clips,
     render_previews,
     reply_scale,
     request_redo,
@@ -971,6 +975,81 @@ class _Run:
         }
 
 
+@dataclass(slots=True)
+class _Prefetch:
+    """The next scene's preview, made in the background while the editor
+    looks at the current one (see :meth:`WizardController.start_prefetch`).
+
+    The thread works on its own copies of the shots and the plan and keeps
+    its result, Gemini turns and warnings here; it never saves the state,
+    the plan or the chat. A foreground analysis of the same scene adopts
+    the result (:meth:`WizardController._adopt_prefetch`); anything else
+    drops it, and its files with it.
+    """
+
+    job_id: str
+    index: int
+    source: Path
+    shots: ShotList
+    # The plan as saved when the prefetch began (the target scene's
+    # preview window filled in), and that scene's recipe as saved: the
+    # result is adopted only while the saved plan still matches.
+    plan: ShotPlan
+    started: ShotRecipe
+    token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    cancel: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    pct: float = 0.0
+    message: str = "Preparing the next scene"
+    recipe: ShotRecipe | None = None
+    turns: list[ChatTurn] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    error: str | None = None
+    # Adopted into the plan, or dropped: either way it is done with. Set
+    # under the worker guard, like ``ended``.
+    merged: bool = False
+    settled: bool = False
+    # The thread has decided whether its previews stay (they stay only
+    # when it made them and was not dropped by then).
+    ended: bool = False
+
+    @property
+    def work_tag(self) -> str:
+        return self.token[:8]
+
+    def same_target(self, other: _Prefetch) -> bool:
+        return (
+            self.job_id == other.job_id
+            and self.index == other.index
+            and self.plan.generation == other.plan.generation
+            and self.plan.scale == other.plan.scale
+            and self.started == other.started
+        )
+
+    def report(self, pct: float, message: str) -> None:
+        """Keep how far the prefetch is; raise :class:`Cancelled` on a stop."""
+        self.check()
+        self.pct, self.message = pct, message
+
+    # The render control (see :func:`.upscale.render_control`): FFmpeg and
+    # SPAN stop as soon as the prefetch is dropped.
+    def check(self) -> None:
+        if self.cancel.is_set():
+            raise Cancelled
+
+    def commit(self) -> None:
+        self.check()
+
+    def view(self) -> dict[str, Any]:
+        finished = self.done.is_set()
+        return {
+            "index": self.index,
+            "ready": finished and self.recipe is not None,
+            "running": not finished,
+        }
+
+
 class WizardController:
     """Drive wizard actions against a jobs directory."""
 
@@ -982,6 +1061,7 @@ class WizardController:
         gemini: GeminiClient | None = None,
         ffmpeg_bin: str = "ffmpeg",
         upscale_engine: UpscaleEngine | None = None,
+        prefetch: bool = False,
     ) -> None:
         self.store = JobStore(jobs_dir)
         self.jobs_dir = self.store.root
@@ -1032,6 +1112,15 @@ class WizardController:
         # the GPU runs hot; tests replace the reader.
         self._heat_note: str | None = None
         self.read_gpu_heat: Callable[[], GpuHeat | None] = read_gpu_heat
+        # Off unless asked for (``review --prefetch``): it spends GPU time
+        # and Gemini quota on scenes the editor may redo or never reach.
+        self.prefetch = prefetch
+        # The next scene's preview in the making, under the worker guard.
+        self._prefetch: _Prefetch | None = None
+        # Prefetches dropped but still winding down (their threads remove
+        # their own files). Work that uses the GPU or a scene's preview
+        # names waits for them first (see _await_dropped).
+        self._dropped: list[_Prefetch] = []
 
     def gemini(self) -> GeminiClient:
         if self._gemini is None:
@@ -1130,6 +1219,16 @@ class WizardController:
             self._clear_progress()
         except Exception as exc:  # noqa: BLE001 - surfaced on the page
             self._land_failure(None, exc)
+        finally:
+            if self.prefetch:
+                # On its own thread, which waits for this one to end: busy()
+                # is true until then, and this worker must end at once.
+                threading.Thread(
+                    target=self._prefetch_after,
+                    args=(threading.current_thread(),),
+                    name="wizard-prefetch-start",
+                    daemon=True,
+                ).start()
 
     @contextlib.contextmanager
     def _running(self, kind: RunKind) -> Iterator[_Run | None]:
@@ -1155,6 +1254,10 @@ class WizardController:
             if run is None:
                 yield None
                 return
+            if kind != "analyze":
+                # Segmenting and the render need the GPU, and leave nothing
+                # a preview made ahead of time could be used for.
+                self._drop_prefetch()
             self._begin_step()
             # Best effort: without it another server only misses that the
             # job is busy, as it did before the file existed.
@@ -1517,7 +1620,9 @@ class WizardController:
         if run is not None:
             run.check()
 
-    def _abandonable(self, call: Callable[[], _T]) -> _T:
+    def _abandonable(
+        self, call: Callable[[], _T], check: Callable[[], None] | None = None
+    ) -> _T:
         """Run a Gemini call so a stop does not wait for it to answer.
 
         The call runs on a helper thread while this one looks for a stop
@@ -1525,10 +1630,16 @@ class WizardController:
         its answer is dropped. Its progress saves check this run first (see
         :meth:`_progress`), so it never saves after the stop has landed.
         Without a run (a direct call in a test), the call simply runs here.
+
+        ``check`` looks for the stop instead of the current run: a preview
+        made ahead of time passes its own (it raises :class:`Cancelled` once
+        the prefetch is dropped), and its helper saves no progress.
         """
-        run = self._run
-        if run is None:
-            return call()
+        run = self._run if check is None else None
+        if check is None:
+            if run is None:
+                return call()
+            check = run.check
         answer: list[_T] = []
         failure: list[BaseException] = []
         done = threading.Event()
@@ -1544,11 +1655,15 @@ class WizardController:
 
         threading.Thread(target=work, name="wizard-gemini", daemon=True).start()
         while not done.wait(_ABANDON_POLL_S):
-            run.check()
-        run.check()
+            check()
+        check()
         if failure:
             raise failure[0]
         return answer[0]
+
+    def _ask(self, call: Callable[[], _T], check: Callable[[], None] | None) -> _T:
+        """Make a Gemini call here, or abandonably when ``check`` is given."""
+        return call() if check is None else self._abandonable(call, check)
 
     def _cancel_view(self, state: WizardState, busy: bool) -> tuple[bool, bool]:
         """Whether a stop can be asked for now, and whether one is pending."""
@@ -1872,6 +1987,14 @@ class WizardController:
             segment_preview = self._segment_preview_view(
                 self.store.job_dir(state.job_id), state.segment_index
             )
+            # The next scene's preview made ahead of time (``--prefetch``).
+            with self._worker_guard:
+                ahead = self._prefetch
+                segment_preview["next"] = (
+                    ahead.view()
+                    if ahead is not None and ahead.job_id == state.job_id
+                    else None
+                )
         return {
             "step": state.step.value,
             "busy": busy,
@@ -1918,6 +2041,7 @@ class WizardController:
                 self._handle_post(path, fields)
             finally:
                 self._posting = outer
+                self._prune_prefetch()
 
     def _handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
         sent_job = fields.get("job_id", [""])[0].strip()
@@ -2270,54 +2394,99 @@ class WizardController:
             self._progress(state, phase, 10, "Boxing faces, hands, and text")
             shots = self._locate(shots, source, job_dir, warnings)
         video = self._gemini_video(state, job_dir, source, phase, 20, 30)
-        self._progress(state, phase, 30, "Gemini is proposing settings")
         try:
-            kwargs: dict[str, Any] = {"video": video} if video is not None else {}
-            reply = self.gemini().propose_looks(
-                shots=shots_payload(shots, plan, indexes),
-                stills=[job_dir / shots.shots[i].still for i in indexes],
-                bounds=LOOK_BOUNDS,
-                scales=(plan.scale,),
-                protected_strength=PROTECTED_STRENGTH,
-                job_dir=job_dir,
-                **kwargs,
-            )
-            plan = apply_proposals(plan, shots, list(reply["shots"]), indexes)
-        except GeminiError as exc:
-            warnings.append(f"Gemini could not propose settings ({exc})")
-            plan = _fallback_plan(plan, shots, indexes)
-        self._progress(state, phase, 50, "Rendering previews on the GPU")
-        try:
-            plan = render_previews(
-                source,
+            plan = self._preview_segment(
                 job_dir,
+                source,
                 shots,
                 plan,
                 indexes,
-                engine=self.upscale_engine(),
-                ffmpeg_bin=self.ffmpeg_bin,
-            )
-            plan = measure_shimmer(job_dir, plan, indexes, ffmpeg_bin=self.ffmpeg_bin)
-            self._progress(state, phase, 80, "Checking the previews")
-            plan = self._check(
-                plan,
-                shots,
-                indexes,
-                source,
-                job_dir,
-                warnings,
-                ask_gemini=not warnings,
+                video=video,
+                report=lambda pct, message: self._progress(state, phase, pct, message),
+                warnings=warnings,
             )
         except (UpscaleError, ShotError, OSError) as exc:
             failed(state, str(exc))
             return
-        plan = finish(plan, indexes)
         if warnings:
             plan.error = "; ".join(warnings) + "."
         save_plan(job_dir, plan)
         state.error = None
         state.step = done
         self._save(state)
+
+    def _preview_segment(
+        self,
+        job_dir: Path,
+        source: Path,
+        shots: ShotList,
+        plan: ShotPlan,
+        indexes: list[int],
+        *,
+        video: GeminiVideo | None,
+        report: Callable[[float, str], None],
+        warnings: list[str],
+        turns_out: list[ChatTurn] | None = None,
+        work_tag: str = "",
+        check: Callable[[], None] | None = None,
+    ) -> ShotPlan:
+        """Propose, preview, and check ``indexes``; the plan with them done.
+
+        ``report`` gets the share of the step done (30 to 80) and what is
+        happening. With ``turns_out`` Gemini's turns are kept there rather
+        than written to the chat, for a caller that may drop them. With
+        ``check`` (a prefetch's) a stop does not wait for Gemini to answer
+        (see :meth:`_abandonable`). Raises
+        :class:`UpscaleError`, :class:`ShotError` or :class:`OSError` when
+        a preview cannot be made; the plan on disk is left alone.
+        """
+        talk: dict[str, Any] = {} if turns_out is None else {"turns_out": turns_out}
+        report(30, "Gemini is proposing settings")
+        try:
+            kwargs: dict[str, Any] = {"video": video} if video is not None else {}
+            reply = self._ask(
+                lambda: self.gemini().propose_looks(
+                    shots=shots_payload(shots, plan, indexes),
+                    stills=[job_dir / shots.shots[i].still for i in indexes],
+                    bounds=LOOK_BOUNDS,
+                    scales=(plan.scale,),
+                    protected_strength=PROTECTED_STRENGTH,
+                    job_dir=job_dir,
+                    **kwargs,
+                    **talk,
+                ),
+                check,
+            )
+            plan = apply_proposals(plan, shots, list(reply["shots"]), indexes)
+        except GeminiError as exc:
+            warnings.append(f"Gemini could not propose settings ({exc})")
+            plan = _fallback_plan(plan, shots, indexes)
+        report(50, "Rendering previews on the GPU")
+        plan = render_previews(
+            source,
+            job_dir,
+            shots,
+            plan,
+            indexes,
+            engine=self.upscale_engine(),
+            ffmpeg_bin=self.ffmpeg_bin,
+            work_tag=work_tag,
+        )
+        plan = measure_shimmer(job_dir, plan, indexes, ffmpeg_bin=self.ffmpeg_bin)
+        report(80, "Checking the previews")
+        plan = self._check(
+            plan,
+            shots,
+            indexes,
+            source,
+            job_dir,
+            warnings,
+            ask_gemini=not warnings,
+            turns_out=turns_out,
+            work_tag=work_tag,
+            check=check,
+        )
+        return finish(plan, indexes)
 
     def _locate(
         self, shots: ShotList, source: Path, job_dir: Path, warnings: list[str]
@@ -2368,6 +2537,9 @@ class WizardController:
         warnings: list[str],
         *,
         ask_gemini: bool,
+        turns_out: list[ChatTurn] | None = None,
+        work_tag: str = "",
+        check: Callable[[], None] | None = None,
     ) -> ShotPlan:
         """Check each preview; failed shots are fixed and redone once.
 
@@ -2378,21 +2550,28 @@ class WizardController:
         changed: list[int] = []
         if ask_gemini:
             try:
-                verdicts = self.gemini().check_previews(
-                    shots=[
-                        {
-                            "index": index,
-                            "label": shots.shots[index].label,
-                            "contains": list(shots.shots[index].contains),
-                            "strength": plan.recipes[index].strength,
-                            "look": plan.recipes[index].look.to_dict(),
-                            "shimmer": plan.recipes[index].shimmer,
-                        }
-                        for index in indexes
-                    ],
-                    pairs=[check_stills(job_dir, plan, index) for index in indexes],
-                    problems=CHECK_PROBLEMS,
-                    job_dir=job_dir,
+                payload = [
+                    {
+                        "index": index,
+                        "label": shots.shots[index].label,
+                        "contains": list(shots.shots[index].contains),
+                        "strength": plan.recipes[index].strength,
+                        "look": plan.recipes[index].look.to_dict(),
+                        "shimmer": plan.recipes[index].shimmer,
+                    }
+                    for index in indexes
+                ]
+                pairs = [check_stills(job_dir, plan, index) for index in indexes]
+                talk = {} if turns_out is None else {"turns_out": turns_out}
+                verdicts = self._ask(
+                    lambda: self.gemini().check_previews(
+                        shots=payload,
+                        pairs=pairs,
+                        problems=CHECK_PROBLEMS,
+                        job_dir=job_dir,
+                        **talk,
+                    ),
+                    check,
                 )
                 plan, changed = apply_checks(plan, shots, verdicts, indexes)
             except GeminiError as exc:
@@ -2408,6 +2587,7 @@ class WizardController:
                 redo,
                 engine=self.upscale_engine(),
                 ffmpeg_bin=self.ffmpeg_bin,
+                work_tag=work_tag,
             )
             plan = measure_shimmer(job_dir, plan, redo, ffmpeg_bin=self.ffmpeg_bin)
         return plan
@@ -2621,6 +2801,9 @@ class WizardController:
         phase: str,
         low: float,
         high: float,
+        *,
+        allow_upload: bool = True,
+        check: Callable[[], None] | None = None,
     ) -> GeminiVideo | None:
         """The upload Gemini watches, made and uploaded on first use.
 
@@ -2628,6 +2811,11 @@ class WizardController:
         again. None when the video cannot be used (no File API in this
         client, an encode or upload failure); the reason is kept for the
         Segments screen, and Gemini works from the stills instead.
+
+        Without ``allow_upload`` (a preview made ahead of time) only a
+        live upload is used: nothing is encoded, uploaded, saved or noted.
+        With ``check`` a stop does not wait for Gemini to say whether the
+        upload is still there (see :meth:`_abandonable`).
         """
         try:
             client = self.gemini()
@@ -2649,9 +2837,11 @@ class WizardController:
         if (
             known is not None
             and known.usable(time.time())
-            and (not callable(alive) or alive(known))
+            and (not callable(alive) or self._ask(lambda: alive(known), check))
         ):
             return known
+        if not allow_upload:
+            return None
         if isinstance(saved, dict) and saved.get("error") and known is None:
             # It failed for this job already; do not try on every call.
             return None
@@ -2898,7 +3088,21 @@ class WizardController:
                 self._analyze(state)
 
     def _analyze(self, state: WizardState) -> None:
-        """Plan, preview, and check the current segment only."""
+        """Plan, preview, and check the current segment only.
+
+        A preview of this scene made ahead of time is adopted (waited for,
+        if it is still in the making); one of another scene is dropped
+        first, so the GPU works on one preview at a time.
+        """
+        assert state.job_id
+        ahead = self._take_prefetch(state)
+        try:
+            self._analyze_scene(state, ahead)
+        finally:
+            if ahead is not None:
+                self._release_prefetch(ahead)
+
+    def _analyze_scene(self, state: WizardState, ahead: _Prefetch | None) -> None:
         assert state.job_id
         job_dir = self.store.job_dir(state.job_id)
         source = Path(self.store.load(state.job_id).source_path)
@@ -2917,6 +3121,9 @@ class WizardController:
             # clear them): measure the approved ones again.
             shots = None
         if shots is None or plan is None:
+            if ahead is not None:
+                # Made from the plan this one replaces.
+                self._set_aside(ahead, state)
             self._progress(state, "analyzing", 5, "Measuring the segments")
             try:
                 shots = shots_from_segments(
@@ -2948,6 +3155,11 @@ class WizardController:
             state.step = WizardStep.PREVIEW_SEGMENT
             self._save(state)
             return
+        if ahead is not None:
+            if self._adopt_prefetch(state, job_dir, plan, recipe, ahead):
+                return
+            # Dropped before this scene's own previews take its file names.
+            self._set_aside(ahead, state)
         self._work_on(
             state,
             job_dir,
@@ -2959,6 +3171,355 @@ class WizardController:
             done=WizardStep.PREVIEW_SEGMENT,
             failed=self._analyze_failed,
         )
+
+    # Previews made ahead of time (``review --prefetch``) -------------------
+
+    def start_prefetch(self) -> bool:
+        """Preview the next scene in the background. False if not started.
+
+        Only with prefetch on, on a scene preview, while no worker runs,
+        and when the next scene still needs a preview. A prefetch of
+        another scene (or of an older plan) is dropped first.
+        """
+        if not self.prefetch:
+            return False
+        if not self._post_lock.acquire(timeout=_POST_WAIT_S):
+            return False
+        try:
+            with self._worker_guard:
+                if self.busy():
+                    return False
+                wanted = self._prefetch_candidate(self._state())
+                old = self._prefetch
+                if (
+                    old is not None
+                    and wanted is not None
+                    and old.same_target(wanted)
+                    and old.error is None
+                ):
+                    # Already made, or in the making.
+                    return False
+                self._prefetch = None
+            if old is not None:
+                # Not waited for here, under the post lock: its thread stops
+                # at its next check and removes its own files, and the new
+                # prefetch waits for it before it starts (see _run_prefetch).
+                self._release_prefetch(old)
+            if wanted is None:
+                return False
+            with self._worker_guard:
+                # POSTs and worker starts wait for the post lock held here,
+                # so nothing has moved the wizard since the check above.
+                if self.busy() or self._prefetch is not None:
+                    return False
+                worker = threading.Thread(
+                    target=self._run_prefetch,
+                    args=(wanted,),
+                    name="wizard-prefetch",
+                    daemon=True,
+                )
+                wanted.thread = worker
+                self._prefetch = wanted
+                worker.start()
+            return True
+        finally:
+            self._post_lock.release()
+
+    def wait_prefetch(self, timeout: float | None = None) -> bool:
+        """Block until every prefetch thread (dropped ones too) has ended.
+
+        True when none is running any more.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._worker_guard:
+            ahead = self._prefetch
+        if ahead is not None and not ahead.done.wait(timeout):
+            return False
+        left = None if deadline is None else max(0.0, deadline - time.monotonic())
+        return self._await_dropped(timeout=left)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Drop a prefetch in the making, for a server that is stopping.
+
+        Only the prefetch is stopped. A run in progress is left alone on
+        purpose (product decision Q1): its thread dies with the process and
+        the job is offered to resume next time, not saved as stopped.
+        """
+        self._drop_prefetch(timeout)
+
+    def _prefetch_after(self, worker: threading.Thread) -> None:
+        """Start a prefetch once ``worker`` has ended (see _run_worker)."""
+        worker.join()
+        # Background work: a failure here only means no prefetch.
+        with contextlib.suppress(Exception):
+            self.start_prefetch()
+
+    def _prefetch_candidate(self, state: WizardState) -> _Prefetch | None:
+        """The prefetch ``state`` calls for, not started, or ``None``.
+
+        That is the scene after the one shown (the next one approving goes
+        to), when it has no up-to-date preview and the plan's first round
+        (which boxes faces, hands, and text) is done.
+        """
+        if state.step is not WizardStep.PREVIEW_SEGMENT or not state.job_id:
+            return None
+        job_dir = self.store.job_dir(state.job_id)
+        try:
+            if running_elsewhere(job_dir):
+                return None
+            plan = load_plan(job_dir)
+            shots = load_shots(job_dir)
+            source = Path(self.store.load(state.job_id).source_path)
+        except (*_PLAN_READ_ERRORS, JobError):
+            return None
+        if plan is None or shots is None or len(shots.shots) != len(plan.recipes):
+            return None
+        if plan.scale not in SCALE_OPTIONS or not any(
+            recipe.reason for recipe in plan.recipes
+        ):
+            return None
+        index = max(state.approved_count, state.segment_index + 1)
+        if index >= len(plan.recipes):
+            return None
+        started = plan.recipes[index]
+        if started.rev and not started.stale:
+            return None
+        if started.preview_start is None:
+            # The same window the foreground would pick for this scene.
+            seed = f"{state.job_id}:{index}:{started.rev}"
+            plan.recipes[index] = replace(
+                started,
+                preview_start=random_preview_start(shots.shots[index], seed),
+            )
+        return _Prefetch(
+            job_id=state.job_id,
+            index=index,
+            source=source,
+            shots=shots,
+            plan=plan,
+            started=started,
+        )
+
+    def _run_prefetch(self, ahead: _Prefetch) -> None:
+        """The prefetch thread: make the preview and keep it in memory."""
+        job_dir = self.store.job_dir(ahead.job_id)
+        try:
+            # A prefetch dropped just before may still be removing files
+            # with the same names as this one's.
+            while not self._await_dropped(timeout=_ABANDON_POLL_S):
+                ahead.check()
+            with render_control(ahead):
+                video = self._gemini_video(
+                    WizardState(step=WizardStep.ANALYZING, job_id=ahead.job_id),
+                    job_dir,
+                    ahead.source,
+                    "analyzing",
+                    20,
+                    30,
+                    allow_upload=False,
+                    check=ahead.check,
+                )
+                plan = self._preview_segment(
+                    job_dir,
+                    ahead.source,
+                    ahead.shots,
+                    ahead.plan,
+                    [ahead.index],
+                    video=video,
+                    report=ahead.report,
+                    warnings=ahead.warnings,
+                    turns_out=ahead.turns,
+                    work_tag=ahead.work_tag,
+                    check=ahead.check,
+                )
+            ahead.check()
+            ahead.recipe = plan.recipes[ahead.index]
+            ahead.pct, ahead.message = 100, "The next scene is ready"
+        except Cancelled:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the foreground tries again
+            ahead.error = str(exc) or type(exc).__name__
+        finally:
+            with contextlib.suppress(OSError):
+                remove_work_clips(job_dir, ahead.index, ahead.work_tag)
+            with self._worker_guard:
+                # Decided under the guard, so a drop that lands after this
+                # finds ``ended`` set and removes the kept previews itself.
+                ahead.ended = True
+                keep = ahead.recipe is not None and not ahead.cancel.is_set()
+            if not keep:
+                with contextlib.suppress(OSError):
+                    remove_previews_after(job_dir, ahead.index, ahead.started.rev)
+            ahead.done.set()
+
+    def _take_prefetch(self, state: WizardState) -> _Prefetch | None:
+        """Take the prefetch of the current scene for the foreground.
+
+        Any other prefetch is dropped, and every dropped one is waited for
+        (its progress shown as this step's), so the foreground has the GPU
+        and the scene's file names to itself once this returns.
+        """
+        with self._worker_guard:
+            ahead, self._prefetch = self._prefetch, None
+        if ahead is not None and (
+            ahead.job_id != state.job_id or ahead.index != state.segment_index
+        ):
+            self._release_prefetch(ahead)
+            ahead = None
+        self._await_dropped(state)
+        return ahead
+
+    def _set_aside(self, ahead: _Prefetch, state: WizardState) -> None:
+        """Drop the taken prefetch and wait until its thread has ended."""
+        self._release_prefetch(ahead)
+        self._await_dropped(state)
+
+    def _drop_prefetch(self, timeout: float | None = None) -> None:
+        """Drop the prefetch and wait (up to ``timeout``) for it to end."""
+        with self._worker_guard:
+            ahead, self._prefetch = self._prefetch, None
+        if ahead is not None:
+            self._release_prefetch(ahead)
+        self._await_dropped(timeout=timeout)
+
+    def _prune_prefetch(self) -> None:
+        """Drop a prefetch that the step a POST left can no longer use.
+
+        Runs under the post lock, so it does not wait for the thread: that
+        stops at its next check and removes its own files.
+        """
+        with self._worker_guard:
+            ahead = self._prefetch
+            if ahead is None:
+                return
+        try:
+            state = self._state()
+            keep = state.job_id == ahead.job_id and state.step in {
+                WizardStep.PREVIEW_SEGMENT,
+                WizardStep.ANALYZING,
+            }
+        except (WizardError, OSError):
+            keep = False
+        if keep:
+            return
+        with self._worker_guard:
+            if self._prefetch is not ahead:
+                return
+            self._prefetch = None
+        self._release_prefetch(ahead)
+
+    def _release_prefetch(self, ahead: _Prefetch) -> None:
+        """Stop ``ahead`` without waiting for it, unless it was adopted.
+
+        A thread still running removes its own files once it sees the stop;
+        one that has ended kept its previews, so they are removed here.
+        """
+        with self._worker_guard:
+            if ahead.settled:
+                return
+            ahead.settled = True
+            ahead.cancel.set()
+            ended = ahead.ended
+            if not ended:
+                self._dropped.append(ahead)
+        if ended and ahead.recipe is not None:
+            with contextlib.suppress(OSError):
+                remove_previews_after(
+                    self.store.job_dir(ahead.job_id), ahead.index, ahead.started.rev
+                )
+
+    def _await_dropped(
+        self, state: WizardState | None = None, *, timeout: float | None = None
+    ) -> bool:
+        """Wait for the dropped prefetches to end. False if ``timeout`` ran out.
+
+        With ``state`` their progress is shown as that analysis step's while
+        it waits. A dropped prefetch stops at its next check: Gemini calls
+        are abandoned (see :meth:`_abandonable`) and FFmpeg and SPAN are
+        stopped (see :func:`.upscale.render_control`), so this is short.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        shown: int | None = None
+        while True:
+            with self._worker_guard:
+                self._dropped = [p for p in self._dropped if not p.done.is_set()]
+                waiting = self._dropped[0] if self._dropped else None
+            if waiting is None:
+                return True
+            if state is not None and round(waiting.pct) != shown:
+                shown = round(waiting.pct)
+                self._progress(
+                    state, "analyzing", waiting.pct, "Setting the next scene aside"
+                )
+            wait = _ABANDON_POLL_S
+            if deadline is not None:
+                wait = min(wait, deadline - time.monotonic())
+                if wait <= 0:
+                    return False
+            waiting.done.wait(wait)
+
+    def _adopt_prefetch(
+        self,
+        state: WizardState,
+        job_dir: Path,
+        plan: ShotPlan,
+        recipe: ShotRecipe,
+        ahead: _Prefetch,
+    ) -> bool:
+        """Use ``ahead``'s preview for the current scene. False to make it here.
+
+        ``plan`` and ``recipe`` are the plan and the scene's recipe as the
+        foreground read them. Waits for a prefetch still in the making,
+        showing its progress as this step's. The result is used only while
+        the saved plan still holds the scene as the prefetch found it.
+        """
+        if (
+            ahead.cancel.is_set()
+            or plan.generation != ahead.plan.generation
+            or plan.scale != ahead.plan.scale
+            or recipe != ahead.started
+        ):
+            return False
+        shown: tuple[int, str] | None = None
+        while not ahead.done.wait(_ABANDON_POLL_S):
+            now = (round(ahead.pct), ahead.message)
+            if now != shown:
+                shown = now
+                self._progress(state, "analyzing", ahead.pct, ahead.message)
+        if ahead.recipe is None:
+            return False
+        if not self._post_lock.acquire(timeout=_POST_WAIT_S):
+            return False
+        try:
+            # Read again under the post lock: a POST may have changed the
+            # plan (or removed it, as approving new segments does) since.
+            if ahead.cancel.is_set() or not plan_path(job_dir).is_file():
+                return False
+            try:
+                saved = load_plan(job_dir)
+            except _PLAN_READ_ERRORS:
+                return False
+            if (
+                saved is None
+                or saved.generation != ahead.plan.generation
+                or saved.scale != ahead.plan.scale
+                or len(saved.recipes) != len(ahead.plan.recipes)
+                or saved.recipes[ahead.index] != ahead.started
+            ):
+                return False
+            saved.recipes[ahead.index] = ahead.recipe
+            saved.error = "; ".join(ahead.warnings) + "." if ahead.warnings else None
+            save_plan(job_dir, saved)
+            if ahead.turns:
+                append_chat_turns(job_dir, ahead.turns)
+            with self._worker_guard:
+                ahead.merged = ahead.settled = True
+        finally:
+            self._post_lock.release()
+        state.error = None
+        state.step = WizardStep.PREVIEW_SEGMENT
+        self._save(state)
+        return True
 
     def _analyze_failed(self, state: WizardState, detail: str) -> None:
         """A segment preview failed; go back to the segments to try again."""

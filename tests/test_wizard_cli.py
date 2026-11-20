@@ -10,13 +10,14 @@ from urllib.request import urlopen
 
 import pytest
 
-from super_processor.cli import run_review_command
+from super_processor.cli import build_parser, run_review_command
 from super_processor.jobs import JobError, JobStore
-from super_processor.review import WizardServer
+from super_processor.review import ReviewServer, WizardServer
 from super_processor.wizard import (
     WizardController,
     WizardState,
     WizardStep,
+    save_job_wizard_state,
     save_session_state,
 )
 
@@ -91,9 +92,65 @@ def test_review_of_a_job_serves_that_job(
     assert code == 0
     (server,) = servers.made
     assert server.args == (store.job_dir(job_id),)
-    assert server.kwargs == {"jobs_dir": store.root, "job_id": job_id}
+    assert server.kwargs == {
+        "jobs_dir": store.root,
+        "job_id": job_id,
+        "prefetch": False,
+    }
     # A split review page has no token to print.
     assert capsys.readouterr().out.splitlines() == ["http://127.0.0.1:9"]
+
+
+def test_prefetch_is_off_unless_review_is_asked_for_it(
+    tmp_path: Path, servers: type[_Server]
+) -> None:
+    parser = build_parser()
+    plain = parser.parse_args(["--jobs-dir", str(tmp_path), "review"])
+    assert plain.prefetch is False
+    assert run_review_command(plain) == 0
+    asked = parser.parse_args(["--jobs-dir", str(tmp_path), "review", "--prefetch"])
+    assert asked.prefetch is True
+    assert run_review_command(asked) == 0
+    store = JobStore(tmp_path)
+    source = tmp_path / "a.mp4"
+    source.write_bytes(b"x")
+    job_id = store.create(source).job_id
+    one_job = parser.parse_args(
+        ["--jobs-dir", str(tmp_path), "review", job_id, "--prefetch"]
+    )
+    assert run_review_command(one_job) == 0
+    assert [server.kwargs["prefetch"] for server in servers.made] == [
+        False,
+        True,
+        True,
+    ]
+
+
+def test_servers_hand_the_prefetch_choice_to_the_wizard(tmp_path: Path) -> None:
+    plain = WizardServer(tmp_path)
+    plain.start()
+    plain.stop()
+    assert plain.controller.prefetch is False
+    server = WizardServer(tmp_path, prefetch=True)
+    server.start()
+    try:
+        assert server.controller.prefetch is True
+    finally:
+        server.stop()
+    store = JobStore(tmp_path)
+    source = tmp_path / "a.mp4"
+    source.write_bytes(b"x")
+    job_id = store.create(source).job_id
+    job_dir = store.job_dir(job_id)
+    save_job_wizard_state(
+        job_dir, WizardState(step=WizardStep.PREVIEW_SEGMENT, job_id=job_id)
+    )
+    review = ReviewServer(job_dir, jobs_dir=store.root, job_id=job_id, prefetch=True)
+    review.start()
+    try:
+        assert review.controller is not None and review.controller.prefetch is True
+    finally:
+        review.stop()
 
 
 def test_review_of_an_unknown_job_fails_before_serving(

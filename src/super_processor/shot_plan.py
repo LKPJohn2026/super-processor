@@ -609,16 +609,20 @@ def render_previews(
     *,
     engine: UpscaleEngine,
     ffmpeg_bin: str = "ffmpeg",
+    work_tag: str = "",
 ) -> ShotPlan:
     """Render before/after previews and check stills for ``indexes``.
 
     Each shot's ``rev`` goes up by one, so its files get new names and a
     browser never shows a cached older preview. Older files are removed.
+    ``work_tag`` goes into the work clips' names, so a render in the
+    background never shares a work file with one in the foreground.
     """
     require_supported_timing(source, ffmpeg_bin=ffmpeg_bin)
     folder = job_dir / PREVIEWS_DIR
     work = folder / "work"
     work.mkdir(parents=True, exist_ok=True)
+    tag = f"_{work_tag}" if work_tag else ""
     recipes = list(plan.recipes)
     clips: dict[int, Path] = {}
     requests: list[UpscaleRequest] = []
@@ -630,7 +634,7 @@ def render_previews(
         start, end = preview_window(shots.shots[index], recipe.preview_start)
         clip = trim_source(
             source,
-            work / f"shot_{index:03d}_in.mp4",
+            work / f"shot_{index:03d}{tag}_in.mp4",
             start,
             end,
             ffmpeg_bin=ffmpeg_bin,
@@ -639,7 +643,7 @@ def render_previews(
         clips[index] = clip
         request = UpscaleRequest(
             clip,
-            work / f"shot_{index:03d}_up.mp4",
+            work / f"shot_{index:03d}{tag}_up.mp4",
             scale=plan.scale,
             strength=recipe.strength,
             look=recipe.look,
@@ -709,6 +713,32 @@ def _remove_old_previews(folder: Path, index: int) -> None:
         # The delivery encode leaves a ``.delivery.json`` marker beside each.
         if PREVIEW_NAME.fullmatch(old.name.removesuffix(".delivery.json")):
             old.unlink(missing_ok=True)
+
+
+def remove_previews_after(job_dir: Path, index: int, rev: int) -> None:
+    """Remove scene ``index``'s previews newer than ``rev``, as far as we can.
+
+    For previews made ahead of time and then not used: the previews the
+    saved plan points at (``rev`` and older) stay.
+    """
+    folder = job_dir / PREVIEWS_DIR
+    if folder.is_symlink() or not folder.is_dir():
+        return
+    for old in folder.glob(f"shot_{index:03d}_r*_*.*"):
+        match = PREVIEW_NAME.fullmatch(old.name.removesuffix(".delivery.json"))
+        if match and int(match.group(2)) > rev:
+            with suppress(OSError):
+                old.unlink(missing_ok=True)
+
+
+def remove_work_clips(job_dir: Path, index: int, work_tag: str) -> None:
+    """Remove the work clips :func:`render_previews` made under ``work_tag``."""
+    work = job_dir / PREVIEWS_DIR / "work"
+    if work.is_symlink() or not work.is_dir():
+        return
+    for side in ("in", "up"):
+        with suppress(OSError):
+            (work / f"shot_{index:03d}_{work_tag}_{side}.mp4").unlink(missing_ok=True)
 
 
 def measure_shimmer(

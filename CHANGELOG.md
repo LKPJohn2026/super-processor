@@ -63,6 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the result is never deleted unkept. Each version lists the scale and
   strength it was rendered with, and a render resumed after reopening the
   job is kept with the note that asked for it.
+- `super-processor review --prefetch` previews the next scene in the
+  background while you look at the current one, so approving a scene
+  usually shows the next preview at once. It is off by default, since it
+  spends GPU time and Gemini quota on scenes you may redo or never reach.
+  `/api/state` shows it as `segment_preview.next`, and a redo, leaving the
+  scenes, or a render drops it along with its files, without waiting for
+  a Gemini answer it was still expecting. It never uploads the video to
+  Gemini; it uses an upload only while one is still live.
 
 ### Changed
 

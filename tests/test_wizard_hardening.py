@@ -375,6 +375,35 @@ def test_stopping_a_run_needs_the_token_and_an_allowed_origin(
         server.stop()
 
 
+def test_starting_a_prefetch_needs_the_token_and_the_run_link(
+    tmp_path: Path,
+) -> None:
+    controller = WizardController(tmp_path, prefetch=True)
+    started: list[str] = []
+
+    def _start() -> bool:
+        started.append("prefetch")
+        return False
+
+    controller.start_prefetch = _start  # type: ignore[method-assign]
+    server = WizardServer(tmp_path, controller=controller, token=TOKEN)
+    base = server.start()
+    try:
+        status, body = _request(base, "GET", "/api/prefetch?run=1")
+        assert status == 403 and b"wizard token" in body
+        status, _body = _request(base, "GET", "/api/prefetch?run=1&token=guess")
+        assert status == 403
+        # Without the run link it is not an endpoint at all.
+        status, _body = _request(base, "GET", f"/api/prefetch?token={TOKEN}")
+        assert status == 404
+        assert started == []
+        status, body = _request(base, "GET", f"/api/prefetch?run=1&token={TOKEN}")
+        assert status == 200 and json.loads(body)["step"] == "intro"
+        assert started == ["prefetch"]
+    finally:
+        server.stop()
+
+
 def test_two_edits_at_once_apply_one_and_refuse_the_other(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
