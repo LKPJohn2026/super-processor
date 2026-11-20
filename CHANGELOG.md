@@ -84,6 +84,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scene can be opened again with "Look again", which moves focus to the
   scene's page. The job's percentage never goes back while a step runs,
   nor when a scene is looked at again.
+- The Scenes page has a timeline for changing the cuts yourself: drag a
+  cut, focus it and move it with the arrow keys (Enter saves it), or type
+  its time with "Move cut…"; merge a scene with the next one, or split one
+  at a time you type. A click or tap on a cut only selects it. It says at
+  once when a change would leave any scene under 3 seconds or make more
+  than 10 scenes. If another window changed the scenes first, the page
+  shows them as they are now and says why, even when that takes it to
+  another step.
 
 ### Changed
 

@@ -414,33 +414,6 @@ label.option:has(input:checked) {
   margin: 0.8rem 0;
 }
 
-.timeline {
-  display: flex;
-  height: 1.6rem;
-  margin: 1rem 0 0.4rem;
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.timeline span {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 1.2rem;
-  font-size: 0.75rem;
-  color: var(--leaf-text);
-  background: var(--leaf);
-  border-right: 2px solid var(--paper, #f3eee4);
-}
-
-.timeline span:nth-child(even) {
-  opacity: 0.8;
-}
-
-.timeline span:last-child {
-  border-right: 0;
-}
-
 .chip {
   display: inline-block;
   padding: 0.05rem 0.45rem;
@@ -735,4 +708,174 @@ button.small {
 .strip-problem {
   font-size: 0.85rem;
   margin: 0.5rem 0 0;
+}
+
+/* Editing the cuts by hand on the segments step. */
+.cut-editor h2 {
+  margin: 1.2rem 0 0.2rem;
+  font-size: 1.05rem;
+}
+
+.cut-editor > p {
+  margin: 0;
+}
+
+.cut-timeline {
+  margin: 0.9rem 0 0.4rem;
+}
+
+.cut-track {
+  position: relative;
+  height: 3.4rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--sand);
+  touch-action: none;
+}
+
+.cut-block {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  overflow: hidden;
+  background: var(--leaf);
+  border-right: 2px solid var(--panel);
+}
+
+.cut-block:nth-child(even) {
+  background: #35503d;
+}
+
+.cut-block img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.75;
+}
+
+.cut-number {
+  position: absolute;
+  left: 0.3rem;
+  top: 0.2rem;
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--leaf-text);
+  background: rgba(26, 33, 22, 0.8);
+}
+
+/* A 24 px target around a narrow visible bar. */
+.cut-handle {
+  position: absolute;
+  top: -0.45rem;
+  bottom: -0.45rem;
+  width: 1.5rem;
+  margin-left: -0.75rem;
+  cursor: ew-resize;
+  touch-action: none;
+  z-index: 1;
+}
+
+.cut-handle::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 0.5rem;
+  margin-left: -0.25rem;
+  border: 1.5px solid #5c6754;
+  border-radius: 4px;
+  background: var(--panel);
+}
+
+.cut-handle:hover::before,
+.cut-handle:focus-visible::before,
+.cut-handle.moving::before {
+  background: var(--leaf);
+  border-color: var(--leaf);
+}
+
+/* Handles of short scenes can overlap on a narrow track: the one under the
+   pointer, focused or being moved comes to the front. */
+.cut-handle:hover,
+.cut-handle:focus,
+.cut-handle.moving {
+  z-index: 2;
+}
+
+.cut-handle[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+.cut-time {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 0.25rem);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  white-space: nowrap;
+  font-size: 0.8rem;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  color: var(--leaf-text);
+  background: var(--ink);
+}
+
+.cut-handle:hover .cut-time,
+.cut-handle:focus-visible .cut-time,
+.cut-handle.moving .cut-time {
+  display: block;
+}
+
+.cut-scale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 0.3rem;
+  font-size: 0.8rem;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  color: var(--muted);
+}
+
+.cut-help {
+  font-size: 0.85rem;
+  margin: 0.4rem 0 0;
+}
+
+.edit-status {
+  margin: 0.8rem 0 0;
+}
+
+.scene-edits {
+  margin-top: 0.4rem;
+  gap: 0.4rem;
+}
+
+.scene-edits button.small {
+  margin-top: 0;
+}
+
+.split-form {
+  margin-top: 0.4rem;
+  padding: 0.6rem 0.75rem;
+  border-left: 3px solid var(--line);
+  background: var(--sand);
+}
+
+.split-form label {
+  margin-top: 0;
+}
+
+.split-form input {
+  max-width: 9rem;
+}
+
+.split-hint {
+  font-size: 0.85rem;
+}
+
+.split-form .actions {
+  margin-top: 0.5rem;
 }

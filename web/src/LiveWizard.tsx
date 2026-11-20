@@ -4,11 +4,14 @@ import {
   useState,
   type DragEvent,
   type FormEvent,
+  type KeyboardEvent,
   type MutableRefObject,
+  type PointerEvent,
   type ReactNode,
 } from "react";
 import {
   cancelFields,
+  editSegments,
   loadState,
   outputSizeLine,
   outputSrc,
@@ -26,6 +29,7 @@ import {
   type Segment,
   type SegmentList,
   type Navigation,
+  type SegmentEdit,
   type SegmentPreview,
   uploadVideo,
   withJob,
@@ -47,6 +51,30 @@ import {
   steadyOverall,
   stripSummary,
 } from "./jobView";
+import {
+  STALE_SCENES_TEXT,
+  STALE_SCENES_UNLOADED_TEXT,
+  canSplit,
+  scenesText,
+  checkMerge,
+  checkMove,
+  checkSplit,
+  cutName,
+  cutRange,
+  cutValueText,
+  dragTime,
+  formatTime,
+  isDrag,
+  isStaleScenes,
+  limitsOf,
+  nudgeCut,
+  parseTime,
+  splitRange,
+  splitSuggestion,
+  withCutAt,
+  type Range,
+  type SceneLimits,
+} from "./sceneEdit";
 
 const BACK_TEXT: Record<keyof Navigation, string> = {
   setup: "Back to Gemini setup",
@@ -74,6 +102,10 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   const [runFailed, setRunFailed] = useState(false);
   const [recovery, setRecovery] = useState(0);
   const connection = useRef<AbortController | null>(null);
+  // An error to keep when the step it was said for renders: a refused
+  // change reloads the job, which may land on another step, and the step
+  // change must not wipe the reason the page changed. Used once.
+  const carriedError = useRef<{ step: string; text: string } | null>(null);
   // The whole job's percentage last shown, kept here rather than in Busy so
   // it survives the steps between two runs (a scene looked at again must not
   // pull the bar back). Cleared when the job goes back to its scenes list.
@@ -108,6 +140,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
       setLocalError("Still unable to reach the wizard. Check its printed URL, then retry or disconnect.");
       return;
     }
+    carriedError.current = null;
     onView(next);
     setRunFailed(false);
     setLocalError(null);
@@ -117,6 +150,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   async function send(action: string, fields: Record<string, string>): Promise<boolean> {
     setBusy(true);
     setLocalError(null);
+    carriedError.current = null;
     try {
       // Every POST names the job this page shows, so a tab left open on an
       // older job is refused (409) instead of acting on the current one.
@@ -132,12 +166,51 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     }
   }
 
+  // A change to the segments (or approving them) names the list the page
+  // shows. When another window changed them first the server refuses it;
+  // the page then shows the scenes as they are now and says why.
+  async function editScenes(edit: SegmentEdit): Promise<boolean> {
+    setBusy(true);
+    setLocalError(null);
+    carriedError.current = null;
+    try {
+      const next = await editSegments(origin, view, edit);
+      onView(next);
+      // A change the rules refuse comes back as the view's error.
+      return !next.error;
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "Request failed";
+      const status = (error as { status?: unknown } | null)?.status;
+      if (isStaleScenes(text, typeof status === "number" ? status : undefined)) {
+        const next = await loadState(origin);
+        if (next) {
+          const said = status === 409 ? text : STALE_SCENES_TEXT;
+          carriedError.current = { step: next.step, text: said };
+          onView(next);
+          setLocalError(said);
+        } else {
+          // The page could not load the scenes again, so it must not say
+          // it shows them as they are.
+          setLocalError(status === 409 ? text : STALE_SCENES_UNLOADED_TEXT);
+        }
+      } else {
+        setLocalError(text);
+      }
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
   useEffect(() => {
     const run = RUNNERS[view.step];
     setRunFailed(false);
     // A new step starts clean: an error from the last one (say a stop that
-    // came too late) must not show on the step the run went on to.
-    setLocalError(null);
+    // came too late) must not show on the step the run went on to, except
+    // the reason a refused change took the page to this step.
+    const carried = carriedError.current;
+    carriedError.current = null;
+    setLocalError(carried && carried.step === view.step ? carried.text : null);
     // An interrupted step waits for Resume or Stop (see Interrupted).
     if (!run || view.interrupted) return;
     let cancelled = false;
@@ -178,6 +251,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           busy={busy}
           message={message}
           onSend={send}
+          onEditScenes={editScenes}
           onView={onView}
           overallShown={overallShown}
         />
@@ -205,6 +279,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
 
 // Resolves true when the server took the action (false: the error shows).
 type SendAction = (action: string, fields: Record<string, string>) => Promise<boolean | void>;
+type EditScenes = (edit: SegmentEdit) => Promise<boolean>;
 type SteadyOverall = { key: string; value: number };
 
 /** The job's title and its stepper (or the plain rail before a job exists). */
@@ -373,6 +448,7 @@ function WizardStepView({
   busy,
   message,
   onSend,
+  onEditScenes,
   onView,
   overallShown,
 }: {
@@ -381,6 +457,7 @@ function WizardStepView({
   busy: boolean;
   message: string | null;
   onSend: SendAction;
+  onEditScenes: EditScenes;
   onView: (view: WizardView) => void;
   overallShown: MutableRefObject<SteadyOverall | null>;
 }) {
@@ -503,6 +580,7 @@ function WizardStepView({
         busy={busy}
         message={message}
         onSend={onSend}
+        onEdit={onEditScenes}
         view={view}
       />
     );
@@ -1052,16 +1130,6 @@ function ResultStep({
   );
 }
 
-export function formatTime(seconds: number): string {
-  const rounded = Math.round(Math.max(0, seconds) * 10) / 10;
-  const minutes = Math.floor(rounded / 60);
-  const rest = rounded - minutes * 60;
-  const text = Number.isInteger(rest)
-    ? String(rest).padStart(2, "0")
-    : rest.toFixed(1).padStart(4, "0");
-  return `${minutes}:${text}`;
-}
-
 function words(items: string[]): string {
   return items.map((item) => item.replace(/_/g, " ")).join(", ");
 }
@@ -1075,21 +1143,285 @@ function Notice({ text }: { text: string | null }) {
   );
 }
 
-function Timeline({ segments }: { segments: Segment[] }) {
-  const total = segments.reduce((sum, s) => sum + (s.end_s - s.start_s), 0);
+/**
+ * The scenes along the video, with a handle on each cut. A handle is a
+ * slider: drag it, or focus it and use the arrow keys (Page Up / Page Down
+ * for ten seconds, Home / End for as far as it goes), then Enter to save
+ * or Esc to put it back. Moving focus away saves it too.
+ */
+function CutTimeline({
+  origin,
+  segments,
+  limits,
+  locked,
+  onMove,
+  onRefused,
+}: {
+  origin: string;
+  segments: Segment[];
+  limits: SceneLimits;
+  locked: boolean;
+  onMove: (index: number, at: number) => Promise<boolean>;
+  onRefused: (text: string) => void;
+}) {
+  const track = useRef<HTMLDivElement | null>(null);
+  // The cut being moved and where it is now, before the server has it.
+  const [draft, setDraft] = useState<{ index: number; at: number } | null>(null);
+  const saving = useRef(false);
+  // A pointer down on a handle: where it went down and the cut's time
+  // then. It becomes a drag only once it has moved a few pixels, so a
+  // click or tap just focuses the handle and changes nothing.
+  const gesture = useRef<{
+    index: number;
+    pointerId: number;
+    startX: number;
+    startAt: number;
+    width: number;
+    dragging: boolean;
+  } | null>(null);
+  const total = segments.length ? segments[segments.length - 1].end_s : 0;
   if (total <= 0) return null;
+  const shown = draft ? withCutAt(segments, draft.index, draft.at) : segments;
+  const share = (value: number) => `${(value / total) * 100}%`;
+
+  async function save(index: number, at: number) {
+    if (saving.current) return;
+    const before = segments[index]?.end_s;
+    if (before === undefined || Math.round(before * 1000) === Math.round(at * 1000)) {
+      setDraft(null);
+      return;
+    }
+    const refused = checkMove(segments, index, at, limits);
+    if (refused) {
+      setDraft(null);
+      onRefused(refused);
+      return;
+    }
+    saving.current = true;
+    try {
+      await onMove(index, at);
+    } finally {
+      saving.current = false;
+      setDraft(null);
+    }
+  }
+
+  function key(event: KeyboardEvent<HTMLDivElement>, index: number) {
+    if (locked) return;
+    const at = draft?.index === index ? draft.at : segments[index].end_s;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (draft?.index === index) void save(index, draft.at);
+      return;
+    }
+    if (event.key === "Escape") {
+      if (draft) event.preventDefault();
+      setDraft(null);
+      return;
+    }
+    const range = cutRange(segments, index, limits.minS);
+    if (!range) {
+      if (nudgeCut(at, event.key, { low: at, high: at }) !== null) {
+        event.preventDefault();
+        onRefused(checkMove(segments, index, at, limits) ?? "This cut cannot move.");
+      }
+      return;
+    }
+    const next = nudgeCut(at, event.key, range);
+    if (next === null) return;
+    event.preventDefault();
+    setDraft({ index, at: next });
+  }
+
+  // Where the cut being dragged is, or null when the pointer has not moved
+  // far enough yet to be a drag.
+  function dragged(event: PointerEvent<HTMLDivElement>, range: Range): number | null {
+    const current = gesture.current;
+    if (!current || current.pointerId !== event.pointerId) return null;
+    if (!current.dragging && !isDrag(current.startX, event.clientX)) return null;
+    current.dragging = true;
+    return dragTime(current.startAt, current.startX, event.clientX, current.width, total, range);
+  }
+
   return (
-    <div className="timeline" role="img" aria-label={`${segments.length} segments across the video`}>
-      {segments.map((segment, index) => (
-        <span
-          key={`${segment.start_s}-${segment.end_s}`}
-          style={{ width: `${((segment.end_s - segment.start_s) / total) * 100}%` }}
-          title={`${index + 1}. ${formatTime(segment.start_s)}–${formatTime(segment.end_s)}`}
-        >
-          {index + 1}
-        </span>
-      ))}
+    <div className="cut-timeline">
+      <div className="cut-track" ref={track}>
+        {shown.map((segment, index) => {
+          const still = segment.still_url ? outputSrc(origin, segment.still_url) : null;
+          return (
+            <span
+              key={index}
+              className="cut-block"
+              aria-hidden="true"
+              style={{ left: share(segment.start_s), width: share(segment.end_s - segment.start_s) }}
+            >
+              {still ? <img src={still} alt="" loading="lazy" /> : null}
+              <span className="cut-number">{index + 1}</span>
+            </span>
+          );
+        })}
+        {shown.slice(0, -1).map((segment, index) => {
+          const range = cutRange(segments, index, limits.minS);
+          const moving = draft?.index === index;
+          return (
+            <div
+              key={index}
+              role="slider"
+              tabIndex={0}
+              className={`cut-handle${moving ? " moving" : ""}`}
+              style={{ left: share(segment.end_s) }}
+              aria-label={cutName(index)}
+              aria-valuemin={range?.low ?? segment.end_s}
+              aria-valuemax={range?.high ?? segment.end_s}
+              aria-valuenow={segment.end_s}
+              aria-valuetext={cutValueText(index, segment.end_s)}
+              aria-describedby="cut-help"
+              aria-disabled={locked || !range ? true : undefined}
+              onKeyDown={(event) => key(event, index)}
+              onBlur={() => {
+                if (moving && draft) void save(index, draft.at);
+              }}
+              onPointerDown={(event) => {
+                if (locked || !range || event.button !== 0) return;
+                event.preventDefault();
+                event.currentTarget.focus();
+                event.currentTarget.setPointerCapture(event.pointerId);
+                gesture.current = {
+                  index,
+                  pointerId: event.pointerId,
+                  startX: event.clientX,
+                  // A cut moved with the keys and not saved yet drags on from there.
+                  startAt: moving && draft ? draft.at : segments[index].end_s,
+                  width: track.current?.getBoundingClientRect().width ?? 0,
+                  dragging: false,
+                };
+              }}
+              onPointerMove={(event) => {
+                if (!range || gesture.current?.index !== index) return;
+                const at = dragged(event, range);
+                if (at !== null) setDraft({ index, at });
+              }}
+              onPointerUp={(event) => {
+                const current = gesture.current;
+                if (!range || !current || current.index !== index || current.pointerId !== event.pointerId) return;
+                const at = dragged(event, range);
+                gesture.current = null;
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }
+                // A click or tap only focuses the cut: nothing is sent.
+                if (!current.dragging || at === null) return;
+                void save(index, at);
+              }}
+              onPointerCancel={() => {
+                const current = gesture.current;
+                gesture.current = null;
+                if (current?.dragging) setDraft(null);
+              }}
+            >
+              <span className="cut-time" aria-hidden="true">
+                {formatTime(segment.end_s)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <div className="cut-scale" aria-hidden="true">
+        <span>0:00</span>
+        <span>{formatTime(total)}</span>
+      </div>
+      <p id="cut-help" className="muted cut-help">
+        Drag a cut to move it, or use "Move cut…" under a scene to type a time.
+        With the keyboard, focus a cut and use the arrow keys (Page Up and Page
+        Down move it 10 s), then press Enter to save it or Esc to put it back.
+      </p>
     </div>
+  );
+}
+
+/** A time typed for a change to one scene: where to split it, or where its cut goes. */
+function TimeForm({
+  id,
+  title,
+  label,
+  submitText,
+  initial,
+  range,
+  locked,
+  closeIfUnchanged = false,
+  check,
+  onSubmit,
+  onClose,
+}: {
+  id: string;
+  title: string;
+  label: string;
+  submitText: string;
+  initial: number | null;
+  range: Range | null;
+  locked: boolean;
+  // When the time is left as it was shown, close without sending anything.
+  closeIfUnchanged?: boolean;
+  check: (at: number) => string | null;
+  onSubmit: (at: number) => Promise<boolean>;
+  onClose: () => void;
+}) {
+  const [text, setText] = useState(initial === null ? "" : formatTime(initial));
+  const [problem, setProblem] = useState<string | null>(null);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (closeIfUnchanged && initial !== null && text.trim() === formatTime(initial)) {
+      onClose();
+      return;
+    }
+    const at = parseTime(text);
+    const refused = at === null ? "Write the time like 1:30, or in seconds like 90." : check(at);
+    setProblem(refused);
+    if (refused || at === null) return;
+    if (await onSubmit(at)) onClose();
+  }
+
+  return (
+    <form className="split-form" onSubmit={submit} aria-label={title}>
+      <label htmlFor={`${id}-at`}>
+        {label}
+        <input
+          id={`${id}-at`}
+          type="text"
+          inputMode="decimal"
+          autoComplete="off"
+          spellCheck={false}
+          value={text}
+          placeholder="1:30"
+          aria-describedby={`${id}-hint`}
+          aria-invalid={problem ? true : undefined}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") onClose();
+          }}
+          autoFocus
+        />
+      </label>
+      <p id={`${id}-hint`} className="muted split-hint">
+        {range
+          ? `Minutes and seconds, between ${formatTime(Math.ceil(range.low * 10 - 1e-6) / 10)} and ${formatTime(Math.floor(range.high * 10 + 1e-6) / 10)}.`
+          : null}
+      </p>
+      {problem ? (
+        <p className="error" role="alert">
+          {problem}
+        </p>
+      ) : null}
+      <div className="actions">
+        <button type="submit" className="small" disabled={locked}>
+          {submitText}
+        </button>
+        <button type="button" className="secondary small" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -1099,6 +1431,7 @@ function SegmentsStep({
   busy,
   message,
   onSend,
+  onEdit,
   view,
 }: {
   origin: string;
@@ -1106,24 +1439,88 @@ function SegmentsStep({
   busy: boolean;
   message: string | null;
   onSend: SendAction;
+  onEdit: EditScenes;
   view: WizardView;
 }) {
   const [note, setNote] = useState("");
-  const count = list.segments.length;
-  const noun = count === 1 ? "segment" : "segments";
+  // What the last change by hand did, or why it could not be made.
+  const [said, setSaid] = useState<{ text: string; refused: boolean } | null>(null);
+  // The time form open under a scene: split it, or move the cut after it.
+  const [open, setOpen] = useState<{ kind: "split" | "move"; index: number } | null>(null);
+  // The scene to focus once the list shows a merge or a split.
+  const [focusScene, setFocusScene] = useState<number | null>(null);
+  const sceneList = useRef<HTMLOListElement | null>(null);
+  const segments = list.segments;
+  const count = segments.length;
+  const limits = limitsOf(list);
+  const locked = busy || Boolean(view.busy);
+  // A list the server could not read cannot be changed (its error shows).
+  const editable = count > 0 && typeof list.revision === "number";
+
+  useEffect(() => {
+    if (focusScene === null) return;
+    sceneList.current?.querySelector<HTMLElement>(`[data-scene-title="${focusScene}"]`)?.focus();
+    setFocusScene(null);
+  }, [focusScene, list.revision]);
+
+  // A new list (a change, or a reload) closes a time form left open on it.
+  useEffect(() => setOpen(null), [list.revision]);
 
   function propose(event: FormEvent) {
     event.preventDefault();
-    void onSend("segments", { action: "note", note });
+    void onEdit({ action: "note", note });
+  }
+
+  function refused(text: string) {
+    setSaid({ text, refused: true });
+  }
+
+  async function edit(change: SegmentEdit, done: string, focus: number | null) {
+    setSaid(null);
+    if (await onEdit(change)) {
+      setSaid({ text: done, refused: false });
+      if (focus !== null) setFocusScene(focus);
+      return true;
+    }
+    return false;
+  }
+
+  function merge(index: number) {
+    const problem = checkMerge(segments, index, limits);
+    if (problem) return refused(problem);
+    void edit(
+      { action: "merge", index },
+      `Scenes ${index + 1} and ${index + 2} are one scene now. ${scenesText(count - 1)}.`,
+      index,
+    );
+  }
+
+  function openSplit(index: number) {
+    const problem = canSplit(segments, index, limits);
+    if (problem) return refused(problem);
+    setSaid(null);
+    setOpen(open?.kind === "split" && open.index === index ? null : { kind: "split", index });
+  }
+
+  function openMove(index: number) {
+    if (!cutRange(segments, index, limits.minS)) {
+      return refused(checkMove(segments, index, segments[index].end_s + 1, limits) ?? "This cut cannot move.");
+    }
+    setSaid(null);
+    setOpen(open?.kind === "move" && open.index === index ? null : { kind: "move", index });
+  }
+
+  function move(index: number, at: number) {
+    return edit({ action: "move", index, at }, `${cutName(index)} moved to ${formatTime(at)}.`, null);
   }
 
   return (
     <>
-      <h1>Segments</h1>
+      <h1>Scenes</h1>
       <p className="lede">
         {list.error
-          ? "Gemini could not split the video, so it is one segment for now. Approve it to go on, or ask Gemini to try again."
-          : "Gemini split the video where the picture needs different settings. Approve the segments, or say where the cuts should go and Gemini will try again."}
+          ? "Gemini could not split the video, so it is one scene for now. Approve it to go on, or ask Gemini to try again."
+          : "Gemini split the video where the picture needs different settings. Approve the scenes, change the cuts yourself, or say where they should go and Gemini will try again."}
       </p>
       <StoppedNote view={view} />
       {message ? <Alert text={message} /> : null}
@@ -1137,22 +1534,38 @@ function SegmentsStep({
       {scaleChoiceText(list.scale, list.scale_reason) ? (
         <p className="muted">{scaleChoiceText(list.scale, list.scale_reason)}</p>
       ) : null}
-      <Timeline segments={list.segments} />
-      <p className="muted">
-        {count} {noun}
+      {editable ? (
+        <section className="cut-editor" aria-labelledby="cut-editor-title">
+          <h2 id="cut-editor-title">Timeline</h2>
+          <p className="muted">
+            Move, merge or split the cuts yourself. Each scene needs at least{" "}
+            {limits.minS} s, and there can be up to {limits.maxScenes} scenes.
+          </p>
+          <CutTimeline
+            origin={origin}
+            segments={segments}
+            limits={limits}
+            locked={locked}
+            onRefused={refused}
+            onMove={move}
+          />
+        </section>
+      ) : null}
+      <p className={said?.refused ? "error edit-status" : "muted edit-status"} role="status">
+        {said ? said.text : scenesText(count)}
       </p>
-      <ol className="shots">
-        {list.segments.map((segment, index) => (
-          <li key={`${segment.start_s}-${segment.end_s}`} className="shot">
+      <ol className="shots" ref={sceneList}>
+        {segments.map((segment, index) => (
+          <li key={index} className="shot">
             {segment.still_url ? (
               <img
                 src={outputSrc(origin, segment.still_url) ?? undefined}
-                alt={`Still from segment ${index + 1}`}
+                alt={`Still from scene ${index + 1}`}
               />
             ) : null}
             <div>
-              <h2>
-                {index + 1}. {segment.label || "Unlabelled segment"}
+              <h2 tabIndex={-1} data-scene-title={index}>
+                {index + 1}. {segment.label || "Unlabelled scene"}
               </h2>
               <p className="muted">
                 {formatTime(segment.start_s)}–{formatTime(segment.end_s)} ·{" "}
@@ -1169,17 +1582,91 @@ function SegmentsStep({
                   <span className="muted">Nothing to protect</span>
                 )}
               </p>
+              {editable ? (
+                <div className="actions scene-edits">
+                  {index < count - 1 ? (
+                    <button
+                      type="button"
+                      className="secondary small"
+                      disabled={locked}
+                      aria-label={`Merge scenes ${index + 1} and ${index + 2}`}
+                      onClick={() => merge(index)}
+                    >
+                      Merge with {index + 2}
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="secondary small"
+                    disabled={locked}
+                    aria-expanded={open?.kind === "split" && open.index === index}
+                    aria-controls={open?.kind === "split" && open.index === index ? `split-${index}-form` : undefined}
+                    aria-label={`Split scene ${index + 1}`}
+                    onClick={() => openSplit(index)}
+                  >
+                    Split…
+                  </button>
+                  {index < count - 1 ? (
+                    <button
+                      type="button"
+                      className="secondary small"
+                      disabled={locked}
+                      aria-expanded={open?.kind === "move" && open.index === index}
+                      aria-controls={open?.kind === "move" && open.index === index ? `move-${index}-form` : undefined}
+                      aria-label={`Move the cut between scenes ${index + 1} and ${index + 2}`}
+                      onClick={() => openMove(index)}
+                    >
+                      Move cut…
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+              {editable && open?.kind === "split" && open.index === index ? (
+                <div id={`split-${index}-form`}>
+                  <TimeForm
+                    id={`split-${index}`}
+                    title={`Split scene ${index + 1}`}
+                    label={`Split scene ${index + 1} at`}
+                    submitText="Split here"
+                    initial={splitSuggestion(segments, index, limits.minS)}
+                    range={splitRange(segments, index, limits.minS)}
+                    locked={locked}
+                    check={(at) => checkSplit(segments, index, at, limits)}
+                    onClose={() => setOpen(null)}
+                    onSubmit={(at) =>
+                      edit(
+                        { action: "split", index, at },
+                        `Scene ${index + 1} is two scenes now, cut at ${formatTime(at)}. ${scenesText(count + 1)}.`,
+                        index + 1,
+                      )
+                    }
+                  />
+                </div>
+              ) : null}
+              {editable && open?.kind === "move" && open.index === index ? (
+                <div id={`move-${index}-form`}>
+                  <TimeForm
+                    id={`move-${index}`}
+                    title={cutName(index)}
+                    label={`Move the cut between scenes ${index + 1} and ${index + 2} to`}
+                    submitText="Move cut"
+                    initial={segment.end_s}
+                    closeIfUnchanged
+                    range={cutRange(segments, index, limits.minS)}
+                    locked={locked}
+                    check={(at) => checkMove(segments, index, at, limits)}
+                    onClose={() => setOpen(null)}
+                    onSubmit={(at) => move(index, at)}
+                  />
+                </div>
+              ) : null}
             </div>
           </li>
         ))}
       </ol>
       <div className="actions">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void onSend("segments", { action: "approve" })}
-        >
-          Approve {count} {noun}
+        <button type="button" disabled={locked} onClick={() => void onEdit({ action: "approve" })}>
+          Approve {scenesText(count)}
         </button>
       </div>
       <form onSubmit={propose}>
