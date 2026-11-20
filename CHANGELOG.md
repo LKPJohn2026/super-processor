@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces the old file in one step, retried while Windows briefly holds
   the file open. A page refresh racing a save no longer fails the request
   or reads a half-written file, and no `.tmp` file is left behind.
+- Two Gemini calls on one job finishing at the same moment could drop
+  each other's turns from the saved chat, or leave a question without its
+  answer. Each question and answer are now saved together under one lock,
+  so the chat Gemini is shown on the next call is always complete.
 
 ## [4.1.1] - 2026-11-17
 

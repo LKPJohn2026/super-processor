@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from super_processor.gemini import (
     GeminiError,
     ModelInfo,
     append_chat_turn,
+    append_chat_turns,
     contents_from_chat,
     load_chat,
     model_accepts_text_or_video,
@@ -38,6 +40,99 @@ def test_the_chat_survives_a_save_and_load(tmp_path: Path) -> None:
     assert load_chat(tmp_path) == appended == [*turns, ChatTurn("user", "more")]
     # The write goes through a temporary file that is moved into place.
     assert sorted(p.name for p in tmp_path.iterdir()) == ["gemini_chat.json"]
+
+
+def test_append_chat_turns_adds_them_in_one_go(tmp_path: Path) -> None:
+    append_chat_turn(tmp_path, ChatTurn(role="user", text="first"))
+    pair = [ChatTurn("user", "question"), ChatTurn("model", "{}")]
+    assert append_chat_turns(tmp_path, pair) == [ChatTurn("user", "first"), *pair]
+    assert load_chat(tmp_path) == [ChatTurn("user", "first"), *pair]
+
+
+def test_two_threads_logging_at_once_keep_every_pair_together(
+    tmp_path: Path,
+) -> None:
+    client = GeminiClient(api_key="k", transport=_FakeTransport({}))
+    start = threading.Barrier(2)
+
+    def log_twenty(name: str) -> None:
+        start.wait()
+        for index in range(20):
+            client._log(tmp_path, f"{name} {index}", {"who": name, "n": index})
+
+    threads = [threading.Thread(target=log_twenty, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    turns = load_chat(tmp_path)
+    # No append is lost, and no other thread's turn lands between a question
+    # and its answer.
+    assert len(turns) == 80
+    pairs = list(zip(turns[0::2], turns[1::2], strict=True))
+    assert all(q.role == "user" and a.role == "model" for q, a in pairs)
+    answers = [a.structured for _q, a in pairs if a.structured is not None]
+    assert len(answers) == 40
+    assert [q.text for q, _a in pairs] == [f"{a['who']} {a['n']}" for a in answers]
+    for name in ("a", "b"):
+        mine = [a["n"] for a in answers if a["who"] == name]
+        assert mine == list(range(20))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["gemini_chat.json"]
+
+
+def test_turns_out_replays_the_chat_but_does_not_save(tmp_path: Path) -> None:
+    earlier = [ChatTurn("user", "earlier ask"), ChatTurn("model", '{"x": 1}')]
+    save_chat(tmp_path, earlier)
+    reply = {"segments": [{"start_s": 0.0, "end_s": 3.0, "label": "kitchen"}]}
+    transport = _FakeTransport(reply)
+    client = GeminiClient(api_key="k", transport=transport)
+    held: list[ChatTurn] = []
+    client.propose_segments(
+        stills=_segment_stills(tmp_path, 2),
+        times=[0.0, 1.0],
+        duration_s=3.0,
+        job_dir=tmp_path,
+        turns_out=held,
+    )
+    assert transport.last_body is not None
+    sent = transport.last_body["contents"]
+    assert sent[0]["parts"][0]["text"] == "earlier ask"
+    assert load_chat(tmp_path) == earlier
+    assert [turn.role for turn in held] == ["user", "model"]
+    assert held[1].structured == reply
+    # The caller decides later: appending the held pair matches a normal call.
+    append_chat_turns(tmp_path, held)
+    assert load_chat(tmp_path) == [*earlier, *held]
+
+
+def test_turns_out_also_holds_label_and_revise_turns(tmp_path: Path) -> None:
+    held: list[ChatTurn] = []
+    client = GeminiClient(api_key="k", transport=_FakeTransport(_UPSCALE_REPLY))
+    client.revise_upscale_params(
+        note="softer",
+        prior_scale=2,
+        prior_strength=0.5,
+        prior_start_s=0.0,
+        prior_end_s=20.0,
+        duration_s=20.0,
+        job_dir=tmp_path,
+        turns_out=held,
+    )
+    still = tmp_path / "s.jpg"
+    still.write_bytes(b"\xff\xd8jpeg")
+    labels = GeminiClient(api_key="k", transport=_FakeTransport({"shots": []}))
+    labels.label_shots(
+        shots=[{"start_s": 0.0, "end_s": 1.0}],
+        stills=[still],
+        issues=("noise",),
+        contains=("faces",),
+        job_dir=tmp_path,
+        turns_out=held,
+    )
+    assert [turn.role for turn in held] == ["user", "model", "user", "model"]
+    assert held[1].structured == _UPSCALE_REPLY
+    assert held[3].structured == {"shots": []}
+    assert load_chat(tmp_path) == []
 
 
 def test_contents_from_chat_alternates_roles() -> None:

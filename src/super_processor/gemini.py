@@ -21,11 +21,12 @@ import contextlib
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,10 @@ _CREDENTIALS_KEY = "gemini_api_key"
 GEMINI_MODEL_ENV = "SUPER_PROCESSOR_GEMINI_MODEL"
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 CHAT_FILE_NAME = "gemini_chat.json"
+# One process-wide lock around every read-modify-write of a chat file, so two
+# threads appending at once (a foreground call and a prefetch, or a restart
+# note) never drop each other's turns. Reentrant, so a holder can save.
+_CHAT_LOCK = threading.RLock()
 CHAT_VERSION = 1
 # Production revise loops until the user picks an option; tests use this cap.
 _MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -804,15 +809,26 @@ def save_chat(job_dir: Path, turns: list[ChatTurn]) -> Path:
     job_dir.mkdir(parents=True, exist_ok=True)
     path = job_dir / CHAT_FILE_NAME
     payload = {"version": CHAT_VERSION, "turns": [turn.to_dict() for turn in turns]}
-    return write_text_atomic(path, json.dumps(payload, indent=2) + "\n")
+    with _CHAT_LOCK:
+        return write_text_atomic(path, json.dumps(payload, indent=2) + "\n")
 
 
 def append_chat_turn(job_dir: Path, turn: ChatTurn) -> list[ChatTurn]:
     """Append one turn and persist."""
-    turns = load_chat(job_dir)
-    turns.append(turn)
-    save_chat(job_dir, turns)
-    return turns
+    return append_chat_turns(job_dir, [turn])
+
+
+def append_chat_turns(job_dir: Path, turns: Sequence[ChatTurn]) -> list[ChatTurn]:
+    """Append several turns in one locked load-and-save, and persist.
+
+    A question and its answer go in together, so another thread's turns can
+    never land between them. Returns the whole chat after the append.
+    """
+    with _CHAT_LOCK:
+        history = load_chat(job_dir)
+        history.extend(turns)
+        save_chat(job_dir, history)
+        return history
 
 
 def contents_from_chat(turns: list[ChatTurn]) -> list[dict[str, Any]]:
@@ -1024,7 +1040,13 @@ _CHECK_SCHEMA: dict[str, Any] = {
 
 
 class GeminiClient:
-    """Call Gemini with a structured schema for upscale result notes."""
+    """Call Gemini with a structured schema for upscale result notes.
+
+    Every call that takes ``job_dir`` replays that job's chat and then saves
+    its question and answer there as one pair. Passing a list as
+    ``turns_out`` still replays the chat but collects the pair in that list
+    instead of saving it, for work whose result may be thrown away.
+    """
 
     def __init__(
         self,
@@ -1211,6 +1233,7 @@ class GeminiClient:
         issues: tuple[str, ...],
         contains: tuple[str, ...],
         job_dir: Path | None = None,
+        turns_out: list[ChatTurn] | None = None,
     ) -> list[dict[str, Any]]:
         """Label each shot from its still and measurements.
 
@@ -1249,15 +1272,7 @@ class GeminiClient:
         labels = reply.get("shots")
         if not isinstance(labels, list):
             raise GeminiError("Gemini returned no shot labels")
-        if job_dir is not None:
-            append_chat_turn(
-                job_dir,
-                ChatTurn(role="user", text=intro + f" ({len(shots)} shots)"),
-            )
-            append_chat_turn(
-                job_dir,
-                ChatTurn(role="model", text=json.dumps(reply), structured=reply),
-            )
+        self._log(job_dir, intro + f" ({len(shots)} shots)", reply, turns_out)
         return [item for item in labels if isinstance(item, dict)]
 
     def upload_video(
@@ -1324,6 +1339,7 @@ class GeminiClient:
         scales: tuple[int, ...],
         protected_strength: float,
         job_dir: Path | None = None,
+        turns_out: list[ChatTurn] | None = None,
         video: GeminiVideo | None = None,
     ) -> dict[str, Any]:
         """Propose a strength and look per shot, and one scale for the video.
@@ -1391,7 +1407,7 @@ class GeminiClient:
         )
         if not isinstance(reply.get("shots"), list):
             raise GeminiError("Gemini returned no shot recipes")
-        self._log(job_dir, intro + f" ({len(shots)} shots)", reply)
+        self._log(job_dir, intro + f" ({len(shots)} shots)", reply, turns_out)
         return reply
 
     def propose_segments(
@@ -1405,6 +1421,7 @@ class GeminiClient:
         max_segments: int = 10,
         min_segment_s: float = 3.0,
         job_dir: Path | None = None,
+        turns_out: list[ChatTurn] | None = None,
         video: GeminiVideo | None = None,
         scales: tuple[int, ...] = (),
         source_size: tuple[int, int] = (0, 0),
@@ -1480,7 +1497,7 @@ class GeminiClient:
         if not isinstance(segments, list) or not segments:
             raise GeminiError("Gemini returned no segments")
         seen_as = "the video" if video is not None else f"{len(stills)} stills"
-        self._log(job_dir, intro + f" ({seen_as})", reply)
+        self._log(job_dir, intro + f" ({seen_as})", reply, turns_out)
         scale = _offered_scale(reply.get("scale"), scales)
         reason = reply.get("scale_reason")
         return {
@@ -1499,6 +1516,7 @@ class GeminiClient:
         kinds: tuple[str, ...],
         max_regions: int,
         job_dir: Path | None = None,
+        turns_out: list[ChatTurn] | None = None,
     ) -> list[dict[str, Any]]:
         """Box the faces, hands, and text in each shot.
 
@@ -1533,7 +1551,7 @@ class GeminiClient:
         found = reply.get("shots")
         if not isinstance(found, list):
             raise GeminiError("Gemini returned no regions")
-        self._log(job_dir, intro + f" ({len(shots)} shots)", reply)
+        self._log(job_dir, intro + f" ({len(shots)} shots)", reply, turns_out)
         return [item for item in found if isinstance(item, dict)]
 
     def check_previews(
@@ -1543,6 +1561,7 @@ class GeminiClient:
         pairs: list[tuple[Path, Path]],
         problems: tuple[str, ...],
         job_dir: Path | None = None,
+        turns_out: list[ChatTurn] | None = None,
     ) -> list[dict[str, Any]]:
         """Compare each before/after still for restoration mistakes.
 
@@ -1583,16 +1602,30 @@ class GeminiClient:
         verdicts = reply.get("shots")
         if not isinstance(verdicts, list):
             raise GeminiError("Gemini returned no preview checks")
-        self._log(job_dir, intro + f" ({len(shots)} shots)", reply)
+        self._log(job_dir, intro + f" ({len(shots)} shots)", reply, turns_out)
         return [item for item in verdicts if isinstance(item, dict)]
 
-    def _log(self, job_dir: Path | None, prompt: str, reply: dict[str, Any]) -> None:
-        if job_dir is None:
-            return
-        append_chat_turn(job_dir, ChatTurn(role="user", text=prompt))
-        append_chat_turn(
-            job_dir, ChatTurn(role="model", text=json.dumps(reply), structured=reply)
-        )
+    def _log(
+        self,
+        job_dir: Path | None,
+        prompt: str,
+        reply: dict[str, Any],
+        turns_out: list[ChatTurn] | None = None,
+    ) -> None:
+        """Keep the question and its answer as one user and model pair.
+
+        With ``turns_out`` the pair is added to that list and the chat file
+        is left alone, so the caller can append it later or drop it.
+        Otherwise both turns are written to ``job_dir``'s chat in one go.
+        """
+        turns = [
+            ChatTurn(role="user", text=prompt),
+            ChatTurn(role="model", text=json.dumps(reply), structured=reply),
+        ]
+        if turns_out is not None:
+            turns_out.extend(turns)
+        elif job_dir is not None:
+            append_chat_turns(job_dir, turns)
 
     def revise_upscale_params(
         self,
@@ -1605,6 +1638,7 @@ class GeminiClient:
         duration_s: float,
         allowed_scales: tuple[int, ...] = (1, 2),
         job_dir: Path | None = None,
+        turns_out: list[ChatTurn] | None = None,
     ) -> dict[str, Any]:
         """Turn a result note into a bounded scale, strength, and time range."""
         scales = ", ".join(str(scale) for scale in allowed_scales)
@@ -1630,12 +1664,7 @@ class GeminiClient:
             ),
             prior=load_chat(job_dir) if job_dir is not None else None,
         )
-        if job_dir is not None:
-            append_chat_turn(job_dir, ChatTurn(role="user", text=prompt))
-            append_chat_turn(
-                job_dir,
-                ChatTurn(role="model", text=json.dumps(data), structured=data),
-            )
+        self._log(job_dir, prompt, data, turns_out)
         return data
 
 
