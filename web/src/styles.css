@@ -488,3 +488,16 @@ label.inline {
     grid-template-columns: 1fr;
   }
 }
+
+/* After a stop: neutral, neither a success nor an error. */
+.stopped-note {
+  border-left: 3px solid var(--line);
+  background: var(--sand);
+  color: var(--ink);
+  padding: 0.55rem 0.8rem;
+  margin: 0.8rem 0;
+}
+
+.stopped-note[hidden] {
+  display: none;
+}

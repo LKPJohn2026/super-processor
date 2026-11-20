@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scenes, or a render drops it along with its files, without waiting for
   a Gemini answer it was still expecting. It never uploads the video to
   Gemini; it uses an upload only while one is still live.
+- The web app has a Stop button while it finds the segments and while it
+  renders. It turns into a disabled "Stopping…" until the stop lands, and
+  the step it goes back to shows a plain note saying what was kept. A job
+  left interrupted asks Resume or Stop and says what each one does, and a
+  render that failed shows its error with a "Try the render again" button.
 
 ### Changed
 

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import {
+  cancelFields,
   loadState,
   outputSizeLine,
   outputSrc,
@@ -22,6 +23,14 @@ import {
   withJob,
   type WizardView,
 } from "./api";
+import {
+  interruptedChoice,
+  offersRender,
+  readyText,
+  resultTitle,
+  stopControl,
+  stoppedNote,
+} from "./runStates";
 
 const RAIL = ["Setup", "File", "Segments", "Previews", "Result"] as const;
 // Rail steps the editor can go back (or forward) to, by their index.
@@ -108,11 +117,13 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   useEffect(() => {
     const run = RUNNERS[view.step];
     setRunFailed(false);
+    // A new step starts clean: an error from the last one (say a stop that
+    // came too late) must not show on the step the run went on to.
+    setLocalError(null);
     // An interrupted step waits for Resume or Stop (see Interrupted).
     if (!run || view.interrupted) return;
     let cancelled = false;
     const subscription = new AbortController();
-    setLocalError(null);
     // Each poll while the worker runs carries its progress.
     const progress = (next: WizardView) => {
       if (!cancelled) onView(next);
@@ -300,6 +311,7 @@ function WizardStepView({
         title="Finding the segments"
         progress={view.progress ?? null}
         message={message}
+        stop={<StopButton view={view} busy={busy} onSend={onSend} />}
       >
         A small copy of the video, without its sound, is uploaded to Gemini,
         which watches it at one frame a second and splits it where the light,
@@ -366,7 +378,12 @@ function WizardStepView({
 
   if (view.step === "rendering") {
     return (
-      <Busy title="Upscaling" progress={view.progress ?? null} message={message}>
+      <Busy
+        title="Upscaling"
+        progress={view.progress ?? null}
+        message={message}
+        stop={<StopButton view={view} busy={busy} onSend={onSend} />}
+      >
         Restoring and upscaling on the local GPU. FFmpeg only trims, splices,
         and copies audio. This can take several minutes.
       </Busy>
@@ -422,11 +439,13 @@ function Busy({
   title,
   progress,
   message,
+  stop,
   children,
 }: {
   title: string;
   progress: Progress | null;
   message: string | null;
+  stop?: ReactNode;
   children: ReactNode;
 }) {
   const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
@@ -478,7 +497,52 @@ function Busy({
         </p>
       ) : null}
       {message ? <Alert text={message} /> : null}
+      {stop}
     </>
+  );
+}
+
+function StopButton({
+  view,
+  busy,
+  onSend,
+}: {
+  view: WizardView;
+  busy: boolean;
+  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+}) {
+  const control = stopControl(view, busy);
+  return (
+    <>
+      {/* Always in the page, so the "Stopping" line is announced when it appears. */}
+      <p className="stopped-note" role="status" hidden={!control.status}>
+        {control.status}
+      </p>
+      {control.shown ? (
+        <div className="actions">
+          <button
+            type="button"
+            className="secondary"
+            disabled={control.disabled}
+            // The run the page shows, so a late click never stops a newer one.
+            onClick={() => void onSend("cancel", cancelFields(view))}
+          >
+            {control.label}
+          </button>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+/** After a stop: a plain note on the step the run went back to, not an error. */
+function StoppedNote({ view }: { view: WizardView }) {
+  const text = stoppedNote(view);
+  if (!text) return null;
+  return (
+    <p className="stopped-note" role="status">
+      {text}
+    </p>
   );
 }
 
@@ -642,6 +706,7 @@ function PickStep({
         whether to upscale the whole video 2× on your GPU.
       </p>
       <p className="muted">Up to 1080p and 30 minutes.</p>
+      <StoppedNote view={view} />
       {message ? <Alert text={message} /> : null}
       <div className="actions">
         <button type="button" disabled={busy || upload !== null} onClick={() => void onSend("browse", {})}>
@@ -725,7 +790,8 @@ function ResultStep({
 
   return (
     <>
-      <h1>Result</h1>
+      <h1>{resultTitle(view)}</h1>
+      <StoppedNote view={view} />
       {view.scale !== null && view.strength !== null ? (
         <p className="muted">
           Scale {view.scale}× ·{" "}
@@ -868,6 +934,7 @@ function SegmentsStep({
           ? "Gemini could not split the video, so it is one segment for now. Approve it to go on, or ask Gemini to try again."
           : "Gemini split the video where the picture needs different settings. Approve the segments, or say where the cuts should go and Gemini will try again."}
       </p>
+      <StoppedNote view={view} />
       {message ? <Alert text={message} /> : null}
       <Notice
         text={
@@ -1034,7 +1101,6 @@ function Interrupted({
 }) {
   // Nothing runs until the editor chooses, so reopening a job never spends
   // GPU time or Gemini quota by itself.
-  const fields: Record<string, string> = view.job_id ? { job_id: view.job_id } : {};
   if (view.running_elsewhere) {
     return (
       <>
@@ -1047,29 +1113,29 @@ function Interrupted({
       </>
     );
   }
+  const choice = interruptedChoice(view);
   return (
     <>
-      <h1>Carry on where you left off?</h1>
-      <p className="lede">
-        This job was interrupted. Nothing runs until you choose: Resume starts
-        that work again, Stop goes back to the step before it.
-      </p>
+      <h1>{choice.title}</h1>
+      <p className="lede">{choice.lede}</p>
+      {view.cancellable ? <p className="muted">{choice.stopHint}</p> : null}
+      {message ? <Alert text={message} /> : null}
       <div className="actions">
-        <button type="button" disabled={busy} onClick={() => void onSend("resume", fields)}>
-          Resume
+        <button type="button" disabled={busy} onClick={() => void onSend("resume", {})}>
+          {choice.resumeLabel}
         </button>
         {view.cancellable ? (
           <button
             type="button"
             className="secondary"
             disabled={busy}
-            onClick={() => void onSend("cancel", fields)}
+            // No run works on an interrupted step, so no run_id is sent.
+            onClick={() => void onSend("cancel", cancelFields(view))}
           >
-            Stop
+            {choice.stopLabel}
           </button>
         ) : null}
       </div>
-      {message ? <Alert text={message} /> : null}
     </>
   );
 }
@@ -1278,13 +1344,13 @@ function ReadyStep({
     looks.scale !== null && scales.includes(looks.scale) ? looks.scale : (scales[0] ?? null),
   );
   const [width, height] = looks.source_size ?? [0, 0];
+  // After a failed render the error shows, and so does Render, to try again.
+  const text = readyText(view);
   return (
     <>
-      <h1>Ready to render</h1>
-      <p className="lede">
-        Every segment is approved. Check the output size, then render the
-        whole video with these settings.
-      </p>
+      <h1>{text.title}</h1>
+      <p className="lede">{text.lede}</p>
+      <StoppedNote view={view} />
       {message ? <Alert text={message} /> : null}
       <ul className="summary">
         {looks.shots.map((shot) => {
@@ -1331,17 +1397,19 @@ function ReadyStep({
           })}
         </fieldset>
       ) : null}
-      <div className="actions">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() =>
-            void onSend("ready", scale === null ? { action: "render" } : { action: "render", scale: String(scale) })
-          }
-        >
-          Render the whole video
-        </button>
-      </div>
+      {offersRender(view) ? (
+        <div className="actions">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() =>
+              void onSend("ready", scale === null ? { action: "render" } : { action: "render", scale: String(scale) })
+            }
+          >
+            {text.renderLabel}
+          </button>
+        </div>
+      ) : null}
       <Back view={view} to={["segments"]} busy={busy} onSend={onSend} />
     </>
   );
