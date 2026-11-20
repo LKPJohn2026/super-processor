@@ -42,6 +42,14 @@ from .gemini import (
 from .gpu_heat import GpuHeat, SlowdownWatch, read_gpu_heat
 from .jobs import JobError, JobManifest, JobState, JobStore, utc_now_iso
 from .look import LOOK_BOUNDS
+from .output_versions import (
+    OutputVersion,
+    VersionKind,
+    archive_output,
+    can_link,
+    current_version,
+    list_versions,
+)
 from .probe import MediaFacts, ProbeError, probe_file
 from .progress import StepClock, overall_pct
 from .regions import MAX_REGIONS, REGION_STRENGTH
@@ -769,6 +777,80 @@ def _output_url(job_dir: Path) -> str | None:
     return f"/jobs/{job_dir.name}/output.mp4?v={version}"
 
 
+# The progress line while a version is copied (Windows; see can_link).
+_KEEPING_COPY = "Keeping a copy of this version"
+
+
+def _joined(first: str | None, second: str | None) -> str | None:
+    """Two messages for the editor as one; either may be missing."""
+    if first and second:
+        return f"{first} {second}"
+    return first or second
+
+
+def _version_extra(job_dir: Path, source: Path | None = None) -> dict[str, Any]:
+    """What the output being kept was rendered with, best effort.
+
+    The plan that output holds: the one kept before a note revised it, when
+    there is one, and never a pending span, which no output has yet. The
+    scale is read from the file itself when it can be (see
+    :func:`_active_knobs`).
+    """
+    try:
+        before = job_dir / _PLAN_BEFORE_NOTE
+        if before.is_file():
+            plan: UpscalePlan | None = UpscalePlan.from_dict(
+                json.loads(before.read_text(encoding="utf-8"))
+            )
+        else:
+            plan = load_upscale_plan(job_dir)
+        if plan is None or not plan.spans:
+            return {}
+        span = plan.spans[-1]
+        scale = span.scale
+        output = job_dir / "output.mp4"
+        if source is not None and output.is_file():
+            with contextlib.suppress(Exception):
+                scale = rendered_scale(source, output) or scale
+        return {
+            "scale": scale,
+            "strength": span.strength,
+            "strength_summary": strength_summary(plan.spans),
+        }
+    except Exception:
+        return {}
+
+
+def _versions_view(job_dir: Path, job_id: str) -> list[dict[str, Any]]:
+    """The JSON API's ``versions``: every kept result, oldest first."""
+    try:
+        versions = list_versions(job_dir)
+        current = current_version(job_dir)
+    except OSError:
+        return []
+    return [_version_view(version, job_id, current) for version in versions]
+
+
+def _version_view(
+    version: OutputVersion, job_id: str, current: OutputVersion | None
+) -> dict[str, Any]:
+    extra = version.extra
+    return {
+        "number": version.number,
+        "name": version.name,
+        # A version never changes once kept, so its URL needs no ``?v=``.
+        "url": f"/jobs/{job_id}/outputs/{version.name}",
+        "kind": version.kind,
+        "created_at": version.created_at or None,
+        "note": version.note,
+        "size": version.size,
+        "scale": extra.get("scale"),
+        "strength": extra.get("strength"),
+        "strength_summary": extra.get("strength_summary"),
+        "current": current is not None and current.number == version.number,
+    }
+
+
 def _active_knobs(
     job_dir: Path, source: Path
 ) -> tuple[int | None, float | None, str | None]:
@@ -1290,9 +1372,11 @@ class WizardController:
                 raise WizardError(f"no wizard state for job {job_id}")
             state.job_id = job_id
             # A run that died here left its last progress behind; and the
-            # note a render was asked for belongs to that render alone.
+            # note a render was asked for belongs to that render alone, so
+            # it stays only while that render may still be resumed.
             state.progress = None
-            state.render_note = None
+            if state.step is not WizardStep.RENDERING:
+                state.render_note = None
             self._armed = None
             self._save(state, arm=False)
 
@@ -1765,10 +1849,12 @@ class WizardController:
         summary: str | None = None
         seams: list[dict[str, Any]] = []
         seam_error: str | None = None
+        versions: list[dict[str, Any]] = []
         if state.job_id and state.step in {WizardStep.RESULT, WizardStep.DONE}:
             job_dir = self.store.job_dir(state.job_id)
             output_url = _output_url(job_dir)
             output_ready = output_url is not None
+            versions = _versions_view(job_dir, state.job_id)
             if state.step is WizardStep.RESULT:
                 scale, strength, summary = _active_knobs(
                     job_dir, Path(self.store.load(state.job_id).source_path)
@@ -1807,6 +1893,8 @@ class WizardController:
             "has_gemini_key": resolve_gemini_api_key() is not None,
             "output_ready": output_ready,
             "output_url": output_url,
+            # Every kept result of this job, oldest first (RESULT and DONE).
+            "versions": versions,
             "scale": scale,
             "strength": strength,
             "strength_summary": summary,
@@ -1959,14 +2047,18 @@ class WizardController:
         state.notice = None
         state.progress = None
         has_output = (job_dir / "output.mp4").is_file()
+        warning: str | None = None
         if run is not None and run.rendered:
             before.unlink(missing_ok=True)
             self._settle_rendered_plan(job_dir)
+            # The new output is the result the editor now has: keep it too.
+            warning = self._keep_version(job_dir, "render", state.render_note)
         elif has_output and before.is_file():
             with contextlib.suppress(OSError):
                 before.replace(job_dir / UPSCALE_PLAN_FILE)
+        state.render_note = None
         if has_output or (run is not None and run.rendered):
-            state.error = detail
+            state.error = _joined(detail, warning)
             state.step = WizardStep.RESULT
             self._save(state)
             return
@@ -2011,6 +2103,8 @@ class WizardController:
                 with contextlib.suppress(OSError):
                     before.replace(job_dir / UPSCALE_PLAN_FILE)
             state.stopped = _STOPPED_RENDER_KEPT
+            # The note was for the render that was stopped.
+            state.render_note = None
             state.step = WizardStep.RESULT
             self._save(state)
             return
@@ -2063,6 +2157,8 @@ class WizardController:
             state.step = WizardStep.PICK_FILE
         else:
             state.step = WizardStep.SEGMENTS
+            # New cuts make a new render; a result note does not carry over.
+            state.render_note = None
         self._save(state)
 
     def _browse(self, state: WizardState) -> None:
@@ -3242,6 +3338,8 @@ class WizardController:
                     f"Kept {current}x: Gemini answered {ignored}x, but this note "
                     f'did not name a size. To change it, say "make it {example}x".'
                 )
+            # Kept with the version this render makes.
+            state.render_note = note
             self._enter_running_step(state, WizardStep.RENDERING)
         except (UpscaleError, GeminiError, ProbeError, OSError, ValueError) as exc:
             state.error = str(exc)
@@ -3251,6 +3349,21 @@ class WizardController:
     def _restart(self, state: WizardState, job_dir: Path, note: str) -> None:
         """Start the job again from the segments, with the note in the chat."""
         text = " ".join(note.split())[:500]
+        # The output is about to go: move it into outputs/ first (a rename,
+        # so instant), unless it is a version already. When it cannot move,
+        # a link or copy keeps it as well; when nothing can keep it, the
+        # restart is refused, so the editor's result is never deleted unkept.
+        warning = self._keep_version(job_dir, "earlier", None, move=True)
+        if warning is not None:
+            warning = self._keep_version(job_dir, "earlier", None)
+        if warning is not None:
+            state.error = (
+                f"{warning} Nothing was started over, so the result is still "
+                "here; free some space or fix the jobs folder and try again."
+            )
+            state.step = WizardStep.RESULT
+            self._save(state)
+            return
         append_chat_turn(
             job_dir,
             ChatTurn(
@@ -3266,6 +3379,7 @@ class WizardController:
         (job_dir / _PLAN_BEFORE_NOTE).unlink(missing_ok=True)
         state.error = None
         state.notice = None
+        state.render_note = text
         state.segment_index = state.approved_count = 0
         state.progress = None
         self._enter_running_step(state, WizardStep.SAMPLING)
@@ -3295,6 +3409,14 @@ class WizardController:
         except (UpscaleError, OSError, ValueError):
             held = None
         self._revising = held is not None and held.pending is not None
+        if output.is_file() and current_version(job_dir) is None:
+            # An output from before versions were kept (or one a failed step
+            # left): keep it before this render replaces it.
+            if not can_link():
+                self._progress(state, "rendering", 2, _KEEPING_COPY)
+            state.notice = _joined(
+                state.notice, self._keep_version(job_dir, "earlier", None)
+            )
         self._progress(state, "rendering", 5, "Upscaling on the GPU")
         self._heat_note = None
         watch = SlowdownWatch()
@@ -3355,6 +3477,13 @@ class WizardController:
             save_upscale_plan(job_dir, plan)
             self._progress(state, "rendering", 90, "Checking for seams")
             self._check_seams(job_dir, output, source, candidates)
+            if not can_link():
+                self._progress(state, "rendering", 95, _KEEPING_COPY)
+            state.notice = _joined(
+                state.notice,
+                self._keep_version(job_dir, "render", state.render_note),
+            )
+            state.render_note = None
             self._clear_stopped_note(state.job_id)
             state.error = state.notice
             state.notice = None
@@ -3367,6 +3496,35 @@ class WizardController:
             sampler.join()
             self._heat_note = None
         self._save(state)
+
+    def _keep_version(
+        self,
+        job_dir: Path,
+        kind: VersionKind,
+        note: str | None,
+        *,
+        move: bool = False,
+    ) -> str | None:
+        """Keep ``output.mp4`` as the job's next version.
+
+        Returns a warning for the editor when it could not be kept: a lost
+        copy of an earlier result never fails the render or the restart.
+        """
+        try:
+            source: Path | None = Path(self.store.load(job_dir.name).source_path)
+        except Exception:
+            source = None
+        try:
+            archive_output(
+                job_dir,
+                kind=kind,
+                note=note,
+                extra=_version_extra(job_dir, source),
+                move=move,
+            )
+        except Exception as exc:
+            return f"This result could not be kept as a version: {exc}"
+        return None
 
     def _sample_heat(self, watch: SlowdownWatch, stop: threading.Event) -> None:
         """Read the GPU's heat into ``watch`` until the render ends."""

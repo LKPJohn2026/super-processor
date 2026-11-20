@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -244,7 +245,7 @@ def test_run_1_on_an_interrupted_job_is_refused_over_http(tmp_path: Path) -> Non
 
 def test_opening_a_job_shows_it_where_it_was_left(tmp_path: Path) -> None:
     controller = WizardController(tmp_path / "jobs")
-    first, _first_dir = _job(controller, tmp_path, WizardStep.SEGMENTS)
+    first, first_dir = _job(controller, tmp_path, WizardStep.SEGMENTS)
     second, second_dir = _job(
         controller, tmp_path, WizardStep.RENDERING, name="b.mp4", session=False
     )
@@ -256,12 +257,19 @@ def test_opening_a_job_shows_it_where_it_was_left(tmp_path: Path) -> None:
     controller.handle_post("/jobs/open", {"job": [second], "job_id": [first]})
     opened = controller.current_state()
     assert (opened.job_id, opened.step) == (second, WizardStep.RENDERING)
-    assert opened.progress is None and opened.render_note is None
+    # The render it was left on may still be resumed, so it keeps its note.
+    assert opened.progress is None and opened.render_note == "less grain"
     # Reopened on a run step, its work waits for the editor.
     assert controller.api_view()["interrupted"] is True
     assert controller.start_render() is False
+    # Off a render, a left-over note belongs to no render and is dropped.
+    first_state = load_job_wizard_state(first_dir)
+    assert first_state is not None
+    first_state.render_note = "a note for a render that never ran"
+    save_job_wizard_state(first_dir, first_state)
     controller.handle_post("/jobs/open", {"job": [first]})
     assert controller.current_state().job_id == first
+    assert controller.current_state().render_note is None
 
 
 def test_opening_a_job_disarms_a_resumed_step(tmp_path: Path) -> None:
@@ -519,7 +527,15 @@ def test_a_process_start_tells_two_live_processes_apart() -> None:
 
     mine = _process_start(os.getpid())
     assert mine is not None and mine == _process_start(os.getpid())
-    assert _process_start(os.getppid()) not in (None, mine)
+    # A child started a few clock ticks after us has a start of its own.
+    # The parent is no use here: a shell can fork pytest on its own tick.
+    time.sleep(0.05)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert _process_start(child.pid) not in (None, mine)
+    finally:
+        child.kill()
+        child.wait()
     assert _process_start(0) is None
     assert _process_start(2**22 + 12345) is None
 

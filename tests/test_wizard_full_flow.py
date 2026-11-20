@@ -13,10 +13,26 @@ from urllib.request import Request, urlopen
 import pytest
 
 from super_processor.gemini import GeminiClient
+from super_processor.jobs import JobState
+from super_processor.output_versions import archive_output, list_versions
 from super_processor.probe import probe_file
 from super_processor.review import WizardServer
-from super_processor.upscale import FakeUpscaleEngine, load_upscale_plan
-from super_processor.wizard import WizardController, WizardStep
+from super_processor.segment_loop import LoopSegment, SegmentList, save_segment_list
+from super_processor.upscale import (
+    FakeUpscaleEngine,
+    UpscalePlan,
+    _commit,
+    default_span,
+    load_upscale_plan,
+    save_upscale_plan,
+)
+from super_processor.wizard import (
+    WizardController,
+    WizardState,
+    WizardStep,
+    save_job_wizard_state,
+    save_session_state,
+)
 
 TOKEN = "test-token"
 
@@ -247,6 +263,14 @@ def test_wizard_website_full_flow_intro_to_done(
         ]
         primary = probe_file(output).primary_video()
         assert primary is not None and (primary.width, primary.height) == (320, 180)
+        # The first result and the revise are both kept, and served by job.
+        versions = controller.api_view()["versions"]
+        assert [v["name"] for v in versions] == ["v001.mp4", "v002.mp4"]
+        assert versions[1]["note"] == "reduce artificial detail from 2s to 5s"
+        assert versions[1]["current"] is True
+        with urlopen(base + versions[0]["url"]) as response:
+            assert response.headers.get_content_type() == "video/mp4"
+            assert len(response.read()) > 0
 
         done = _post(base, "/result", {"mood": "happy"})
         assert "<h1>Done</h1>" in done
@@ -279,3 +303,255 @@ def test_wizard_website_local_llm_stub_then_gemini_path(
         assert controller.current_state().step is WizardStep.SETUP
     finally:
         server.stop()
+
+
+# Kept versions ------------------------------------------------------------
+#
+# These drive the controller with a fake renderer, so they need no FFmpeg:
+# the fake replaces output.mp4 with a new file, as the real renderer does.
+
+
+class _Facts:
+    duration_s = 8.0
+
+    def primary_video(self) -> None:
+        return None
+
+
+class _ReviseGemini:
+    """Answers every result note with a lighter 2-5 s span."""
+
+    def revise_upscale_params(self, **_kwargs: Any) -> dict[str, Any]:
+        return {"start_s": 2, "end_s": 5, "scale": 2, "strength": 0.2}
+
+
+@pytest.fixture
+def fake_render(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
+    """Each render writes the next of ``renders`` (``render N`` by default)."""
+    renders: list[bytes] = []
+
+    def render(_source: Path, output: Path, *_args: Any, **_kwargs: Any) -> None:
+        work = output.with_name("work.mp4")
+        work.write_bytes(f"render {len(renders) + 1}".encode())
+        renders.append(work.read_bytes())
+        _commit()
+        work.replace(output)
+
+    monkeypatch.setattr("super_processor.wizard.probe_file", lambda _path: _Facts())
+    monkeypatch.setattr("super_processor.wizard.render_plan", render)
+    monkeypatch.setattr(
+        "super_processor.wizard.video_stream_facts", lambda *a, **k: (8, "24")
+    )
+    monkeypatch.setattr("super_processor.wizard.seam_candidates", lambda *a, **k: [])
+    monkeypatch.setattr(WizardController, "_check_seams", lambda *_args: None)
+    return renders
+
+
+def _job_on(tmp_path: Path, step: WizardStep) -> tuple[WizardController, str, Path]:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"not really a video")
+    gemini: Any = _ReviseGemini()
+    controller = WizardController(
+        tmp_path / "jobs", gemini=gemini, upscale_engine=FakeUpscaleEngine()
+    )
+    job_id = controller.store.create(source).job_id
+    controller.store.transition(job_id, JobState.PROBED)
+    job_dir = controller.store.job_dir(job_id)
+    state = WizardState(step=step, job_id=job_id)
+    save_job_wizard_state(job_dir, state)
+    save_session_state(controller.jobs_dir, state)
+    save_upscale_plan(job_dir, UpscalePlan(spans=(default_span(8.0),)))
+    return controller, job_id, job_dir
+
+
+def _render(controller: WizardController) -> None:
+    assert controller.start_render()
+    assert controller.wait_idle(5)
+    assert controller.current_state().step is WizardStep.RESULT
+
+
+def _kept(job_dir: Path) -> list[tuple[str, str, str | None, bytes]]:
+    return [
+        (v.name, v.kind, v.note, (job_dir / "outputs" / v.name).read_bytes())
+        for v in list_versions(job_dir)
+    ]
+
+
+def test_first_render_and_two_revises_keep_three_versions(
+    tmp_path: Path, fake_render: list[bytes]
+) -> None:
+    controller, job_id, job_dir = _job_on(tmp_path, WizardStep.RENDERING)
+    controller.resume()
+    _render(controller)
+    for note in ("less detail from 2s to 5s", "even less there"):
+        controller.handle_post("/result", {"note": [note]})
+        assert controller.current_state().render_note == note
+        _render(controller)
+        assert controller.current_state().render_note is None
+
+    assert _kept(job_dir) == [
+        ("v001.mp4", "render", None, b"render 1"),
+        ("v002.mp4", "render", "less detail from 2s to 5s", b"render 2"),
+        ("v003.mp4", "render", "even less there", b"render 3"),
+    ]
+    view = controller.api_view()
+    assert [v["url"] for v in view["versions"]] == [
+        f"/jobs/{job_id}/outputs/v00{n}.mp4" for n in (1, 2, 3)
+    ]
+    assert [v["current"] for v in view["versions"]] == [False, False, True]
+    assert view["versions"][0]["scale"] == 2
+    assert view["error"] is None
+
+    controller.handle_post("/result", {"mood": ["happy"]})
+    view = controller.api_view()
+    assert view["step"] == "done" and len(view["versions"]) == 3
+    # Happy keeps nothing new.
+    assert len(list_versions(job_dir)) == 3
+
+
+def test_an_output_from_before_versions_is_kept_when_a_render_starts(
+    tmp_path: Path, fake_render: list[bytes]
+) -> None:
+    controller, _job_id, job_dir = _job_on(tmp_path, WizardStep.RESULT)
+    (job_dir / "output.mp4").write_bytes(b"legacy result")
+    controller.handle_post("/result", {"note": ["less detail at 2s"]})
+    _render(controller)
+
+    assert _kept(job_dir) == [
+        ("v001.mp4", "earlier", None, b"legacy result"),
+        ("v002.mp4", "render", "less detail at 2s", b"render 1"),
+    ]
+    # Each version is listed with what it holds: the earlier output has the
+    # plan from before the note, not the note's lighter span.
+    earlier, revised = list_versions(job_dir)
+    assert earlier.extra["scale"] == 2 and earlier.extra["strength"] == 0.5
+    assert "0.20" not in earlier.extra["strength_summary"]
+    assert revised.extra["strength"] == 0.2
+
+
+def test_an_earlier_output_is_listed_at_the_scale_it_has(
+    tmp_path: Path, fake_render: list[bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def measured(_source: Path, output: Path) -> int | None:
+        return 4 if output.read_bytes() == b"rendered at 4x" else None
+
+    monkeypatch.setattr("super_processor.wizard.rendered_scale", measured)
+    controller, _job_id, job_dir = _job_on(tmp_path, WizardStep.RESULT)
+    (job_dir / "output.mp4").write_bytes(b"rendered at 4x")
+    controller.handle_post("/result", {"note": ["less detail at 2s"]})
+    _render(controller)
+
+    assert [v.extra["scale"] for v in list_versions(job_dir)] == [4, 2]
+
+
+def test_a_restart_moves_the_output_into_the_versions(
+    tmp_path: Path, fake_render: list[bytes]
+) -> None:
+    controller, _job_id, job_dir = _job_on(tmp_path, WizardStep.RESULT)
+    (job_dir / "output.mp4").write_bytes(b"result before the restart")
+    controller.handle_post(
+        "/result", {"note": ["the colours are all wrong"], "restart": ["1"]}
+    )
+
+    state = controller.current_state()
+    assert state.step is WizardStep.SAMPLING
+    assert state.render_note == "the colours are all wrong"
+    assert state.notice is None
+    assert not (job_dir / "output.mp4").exists()
+    assert _kept(job_dir) == [
+        ("v001.mp4", "earlier", None, b"result before the restart"),
+    ]
+
+
+def test_a_restart_copies_the_output_when_it_cannot_move_it(
+    tmp_path: Path, fake_render: list[bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = archive_output
+
+    def no_rename(job_dir: Path, **kwargs: Any) -> Any:
+        if kwargs.get("move"):
+            raise OSError("Permission denied")
+        return real(job_dir, **kwargs)
+
+    monkeypatch.setattr("super_processor.wizard.archive_output", no_rename)
+    controller, _job_id, job_dir = _job_on(tmp_path, WizardStep.RESULT)
+    (job_dir / "output.mp4").write_bytes(b"result before the restart")
+    controller.handle_post("/result", {"note": ["start over"], "restart": ["1"]})
+
+    state = controller.current_state()
+    assert state.step is WizardStep.SAMPLING and state.notice is None
+    assert not (job_dir / "output.mp4").exists()
+    assert _kept(job_dir) == [
+        ("v001.mp4", "earlier", None, b"result before the restart"),
+    ]
+
+
+def test_a_restart_that_cannot_keep_the_output_is_refused(
+    tmp_path: Path, fake_render: list[bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def full_disk(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr("super_processor.wizard.archive_output", full_disk)
+    controller, _job_id, job_dir = _job_on(tmp_path, WizardStep.RESULT)
+    (job_dir / "output.mp4").write_bytes(b"result before the restart")
+    controller.handle_post("/result", {"note": ["start over"], "restart": ["1"]})
+
+    state = controller.current_state()
+    assert state.step is WizardStep.RESULT
+    assert state.error is not None and "No space left" in state.error
+    assert state.render_note is None
+    # Nothing was deleted, and nothing was started.
+    assert (job_dir / "output.mp4").read_bytes() == b"result before the restart"
+    assert (job_dir / "upscale_plan.json").is_file()
+    assert controller.api_view()["run"] is None
+
+
+def test_a_restart_does_not_keep_an_output_twice(
+    tmp_path: Path, fake_render: list[bytes]
+) -> None:
+    controller, _job_id, job_dir = _job_on(tmp_path, WizardStep.RENDERING)
+    controller.resume()
+    _render(controller)
+    controller.handle_post("/result", {"note": ["start over"], "restart": ["1"]})
+
+    assert not (job_dir / "output.mp4").exists()
+    assert _kept(job_dir) == [("v001.mp4", "render", None, b"render 1")]
+
+
+def test_a_version_that_cannot_be_kept_is_a_warning_only(
+    tmp_path: Path, fake_render: list[bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def full_disk(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr("super_processor.wizard.archive_output", full_disk)
+    controller, _job_id, job_dir = _job_on(tmp_path, WizardStep.RENDERING)
+    controller.resume()
+    _render(controller)
+
+    state = controller.current_state()
+    assert state.error is not None
+    assert "could not be kept as a version" in state.error
+    assert "No space left" in state.error
+    assert (job_dir / "output.mp4").read_bytes() == b"render 1"
+    assert controller.api_view()["run"]["outcome"] == "done"
+
+
+def test_going_back_to_the_segments_drops_the_render_note(
+    tmp_path: Path, fake_render: list[bytes]
+) -> None:
+    controller, _job_id, job_dir = _job_on(tmp_path, WizardStep.RESULT)
+    state = controller.current_state()
+    state.render_note = "a note for a render that never ran"
+    save_session_state(controller.jobs_dir, state)
+    save_job_wizard_state(job_dir, state)
+    save_segment_list(
+        job_dir,
+        SegmentList(segments=[LoopSegment(0.0, 8.0, label="all")], approved=True),
+    )
+    controller.handle_post("/goto", {"to": ["segments"]})
+
+    state = controller.current_state()
+    assert state.step is WizardStep.SEGMENTS
+    assert state.render_note is None

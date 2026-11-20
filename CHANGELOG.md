@@ -51,6 +51,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A job is only shown as busy in another window while the process that
   started its work still runs: a wizard that crashed, or a restart, never
   leaves the job locked, even when its process id is later reused.
+- Every result is kept. Each finished render, and the result a revise or
+  a "start over" replaces, is saved in the job's `outputs/` folder as
+  `v001.mp4`, `v002.mp4`, … with the note that asked for it, and listed
+  in `/api/state` as `versions` on the Result and Done steps (playable at
+  `/jobs/<id>/outputs/v001.mp4`). Nothing is deleted automatically. On
+  Linux and macOS a version takes no extra disk space; on Windows it is a
+  full copy, shown as "Keeping a copy of this version". A version that
+  cannot be kept (a full disk) is a warning on the result, never a failed
+  render; a "start over" that cannot keep the result is refused instead, so
+  the result is never deleted unkept. Each version lists the scale and
+  strength it was rendered with, and a render resumed after reopening the
+  job is kept with the note that asked for it.
 
 ### Changed
 
