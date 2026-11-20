@@ -26,7 +26,13 @@ from super_processor.segment_loop import (
     load_segment_list,
     save_segment_list,
 )
-from super_processor.wizard import WizardController, WizardStep
+from super_processor.wizard import (
+    WizardController,
+    WizardState,
+    WizardStep,
+    save_job_wizard_state,
+    save_session_state,
+)
 
 TOKEN = "test-token"
 
@@ -315,3 +321,52 @@ def test_segment_list_save_and_load_retry_sharing_errors(
     assert loaded.to_dict() == saved.to_dict()
     assert calls == {"replace": 3, "read": 3}
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_stopping_a_run_needs_the_token_and_an_allowed_origin(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    controller = WizardController(tmp_path / "jobs")
+    job_id = controller.store.create(source).job_id
+    state = WizardState(step=WizardStep.RENDERING, job_id=job_id)
+    save_job_wizard_state(controller.store.job_dir(job_id), state)
+    save_session_state(controller.jobs_dir, state)
+    server = WizardServer(controller.jobs_dir, controller=controller, token=TOKEN)
+    base = server.start()
+    stop = json.dumps({"job_id": job_id}).encode()
+    try:
+        plain = {"Content-Type": "application/json"}
+        assert _request(base, "POST", "/api/cancel", headers=plain, body=stop)[0] == 403
+        foreign = {
+            **plain,
+            "Origin": "https://evil.example",
+            "X-Wizard-Token": TOKEN,
+        }
+        status, body = _request(base, "POST", "/api/cancel", headers=foreign, body=stop)
+        assert status == 403 and b"origin not allowed" in body
+        assert controller.current_state().step is WizardStep.RENDERING
+
+        status, body = _request(
+            base,
+            "POST",
+            "/api/cancel",
+            headers={**plain, "X-Wizard-Token": TOKEN},
+            body=stop,
+        )
+        assert status == 200
+        view = json.loads(body)
+        assert view["step"] == "ready_to_render" and view["stopped"]
+        assert view["run"]["outcome"] == "stopped"
+        # Nothing is left to stop now.
+        status, body = _request(
+            base,
+            "POST",
+            "/api/cancel",
+            headers={**plain, "X-Wizard-Token": TOKEN},
+            body=stop,
+        )
+        assert status == 400 and b"nothing running to stop" in body
+    finally:
+        server.stop()

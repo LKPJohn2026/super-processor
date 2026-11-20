@@ -477,6 +477,8 @@ _API_POSTS = {
     "/api/scene": "/scene",
     "/api/ready": "/ready",
     "/api/result": "/result",
+    # Stops the segmenting or render in progress (see WizardController.cancel).
+    "/api/cancel": "/cancel",
 }
 
 

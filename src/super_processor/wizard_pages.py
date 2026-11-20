@@ -766,19 +766,44 @@ def _progress_bar(progress: dict[str, object] | None) -> str:
     ) + _notice(progress.get("note"))
 
 
-def _busy(title: str, lede: str, run_url: str, phase: str, progress: object) -> str:
+def _stop_control(*, can_stop: bool, stopping: bool) -> str:
+    """The Stop button of a step the editor can stop, or that it is stopping."""
+    if stopping:
+        return (
+            '<p class="muted" role="status">Stopping… this can take up to a '
+            "minute while the GPU finishes its current frames.</p>"
+        )
+    if not can_stop:
+        return ""
+    return """<form method="post" action="/cancel">
+<button type="submit" class="secondary">Stop</button>
+</form>"""
+
+
+def _busy(
+    title: str,
+    lede: str,
+    run_url: str,
+    phase: str,
+    progress: object,
+    *,
+    stop: str = "",
+) -> str:
     bar = _progress_bar(progress if isinstance(progress, dict) else None)
     body = f"""
 <h1>{escape(title)}</h1>
 <p class="lede">{lede}</p>
 {bar}
+{stop}
 <p class="muted">The page will refresh.</p>
 <meta http-equiv="refresh" content="2;url={run_url}">
 """
     return _page(title, body, phase=phase)
 
 
-def render_sampling(progress: object = None) -> str:
+def render_sampling(
+    progress: object = None, *, can_stop: bool = False, stopping: bool = False
+) -> str:
     return _busy(
         "Finding the segments",
         "A small copy of the video, without its sound, is uploaded to Gemini, "
@@ -788,6 +813,7 @@ def render_sampling(progress: object = None) -> str:
         "/segment?run=1",
         "segments",
         progress,
+        stop=_stop_control(can_stop=can_stop, stopping=stopping),
     )
 
 
@@ -805,6 +831,16 @@ def render_analyzing(index: int, count: int, progress: object = None) -> str:
 
 def _notice(text: object) -> str:
     return f'<p class="notice" role="status">{escape(str(text))}</p>' if text else ""
+
+
+def with_notice(page: str, text: str | None) -> str:
+    """Show ``text`` (such as why a run stopped) under the page's heading."""
+    if not text:
+        return page
+    head, found, rest = page.partition("</h1>")
+    if not found:
+        return page
+    return head + found + "\n" + _notice(text) + rest
 
 
 def _timeline(segments: list[dict[str, object]]) -> str:
@@ -1103,7 +1139,9 @@ def _items(shot: dict[str, object], key: str) -> list[object]:
     return list(value) if isinstance(value, list) else []
 
 
-def render_rendering(progress: object = None) -> str:
+def render_rendering(
+    progress: object = None, *, can_stop: bool = False, stopping: bool = False
+) -> str:
     return _busy(
         "Upscaling",
         "Restoring and upscaling on the local GPU. FFmpeg only trims, splices, "
@@ -1111,6 +1149,7 @@ def render_rendering(progress: object = None) -> str:
         "/render?run=1",
         "result",
         progress,
+        stop=_stop_control(can_stop=can_stop, stopping=stopping),
     )
 
 

@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   summary for a stepper and scene strip: the job's title, each stage and
   whether it is done, and each scene with its still, whether it is
   approved, previewed, and can be reopened.
+- Finding the segments and the render can be stopped: a Stop button on
+  their pages, or `/api/cancel`. The run stops within moments (the GPU
+  can take up to a minute) without waiting for Gemini to answer, and goes
+  back to where it started: the segments from before (or the pick screen),
+  "Ready to render" with every approved scene kept, or the previous result
+  with its settings. A stopped job is never marked failed. A render that
+  has started replacing its output can no longer be stopped. A stop asked
+  for just before the wizard was closed still applies when it restarts,
+  and a job left mid-step can be stopped without starting its work again.
+  `/api/state` has `cancellable`, `cancel_requested` and `stopped`.
 
 ### Fixed
 

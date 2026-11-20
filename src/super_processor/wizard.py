@@ -14,9 +14,14 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
-from .atomic_io import read_text_retrying, write_text_atomic
+from .atomic_io import (
+    read_text_retrying,
+    rmtree_quietly,
+    unlink_quietly,
+    write_text_atomic,
+)
 from .cancel import Cancelled
 from .file_dialog import VIDEO_EXTENSIONS, FileDialogError, choose_video
 from .gemini import (
@@ -30,12 +35,13 @@ from .gemini import (
     store_gemini_api_key,
 )
 from .gpu_heat import GpuHeat, SlowdownWatch, read_gpu_heat
-from .jobs import JobError, JobState, JobStore
+from .jobs import JobError, JobState, JobStore, utc_now_iso
 from .look import LOOK_BOUNDS
 from .probe import MediaFacts, ProbeError, probe_file
 from .progress import StepClock, overall_pct
 from .regions import MAX_REGIONS, REGION_STRENGTH
 from .segment_loop import (
+    GEMINI_COPY_NAME,
     MAX_LOOP_SEGMENTS,
     MIN_LOOP_SEGMENT_S,
     LoopSegment,
@@ -101,6 +107,7 @@ from .upscale import (
     _ffprobe_for,
     default_span,
     load_upscale_plan,
+    render_control,
     render_plan,
     rendered_scale,
     replace_overlapping,
@@ -123,6 +130,7 @@ from .wizard_pages import (
     render_segments,
     render_setup,
     with_navigation,
+    with_notice,
 )
 
 WIZARD_STATE_FILE = "wizard_state.json"
@@ -202,6 +210,29 @@ _RUN_STEPS: dict[str, frozenset[WizardStep]] = {
     "analyze": frozenset({WizardStep.ANALYZING}),
     "render": frozenset({WizardStep.RENDERING}),
 }
+# The steps the editor can stop: finding the segments, and the render.
+_CANCEL_STEPS = frozenset({*_SEGMENTING_STEPS, WizardStep.RENDERING})
+# Left in the job folder while a stop is asked for and not yet landed, so a
+# stop asked for just before the server went away still lands when the run
+# starts again, instead of the work carrying on by itself.
+CANCEL_MARKER = "cancel_requested"
+# How often a run waiting on a Gemini call looks for a stop.
+_ABANDON_POLL_S = 0.2
+_STOPPED_RENDER_KEPT = (
+    "You stopped the render. The video below is the one you had before, "
+    "with its settings."
+)
+_STOPPED_RENDER_NONE = (
+    "You stopped the render, so there is no result yet. Press Render to "
+    "start it again; every approved scene is kept."
+)
+_STOPPED_SEGMENTS_KEPT = (
+    "You stopped Gemini. These are the segments from before; approve them "
+    "or send another note."
+)
+_STOPPED_SEGMENTS_NONE = (
+    "You stopped finding the segments. Pick the file again to start over."
+)
 # How long starting a worker waits for a POST in progress to finish.
 _POST_WAIT_S = 30.0
 _JOB_CONFLICT_MESSAGE = "this job is no longer open in this window"
@@ -224,6 +255,9 @@ _STEP_STAGES: dict[WizardStep, str] = {
 _REOPEN_STEPS = frozenset({WizardStep.PREVIEW_SEGMENT, WizardStep.READY_TO_RENDER})
 # An uploaded file's name starts with 12 hex digits (see upload_target).
 _UPLOAD_PREFIX = re.compile(r"[0-9a-f]{12}-")
+
+
+_T = TypeVar("_T")
 
 
 def _optional_str(value: object) -> str | None:
@@ -642,6 +676,11 @@ class WizardController:
         self._cancel_guard = threading.Lock()
         self._run: _Run | None = None
         self._last_run: _Run | None = None
+        # On a helper thread a run hands a Gemini call to (see _abandonable):
+        # the run it works for. Its progress saves check that run, not
+        # whichever run is current, so a helper left behind by a stop can
+        # never save over the stopped screen or over a newer run.
+        self._bound = threading.local()
         # The running worker's time-left estimate, per measurable task.
         self._clock: StepClock | None = None
         self._clock_task = ""
@@ -773,10 +812,15 @@ class WizardController:
                 return
             self._begin_step()
             try:
+                if self._cancel_marker(run.job_id).is_file():
+                    # A stop was asked for before this run began: while its
+                    # worker was starting, or before the server restarted.
+                    self._land_cancel(run)
+                    yield None
+                    return
                 yield run
             except Cancelled:
-                run.outcome = "stopped"
-                raise
+                self._land_cancel(run)
             except Exception as exc:  # noqa: BLE001 - surfaced on the page
                 self._land_failure(run, exc)
         finally:
@@ -786,9 +830,168 @@ class WizardController:
                     run.outcome = "done"
             with self._cancel_guard:
                 if run is not None:
+                    # Under the guard, so a stop asked for from here on finds
+                    # no run and reads the step this run left behind.
+                    self._drop_cancel_marker(run.job_id)
                     self._last_run = replace(run)
                 self._run = None
             self._work_lock.release()
+
+    def _cancel_marker(self, job_id: str | None) -> Path:
+        assert job_id
+        return self.store.job_dir(job_id) / CANCEL_MARKER
+
+    def _drop_cancel_marker(self, job_id: str | None) -> None:
+        if job_id:
+            unlink_quietly(self._cancel_marker(job_id))
+
+    def _enter_running_step(self, state: WizardState, step: WizardStep) -> None:
+        """Move to a step a run works on, dropping a stop left from before.
+
+        Every POST that starts segmenting or a render goes through here, so
+        a stop asked for on an earlier run never stops the new one.
+        """
+        self._drop_cancel_marker(state.job_id)
+        state.step = step
+
+    def cancel(self, *, job_id: str = "", run_id: str = "") -> None:
+        """Stop the scan or render in progress, or one left interrupted.
+
+        ``job_id`` and ``run_id`` are what the page showed; when the wizard
+        has moved on to another job, or the run the page showed has ended,
+        :class:`WizardConflict` refuses the stop, so a late click never
+        stops something the editor did not see. A run stops at its next
+        check (within moments; the GPU can take up to a minute) and lands
+        on the step before it. A render that has started replacing its
+        output, or segments being saved, can no longer be stopped.
+        """
+        with self._post_lock:
+            state = self._state()
+            if job_id and job_id != state.job_id:
+                raise WizardConflict(_JOB_CONFLICT_MESSAGE)
+            if state.step not in _CANCEL_STEPS or not state.job_id:
+                raise WizardError("there is nothing running to stop")
+            marker = self._cancel_marker(state.job_id)
+            with self._cancel_guard:
+                run = self._run
+                if run_id and (run is None or run.id != run_id):
+                    raise WizardConflict("that run has already ended; reload the page")
+                if run is not None:
+                    if not run.cancellable:
+                        what = "render" if run.kind == "render" else "segmenting"
+                        raise WizardError(
+                            f"the {what} is finishing and can no longer be stopped"
+                        )
+                    # The run itself stops on the event; the marker only
+                    # covers a server that goes away before it lands.
+                    with contextlib.suppress(OSError):
+                        marker.touch()
+                    run.cancel.set()
+                    return
+                idle = not self.busy() and self._work_lock.acquire(blocking=False)
+                if not idle:
+                    # A worker is about to begin its run, and checks the
+                    # marker first thing; or one has just finished, and the
+                    # step it saved says so.
+                    if self._state().step not in _CANCEL_STEPS:
+                        raise WizardError("it has already finished")
+                    try:
+                        marker.touch()
+                    except OSError as exc:
+                        raise WizardError(f"could not ask it to stop: {exc}") from exc
+                    return
+            # Nothing runs (the server restarted mid-step, say): land the stop
+            # here, holding the work lock so no run starts meanwhile.
+            try:
+                state = self._state()
+                if state.step not in _CANCEL_STEPS or not state.job_id:
+                    raise WizardError("there is nothing running to stop")
+                kind: RunKind = (
+                    "render" if state.step is WizardStep.RENDERING else "segmenting"
+                )
+                stopped = _Run(kind=kind, job_id=state.job_id, guard=self._cancel_guard)
+                self._land_cancel(stopped)
+                stopped.finished_at = time.time()
+                with self._cancel_guard:
+                    self._drop_cancel_marker(stopped.job_id)
+                    self._last_run = replace(stopped)
+            finally:
+                self._work_lock.release()
+
+    def _land_cancel(self, run: _Run) -> None:
+        """Save the screen a stopped run goes back to.
+
+        Runs under the work lock, and under the state lock so a progress
+        save from a helper the run left behind lands before it or not at
+        all (see :meth:`_progress`).
+        """
+        with self._state_lock:
+            run.outcome = "stopped"
+            run.landed = True
+            try:
+                state = self._state()
+                state.error = None
+                state.progress = None
+                if state.step is WizardStep.RENDERING:
+                    self._render_cancelled(state)
+                elif state.step in _SEGMENTING_STEPS:
+                    self._segmenting_cancelled(state)
+                else:
+                    self._save(state)
+            except Exception as exc:  # noqa: BLE001 - last resort
+                message = f"Stopped, but saving that failed: {exc}"
+                with contextlib.suppress(Exception):
+                    self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
+            finally:
+                self._drop_cancel_marker(run.job_id)
+
+    def _check_stop(self) -> None:
+        """Raise :class:`Cancelled` when the current run was asked to stop."""
+        run = self._run
+        if run is not None:
+            run.check()
+
+    def _abandonable(self, call: Callable[[], _T]) -> _T:
+        """Run a Gemini call so a stop does not wait for it to answer.
+
+        The call runs on a helper thread while this one looks for a stop
+        every moment; on a stop the helper is left to finish on its own and
+        its answer is dropped. Its progress saves check this run first (see
+        :meth:`_progress`), so it never saves after the stop has landed.
+        Without a run (a direct call in a test), the call simply runs here.
+        """
+        run = self._run
+        if run is None:
+            return call()
+        answer: list[_T] = []
+        failure: list[BaseException] = []
+        done = threading.Event()
+
+        def work() -> None:
+            self._bound.run = run
+            try:
+                answer.append(call())
+            except BaseException as exc:  # noqa: BLE001 - raised below
+                failure.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=work, name="wizard-gemini", daemon=True).start()
+        while not done.wait(_ABANDON_POLL_S):
+            run.check()
+        run.check()
+        if failure:
+            raise failure[0]
+        return answer[0]
+
+    def _cancel_view(self, state: WizardState, busy: bool) -> tuple[bool, bool]:
+        """Whether a stop can be asked for now, and whether one is pending."""
+        with self._cancel_guard:
+            run = self._run
+            live = run is not None and run.cancellable and not run.cancel.is_set()
+            asked = run is not None and run.cancel.is_set()
+        on_step = state.step in _CANCEL_STEPS and bool(state.job_id)
+        return on_step and (not busy or live), busy and asked
 
     def _mark_failed(self, run: _Run | None) -> None:
         """Record that ``run`` failed. Only the run's own thread can do this,
@@ -881,7 +1084,9 @@ class WizardController:
         if self._heat_note:
             state.progress["note"] = self._heat_note
         with self._state_lock:
-            run = self._run
+            # A helper thread checks the run it works for, which may have
+            # been stopped and replaced since (see _abandonable).
+            run = getattr(self._bound, "run", None) or self._run
             if run is not None:
                 run.check()
             self._save(state)
@@ -950,7 +1155,8 @@ class WizardController:
             self._session_state = state
 
     def render(self) -> str:
-        return with_navigation(self._render_page(), self.navigation())
+        page = with_notice(self._render_page(), self._state().stopped)
+        return with_navigation(page, self.navigation())
 
     def navigation(self) -> dict[str, bool]:
         """Which of setup, file, and segments the editor can go to now."""
@@ -990,7 +1196,8 @@ class WizardController:
         if state.step is WizardStep.PICK_FILE:
             return render_pick(error=state.error)
         if state.step in _SEGMENTING_STEPS:
-            return render_sampling(state.progress)
+            can_stop, stopping = self._cancel_view(state, self.busy())
+            return render_sampling(state.progress, can_stop=can_stop, stopping=stopping)
         if state.step is WizardStep.SEGMENTS:
             assert state.job_id
             return render_segments(
@@ -1017,7 +1224,10 @@ class WizardController:
                 error=state.error,
             )
         if state.step is WizardStep.RENDERING:
-            return render_rendering(state.progress)
+            can_stop, stopping = self._cancel_view(state, self.busy())
+            return render_rendering(
+                state.progress, can_stop=can_stop, stopping=stopping
+            )
         if state.step is WizardStep.RESULT:
             assert state.job_id
             job_dir = self.store.job_dir(state.job_id)
@@ -1044,6 +1254,7 @@ class WizardController:
         # of the work lock, so "not busy" is never paired with "running".
         busy = self.busy()
         run = self._public_run(state)
+        cancellable, cancel_requested = self._cancel_view(state, busy)
         output_ready = False
         output_url: str | None = None
         scale: int | None = None
@@ -1079,6 +1290,9 @@ class WizardController:
             # A worker that died mid-run leaves its last progress behind.
             "progress": _aged(state.progress, time.time()) if busy else None,
             "run": run,
+            "cancellable": cancellable,
+            "cancel_requested": cancel_requested,
+            "stopped": state.stopped,
             "job": self._job_summary(state, busy),
             "navigation": self.navigation(),
             "segment_index": state.segment_index,
@@ -1103,6 +1317,13 @@ class WizardController:
         to another job since, :class:`WizardConflict` refuses the POST.
         """
         with self._post_lock:
+            if path == "/cancel":
+                # The one action meant for while a run works.
+                self.cancel(
+                    job_id=fields.get("job_id", [""])[0].strip(),
+                    run_id=fields.get("run_id", [""])[0].strip(),
+                )
+                return
             if self.busy():
                 raise WizardError("the last step is still running; wait for it")
             state = self._state()
@@ -1246,6 +1467,40 @@ class WizardController:
             WizardState(step=WizardStep.PICK_FILE, job_id=job_id, error=message),
         )
         self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
+
+    def _render_cancelled(self, state: WizardState) -> None:
+        """The editor stopped a render before it replaced the output.
+
+        The rules of :meth:`_render_failed` apply, except that a stop is
+        never a failure: with an earlier output the result screen shows it
+        with the plan it holds; without one the editor goes back to "Ready
+        to render", even when the scenes cannot be read back, and the job is
+        never marked failed. The render's work files are removed.
+        """
+        assert state.job_id
+        job_dir = self.store.job_dir(state.job_id)
+        before = job_dir / _PLAN_BEFORE_NOTE
+        state.notice = None
+        state.progress = None
+        state.error = None
+        for name in ("shot_work", "range_work"):
+            rmtree_quietly(job_dir / name)
+        unlink_quietly(job_dir / "output.encoding.mp4")
+        if (job_dir / "output.mp4").is_file():
+            if before.is_file():
+                with contextlib.suppress(OSError):
+                    before.replace(job_dir / UPSCALE_PLAN_FILE)
+            state.stopped = _STOPPED_RENDER_KEPT
+            state.step = WizardStep.RESULT
+            self._save(state)
+            return
+        unlink_quietly(before)
+        scenes = self._approved_scene_count(job_dir)
+        if scenes:
+            state.segment_index = state.approved_count = scenes
+        state.stopped = _STOPPED_RENDER_NONE
+        state.step = WizardStep.READY_TO_RENDER
+        self._save(state)
 
     def _settle_rendered_plan(self, job_dir: Path) -> None:
         """Clear the plan's pending span once the output holds it.
@@ -1630,6 +1885,9 @@ class WizardController:
         except (SegmentLoopError, ProbeError, ValueError, OSError) as exc:
             self._segmenting_failed(state, str(exc))
             return
+        # A stop asked for while the last stills were saved lands here, not
+        # after Gemini has been asked.
+        self._check_stop()
         state.step = WizardStep.PROPOSING
         self._save(state)
 
@@ -1680,7 +1938,9 @@ class WizardController:
                 media: dict[str, Any] = (
                     stills_ask if video is None else {"video": video}
                 )
-                raw = self.gemini().propose_segments(**media, **ask)
+                raw = self._abandonable(
+                    lambda: self.gemini().propose_segments(**media, **ask)
+                )
             except GeminiError as exc:
                 if video is None:
                     raise
@@ -1689,7 +1949,9 @@ class WizardController:
                 self._note_video_problem(
                     job_dir, f"watching the video failed: {exc}", video=video
                 )
-                raw = self.gemini().propose_segments(**stills_ask, **ask)
+                raw = self._abandonable(
+                    lambda: self.gemini().propose_segments(**stills_ask, **ask)
+                )
             else:
                 if video is not None:
                     self._save_video_record(job_dir, video)
@@ -1704,12 +1966,16 @@ class WizardController:
                 f"Gemini could not propose segments ({exc}); the whole video is one."
             )
             segments = [LoopSegment(0.0, duration, label="whole video")]
+        # From here on the new segments are saved and the stop is refused.
+        if self._run is not None:
+            self._run.commit()
         save_segment_list(
             job_dir,
             SegmentList(
                 segments=segments, error=error, scale=scale, scale_reason=reason
             ),
         )
+        self._clear_stopped_note(state.job_id)
         state.error = None
         state.step = WizardStep.SEGMENTS
         self._save(state)
@@ -1776,17 +2042,15 @@ class WizardController:
                 ),
             )
             self._progress(state, phase, middle, "Uploading the video to Gemini")
-            video = upload(
-                copy,
-                on_progress=self._task_progress(
-                    state,
-                    phase,
-                    middle,
-                    high,
-                    "gemini-upload",
-                    lambda done: f"Uploading the video to Gemini: {round(done * 100)}%",
-                ),
+            on_upload = self._task_progress(
+                state,
+                phase,
+                middle,
+                high,
+                "gemini-upload",
+                lambda done: f"Uploading the video to Gemini: {round(done * 100)}%",
             )
+            video = self._abandonable(lambda: upload(copy, on_progress=on_upload))
             if not isinstance(video, GeminiVideo):
                 raise GeminiError("the upload returned no video")
         except (GeminiError, SegmentLoopError, ProbeError, OSError) as exc:
@@ -1834,6 +2098,48 @@ class WizardController:
             WizardState(step=WizardStep.PICK_FILE, job_id=job_id, error=message),
         )
         self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
+
+    def _segmenting_cancelled(self, state: WizardState) -> None:
+        """The editor stopped sampling or proposing.
+
+        A stop is not a failure: the job stays as it was (never marked
+        failed) and its upload record keeps no error, so the next try
+        watches the video again. When segments were proposed before (the
+        editor sent a note back), they come back as they were; otherwise
+        the editor goes back to the pick screen and the job keeps its place.
+        """
+        assert state.job_id
+        job_id = state.job_id
+        job_dir = self.store.job_dir(job_id)
+        # Only the half-made copy: a finished copy may still be open in an
+        # upload the stop left behind (Windows would refuse to remove it).
+        unlink_quietly(job_dir / Path(GEMINI_COPY_NAME).with_suffix(".part.mp4"))
+        with contextlib.suppress(JobError, OSError):
+            self.store.update_notes(job_id, {"stopped": utc_now_iso()})
+        try:
+            found = load_segment_list(job_dir)
+        except (SegmentLoopError, OSError):
+            found = None
+        if found is not None and found.segments:
+            state.stopped = _STOPPED_SEGMENTS_KEPT
+            state.step = WizardStep.SEGMENTS
+            self._save(state)
+            return
+        save_job_wizard_state(
+            job_dir,
+            WizardState(
+                step=WizardStep.PICK_FILE, job_id=job_id, stopped=_STOPPED_SEGMENTS_NONE
+            ),
+        )
+        self._save(
+            WizardState(step=WizardStep.PICK_FILE, stopped=_STOPPED_SEGMENTS_NONE)
+        )
+
+    def _clear_stopped_note(self, job_id: str) -> None:
+        """Forget that the job was stopped once a run gets it further."""
+        with contextlib.suppress(JobError, OSError):
+            if self.store.load(job_id).notes.get("stopped"):
+                self.store.update_notes(job_id, {"stopped": None})
 
     def _segments_view(self, job_dir: Path) -> dict[str, Any]:
         try:
@@ -1890,7 +2196,7 @@ class WizardController:
                 found.note = text[:500]
                 found.approved = False
                 save_segment_list(job_dir, found)
-                state.step = WizardStep.PROPOSING
+                self._enter_running_step(state, WizardStep.PROPOSING)
         else:
             state.error = f"unknown action {action!r}"
         self._save(state)
@@ -2217,7 +2523,7 @@ class WizardController:
             upscale_plan = plan.to_upscale_plan(shots)
             self._keep_plan_before_render(job_dir)
             save_upscale_plan(job_dir, upscale_plan)
-            state.step = WizardStep.RENDERING
+            self._enter_running_step(state, WizardStep.RENDERING)
         except (ShotPlanError, OSError) as exc:
             state.error = str(exc)
         self._save(state)
@@ -2340,7 +2646,7 @@ class WizardController:
                     f"Kept {current}x: Gemini answered {ignored}x, but this note "
                     f'did not name a size. To change it, say "make it {example}x".'
                 )
-            state.step = WizardStep.RENDERING
+            self._enter_running_step(state, WizardStep.RENDERING)
         except (UpscaleError, GeminiError, ProbeError, OSError, ValueError) as exc:
             state.error = str(exc)
             state.step = WizardStep.RESULT
@@ -2366,7 +2672,7 @@ class WizardController:
         state.notice = None
         state.segment_index = state.approved_count = 0
         state.progress = None
-        state.step = WizardStep.SAMPLING
+        self._enter_running_step(state, WizardStep.SAMPLING)
         self._save(state)
 
     def run_render(self) -> None:
@@ -2412,16 +2718,26 @@ class WizardController:
                 plan = UpscalePlan(spans=(default_span(duration),))
                 save_upscale_plan(job_dir, plan)
             revised_ranges: list[tuple[float, float]] = []
-            render_plan(
-                source,
-                output,
-                plan,
-                engine=self.upscale_engine(),
-                ffmpeg_bin=self.ffmpeg_bin,
-                duration_s=duration,
-                on_progress=self._watched(watch, self._render_progress(state)),
-                on_revise_range=lambda start, end: revised_ranges.append((start, end)),
+            # The run tells FFmpeg and SPAN when to stop, and the renderer
+            # commits it just before it replaces the output.
+            control = (
+                render_control(self._run)
+                if self._run is not None
+                else contextlib.nullcontext()
             )
+            with control:
+                render_plan(
+                    source,
+                    output,
+                    plan,
+                    engine=self.upscale_engine(),
+                    ffmpeg_bin=self.ffmpeg_bin,
+                    duration_s=duration,
+                    on_progress=self._watched(watch, self._render_progress(state)),
+                    on_revise_range=lambda start, end: revised_ranges.append(
+                        (start, end)
+                    ),
+                )
             # The output now holds this plan, so a later failure must keep it.
             if self._run is not None:
                 self._run.rendered = True
@@ -2443,6 +2759,7 @@ class WizardController:
             save_upscale_plan(job_dir, plan)
             self._progress(state, "rendering", 90, "Checking for seams")
             self._check_seams(job_dir, output, source, candidates)
+            self._clear_stopped_note(state.job_id)
             state.error = state.notice
             state.notice = None
             state.step = WizardStep.RESULT

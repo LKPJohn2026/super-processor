@@ -17,8 +17,10 @@ from super_processor.wizard_pages import (
     render_ready,
     render_rendering,
     render_result,
+    render_sampling,
     render_segments,
     render_setup,
+    with_notice,
 )
 
 TOKEN = "test-token"
@@ -136,3 +138,17 @@ def test_wizard_server_post_intro_with_the_form_token(tmp_path: Path) -> None:
         assert controller.current_state().step is WizardStep.LLM_CHOICE
     finally:
         server.stop()
+
+
+def test_running_pages_offer_stop_while_it_can_still_stop() -> None:
+    for render in (render_rendering, render_sampling):
+        assert 'action="/cancel"' not in render()
+        page = render(can_stop=True)
+        assert '<form method="post" action="/cancel">' in page
+        assert ">Stop</button>" in page
+        stopping = render(can_stop=False, stopping=True)
+        assert 'action="/cancel"' not in stopping and "Stopping" in stopping
+    marked = with_notice(render_pick(), "You <b>stopped</b> it.")
+    shown = '<p class="notice" role="status">You &lt;b&gt;stopped&lt;/b&gt; it.</p>'
+    assert shown in marked
+    assert with_notice(render_pick(), None) == render_pick()
