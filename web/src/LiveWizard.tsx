@@ -1,4 +1,12 @@
-import { useEffect, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type DragEvent,
+  type FormEvent,
+  type MutableRefObject,
+  type ReactNode,
+} from "react";
 import {
   cancelFields,
   loadState,
@@ -31,10 +39,15 @@ import {
   stopControl,
   stoppedNote,
 } from "./runStates";
+import {
+  jobTitle,
+  overallKey,
+  sceneStrip,
+  stepperItems,
+  steadyOverall,
+  stripSummary,
+} from "./jobView";
 
-const RAIL = ["Setup", "File", "Segments", "Previews", "Result"] as const;
-// Rail steps the editor can go back (or forward) to, by their index.
-const NAV_TARGETS: Record<number, keyof Navigation> = { 0: "setup", 1: "file", 2: "segments" };
 const BACK_TEXT: Record<keyof Navigation, string> = {
   setup: "Back to Gemini setup",
   file: "Choose another file",
@@ -47,18 +60,6 @@ const RUNNERS: Partial<Record<WizardView["step"], Runner>> = {
   analyzing: runAnalyze,
   rendering: runRender,
 };
-
-function railIndex(step: WizardView["step"]): number {
-  if (step === "intro" || step === "llm_choice" || step === "local_llm_stub" || step === "setup") {
-    return 0;
-  }
-  if (step === "pick_file") return 1;
-  if (step === "sampling" || step === "proposing" || step === "segments") return 2;
-  if (step === "analyzing" || step === "preview_segment" || step === "ready_to_render") {
-    return 3;
-  }
-  return 4;
-}
 
 type LiveWizardProps = {
   origin: string;
@@ -73,7 +74,22 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   const [runFailed, setRunFailed] = useState(false);
   const [recovery, setRecovery] = useState(0);
   const connection = useRef<AbortController | null>(null);
-  const active = railIndex(view.step);
+  // The whole job's percentage last shown, kept here rather than in Busy so
+  // it survives the steps between two runs (a scene looked at again must not
+  // pull the bar back). Cleared when the job goes back to its scenes list.
+  const overallShown = useRef<SteadyOverall | null>(null);
+  if (view.step === "segments" || view.step === "pick_file") overallShown.current = null;
+  // Set after a scene is opened again: once its step has rendered, focus
+  // moves to that step's heading (the button that was pressed is gone).
+  const [headingFocus, setHeadingFocus] = useState(0);
+  useEffect(() => {
+    if (!headingFocus) return;
+    const heading = document.querySelector<HTMLElement>(".panel h1");
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus();
+    }
+  }, [headingFocus]);
 
   useEffect(() => {
     const current = new AbortController();
@@ -98,7 +114,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     setRecovery((value) => value + 1);
   }
 
-  async function send(action: string, fields: Record<string, string>) {
+  async function send(action: string, fields: Record<string, string>): Promise<boolean> {
     setBusy(true);
     setLocalError(null);
     try {
@@ -107,8 +123,10 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
       // Opening a job is the exception: any window may switch jobs.
       const body = action === "jobs/open" ? fields : withJob(view, fields);
       onView(await postAction(origin, action, body));
+      return true;
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : "Request failed");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -152,27 +170,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   return (
     <>
       <p className="brand">Super Processor</p>
-      <ol className="steps" aria-label="Progress">
-        {RAIL.map((label, index) => {
-          const target = NAV_TARGETS[index];
-          const reachable = target !== undefined && view.navigation?.[target] && !busy;
-          return (
-            <li key={label} className={index === active ? "active" : undefined}>
-              {reachable ? (
-                <button
-                  type="button"
-                  className="step-link"
-                  onClick={() => void send("goto", { to: target })}
-                >
-                  {label}
-                </button>
-              ) : (
-                label
-              )}
-            </li>
-          );
-        })}
-      </ol>
+      <JobHeader view={view} busy={busy} onSend={send} />
       <div className="panel" aria-busy={busy}>
         <WizardStepView
           origin={origin}
@@ -181,6 +179,14 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           message={message}
           onSend={send}
           onView={onView}
+          overallShown={overallShown}
+        />
+        <SceneStrip
+          origin={origin}
+          view={view}
+          busy={busy}
+          onSend={send}
+          onReopened={() => setHeadingFocus((value) => value + 1)}
         />
         <div className="actions">
           {runFailed && (
@@ -197,6 +203,170 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   );
 }
 
+// Resolves true when the server took the action (false: the error shows).
+type SendAction = (action: string, fields: Record<string, string>) => Promise<boolean | void>;
+type SteadyOverall = { key: string; value: number };
+
+/** The job's title and its stepper (or the plain rail before a job exists). */
+function JobHeader({ view, busy, onSend }: { view: WizardView; busy: boolean; onSend: SendAction }) {
+  const title = jobTitle(view);
+  const items = stepperItems(view, busy);
+  const fromJob = items.length > 0 && items[0].key === "file";
+  const setupLink = fromJob && view.navigation?.setup && !busy && !view.busy;
+  return (
+    <>
+      {title ? (
+        <p className="job-title">
+          <span className="sr-only">Job: </span>
+          {title}
+        </p>
+      ) : null}
+      <nav aria-label={fromJob ? "Steps of this job" : "Progress"}>
+        <ol className={fromJob ? "stepper" : "steps"}>
+          {items.map((item, index) => {
+            const label = item.nav ? (
+              <button
+                type="button"
+                className="step-link"
+                aria-label={`${item.label}: ${BACK_TEXT[item.nav].toLowerCase()}`}
+                onClick={() => void onSend("goto", { to: item.nav! })}
+              >
+                {item.label}
+              </button>
+            ) : (
+              item.label
+            );
+            if (!fromJob) {
+              return (
+                <li
+                  key={item.key}
+                  className={item.state === "current" ? "active" : undefined}
+                  aria-current={item.state === "current" ? "step" : undefined}
+                >
+                  {label}
+                </li>
+              );
+            }
+            return (
+              <li
+                key={item.key}
+                className={`stage ${item.state}`}
+                aria-current={item.state === "current" ? "step" : undefined}
+              >
+                <span className="marker" aria-hidden="true">
+                  {item.state === "done" ? "✓" : index + 1}
+                </span>
+                <span className="stage-text">
+                  <span className="stage-label">{label}</span>
+                  <span className="sr-only">
+                    {item.state === "done" ? ", done" : item.state === "current" ? ", now" : ", to come"}
+                  </span>
+                  {item.detail ? <span className="stage-detail">{item.detail}</span> : null}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      </nav>
+      {setupLink ? (
+        <p className="setup-link">
+          <button type="button" className="link" onClick={() => void onSend("goto", { to: "setup" })}>
+            Gemini key settings
+          </button>
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+/** Every scene of the job with its state; approved scenes can be opened again. */
+function SceneStrip({
+  origin,
+  view,
+  busy,
+  onSend,
+  onReopened,
+}: {
+  origin: string;
+  view: WizardView;
+  busy: boolean;
+  onSend: SendAction;
+  onReopened: () => void;
+}) {
+  const scenes = sceneStrip(view);
+  const list = useRef<HTMLOListElement | null>(null);
+  const current = scenes.find((scene) => scene.status === "current")?.index;
+  // On a narrow screen the strip scrolls sideways: keep the scene being
+  // looked at in sight, without scrolling the page.
+  useEffect(() => {
+    const strip = list.current;
+    if (!strip || current === undefined || strip.scrollWidth <= strip.clientWidth) return;
+    const pill = strip.querySelector<HTMLElement>(`[data-scene="${current}"]`);
+    if (pill) strip.scrollLeft = Math.max(0, pill.offsetLeft - strip.clientWidth / 2 + pill.offsetWidth / 2);
+  }, [current, scenes.length]);
+  const summary = stripSummary(view);
+  const problem = view.job?.error;
+  if (!scenes.length) {
+    return problem ? (
+      <p className="muted strip-problem">Part of this job could not be read: {problem}</p>
+    ) : null;
+  }
+  const locked = busy || Boolean(view.busy);
+  async function reopen(index: number) {
+    // Focus moves only when the scene opened; a refusal keeps it here, by
+    // the error. The move itself waits for the new step to render.
+    if ((await onSend("scene", { index: String(index) })) === true) onReopened();
+  }
+  return (
+    <section className="scene-strip" aria-labelledby="scene-strip-title">
+      <div className="strip-head">
+        <h2 id="scene-strip-title">Scenes</h2>
+        <p className="muted" role="status">
+          {summary}
+        </p>
+      </div>
+      <ol ref={list} tabIndex={0} aria-label="Scenes of this job">
+        {scenes.map((scene) => {
+          const still = outputSrc(origin, scene.stillUrl);
+          return (
+            <li
+              key={scene.index}
+              data-scene={scene.index}
+              className={`scene-pill ${scene.status}`}
+              aria-current={scene.status === "current" ? "step" : undefined}
+            >
+              {still ? <img src={still} alt="" loading="lazy" /> : <span className="still-gap" aria-hidden="true" />}
+              <span className="scene-text">
+                <strong className="scene-name">{scene.name}</strong>
+                <span className="scene-range">{scene.range}</span>
+                <span className="scene-status">
+                  <span className="sdot" aria-hidden="true" />
+                  {scene.statusText}
+                  {scene.previewed && scene.status !== "pending" ? (
+                    <span className="previewed"> · preview ready</span>
+                  ) : null}
+                </span>
+                {scene.reopen ? (
+                  <button
+                    type="button"
+                    className="secondary small"
+                    disabled={locked}
+                    aria-label={scene.reopen.label}
+                    onClick={() => void reopen(scene.index)}
+                  >
+                    {scene.reopen.text}
+                  </button>
+                ) : null}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+      {problem ? <p className="muted strip-problem">Part of this job could not be read: {problem}</p> : null}
+    </section>
+  );
+}
+
 function WizardStepView({
   origin,
   view,
@@ -204,13 +374,15 @@ function WizardStepView({
   message,
   onSend,
   onView,
+  overallShown,
 }: {
   origin: string;
   view: WizardView;
   busy: boolean;
   message: string | null;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
   onView: (view: WizardView) => void;
+  overallShown: MutableRefObject<SteadyOverall | null>;
 }) {
   if (view.step === "intro") {
     return (
@@ -310,6 +482,8 @@ function WizardStepView({
       <Busy
         title="Finding the segments"
         progress={view.progress ?? null}
+        overallKey={overallKey(view)}
+        overallShown={overallShown}
         message={message}
         stop={<StopButton view={view} busy={busy} onSend={onSend} />}
       >
@@ -335,11 +509,13 @@ function WizardStepView({
   }
 
   if (view.step === "analyzing") {
-    const count = view.segments?.segments.length;
+    const count = view.job?.scene_count || view.segments?.segments.length;
     return (
       <Busy
         title={`Segment ${(view.segment_index ?? 0) + 1}${count ? ` of ${count}` : ""}`}
         progress={view.progress ?? null}
+        overallKey={overallKey(view)}
+        overallShown={overallShown}
         message={message}
       >
         Gemini is choosing clean-up, strength, and finishing for this segment.
@@ -381,6 +557,8 @@ function WizardStepView({
       <Busy
         title="Upscaling"
         progress={view.progress ?? null}
+        overallKey={overallKey(view)}
+        overallShown={overallShown}
         message={message}
         stop={<StopButton view={view} busy={busy} onSend={onSend} />}
       >
@@ -438,19 +616,32 @@ function WizardStepView({
 function Busy({
   title,
   progress,
+  overallKey: steadyKey,
+  overallShown,
   message,
   stop,
   children,
 }: {
   title: string;
   progress: Progress | null;
+  // The run the whole job's percentage is kept steady for.
+  overallKey?: string;
+  // Where the last shown percentage is kept (the page's, so it outlives Busy).
+  overallShown?: MutableRefObject<SteadyOverall | null>;
   message: string | null;
   stop?: ReactNode;
   children: ReactNode;
 }) {
   const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
-  const overall =
-    typeof progress?.overall === "number" ? Math.max(0, Math.min(100, Math.round(progress.overall))) : null;
+  // The whole job's percentage never goes back while one run works, even
+  // when a poll arrives late or a phase reports a lower estimate.
+  const own = useRef<SteadyOverall | null>(null);
+  const shown = overallShown ?? own;
+  let overall: number | null = null;
+  if (typeof progress?.overall === "number") {
+    shown.current = steadyOverall(shown.current, steadyKey ?? "", progress.overall);
+    overall = Math.round(shown.current.value);
+  }
   // The view arrives every two seconds; count the clock down between them.
   // The tick names the view it was counted from, so a new view starts at
   // zero on its first paint instead of with the old view's seconds.
@@ -509,7 +700,7 @@ function StopButton({
 }: {
   view: WizardView;
   busy: boolean;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
 }) {
   const control = stopControl(view, busy);
   return (
@@ -555,7 +746,7 @@ function Back({
   view: WizardView;
   to: (keyof Navigation)[];
   busy: boolean;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
 }) {
   const shown = to.filter((target) => view.navigation?.[target]);
   if (!shown.length) return null;
@@ -593,7 +784,7 @@ function SetupStep({
   busy: boolean;
   hasKey: boolean;
   message: string | null;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
 }) {
   const [apiKey, setApiKey] = useState("");
 
@@ -666,7 +857,7 @@ function PickStep({
   view: WizardView;
   busy: boolean;
   message: string | null;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
   onView: (view: WizardView) => void;
 }) {
   const [path, setPath] = useState("");
@@ -778,7 +969,7 @@ function ResultStep({
   view: WizardView;
   busy: boolean;
   message: string | null;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
 }) {
   const [note, setNote] = useState("");
   const src = outputSrc(origin, view.output_url);
@@ -914,7 +1105,7 @@ function SegmentsStep({
   list: SegmentList;
   busy: boolean;
   message: string | null;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
   view: WizardView;
 }) {
   const [note, setNote] = useState("");
@@ -1097,7 +1288,7 @@ function Interrupted({
   view: WizardView;
   busy: boolean;
   message: string | null;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
 }) {
   // Nothing runs until the editor chooses, so reopening a job never spends
   // GPU time or Gemini quota by itself.
@@ -1228,7 +1419,7 @@ function PreviewStep({
   preview: SegmentPreview;
   busy: boolean;
   message: string | null;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
   view: WizardView;
 }) {
   const [note, setNote] = useState("");
@@ -1305,7 +1496,7 @@ function UpscaleToggle({
 }: {
   shot: LookShot;
   busy: boolean;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
 }) {
   const on = shot.use_upscale !== false;
   const who = typeof shot.upscale_override === "boolean" ? "You" : "Gemini";
@@ -1336,7 +1527,7 @@ function ReadyStep({
   looks: Looks;
   busy: boolean;
   message: string | null;
-  onSend: (action: string, fields: Record<string, string>) => Promise<void>;
+  onSend: SendAction;
   view: WizardView;
 }) {
   const scales = [...(looks.scales ?? [])].sort((a, b) => b - a);

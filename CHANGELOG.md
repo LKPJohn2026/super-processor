@@ -76,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the step it goes back to shows a plain note saying what was kept. A job
   left interrupted asks Resume or Stop and says what each one does, and a
   render that failed shows its error with a "Try the render again" button.
+- The web app shows the job's title and a five-step stepper (Video,
+  Scenes, Previews, Render, Result) with a short line under each step,
+  such as "2 of 5 approved". From the previews on, a scene strip lists
+  every scene with its still, time range and state (Approved, Reviewing,
+  Waiting) below the step, scrolling sideways on a phone, and an approved
+  scene can be opened again with "Look again", which moves focus to the
+  scene's page. The job's percentage never goes back while a step runs,
+  nor when a scene is looked at again.
 
 ### Changed
 
