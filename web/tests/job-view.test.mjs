@@ -76,7 +76,7 @@ test("without a job summary the old rail follows the step", () => {
     const v = view("segments", { navigation: { setup: true, file: true, segments: false }, ...extra });
     assert.equal(hasJobStages(v), false);
     const items = stepperItems(v, false);
-    assert.deepEqual(items.map((i) => i.label), ["Setup", "File", "Segments", "Previews", "Result"]);
+    assert.deepEqual(items.map((i) => i.label), ["Setup", "File", "Scenes", "Previews", "Result"]);
     assert.deepEqual(items.map((i) => i.state), ["done", "done", "current", "upcoming", "upcoming"]);
     assert.deepEqual(items.map((i) => i.nav), ["setup", "file", null, null, null]);
   }

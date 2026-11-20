@@ -25,6 +25,7 @@ const {
 
 const view = (step, extra = {}) => ({ step, error: null, ...extra });
 const RENDER_STOPPED = "You stopped the render, so there is no result yet. Press Render to start it again; every approved scene is kept.";
+const FAILED_RENDER = { id: "r1", kind: "render", job_id: "j", started_at: 1, finished_at: 2, outcome: "failed" };
 const KEPT = "You stopped the render. The video below is the one you had before, with its settings.";
 
 test("a stopped view is not shown as success", () => {
@@ -50,7 +51,7 @@ test("no stopped note while a run works or waits, or once it was cleared", () =>
   assert.equal(stoppedNote(view("result", { stopped: null })), null);
   assert.equal(stoppedNote(view("result", { stopped: "   " })), null);
   // A newer error wins over an old stop.
-  const both = view("ready_to_render", { stopped: RENDER_STOPPED, error: "out of memory" });
+  const both = view("ready_to_render", { stopped: RENDER_STOPPED, error: "out of memory", run: FAILED_RENDER });
   assert.equal(viewTone(both), "failed");
   assert.equal(stoppedNote(both), null);
 });
@@ -58,16 +59,44 @@ test("no stopped note while a run works or waits, or once it was cleared", () =>
 test("ready_to_render with an error still offers Render", () => {
   const failed = view("ready_to_render", {
     error: "The render failed, so there is no result yet: CUDA out of memory",
+    run: FAILED_RENDER,
     looks: { scale: 2, error: null, shots: [{}, {}, {}] },
   });
   assert.equal(offersRender(failed), true);
   assert.equal(viewTone(failed), "failed");
   const text = readyText(failed);
   assert.equal(text.renderLabel, "Try the render again");
-  assert.match(text.lede, /3 approved segments/);
+  assert.match(text.lede, /3 approved scenes/);
   assert.equal(readyText(view("ready_to_render")).renderLabel, "Render the whole video");
   assert.equal(offersRender(view("ready_to_render", { stopped: RENDER_STOPPED })), true);
   assert.equal(offersRender(view("result")), false);
+});
+
+test("another error on ready_to_render keeps Ready to render, with Render offered", () => {
+  const refusal = "scene 2 still has changes to preview";
+  // No run, or a run that is not a failed render: not a failure.
+  for (const run of [
+    null,
+    { ...FAILED_RENDER, kind: "analyze" },
+    { ...FAILED_RENDER, outcome: "done" },
+    { ...FAILED_RENDER, outcome: "stopped" },
+  ]) {
+    const refused = view("ready_to_render", { error: refusal, run, looks: { scale: 2, error: null, shots: [{}, {}] } });
+    assert.notEqual(viewTone(refused), "failed", JSON.stringify(run));
+    const text = readyText(refused);
+    assert.equal(text.title, "Ready to render");
+    assert.equal(text.renderLabel, "Render the whole video");
+    assert.equal(offersRender(refused), true);
+    // The error is newer than an old stop, so the stop note goes.
+    assert.equal(stoppedNote({ ...refused, stopped: RENDER_STOPPED }), null);
+  }
+  // A failed render is a failure.
+  const failed = view("ready_to_render", { error: "CUDA out of memory", run: FAILED_RENDER });
+  assert.equal(viewTone(failed), "failed");
+  assert.equal(readyText(failed).title, "The render didn’t finish");
+  assert.equal(offersRender(failed), true);
+  // Other steps keep treating an error as a failure.
+  assert.equal(viewTone(view("result", { error: "x" })), "failed");
 });
 
 test("Stop shows only when the server says it can stop", () => {
@@ -101,8 +130,8 @@ test("an interrupted job offers Resume and says what Stop does", () => {
   const render = interruptedChoice(view("rendering", { interrupted: true }));
   assert.match(render.lede, /^Nothing runs until you choose\./);
   assert.equal(render.resumeLabel, "Resume the render");
-  assert.match(render.stopHint, /approved segments/);
-  assert.match(interruptedChoice(view("analyzing", { interrupted: true, segment_index: 2 })).title, /Segment 3/);
-  assert.match(interruptedChoice(view("proposing", { interrupted: true })).title, /Finding the segments/);
+  assert.match(render.stopHint, /approved scenes/);
+  assert.match(interruptedChoice(view("analyzing", { interrupted: true, segment_index: 2 })).title, /Scene 3/);
+  assert.match(interruptedChoice(view("proposing", { interrupted: true })).title, /Finding the scenes/);
   assert.equal(viewTone(view("sampling", { interrupted: true })), "interrupted");
 });

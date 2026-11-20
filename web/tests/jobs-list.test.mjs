@@ -73,8 +73,8 @@ test("jobStatus: the badge says where each job is, in the mockup's words", () =>
 
 test("jobAction: open, continue, back to the open job, or why it cannot open", () => {
   assert.deepEqual(jobAction(entry({ status: "result" }), false), { label: "Open", kind: "open", reason: null });
-  // A job waiting for the editor says "Resume", as in the s1-jobs mockup.
-  assert.deepEqual(jobAction(entry(), false), { label: "Resume", kind: "open", reason: null });
+  // A job waiting for the editor only opens: "Resume" means starting GPU or Gemini work.
+  assert.deepEqual(jobAction(entry(), false), { label: "Open", kind: "open", reason: null });
   // An interrupted job opens to the Resume or Stop choice: the button only opens it.
   assert.deepEqual(jobAction(entry({ interrupted: true, resumes_work: true }), false), {
     label: "Open",

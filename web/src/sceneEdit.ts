@@ -268,13 +268,6 @@ export function dragTime(
   return clamp(at, range);
 }
 
-/** The time under a pointer at `x` on a timeline drawn from `left`, `width` wide, in tenths. */
-export function timeAt(x: number, left: number, width: number, duration: number): number {
-  if (!(width > 0) || !(duration > 0)) return 0;
-  const share = Math.min(1, Math.max(0, (x - left) / width));
-  return Math.round(share * duration * 10) / 10;
-}
-
 export function scenesText(count: number): string {
   return `${count} ${count === 1 ? "scene" : "scenes"}`;
 }

@@ -90,9 +90,9 @@ export function jobAction(entry: JobEntry, busyHere: boolean): JobAction {
       reason: "Wait for the current run to finish, or stop it, before opening another job.",
     };
   }
-  if (entry.interrupted) return { label: "Open", kind: "open", reason: null };
-  if (entry.status === "result") return { label: "Open", kind: "open", reason: null };
-  return { label: "Resume", kind: "open", reason: null };
+  // Opening never starts work ("Resume" is the GPU or Gemini restart on an
+  // interrupted job), so a job that waits for the editor says "Open" too.
+  return { label: "Open", kind: "open", reason: null };
 }
 
 /** Most recently changed first; jobs with no time last, then by id, so the order is stable. */

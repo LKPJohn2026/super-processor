@@ -45,6 +45,18 @@ export function JobsHome({
     return () => window.clearInterval(timer);
   }, []);
   useEffect(() => setNow(Date.now()), [jobs]);
+  // "Looking for your videos…" only when the list is slow, so a quick load
+  // does not flash it.
+  const loading = jobs === null && !loadError;
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (!loading) {
+      setSlow(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setSlow(true), 300);
+    return () => window.clearTimeout(timer);
+  }, [loading]);
 
   const route = newVideoRoute(view);
   const here = busyHere(view, jobs ?? []);
@@ -76,7 +88,7 @@ export function JobsHome({
           {openError}
         </p>
       ) : null}
-      {jobs === null && !loadError ? <p className="muted">Looking for your videos…</p> : null}
+      {loading && slow ? <p className="muted">Looking for your videos…</p> : null}
       {loadError ? (
         <div className="notice">
           <p>Could not list your videos: {loadError}</p>

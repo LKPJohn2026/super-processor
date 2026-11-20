@@ -31,7 +31,7 @@ const STAGE_NAV: Partial<Record<StageKey, keyof Navigation>> = {
 };
 
 // The rail shown before a job exists, or by a server with no job summary.
-const RAIL = ["Setup", "File", "Segments", "Previews", "Result"] as const;
+const RAIL = ["Setup", "File", "Scenes", "Previews", "Result"] as const;
 const RAIL_NAV: Partial<Record<number, keyof Navigation>> = { 0: "setup", 1: "file", 2: "segments" };
 
 export function railIndex(step: WizardView["step"]): number {

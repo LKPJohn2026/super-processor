@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import {
-  cancelFields,
+  cancelRun,
   editSegments,
   loadJobs,
   loadState,
@@ -19,6 +19,8 @@ import {
   outputSrc,
   postAction,
   progressTiming,
+  reopenScene,
+  resumeRun,
   scaleChoiceText,
   runAnalyze,
   runRender,
@@ -102,8 +104,13 @@ import {
 const BACK_TEXT: Record<keyof Navigation, string> = {
   setup: "Back to Gemini setup",
   file: "Choose another file",
-  segments: "Back to the segments",
+  segments: "Back to the scenes",
 };
+
+// How often, and how many times while none has started, the page looks
+// for the next scene's background preview.
+const PREFETCH_LOOK_MS = 2000;
+const PREFETCH_WAITING_LOOKS = 6;
 
 const RUNNERS: Partial<Record<WizardView["step"], Runner>> = {
   sampling: runSegmenting,
@@ -327,23 +334,61 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     setRecovery((value) => value + 1);
   }
 
-  async function send(action: string, fields: Record<string, string>): Promise<boolean> {
+  // A POST refused because the page is out of date (409: another window
+  // opened another job, or the run it names already ended): load the job as
+  // it is now and say the server's reason on that view. False when the job
+  // could not be loaded again.
+  async function showCurrent(said: string): Promise<boolean> {
+    const current = connection.current;
+    const next = await loadState(origin);
+    if (current?.signal.aborted) return true;
+    if (!next) return false;
+    carriedError.current = { step: next.step, text: said };
+    onView(next);
+    setLocalError(said);
+    return true;
+  }
+
+  // Every request from the page goes through here: one at a time, the
+  // answer shown, a refusal said.
+  async function perform(request: (shown: WizardView) => Promise<WizardView>): Promise<boolean> {
     setBusy(true);
     setLocalError(null);
     carriedError.current = null;
     try {
-      // Every POST names the job this page shows, so a tab left open on an
-      // older job is refused (409) instead of acting on the current one.
-      // Opening a job is the exception: any window may switch jobs.
-      const body = action === "jobs/open" ? fields : withJob(view, fields);
-      onView(await postAction(origin, action, body));
+      onView(await request(view));
       return true;
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : "Request failed");
+      const text = error instanceof Error ? error.message : "Request failed";
+      const status = (error as { status?: unknown } | null)?.status;
+      if (status !== 409 || !(await showCurrent(text))) setLocalError(text);
       return false;
     } finally {
       setBusy(false);
     }
+  }
+
+  // Every POST names the job this page shows, so a tab left open on an
+  // older job is refused (409) instead of acting on the current one.
+  function send(action: string, fields: Record<string, string>): Promise<boolean> {
+    return perform((shown) => postAction(origin, action, withJob(shown, fields)));
+  }
+
+  // Load the job as it is now (the "Working in another window" screen).
+  async function checkAgain(): Promise<boolean> {
+    const current = connection.current;
+    setBusy(true);
+    setLocalError(null);
+    const next = await loadState(origin);
+    if (current?.signal.aborted) return false;
+    setBusy(false);
+    if (!next) {
+      setLocalError("Could not reach the wizard. Check that it still runs, then try again.");
+      return false;
+    }
+    carriedError.current = null;
+    onView(next);
+    return true;
   }
 
   // A change to the segments (or approving them) names the list the page
@@ -362,17 +407,10 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
       const text = error instanceof Error ? error.message : "Request failed";
       const status = (error as { status?: unknown } | null)?.status;
       if (isStaleScenes(text, typeof status === "number" ? status : undefined)) {
-        const next = await loadState(origin);
-        if (next) {
-          const said = status === 409 ? text : STALE_SCENES_TEXT;
-          carriedError.current = { step: next.step, text: said };
-          onView(next);
-          setLocalError(said);
-        } else {
-          // The page could not load the scenes again, so it must not say
-          // it shows them as they are.
-          setLocalError(status === 409 ? text : STALE_SCENES_UNLOADED_TEXT);
-        }
+        const said = status === 409 ? text : STALE_SCENES_TEXT;
+        // The page could not load the scenes again, so it must not say
+        // it shows them as they are.
+        if (!(await showCurrent(said))) setLocalError(status === 409 ? text : STALE_SCENES_UNLOADED_TEXT);
       } else {
         setLocalError(text);
       }
@@ -381,6 +419,47 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
       setBusy(false);
     }
   }
+
+  // The next scene's preview made in the background (--prefetch): the view
+  // only changes when the page asks, so while it is on its way the page
+  // looks again every two seconds. A few looks while none has started yet,
+  // for as long as one runs; never with ?run=1, so nothing starts from here.
+  const busyNow = useRef(busy);
+  busyNow.current = busy;
+  const shownPreview = view.step === "preview_segment" ? view.segment_preview : null;
+  const prefetchNext = shownPreview?.next;
+  const prefetchWait =
+    !shownPreview || prefetchNext === undefined
+      ? null
+      : prefetchNext === null
+        ? "waiting"
+        : prefetchNext.running
+          ? "running"
+          : null;
+  const previewIndex = shownPreview?.index;
+  useEffect(() => {
+    if (!prefetchWait) return;
+    let cancelled = false;
+    let timer = 0;
+    let looks = 0;
+    const look = async () => {
+      if (prefetchWait === "waiting" && looks >= PREFETCH_WAITING_LOOKS) return;
+      looks += 1;
+      if (!busyNow.current) {
+        const before = latestView.current;
+        const next = await loadState(origin);
+        if (cancelled) return;
+        // A request the page sent meanwhile has the newer word.
+        if (next && !busyNow.current && latestView.current === before) onView(next);
+      }
+      if (!cancelled) timer = window.setTimeout(() => void look(), PREFETCH_LOOK_MS);
+    };
+    timer = window.setTimeout(() => void look(), PREFETCH_LOOK_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [origin, prefetchWait, previewIndex, view.job_id, onView]);
 
   useEffect(() => {
     const run = RUNNERS[view.step];
@@ -466,6 +545,8 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           busy={busy}
           message={message}
           onSend={send}
+          onRequest={perform}
+          onCheckAgain={checkAgain}
           onEditScenes={editScenes}
           onView={onView}
           overallShown={overallShown}
@@ -475,7 +556,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           origin={origin}
           view={view}
           busy={busy}
-          onSend={send}
+          onRequest={perform}
           onReopened={() => setHeadingFocus((value) => value + 1)}
         />
         <div className="actions">
@@ -496,6 +577,8 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
 // Resolves true when the server took the action (false: the error shows).
 type SendAction = (action: string, fields: Record<string, string>) => Promise<boolean | void>;
 type EditScenes = (edit: SegmentEdit) => Promise<boolean>;
+// A request made with one of api.ts's helpers, given the view the page shows.
+type RequestAction = (request: (shown: WizardView) => Promise<WizardView>) => Promise<boolean>;
 type SteadyOverall = { key: string; value: number };
 
 function browserStorage(): Storage | null {
@@ -636,13 +719,13 @@ function SceneStrip({
   origin,
   view,
   busy,
-  onSend,
+  onRequest,
   onReopened,
 }: {
   origin: string;
   view: WizardView;
   busy: boolean;
-  onSend: SendAction;
+  onRequest: RequestAction;
   onReopened: () => void;
 }) {
   const scenes = sceneStrip(view);
@@ -667,7 +750,7 @@ function SceneStrip({
   async function reopen(index: number) {
     // Focus moves only when the scene opened; a refusal keeps it here, by
     // the error. The move itself waits for the new step to render.
-    if ((await onSend("scene", { index: String(index) })) === true) onReopened();
+    if (await onRequest((shown) => reopenScene(origin, shown, index))) onReopened();
   }
   return (
     <section className="scene-strip" aria-labelledby="scene-strip-title">
@@ -725,6 +808,8 @@ function WizardStepView({
   busy,
   message,
   onSend,
+  onRequest,
+  onCheckAgain,
   onEditScenes,
   onView,
   overallShown,
@@ -735,6 +820,8 @@ function WizardStepView({
   busy: boolean;
   message: string | null;
   onSend: SendAction;
+  onRequest: RequestAction;
+  onCheckAgain: () => Promise<boolean>;
   onEditScenes: EditScenes;
   onView: (view: WizardView) => void;
   overallShown: MutableRefObject<SteadyOverall | null>;
@@ -831,18 +918,27 @@ function WizardStepView({
   }
 
   if (view.interrupted && RUNNERS[view.step]) {
-    return <Interrupted view={view} busy={busy} message={message} onSend={onSend} />;
+    return (
+      <Interrupted
+        origin={origin}
+        view={view}
+        busy={busy}
+        message={message}
+        onRequest={onRequest}
+        onCheckAgain={onCheckAgain}
+      />
+    );
   }
 
   if (view.step === "sampling" || view.step === "proposing") {
     return (
       <Busy
-        title="Finding the segments"
+        title="Finding the scenes"
         progress={view.progress ?? null}
         overallKey={overallKey(view)}
         overallShown={overallShown}
         message={message}
-        stop={<StopButton view={view} busy={busy} onSend={onSend} />}
+        stop={<StopButton origin={origin} view={view} busy={busy} onRequest={onRequest} />}
         notify={notify}
       >
         A small copy of the video, without its sound, is uploaded to Gemini,
@@ -871,13 +967,13 @@ function WizardStepView({
     const count = view.job?.scene_count || view.segments?.segments.length;
     return (
       <Busy
-        title={`Segment ${(view.segment_index ?? 0) + 1}${count ? ` of ${count}` : ""}`}
+        title={`Scene ${(view.segment_index ?? 0) + 1}${count ? ` of ${count}` : ""}`}
         progress={view.progress ?? null}
         overallKey={overallKey(view)}
         overallShown={overallShown}
         message={message}
       >
-        Gemini is choosing clean-up, strength, and finishing for this segment.
+        Gemini is choosing clean-up, strength, and finishing for this scene.
         A few seconds of it are previewed on the local GPU, and Gemini checks
         the preview for faces, hands, text, and texture that went wrong.
       </Busy>
@@ -919,7 +1015,7 @@ function WizardStepView({
         overallKey={overallKey(view)}
         overallShown={overallShown}
         message={message}
-        stop={<StopButton view={view} busy={busy} onSend={onSend} />}
+        stop={<StopButton origin={origin} view={view} busy={busy} onRequest={onRequest} />}
         notify={notify}
       >
         Restoring and upscaling on the local GPU. FFmpeg only trims, splices,
@@ -1045,11 +1141,8 @@ function Busy({
           {step}
         </p>
       ) : null}
-      {progress?.note ? (
-        <p className="notice" role="status">
-          {progress.note}
-        </p>
-      ) : null}
+      {/* Always in the page, so a note that appears is read out. */}
+      <div role="status">{progress?.note ? <p className="notice">{progress.note}</p> : null}</div>
       {message ? <Alert text={message} /> : null}
       {notify}
       {stop}
@@ -1058,21 +1151,21 @@ function Busy({
 }
 
 function StopButton({
+  origin,
   view,
   busy,
-  onSend,
+  onRequest,
 }: {
+  origin: string;
   view: WizardView;
   busy: boolean;
-  onSend: SendAction;
+  onRequest: RequestAction;
 }) {
   const control = stopControl(view, busy);
   return (
     <>
       {/* Always in the page, so the "Stopping" line is announced when it appears. */}
-      <p className="stopped-note" role="status" hidden={!control.status}>
-        {control.status}
-      </p>
+      <div role="status">{control.status ? <p className="stopped-note">{control.status}</p> : null}</div>
       {control.shown ? (
         <div className="actions">
           <button
@@ -1080,7 +1173,7 @@ function StopButton({
             className="secondary"
             disabled={control.disabled}
             // The run the page shows, so a late click never stops a newer one.
-            onClick={() => void onSend("cancel", cancelFields(view))}
+            onClick={() => void onRequest((shown) => cancelRun(origin, shown))}
           >
             {control.label}
           </button>
@@ -1093,12 +1186,8 @@ function StopButton({
 /** After a stop: a plain note on the step the run went back to, not an error. */
 function StoppedNote({ view }: { view: WizardView }) {
   const text = stoppedNote(view);
-  if (!text) return null;
-  return (
-    <p className="stopped-note" role="status">
-      {text}
-    </p>
-  );
+  // The live region is always there, so a note that appears is read out.
+  return <div role="status">{text ? <p className="stopped-note">{text}</p> : null}</div>;
 }
 
 function Back({
@@ -1256,7 +1345,7 @@ function PickStep({
     <>
       <h1>Pick a video file</h1>
       <p className="lede">
-        Choose a video on this computer. Gemini splits it into segments, you
+        Choose a video on this computer. Gemini splits it into scenes, you
         approve a short before/after preview of each, and then you choose
         whether to upscale the whole video 2× on your GPU.
       </p>
@@ -1399,7 +1488,7 @@ function ResultStep({
             disabled={busy}
             onClick={() => void onSend("result", { note, restart: "1" })}
           >
-            Start over from the segments with this note
+            Start over from the scenes with this note
           </button>
         </div>
       </form>
@@ -2054,7 +2143,7 @@ function SegmentsStep({
           />
         </label>
         <div className="actions">
-          <button type="submit" className="secondary" disabled={busy}>
+          <button type="submit" className="secondary" disabled={locked}>
             Propose again
           </button>
         </div>
@@ -2140,16 +2229,22 @@ function SeamNote({
 }
 
 function Interrupted({
+  origin,
   view,
   busy,
   message,
-  onSend,
+  onRequest,
+  onCheckAgain,
 }: {
+  origin: string;
   view: WizardView;
   busy: boolean;
   message: string | null;
-  onSend: SendAction;
+  onRequest: RequestAction;
+  onCheckAgain: () => Promise<boolean>;
 }) {
+  // What the last "Check again" found, read out.
+  const [checked, setChecked] = useState<string | null>(null);
   // Nothing runs until the editor chooses, so reopening a job never spends
   // GPU time or Gemini quota by itself.
   if (view.running_elsewhere) {
@@ -2158,9 +2253,26 @@ function Interrupted({
         <h1>Working in another window</h1>
         <p className="lede">
           Another Super Processor window on this computer is working on this job.
-          Wait for it to finish there, then reload.
+          Wait for it to finish there, then check again.
         </p>
         {message ? <Alert text={message} /> : null}
+        <p className="muted" role="status">
+          {checked}
+        </p>
+        <div className="actions">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setChecked(null);
+              void onCheckAgain().then((ok) => {
+                if (ok) setChecked(`Still working there (checked at ${new Date().toLocaleTimeString()}).`);
+              });
+            }}
+          >
+            {busy ? "Checking…" : "Check again"}
+          </button>
+        </div>
       </>
     );
   }
@@ -2172,7 +2284,7 @@ function Interrupted({
       {view.cancellable ? <p className="muted">{choice.stopHint}</p> : null}
       {message ? <Alert text={message} /> : null}
       <div className="actions">
-        <button type="button" disabled={busy} onClick={() => void onSend("resume", {})}>
+        <button type="button" disabled={busy} onClick={() => void onRequest((shown) => resumeRun(origin, shown))}>
           {choice.resumeLabel}
         </button>
         {view.cancellable ? (
@@ -2181,7 +2293,7 @@ function Interrupted({
             className="secondary"
             disabled={busy}
             // No run works on an interrupted step, so no run_id is sent.
-            onClick={() => void onSend("cancel", cancelFields(view))}
+            onClick={() => void onRequest((shown) => cancelRun(origin, shown))}
           >
             {choice.stopLabel}
           </button>
@@ -2214,7 +2326,7 @@ function LookCard({ origin, shot }: { origin: string; shot: LookShot }) {
     <>
       <h2>
         {shot.index + 1}. {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
-        {shot.label || "Unlabelled segment"}
+        {shot.label || "Unlabelled scene"}
       </h2>
       {shot.after_url ? (
         <div className="pair">
@@ -2228,7 +2340,7 @@ function LookCard({ origin, shot }: { origin: string; shot: LookShot }) {
                 preload="metadata"
                 src={outputSrc(origin, shot.before_url) ?? undefined}
                 poster={outputSrc(origin, poster(shot.before_url)) ?? undefined}
-                aria-label={`Segment ${shot.index + 1} before`}
+                aria-label={`Scene ${shot.index + 1} before`}
               />
               <Boxes regions={shot.regions ?? []} />
             </div>
@@ -2243,7 +2355,7 @@ function LookCard({ origin, shot }: { origin: string; shot: LookShot }) {
                 preload="metadata"
                 src={outputSrc(origin, shot.after_url) ?? undefined}
                 poster={outputSrc(origin, poster(shot.after_url)) ?? undefined}
-                aria-label={`Segment ${shot.index + 1} after`}
+                aria-label={`Scene ${shot.index + 1} after`}
               />
               <Boxes regions={shot.regions ?? []} />
             </div>
@@ -2294,10 +2406,10 @@ function PreviewStep({
   return (
     <>
       <h1>
-        Segment {preview.index + 1} of {preview.count}
+        Scene {preview.index + 1} of {preview.count}
       </h1>
       <p className="lede">
-        A few seconds of this segment, before and after. Approve it, or tell me
+        A few seconds of this scene, before and after. Approve it, or tell me
         what to change.
       </p>
       {preview.scale ? (
@@ -2316,12 +2428,12 @@ function PreviewStep({
           disabled={busy}
           onClick={() => void onSend("preview", { action: "approve" })}
         >
-          {last ? "Approve and finish" : "Approve and go to the next segment"}
+          {last ? "Approve and finish" : "Approve and go to the next scene"}
         </button>
       </div>
       <form onSubmit={redo}>
         <label htmlFor="preview-note">
-          Not right? Tell me what to change in this segment
+          Not right? Tell me what to change in this scene
           <input
             id="preview-note"
             type="text"
@@ -2341,7 +2453,7 @@ function PreviewStep({
         </label>
         <div className="actions">
           <button type="submit" className="secondary" disabled={busy}>
-            Redo this segment
+            Redo this scene
           </button>
         </div>
       </form>
@@ -2367,7 +2479,7 @@ function UpscaleToggle({
   return (
     <div className="actions">
       <p className="muted">
-        {who} chose: this segment {on ? "uses upscaling" : "skips upscaling (plain resize)"}.
+        {who} chose: this scene {on ? "uses upscaling" : "skips upscaling (plain resize)"}.
       </p>
       <button
         type="button"
@@ -2375,7 +2487,7 @@ function UpscaleToggle({
         disabled={busy}
         onClick={() => void onSend("preview", { action: "upscale", on: on ? "0" : "1" })}
       >
-        {on ? "Skip upscaling for this segment" : "Use upscaling for this segment"}
+        {on ? "Skip upscaling for this scene" : "Use upscaling for this scene"}
       </button>
     </div>
   );
@@ -2413,7 +2525,7 @@ function ReadyStep({
           return (
             <li key={shot.index}>
               {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
-              {shot.label || "Unlabelled segment"}:{" "}
+              {shot.label || "Unlabelled scene"}:{" "}
               {shot.use_upscale === false ? `No upscaling: resized only. ${summary}` : summary}
             </li>
           );

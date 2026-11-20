@@ -32,7 +32,6 @@ const {
   scenesText,
   splitRange,
   splitSuggestion,
-  timeAt,
   withCutAt,
   withMerge,
   withSplit,
@@ -126,14 +125,6 @@ test("withCutAt draws a cut being moved without changing the others", () => {
   assert.deepEqual(moved, scenes(0, 10, 14, 30));
   assert.deepEqual(list, scenes(0, 10, 20, 30), "the list given is left alone");
   assert.equal(withCutAt(list, 2, 25), list);
-});
-
-test("timeAt turns a pointer position into a time on the timeline", () => {
-  assert.equal(timeAt(150, 100, 200, 60), 15);
-  assert.equal(timeAt(50, 100, 200, 60), 0);
-  assert.equal(timeAt(400, 100, 200, 60), 60);
-  assert.equal(timeAt(133, 100, 200, 60), 9.9);
-  assert.equal(timeAt(150, 100, 0, 60), 0);
 });
 
 test("times are written and read the way the editor sees them", () => {
