@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   just as it finished) could be applied in the middle of that work and
   be overwritten by it. Actions and background work now take turns, and
   the wizard counts as busy until the work has fully wrapped up.
+- A failed first render no longer throws the job away. The wizard goes
+  back to "Ready to render" with the error and every approved scene kept,
+  so pressing Render again retries it; the job is no longer marked failed.
+  A render started from the result screen's segments that fails now puts
+  back the settings the existing result was made with, and a failure after
+  the new video is already in place (such as the seam check) shows that
+  new video rather than the old settings.
 - A page left open on an old job could change the job another window had
   since opened. Such a request is now refused with "this job is no longer
   open in this window".

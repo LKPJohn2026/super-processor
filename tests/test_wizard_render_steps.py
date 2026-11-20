@@ -13,6 +13,8 @@ import pytest
 from super_processor.gemini import GeminiError
 from super_processor.jobs import JobState
 from super_processor.review import WizardServer
+from super_processor.shot_plan import ShotPlan, ShotRecipe, save_plan
+from super_processor.shots import Shot, ShotList, save_shots
 from super_processor.upscale import FakeUpscaleEngine, UpscaleError
 from super_processor.wizard import (
     WizardController,
@@ -174,7 +176,7 @@ class _NoGemini:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
+def test_failed_first_upscale_goes_back_to_ready_to_render(tmp_path: Path) -> None:
     clip = tmp_path / "real.mp4"
     subprocess.run(
         [
@@ -227,17 +229,92 @@ def test_failed_first_upscale_returns_to_pick(tmp_path: Path) -> None:
     assert controller.current_state().step is WizardStep.RENDERING
     controller._upscale = _BrokenEngine()
     controller.run_render()
+    # The approved scenes are kept: back to "Ready to render" on the same
+    # job, which is not marked failed, so the editor can simply try again.
     state = controller.current_state()
-    assert state.step is WizardStep.PICK_FILE
-    assert state.job_id is None
+    assert state.step is WizardStep.READY_TO_RENDER
+    assert state.job_id == job_id
+    assert (state.segment_index, state.approved_count) == (1, 1)
+    assert state.error is not None
+    assert "no result yet" in state.error and "CUDA" in state.error
+    assert controller.store.load(job_id).state is not JobState.FAILED
+    assert controller.api_view()["run"]["outcome"] == "failed"
+    page = controller.render()
+    assert "Ready to render" in page and "CUDA" in page
+    # With the GPU back, the same render goes through to the result.
+    controller._upscale = FakeUpscaleEngine()
+    controller.handle_post("/ready", {"action": ["render"]})
+    assert controller.current_state().step is WizardStep.RENDERING
+    controller.run_render()
+    state = controller.current_state()
+    assert (state.step, state.job_id, state.error) == (
+        WizardStep.RESULT,
+        job_id,
+        None,
+    )
+
+
+def _seed_scenes(job_dir: Path) -> None:
+    """Two approved scenes, as the segment loop leaves them."""
+    save_shots(
+        job_dir,
+        ShotList(shots=[Shot(0.0, 4.0, label="first"), Shot(4.0, 8.0, label="second")]),
+    )
+    save_plan(
+        job_dir,
+        ShotPlan(
+            scale=2,
+            recipes=[
+                ShotRecipe(strength=0.4, rev=1, reason="planned"),
+                ShotRecipe(strength=0.3, rev=1, reason="planned"),
+            ],
+        ),
+    )
+
+
+def _fail_render(controller: WizardController) -> WizardState:
+    def _boom() -> None:
+        raise UpscaleError("SPAN needs an NVIDIA GPU with CUDA")
+
+    controller._run_render = _boom  # type: ignore[method-assign]
+    assert controller.start_render() is True
+    assert controller.wait_idle(timeout=5)
+    return controller.current_state()
+
+
+def test_a_failed_first_render_keeps_the_approved_scenes(tmp_path: Path) -> None:
+    controller, job_id, job_dir = _seed_job(tmp_path)
+    _seed_scenes(job_dir)
+    controller._save(WizardState(step=WizardStep.RENDERING, job_id=job_id))
+    state = _fail_render(controller)
+    assert (state.step, state.job_id) == (WizardStep.READY_TO_RENDER, job_id)
+    assert (state.segment_index, state.approved_count) == (2, 2)
+    assert state.error is not None and "CUDA" in state.error
+    assert controller.store.load(job_id).state is not JobState.FAILED
+    assert (job_dir / "shots.json").is_file()
+    assert (job_dir / "shot_plan.json").is_file()
+
+
+@pytest.mark.parametrize("damage", ["truncated_shots", "plan_without_recipes"])
+def test_a_failed_first_render_with_unreadable_scenes_goes_back_to_pick(
+    tmp_path: Path, damage: str
+) -> None:
+    controller, job_id, job_dir = _seed_job(tmp_path)
+    _seed_scenes(job_dir)
+    if damage == "truncated_shots":
+        text = (job_dir / "shots.json").read_text(encoding="utf-8")
+        (job_dir / "shots.json").write_text(text[: len(text) // 2], encoding="utf-8")
+    else:
+        raw = json.loads((job_dir / "shot_plan.json").read_text(encoding="utf-8"))
+        del raw["recipes"]
+        (job_dir / "shot_plan.json").write_text(json.dumps(raw), encoding="utf-8")
+    controller._save(WizardState(step=WizardStep.RENDERING, job_id=job_id))
+    state = _fail_render(controller)
+    assert (state.step, state.job_id) == (WizardStep.PICK_FILE, None)
     assert state.error is not None
     assert "no result yet" in state.error and "CUDA" in state.error
     assert controller.store.load(job_id).state is JobState.FAILED
-    page = controller.render()
-    assert "Pick" in page and "CUDA" in page
-    # Picking again starts a fresh job.
-    controller.handle_post("/pick", {"path": [str(clip)]})
-    assert controller.current_state().job_id not in {None, job_id}
+    assert controller.start_render() is False
 
 
 def test_start_new_job_from_done_and_result(

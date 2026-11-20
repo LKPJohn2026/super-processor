@@ -521,6 +521,10 @@ class _Run:
     # Until the run commits its result, a stop can still undo it.
     cancellable: bool = True
     committed: bool = False
+    # True once a render's ``render_plan`` returned: ``output.mp4`` now holds
+    # the new plan, so a later failure (the probe, the seam check, a save)
+    # must keep that plan rather than restore the old one.
+    rendered: bool = False
     # True once a stop has been landed (the state saved as stopped).
     landed: bool = False
     # The worker thread that owns the run; only it may mark the run failed.
@@ -1138,25 +1142,52 @@ class WizardController:
         self._save(WizardState(step=step))
 
     def _render_failed(self, state: WizardState, detail: str) -> None:
-        """A render failed. Keep a previous result if there is one.
+        """A render failed. Keep whatever the editor already had.
 
-        When a revise fails, the earlier ``output.mp4`` is still good, so the
-        user stays on the result screen with the error. When the first upscale
-        fails there is nothing to show; the job is marked failed and the user
-        goes back to the pick screen to fix the cause or choose another file.
+        The renderer replaces ``output.mp4`` in one step, so the file on disk
+        is either the old output or the new one. The rules, in order:
+
+        1. The render finished (``render_plan`` returned) and a later step
+           failed, such as the probe, the seam check or a save: the output
+           holds the new plan, so the result screen shows it with the error.
+        2. The render did not finish and there is an earlier output: it is
+           untouched, so the plan goes back to the one it holds (the copy
+           ``_ready_post`` or ``_result_post`` kept) and the result screen
+           shows it with the error. A failed rescale would otherwise pin
+           later notes to a size it never reached.
+        3. There is no output yet, but the approved scenes are still on
+           disk: back to "Ready to render" with the error, so the editor can
+           try again. The job is kept as it is and nothing is deleted.
+        4. Otherwise (the scenes cannot be read back) the job is marked
+           failed and the editor goes back to the pick screen.
         """
-        self._mark_failed(self._run)
+        run = self._run
+        self._mark_failed(run)
         assert state.job_id
         job_id = state.job_id
         job_dir = self.store.job_dir(job_id)
+        before = job_dir / _PLAN_BEFORE_NOTE
         state.notice = None
-        if (job_dir / "output.mp4").is_file():
-            # The plan goes back to what the file on disk holds. A failed
-            # rescale would otherwise pin later notes to a size it never reached.
+        state.progress = None
+        has_output = (job_dir / "output.mp4").is_file()
+        if run is not None and run.rendered:
+            before.unlink(missing_ok=True)
+            self._settle_rendered_plan(job_dir)
+        elif has_output and before.is_file():
             with contextlib.suppress(OSError):
-                (job_dir / _PLAN_BEFORE_NOTE).replace(job_dir / UPSCALE_PLAN_FILE)
+                before.replace(job_dir / UPSCALE_PLAN_FILE)
+        if has_output or (run is not None and run.rendered):
             state.error = detail
             state.step = WizardStep.RESULT
+            self._save(state)
+            return
+        # A copy of a plan with no output to go with it means nothing.
+        before.unlink(missing_ok=True)
+        scenes = self._approved_scene_count(job_dir)
+        if scenes:
+            state.error = f"The render failed, so there is no result yet: {detail}"
+            state.segment_index = state.approved_count = scenes
+            state.step = WizardStep.READY_TO_RENDER
             self._save(state)
             return
         with contextlib.suppress(JobError):
@@ -1167,6 +1198,33 @@ class WizardController:
             WizardState(step=WizardStep.PICK_FILE, job_id=job_id, error=message),
         )
         self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
+
+    def _settle_rendered_plan(self, job_dir: Path) -> None:
+        """Clear the plan's pending span once the output holds it.
+
+        Best effort: a render that failed after its output was written may
+        not have got as far as saving this itself.
+        """
+        with contextlib.suppress(OSError, UpscaleError, ValueError, TypeError):
+            plan = load_upscale_plan(job_dir)
+            if plan is not None and plan.pending is not None:
+                save_upscale_plan(job_dir, replace(plan, pending=None))
+
+    def _approved_scene_count(self, job_dir: Path) -> int:
+        """How many approved scenes a new render can start from, or 0.
+
+        0 when the shots or the plan are missing, unreadable, or do not
+        match one to one.
+        """
+        try:
+            shots = load_shots(job_dir)
+            plan = load_plan(job_dir)
+            if shots is None or plan is None:
+                return 0
+            count = len(plan.recipes)
+            return count if count and count == len(shots.shots) else 0
+        except (ShotPlanError, ShotError, OSError, KeyError, TypeError, ValueError):
+            return 0
 
     def _goto(self, state: WizardState, target: str) -> None:
         """Go back (or forward again) to setup, the file pick, or the segments.
@@ -1928,11 +1986,29 @@ class WizardController:
             save_plan(job_dir, plan)
         self._fit_plan_scale(job_dir, plan)
         try:
-            save_upscale_plan(job_dir, plan.to_upscale_plan(shots))
+            upscale_plan = plan.to_upscale_plan(shots)
+            self._keep_plan_before_render(job_dir)
+            save_upscale_plan(job_dir, upscale_plan)
             state.step = WizardStep.RENDERING
-        except ShotPlanError as exc:
+        except (ShotPlanError, OSError) as exc:
             state.error = str(exc)
         self._save(state)
+
+    def _keep_plan_before_render(self, job_dir: Path) -> None:
+        """Keep the plan the current ``output.mp4`` holds, before a new
+        render replaces it, so a render that fails or is stopped can put it
+        back (see :meth:`_render_failed`). Nothing is kept without an output.
+        """
+        before = job_dir / _PLAN_BEFORE_NOTE
+        held: UpscalePlan | None = None
+        if (job_dir / "output.mp4").is_file():
+            # An unreadable plan cannot be put back; the render still runs.
+            with contextlib.suppress(UpscaleError, OSError, ValueError):
+                held = load_upscale_plan(job_dir)
+        if held is None:
+            before.unlink(missing_ok=True)
+            return
+        write_text_atomic(before, json.dumps(held.to_dict(), indent=2) + "\n")
 
     def _source_size(self, job_id: str) -> tuple[int, int]:
         source = Path(self.store.load(job_id).source_path)
@@ -2020,8 +2096,8 @@ class WizardController:
             updated = replace_overlapping(
                 plan, patch, duration, preserve_shot_settings=True
             )
-            (job_dir / _PLAN_BEFORE_NOTE).write_text(
-                json.dumps(plan.to_dict(), indent=2) + "\n", encoding="utf-8"
+            write_text_atomic(
+                job_dir / _PLAN_BEFORE_NOTE, json.dumps(plan.to_dict(), indent=2) + "\n"
             )
             save_upscale_plan(job_dir, updated)
             state.error = None
@@ -2082,9 +2158,13 @@ class WizardController:
         source = Path(self.store.load(state.job_id).source_path)
         output = job_dir / "output.mp4"
         # A render from a result note revises the output: its percentage is
-        # its own. Only that path leaves the plan before the note behind; a
-        # job re-planned from the segments renders as part of the whole job.
-        self._revising = (job_dir / _PLAN_BEFORE_NOTE).is_file()
+        # its own. Only a note leaves a pending span on the plan; a job
+        # re-planned from the segments renders as part of the whole job.
+        try:
+            held = load_upscale_plan(job_dir)
+        except (UpscaleError, OSError, ValueError):
+            held = None
+        self._revising = held is not None and held.pending is not None
         self._progress(state, "rendering", 5, "Upscaling on the GPU")
         self._heat_note = None
         watch = SlowdownWatch()
@@ -2115,6 +2195,8 @@ class WizardController:
                 on_revise_range=lambda start, end: revised_ranges.append((start, end)),
             )
             # The output now holds this plan, so a later failure must keep it.
+            if self._run is not None:
+                self._run.rendered = True
             (job_dir / _PLAN_BEFORE_NOTE).unlink(missing_ok=True)
             # The renderer probes the old output's keyframes (after legacy
             # delivery conversion, if needed). Keep its actual splice edges,

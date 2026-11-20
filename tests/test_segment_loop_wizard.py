@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from dataclasses import replace
 from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,14 @@ from loop_driver import to_ready
 
 from super_processor.review import WizardServer
 from super_processor.shot_plan import load_plan
-from super_processor.upscale import FakeUpscaleEngine, UpscaleRequest, UpscaleSpan
+from super_processor.upscale import (
+    FakeUpscaleEngine,
+    UpscaleError,
+    UpscaleRequest,
+    UpscaleSpan,
+    load_upscale_plan,
+    save_upscale_plan,
+)
 from super_processor.wizard import (
     WizardController,
     WizardError,
@@ -465,15 +473,17 @@ def test_only_a_render_from_a_result_note_counts_on_its_own(
     assert (job_dir / "output.mp4").is_file()
 
     # Rendering again with an output on disk, but not from a note (the job
-    # went back through the segments): still the render band of the job.
-    state.step = WizardStep.RENDERING
+    # went back through the segments): still the render band of the job,
+    # even though /ready now keeps the plan the output holds.
+    state.step = WizardStep.READY_TO_RENDER
     controller._save(state)
+    controller.handle_post("/ready", {"action": ["render"]})
+    assert (job_dir / wizard_module._PLAN_BEFORE_NOTE).is_file()
     assert _run(controller, "start_render").step is WizardStep.RESULT
-    # A result note leaves the plan before the note behind: a revise.
-    plan_file = job_dir / "upscale_plan.json"
-    (job_dir / wizard_module._PLAN_BEFORE_NOTE).write_text(
-        plan_file.read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    # A result note leaves a pending span on the plan: a revise.
+    plan = load_upscale_plan(job_dir)
+    assert plan is not None
+    save_upscale_plan(job_dir, replace(plan, pending=plan.spans[0]))
     state = controller.current_state()
     state.step = WizardStep.RENDERING
     controller._save(state)
@@ -598,3 +608,92 @@ def test_result_strength_for_one_recipe_or_none() -> None:
     assert strength_summary(same) == "strength 0.40"
     off = (UpscaleSpan(0.0, 5.0, use_upscale=False),)
     assert strength_summary(off) == "upscaling off"
+
+
+@needs_ffmpeg
+def test_a_failed_render_after_going_back_to_the_segments_keeps_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A result, then back to the segments and a new render at another scale.
+    # The new render fails before it replaces output.mp4, so the result
+    # screen comes back with the old output and the plan that output holds.
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Gemini(),  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
+    controller.handle_post("/ready", {"action": ["render"]})
+    assert _run(controller, "start_render").step is WizardStep.RESULT
+    output = (job_dir / "output.mp4").read_bytes()
+    plan_file = job_dir / "upscale_plan.json"
+    held = plan_file.read_text(encoding="utf-8")
+    assert json.loads(held)["spans"][0]["scale"] == 2
+
+    controller.handle_post("/goto", {"to": ["segments"]})
+    assert controller.current_state().step is WizardStep.SEGMENTS
+    controller.handle_post("/segments", {"action": ["approve"]})
+    state = controller.current_state()
+    while state.step in (WizardStep.ANALYZING, WizardStep.PREVIEW_SEGMENT):
+        if state.step is WizardStep.ANALYZING:
+            controller.run_analyze()
+        else:
+            controller.handle_post("/preview", {"action": ["approve"]})
+        state = controller.current_state()
+    assert state.step is WizardStep.READY_TO_RENDER, state.error
+    controller.handle_post("/ready", {"action": ["render"], "scale": ["1"]})
+    assert json.loads(plan_file.read_text(encoding="utf-8"))["spans"][0]["scale"] == 1
+
+    def _no_gpu(*_args: Any, **_kwargs: Any) -> Path:
+        raise UpscaleError("SPAN needs an NVIDIA GPU with CUDA")
+
+    monkeypatch.setattr("super_processor.wizard.render_plan", _no_gpu)
+    state = _run(controller, "start_render")
+    assert state.step is WizardStep.RESULT
+    assert state.error is not None and "CUDA" in state.error
+    assert (job_dir / "output.mp4").read_bytes() == output
+    assert plan_file.read_text(encoding="utf-8") == held
+    assert controller.api_view()["run"]["outcome"] == "failed"
+
+
+@needs_ffmpeg
+def test_a_failure_after_the_output_is_written_keeps_the_new_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The new output is in place when the seam report cannot be written:
+    # the result screen shows it, and the plan stays the one it holds.
+    from super_processor import wizard as wizard_module
+
+    controller = WizardController(
+        tmp_path / "jobs",
+        gemini=_Gemini(),  # type: ignore[arg-type]
+        upscale_engine=FakeUpscaleEngine(),
+    )
+    job_dir = to_ready(controller, _clip(tmp_path / "in.mp4"))
+    controller.handle_post("/ready", {"action": ["render"]})
+    assert _run(controller, "start_render").step is WizardStep.RESULT
+    plan = load_upscale_plan(job_dir)
+    assert plan is not None
+    # A result note: the old plan is kept beside the revised one.
+    revised = replace(plan, pending=replace(plan.spans[0], strength=0.9))
+    (job_dir / wizard_module._PLAN_BEFORE_NOTE).write_text(
+        json.dumps(plan.to_dict()), encoding="utf-8"
+    )
+    save_upscale_plan(job_dir, revised)
+    state = controller.current_state()
+    state.step = WizardStep.RENDERING
+    controller._save(state)
+    before = (job_dir / "output.mp4").stat().st_mtime_ns
+
+    def _full_disk(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(controller, "_check_seams", _full_disk)
+    state = _run(controller, "start_render")
+    assert state.step is WizardStep.RESULT
+    assert state.error == "no space left on device"
+    assert (job_dir / "output.mp4").stat().st_mtime_ns != before
+    assert not (job_dir / wizard_module._PLAN_BEFORE_NOTE).exists()
+    kept = load_upscale_plan(job_dir)
+    assert kept is not None and kept.pending is None
+    assert kept.spans == revised.spans
