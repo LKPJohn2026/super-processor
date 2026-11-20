@@ -6,6 +6,7 @@ import json
 import shutil
 import socket
 import subprocess
+import threading
 from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,13 @@ from super_processor.review import (
     form_fields_from_body,
 )
 from super_processor.upscale import FakeUpscaleEngine
-from super_processor.wizard import WizardController, WizardError, WizardStep
+from super_processor.wizard import (
+    WizardController,
+    WizardError,
+    WizardState,
+    WizardStep,
+    save_session_state,
+)
 
 TOKEN = "test-token"
 
@@ -86,6 +93,7 @@ def test_api_state_and_cors_before_a_job(tmp_path: Path) -> None:
         assert status == 200
         assert payload["step"] == "intro"
         assert payload["output_ready"] is False
+        assert payload["run"] is None
         assert allow == "http://127.0.0.1:5173"
         connection = _connection(base)
         connection.request(
@@ -334,6 +342,79 @@ def test_html_post_still_redirects(tmp_path: Path) -> None:
         with urlopen(request) as response:
             html = response.read().decode()
         assert "What type of LLM" in html
+    finally:
+        server.stop()
+
+
+def test_run_keeps_its_id_across_polls(tmp_path: Path) -> None:
+    controller = WizardController(tmp_path)
+    (tmp_path / "job00001").mkdir()
+    save_session_state(
+        tmp_path, WizardState(step=WizardStep.RENDERING, job_id="job00001")
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _slow_render() -> None:
+        entered.set()
+        release.wait(5)
+        save_session_state(tmp_path, WizardState(step=WizardStep.PICK_FILE))
+
+    controller._run_render = _slow_render  # type: ignore[method-assign]
+    server = WizardServer(tmp_path, token=TOKEN, controller=controller)
+    base = server.start()
+    try:
+        status, started, _origin = _json_request(base, "GET", "/api/render?run=1")
+        assert status == 200
+        assert entered.wait(5)
+        _status, first, _origin = _json_request(base, "GET", "/api/state")
+        _status, second, _origin = _json_request(base, "GET", "/api/state")
+        assert first["busy"] is True
+        assert first["run"]["outcome"] == "running"
+        assert first["run"]["kind"] == "render"
+        assert first["run"]["job_id"] == "job00001"
+        assert first["run"]["finished_at"] is None
+        assert second["run"]["id"] == first["run"]["id"]
+        release.set()
+        assert controller.wait_idle(timeout=5)
+        _status, after, _origin = _json_request(base, "GET", "/api/state")
+        assert after["busy"] is False
+        assert after["run"]["id"] == first["run"]["id"]
+        assert after["run"]["outcome"] == "done"
+        assert after["run"]["finished_at"] >= after["run"]["started_at"]
+    finally:
+        release.set()
+        server.stop()
+
+
+def test_a_post_for_a_job_no_longer_open_is_409(tmp_path: Path) -> None:
+    (tmp_path / "job00002").mkdir()
+    save_session_state(tmp_path, WizardState(step=WizardStep.INTRO, job_id="job00002"))
+    server = WizardServer(tmp_path, token=TOKEN)
+    base = server.start()
+    try:
+        status, body, _origin = _json_request(
+            base, "POST", "/api/intro", {"job_id": "job00001"}
+        )
+        assert status == 409
+        assert body["error"] == "this job is no longer open in this window"
+        status, body, _origin = _json_request(
+            base, "POST", "/api/intro", {"job_id": "job00002"}
+        )
+        assert status == 200 and body["step"] == "llm_choice"
+        html = Request(
+            base + "/intro",
+            data=b"job_id=job00001",
+            headers={
+                "X-Wizard-Token": TOKEN,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as refused:
+            urlopen(html)
+        assert refused.value.code == 409
+        refused.value.close()
     finally:
         server.stop()
 

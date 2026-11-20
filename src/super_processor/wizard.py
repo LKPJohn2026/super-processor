@@ -8,14 +8,15 @@ import shutil
 import threading
 import time
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .atomic_io import read_text_retrying, write_text_atomic
+from .cancel import Cancelled
 from .file_dialog import VIDEO_EXTENSIONS, FileDialogError, choose_video
 from .gemini import (
     ChatTurn,
@@ -142,6 +143,15 @@ class WizardError(RuntimeError):
     """Raised when a wizard step cannot complete."""
 
 
+class WizardConflict(WizardError):
+    """A request was meant for a job this window no longer has open.
+
+    The page sent the ``job_id`` it was showing, and another window (or a
+    new pick) has since moved the wizard to a different job. The server
+    answers 409 so the page reloads instead of changing the wrong job.
+    """
+
+
 class WizardStep(str, Enum):
     """Persisted wizard screen."""
 
@@ -182,6 +192,22 @@ _RETIRED_MESSAGE = (
 
 _SEGMENTING_STEPS = frozenset({WizardStep.SAMPLING, WizardStep.PROPOSING})
 
+RunKind = Literal["segmenting", "analyze", "render"]
+RunOutcome = Literal["running", "done", "failed", "stopped"]
+# The steps each kind of run works on. A run starts only on one of them.
+_RUN_STEPS: dict[str, frozenset[WizardStep]] = {
+    "segmenting": _SEGMENTING_STEPS,
+    "analyze": frozenset({WizardStep.ANALYZING}),
+    "render": frozenset({WizardStep.RENDERING}),
+}
+# How long starting a worker waits for a POST in progress to finish.
+_POST_WAIT_S = 30.0
+_JOB_CONFLICT_MESSAGE = "this job is no longer open in this window"
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
 
 @dataclass(slots=True)
 class WizardState:
@@ -196,6 +222,14 @@ class WizardState:
     progress: dict[str, Any] | None = None
     # Shown as the error once the render in progress succeeds.
     notice: str | None = None
+    # How many segments the editor has approved so far. It never trails
+    # segment_index, which can go back to reopen an earlier segment.
+    approved_count: int = 0
+    # Why the last run stopped when the editor stopped it, shown until the
+    # next action.
+    stopped: str | None = None
+    # The result note the render in progress was asked for.
+    render_note: str | None = None
     schema_version: int = WIZARD_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -207,6 +241,9 @@ class WizardState:
             "segment_index": self.segment_index,
             "progress": self.progress,
             "notice": self.notice,
+            "approved_count": self.approved_count,
+            "stopped": self.stopped,
+            "render_note": self.render_note,
         }
 
     @classmethod
@@ -219,14 +256,24 @@ class WizardState:
         if raw_step in _SHOT_FLOW_STEPS:
             return cls(step=WizardStep.PICK_FILE, error=_SHOT_FLOW_MESSAGE)
         index = data.get("segment_index", 0)
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            index = 0
+        # Files saved before approved_count existed approved every segment
+        # before the current one.
+        approved = data.get("approved_count")
+        if not isinstance(approved, int) or isinstance(approved, bool) or approved < 0:
+            approved = index
         progress = data.get("progress")
         return cls(
             step=WizardStep(raw_step),
             job_id=data.get("job_id"),
             error=data.get("error"),
-            segment_index=index if isinstance(index, int) and index >= 0 else 0,
+            segment_index=index,
             progress=progress if isinstance(progress, dict) else None,
             notice=data.get("notice"),
+            approved_count=max(approved, index),
+            stopped=_optional_str(data.get("stopped")),
+            render_note=_optional_str(data.get("render_note")),
         )
 
 
@@ -456,6 +503,60 @@ def _aged(progress: dict[str, Any] | None, now: float) -> dict[str, Any] | None:
     return aged
 
 
+@dataclass(slots=True)
+class _Run:
+    """One foreground run (segmenting, analyze or render) and how it ended.
+
+    ``api_view`` shows it as ``run``, so a page can tell a run that finished
+    from one that failed or was stopped, even after the step has moved on.
+    """
+
+    kind: RunKind
+    job_id: str | None
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    started_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    outcome: RunOutcome = "running"
+    cancel: threading.Event = field(default_factory=threading.Event)
+    # Until the run commits its result, a stop can still undo it.
+    cancellable: bool = True
+    committed: bool = False
+    # True once a stop has been landed (the state saved as stopped).
+    landed: bool = False
+    # The worker thread that owns the run; only it may mark the run failed.
+    thread_id: int = field(default_factory=threading.get_ident)
+    # The controller's cancel guard, so a stop and a commit never interleave.
+    guard: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def check(self) -> None:
+        """Raise :class:`Cancelled` once the editor has asked to stop."""
+        if self.cancel.is_set():
+            raise Cancelled
+
+    def commit(self) -> None:
+        """Make the run's result final: from here on it cannot be stopped.
+
+        Raises :class:`Cancelled` instead when a stop came first.
+        """
+        with self.guard:
+            if self.cancel.is_set():
+                raise Cancelled
+            self.cancellable = False
+            self.committed = True
+
+    def view(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "job_id": self.job_id,
+            "started_at": round(self.started_at, 3),
+            "finished_at": (
+                None if self.finished_at is None else round(self.finished_at, 3)
+            ),
+            "outcome": self.outcome,
+        }
+
+
 class WizardController:
     """Drive wizard actions against a jobs directory."""
 
@@ -485,6 +586,16 @@ class WizardController:
         self._work_lock = threading.Lock()
         self._worker_guard = threading.Lock()
         self._worker: threading.Thread | None = None
+        # Held for the whole of a POST, and while a worker starts, so a worker
+        # never starts in the middle of a POST's read-modify-save.
+        self._post_lock = threading.RLock()
+        # A run's progress save and the landing of its failure (or stop) go
+        # one at a time, so a late progress save never lands after them.
+        self._state_lock = threading.RLock()
+        # Guards the run record: setting it, reading it, stopping it.
+        self._cancel_guard = threading.Lock()
+        self._run: _Run | None = None
+        self._last_run: _Run | None = None
         # The running worker's time-left estimate, per measurable task.
         self._clock: StepClock | None = None
         self._clock_task = ""
@@ -519,8 +630,13 @@ class WizardController:
         return self.current_state()
 
     def busy(self) -> bool:
-        """True while a shot scan or a render pass is running."""
-        return self._work_lock.locked()
+        """True while a worker runs: from its start until its thread ends.
+
+        This covers the moment before a new worker takes the work lock and
+        the progress clean-up after it lets go, so no POST lands in between.
+        """
+        worker = self._worker
+        return self._work_lock.locked() or (worker is not None and worker.is_alive())
 
     def start_render(self) -> bool:
         """Run :meth:`run_render` on a worker thread. False if not started."""
@@ -546,23 +662,26 @@ class WizardController:
         self, step: WizardStep | frozenset[WizardStep], target: Callable[[], None]
     ) -> bool:
         steps = step if isinstance(step, frozenset) else frozenset({step})
-        with self._worker_guard:
-            if self._worker is not None and self._worker.is_alive():
-                return False
-            if self.busy():
-                return False
-            current = self._state().step
-            if current not in steps:
-                return False
-            worker = threading.Thread(
-                target=self._run_worker,
-                args=(target,),
-                name=f"wizard-{current.value}",
-                daemon=True,
-            )
-            self._worker = worker
-            worker.start()
-            return True
+        if not self._post_lock.acquire(timeout=_POST_WAIT_S):
+            return False
+        try:
+            with self._worker_guard:
+                if self.busy():
+                    return False
+                current = self._state().step
+                if current not in steps:
+                    return False
+                worker = threading.Thread(
+                    target=self._run_worker,
+                    args=(target,),
+                    name=f"wizard-{current.value}",
+                    daemon=True,
+                )
+                self._worker = worker
+                worker.start()
+                return True
+        finally:
+            self._post_lock.release()
 
     def _begin_step(self) -> None:
         """Start the clocks for a worker step (called under the work lock)."""
@@ -572,22 +691,101 @@ class WizardController:
         self._revising = False
 
     def _run_worker(self, target: Callable[[], None]) -> None:
+        # A run lands its own failure under the work lock (see _running).
+        # This only catches a crash outside any run, such as an unreadable
+        # state file; busy() stays true until this thread ends, so no POST
+        # lands in between.
         try:
             target()
             self._clear_progress()
         except Exception as exc:  # noqa: BLE001 - surfaced on the page
+            self._land_failure(None, exc)
+
+    @contextlib.contextmanager
+    def _running(self, kind: RunKind) -> Iterator[_Run | None]:
+        """Hold the work lock for one run of ``kind`` and record how it ends.
+
+        Yields ``None`` without doing anything when another run holds the
+        lock or the wizard is not on one of the run's steps; no run is
+        recorded then. Otherwise yields the new run. An exception from the
+        body is landed under the lock (the step's failure screen is saved),
+        and the run's outcome is set before the lock is released, so a page
+        that sees ``busy`` false also sees how the run ended.
+        """
+        if not self._work_lock.acquire(blocking=False):
+            yield None
+            return
+        run: _Run | None = None
+        try:
             state = self._state()
-            state.error = str(exc) or type(exc).__name__
-            if state.step is WizardStep.RENDERING:
-                self._render_failed(state, str(exc) or type(exc).__name__)
+            if state.job_id and state.step in _RUN_STEPS[kind]:
+                run = _Run(kind=kind, job_id=state.job_id, guard=self._cancel_guard)
+            with self._cancel_guard:
+                self._run = run
+            if run is None:
+                yield None
                 return
-            if state.step in _SEGMENTING_STEPS:
-                self._segmenting_failed(state, str(exc) or type(exc).__name__)
-                return
-            if state.step is WizardStep.ANALYZING:
-                self._analyze_failed(state, str(exc) or type(exc).__name__)
-                return
-            self._save(state)
+            self._begin_step()
+            try:
+                yield run
+            except Cancelled:
+                run.outcome = "stopped"
+                raise
+            except Exception as exc:  # noqa: BLE001 - surfaced on the page
+                self._land_failure(run, exc)
+        finally:
+            if run is not None:
+                run.finished_at = time.time()
+                if run.outcome == "running":
+                    run.outcome = "done"
+            with self._cancel_guard:
+                if run is not None:
+                    self._last_run = replace(run)
+                self._run = None
+            self._work_lock.release()
+
+    def _mark_failed(self, run: _Run | None) -> None:
+        """Record that ``run`` failed. Only the run's own thread can do this,
+        so a late call from elsewhere never marks a newer run."""
+        if run is not None and run.thread_id == threading.get_ident():
+            run.outcome = "failed"
+
+    def _land_failure(self, run: _Run | None, exc: Exception) -> None:
+        """Save the failure screen for the step a run crashed on."""
+        detail = str(exc) or type(exc).__name__
+        with self._state_lock:
+            self._mark_failed(run)
+            try:
+                state = self._state()
+                state.error = detail
+                if state.step is WizardStep.RENDERING:
+                    self._render_failed(state, detail)
+                elif state.step in _SEGMENTING_STEPS:
+                    self._segmenting_failed(state, detail)
+                elif state.step is WizardStep.ANALYZING:
+                    self._analyze_failed(state, detail)
+                else:
+                    self._save(state)
+            except Exception as again:  # noqa: BLE001 - last resort
+                # The failure screen itself failed (a bad job folder, a full
+                # disk); go back to the pick screen with both errors rather
+                # than leave the job looking as if it still runs.
+                message = f"{detail} (and saving that failed: {again})"
+                with contextlib.suppress(Exception):
+                    self._save(WizardState(step=WizardStep.PICK_FILE, error=message))
+
+    def _public_run(self, state: WizardState) -> dict[str, Any] | None:
+        """The run in progress, else the last one, for ``api_view``."""
+        with self._cancel_guard:
+            run = self._run or self._last_run
+            view = None if run is None else run.view()
+        if view is None:
+            return None
+        # The run has finished its step (the result screen is saved) and is
+        # only tidying up; the page can treat it as done.
+        if view["outcome"] == "running" and state.step not in _RUN_STEPS[view["kind"]]:
+            view["outcome"] = "done"
+        return view
 
     def _progress(
         self,
@@ -634,7 +832,11 @@ class WizardController:
         }
         if self._heat_note:
             state.progress["note"] = self._heat_note
-        self._save(state)
+        with self._state_lock:
+            run = self._run
+            if run is not None:
+                run.check()
+            self._save(state)
 
     def _segment_count(self, state: WizardState) -> int:
         if not state.job_id:
@@ -790,6 +992,10 @@ class WizardController:
     def api_view(self) -> dict[str, Any]:
         """JSON snapshot of the current step for a separate UI shell."""
         state = self._state()
+        # Read busy before the run: a run's outcome is set before it lets go
+        # of the work lock, so "not busy" is never paired with "running".
+        busy = self.busy()
+        run = self._public_run(state)
         output_ready = False
         output_url: str | None = None
         scale: int | None = None
@@ -820,10 +1026,11 @@ class WizardController:
             )
         return {
             "step": state.step.value,
-            "busy": self.busy(),
+            "busy": busy,
             "error": state.error,
             # A worker that died mid-run leaves its last progress behind.
-            "progress": _aged(state.progress, time.time()) if self.busy() else None,
+            "progress": _aged(state.progress, time.time()) if busy else None,
+            "run": run,
             "navigation": self.navigation(),
             "segment_index": state.segment_index,
             "job_id": state.job_id,
@@ -841,10 +1048,25 @@ class WizardController:
         }
 
     def handle_post(self, path: str, fields: dict[str, list[str]]) -> None:
-        if self.busy():
-            raise WizardError("the last step is still running; wait for it")
-        state = self._state()
-        state.error = None
+        """Apply one POST. POSTs run one at a time, never beside a worker.
+
+        A page may send the ``job_id`` it shows; when the wizard has moved
+        to another job since, :class:`WizardConflict` refuses the POST.
+        """
+        with self._post_lock:
+            if self.busy():
+                raise WizardError("the last step is still running; wait for it")
+            state = self._state()
+            sent_job = fields.get("job_id", [""])[0].strip()
+            if sent_job and sent_job != state.job_id:
+                raise WizardConflict(_JOB_CONFLICT_MESSAGE)
+            state.error = None
+            state.stopped = None
+            self._dispatch_post(path, fields, state)
+
+    def _dispatch_post(
+        self, path: str, fields: dict[str, list[str]], state: WizardState
+    ) -> None:
         if path == "/intro":
             state.step = WizardStep.LLM_CHOICE
             self._save(state)
@@ -923,6 +1145,7 @@ class WizardController:
         fails there is nothing to show; the job is marked failed and the user
         goes back to the pick screen to fix the cause or choose another file.
         """
+        self._mark_failed(self._run)
         assert state.job_id
         job_id = state.job_id
         job_dir = self.store.job_dir(job_id)
@@ -990,11 +1213,13 @@ class WizardController:
 
     def pick_upload(self, path: Path, name: str) -> None:
         """Pick an uploaded file; it is removed again when the pick refuses it."""
-        state = self._state()
-        state.error = None
-        self._pick_file(state, str(path), shown_name=Path(name).name)
-        if self._state().step is not WizardStep.SAMPLING:
-            path.unlink(missing_ok=True)
+        with self._post_lock:
+            state = self._state()
+            state.error = None
+            state.stopped = None
+            self._pick_file(state, str(path), shown_name=Path(name).name)
+            if self._state().step is not WizardStep.SAMPLING:
+                path.unlink(missing_ok=True)
 
     def _pick_file(
         self, state: WizardState, raw_path: str, *, shown_name: str | None = None
@@ -1255,18 +1480,15 @@ class WizardController:
     # Segment loop -----------------------------------------------------------
 
     def run_segmenting(self) -> None:
-        if not self._work_lock.acquire(blocking=False):
-            return
-        self._begin_step()
-        try:
+        with self._running("segmenting") as run:
+            if run is None:
+                return
             state = self._state()
             if state.job_id and state.step is WizardStep.SAMPLING:
                 self._sample(state)
             state = self._state()
             if state.job_id and state.step is WizardStep.PROPOSING:
                 self._propose_segments(state)
-        finally:
-            self._work_lock.release()
 
     def _sample(self, state: WizardState) -> None:
         """Save the still grid Gemini cuts the video from."""
@@ -1490,6 +1712,7 @@ class WizardController:
 
     def _segmenting_failed(self, state: WizardState, detail: str) -> None:
         """Sampling or proposing failed; mark the job failed and go back to pick."""
+        self._mark_failed(self._run)
         assert state.job_id
         job_id = state.job_id
         with contextlib.suppress(JobError):
@@ -1562,15 +1785,12 @@ class WizardController:
         self._save(state)
 
     def run_analyze(self) -> None:
-        if not self._work_lock.acquire(blocking=False):
-            return
-        self._begin_step()
-        try:
+        with self._running("analyze") as run:
+            if run is None:
+                return
             state = self._state()
             if state.step is WizardStep.ANALYZING and state.job_id:
                 self._analyze(state)
-        finally:
-            self._work_lock.release()
 
     def _analyze(self, state: WizardState) -> None:
         """Plan, preview, and check the current segment only."""
@@ -1631,6 +1851,7 @@ class WizardController:
 
     def _analyze_failed(self, state: WizardState, detail: str) -> None:
         """A segment preview failed; go back to the segments to try again."""
+        self._mark_failed(self._run)
         state.error = f"The segment preview failed: {detail}"
         state.step = WizardStep.SEGMENTS
         self._save(state)
@@ -1845,13 +2066,10 @@ class WizardController:
         self._save(state)
 
     def run_render(self) -> None:
-        if not self._work_lock.acquire(blocking=False):
-            return
-        self._begin_step()
-        try:
+        with self._running("render") as run:
+            if run is None:
+                return
             self._run_render()
-        finally:
-            self._work_lock.release()
 
     def _run_render(self) -> None:
         state = self._state()

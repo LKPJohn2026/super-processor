@@ -409,6 +409,49 @@ def test_an_analyze_worker_crash_goes_back_to_the_segments(tmp_path: Path) -> No
     assert state.error == "The segment preview failed: stills vanished"
 
 
+def test_a_sampling_crash_inside_the_run_is_landed_as_failed(
+    tmp_path: Path,
+) -> None:
+    controller = _job(tmp_path, WizardStep.SAMPLING)
+    job_id = controller.current_state().job_id
+    assert job_id
+
+    def _crash(state: WizardState) -> None:
+        raise RuntimeError("stills vanished")
+
+    controller._sample = _crash  # type: ignore[method-assign]
+    assert controller.start_segmenting() is True
+    assert controller.wait_idle(timeout=5)
+    state = controller.current_state()
+    assert state.step is WizardStep.PICK_FILE
+    assert state.error == "Finding the segments failed: stills vanished"
+    assert controller.store.load(job_id).state is JobState.FAILED
+    run = controller.api_view()["run"]
+    assert run is not None
+    assert (run["kind"], run["job_id"], run["outcome"]) == (
+        "segmenting",
+        job_id,
+        "failed",
+    )
+
+
+def test_an_analyze_crash_inside_the_run_is_landed_as_failed(tmp_path: Path) -> None:
+    controller = _job(tmp_path, WizardStep.ANALYZING, segment_index=1)
+
+    def _crash(state: WizardState) -> None:
+        raise RuntimeError("stills vanished")
+
+    controller._analyze = _crash  # type: ignore[method-assign]
+    assert controller.start_analyze() is True
+    assert controller.wait_idle(timeout=5)
+    state = controller.current_state()
+    assert state.step is WizardStep.SEGMENTS
+    assert state.error == "The segment preview failed: stills vanished"
+    run = controller._public_run(state)
+    assert run is not None
+    assert (run["kind"], run["outcome"]) == ("analyze", "failed")
+
+
 def test_while_a_worker_runs_navigation_is_off_and_progress_is_live(
     tmp_path: Path,
 ) -> None:

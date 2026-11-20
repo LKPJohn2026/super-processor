@@ -93,6 +93,9 @@ def test_retired_steps_go_back_to_pick(tmp_path: Path) -> None:
         "segment_index": 0,
         "progress": None,
         "notice": None,
+        "approved_count": 0,
+        "stopped": None,
+        "render_note": None,
     }
 
 
@@ -103,6 +106,9 @@ def test_segment_loop_state_round_trips(tmp_path: Path) -> None:
         job_id=job_id,
         segment_index=2,
         progress={"phase": "analyzing", "pct": 40, "message": "proposing"},
+        approved_count=3,
+        stopped="Stopped before the render finished",
+        render_note="brighter",
     )
     save_job_wizard_state(job_dir, state)
     save_session_state(tmp_path, state)
@@ -116,6 +122,37 @@ def test_segment_loop_state_round_trips(tmp_path: Path) -> None:
     loaded = WizardState.from_dict(raw)
     assert loaded.step is WizardStep.SEGMENTS
     assert (loaded.segment_index, loaded.progress) == (0, None)
+    assert (loaded.approved_count, loaded.stopped, loaded.render_note) == (
+        0,
+        None,
+        None,
+    )
+
+
+def test_a_state_file_from_before_approved_count_still_loads() -> None:
+    """Older files have no approved_count: every earlier segment was approved."""
+    old = {
+        "schema_version": 3,
+        "step": "preview_segment",
+        "job_id": "job00001",
+        "segment_index": 2,
+        "progress": None,
+        "notice": None,
+    }
+    loaded = WizardState.from_dict(old)
+    assert loaded.step is WizardStep.PREVIEW_SEGMENT
+    assert (loaded.segment_index, loaded.approved_count) == (2, 2)
+    assert loaded.stopped is None and loaded.render_note is None
+    # A saved count never trails the segment on screen, and junk is ignored.
+    behind = WizardState.from_dict({**old, "approved_count": 1})
+    assert behind.approved_count == 2
+    junk = WizardState.from_dict(
+        {**old, "approved_count": True, "stopped": 3, "render_note": ["x"]}
+    )
+    assert (junk.approved_count, junk.stopped, junk.render_note) == (2, None, None)
+    ahead = WizardState.from_dict({**old, "approved_count": 4})
+    assert ahead.approved_count == 4
+    assert WizardState.from_dict(ahead.to_dict()) == ahead
 
 
 class _BrokenEngine:

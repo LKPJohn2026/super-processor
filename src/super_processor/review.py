@@ -21,7 +21,13 @@ from .jobs import JobError
 from .segments import STILLS_DIR_NAME, SegmentError, load_segments
 from .shot_plan import PREVIEW_NAME, PREVIEWS_DIR
 from .shots import STILLS_DIR
-from .wizard import WizardController, WizardError, WizardStep, load_job_wizard_state
+from .wizard import (
+    WizardConflict,
+    WizardController,
+    WizardError,
+    WizardStep,
+    load_job_wizard_state,
+)
 
 
 class ReviewError(RuntimeError):
@@ -746,10 +752,12 @@ def _wizard_handler(
             try:
                 controller.handle_post(action, fields)
             except WizardError as exc:
+                # 409: the page shows a job the wizard has since left.
+                status = 409 if isinstance(exc, WizardConflict) else 400
                 if path.startswith("/api/"):
-                    self._json({"error": str(exc)}, status=400)
+                    self._json({"error": str(exc)}, status=status)
                     return
-                self._reject(str(exc))
+                self._reject(str(exc), status=status)
                 return
             if path.startswith("/api/"):
                 self._json(self._view())

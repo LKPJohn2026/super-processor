@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The wizard's `/api/state` reports the last scan, preview or render as
+  `run` (its kind, job, start and end times, and whether it finished,
+  failed or was stopped), so a page can tell a crash from a success even
+  after the step has moved on.
+
 ### Fixed
 
 - The wizard's scene list, shot list, plan and Gemini chat are now saved
@@ -18,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each other's turns from the saved chat, or leave a question without its
   answer. Each question and answer are now saved together under one lock,
   so the chat Gemini is shown on the next call is always complete.
+- A wizard button pressed just as a scan, preview or render started (or
+  just as it finished) could be applied in the middle of that work and
+  be overwritten by it. Actions and background work now take turns, and
+  the wizard counts as busy until the work has fully wrapped up.
+- A page left open on an old job could change the job another window had
+  since opened. Such a request is now refused with "this job is no longer
+  open in this window".
 
 ## [4.1.1] - 2026-11-17
 
