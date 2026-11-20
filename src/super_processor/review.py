@@ -474,6 +474,7 @@ _API_POSTS = {
     "/api/goto": "/goto",
     "/api/segments": "/segments",
     "/api/preview": "/preview",
+    "/api/scene": "/scene",
     "/api/ready": "/ready",
     "/api/result": "/result",
 }

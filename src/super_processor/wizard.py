@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import shutil
 import threading
 import time
@@ -40,6 +41,7 @@ from .segment_loop import (
     LoopSegment,
     SegmentList,
     SegmentLoopError,
+    SegmentStill,
     extract_segment_stills,
     load_segment_list,
     load_segment_stills,
@@ -203,10 +205,50 @@ _RUN_STEPS: dict[str, frozenset[WizardStep]] = {
 # How long starting a worker waits for a POST in progress to finish.
 _POST_WAIT_S = 30.0
 _JOB_CONFLICT_MESSAGE = "this job is no longer open in this window"
+# The stages of one job, as the page's stepper shows them, and the stage
+# each step belongs to. Intro, the LLM choice and setup belong to none.
+JOB_STAGES = ("file", "segments", "scenes", "render", "result")
+_STEP_STAGES: dict[WizardStep, str] = {
+    WizardStep.PICK_FILE: "file",
+    WizardStep.SAMPLING: "segments",
+    WizardStep.PROPOSING: "segments",
+    WizardStep.SEGMENTS: "segments",
+    WizardStep.ANALYZING: "scenes",
+    WizardStep.PREVIEW_SEGMENT: "scenes",
+    WizardStep.READY_TO_RENDER: "scenes",
+    WizardStep.RENDERING: "render",
+    WizardStep.RESULT: "result",
+    WizardStep.DONE: "result",
+}
+# Steps a scene can be reopened from: not while one is being analyzed.
+_REOPEN_STEPS = frozenset({WizardStep.PREVIEW_SEGMENT, WizardStep.READY_TO_RENDER})
+# An uploaded file's name starts with 12 hex digits (see upload_target).
+_UPLOAD_PREFIX = re.compile(r"[0-9a-f]{12}-")
 
 
 def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+# What reading shots.json or shot_plan.json can raise when either is damaged
+# or half-written.
+_PLAN_READ_ERRORS = (ShotPlanError, ShotError, OSError, KeyError, TypeError, ValueError)
+
+
+def _job_title(source_path: str) -> str:
+    """The source's file name, without the prefix an upload gets."""
+    name = Path(source_path).name
+    found = _UPLOAD_PREFIX.match(name)
+    return name[found.end() :] if found and name[found.end() :] else name
+
+
+def _nearest_still_url(
+    stills: list[SegmentStill], start_s: float, end_s: float
+) -> str | None:
+    """The URL of the sampled still nearest the middle of a span."""
+    middle = (start_s + end_s) / 2
+    nearest = min(stills, key=lambda s: abs(s.t_s - middle), default=None)
+    return f"/{nearest.path}" if nearest else None
 
 
 @dataclass(slots=True)
@@ -826,7 +868,9 @@ class WizardController:
             "overall": overall_pct(
                 phase,
                 pct,
-                segment_index=state.segment_index,
+                # A reopened scene does not move the bar back: it counts
+                # from the furthest scene approved so far.
+                segment_index=max(state.segment_index, state.approved_count),
                 segment_count=self._segment_count(state),
                 revising=self._revising,
             ),
@@ -1035,6 +1079,7 @@ class WizardController:
             # A worker that died mid-run leaves its last progress behind.
             "progress": _aged(state.progress, time.time()) if busy else None,
             "run": run,
+            "job": self._job_summary(state, busy),
             "navigation": self.navigation(),
             "segment_index": state.segment_index,
             "job_id": state.job_id,
@@ -1124,6 +1169,9 @@ class WizardController:
             return
         if path == "/preview":
             self._preview_post(state, fields)
+            return
+        if path == "/scene":
+            self._scene_post(state, fields)
             return
         if path == "/ready":
             self._ready_post(state, fields)
@@ -1223,7 +1271,7 @@ class WizardController:
                 return 0
             count = len(plan.recipes)
             return count if count and count == len(shots.shots) else 0
-        except (ShotPlanError, ShotError, OSError, KeyError, TypeError, ValueError):
+        except _PLAN_READ_ERRORS:
             return 0
 
     def _goto(self, state: WizardState, target: str) -> None:
@@ -1316,6 +1364,7 @@ class WizardController:
             self._save(state)
             return
         state.job_id = manifest.job_id
+        state.segment_index = state.approved_count = 0
         state.step = WizardStep.SAMPLING
         self._save(state)
 
@@ -1499,8 +1548,12 @@ class WizardController:
         )
 
     def _looks_view(self, job_dir: Path) -> dict[str, Any]:
-        shots = load_shots(job_dir)
-        plan = load_plan(job_dir)
+        try:
+            shots = load_shots(job_dir)
+            plan = load_plan(job_dir)
+        except _PLAN_READ_ERRORS as exc:
+            # A half-written or damaged file: show the error, not a crash.
+            return {"scale": None, "error": str(exc), "shots": []}
         if shots is None or plan is None:
             return {"scale": None, "error": None, "shots": []}
         items: list[dict[str, Any]] = []
@@ -1794,9 +1847,9 @@ class WizardController:
         for segment in found.segments:
             item = segment.to_dict()
             # The sampled still nearest the middle stands for the segment.
-            middle = (segment.start_s + segment.end_s) / 2
-            nearest = min(stills, key=lambda s: abs(s.t_s - middle), default=None)
-            item["still_url"] = f"/{nearest.path}" if nearest else None
+            item["still_url"] = _nearest_still_url(
+                stills, segment.start_s, segment.end_s
+            )
             items.append(item)
         return {
             "segments": items,
@@ -1827,7 +1880,7 @@ class WizardController:
                 save_segment_list(job_dir, found)
                 shots_path(job_dir).unlink(missing_ok=True)
                 plan_path(job_dir).unlink(missing_ok=True)
-                state.segment_index = 0
+                state.segment_index = state.approved_count = 0
             state.step = WizardStep.ANALYZING
         elif action == "note":
             text = " ".join(fields.get("note", [""])[0].split())
@@ -1879,6 +1932,8 @@ class WizardController:
             scale = found.scale if found.scale in options else default_scale(options)
             plan = new_plan(shots, scale)
             save_plan(job_dir, plan)
+            # A new plan has nothing approved yet.
+            state.segment_index = state.approved_count = 0
         self._fit_plan_scale(job_dir, plan)
         index = state.segment_index
         if index >= len(plan.recipes):
@@ -1936,7 +1991,12 @@ class WizardController:
         action = fields.get("action", [""])[0]
         try:
             if action == "approve":
-                state.segment_index += 1
+                # Approving a reopened scene goes on from the furthest scene
+                # reached, not from the one after it.
+                state.approved_count = max(
+                    state.approved_count, state.segment_index + 1
+                )
+                state.segment_index = state.approved_count
                 state.step = (
                     WizardStep.READY_TO_RENDER
                     if state.segment_index >= len(plan.recipes)
@@ -1963,6 +2023,167 @@ class WizardController:
             state.error = str(exc)
         self._save(state)
 
+    def _scene_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
+        """Reopen an approved scene, or the next one to approve, to look again.
+
+        Allowed from a scene preview and from "Ready to render", for any
+        scene up to the first one not approved yet. Approving the reopened
+        scene goes on from the furthest scene reached.
+        """
+        if state.step not in _REOPEN_STEPS or not state.job_id:
+            raise WizardError(
+                "a scene can be reopened from a scene preview or from Ready to render"
+            )
+        raw = fields.get("index", [""])[0].strip()
+        if not re.fullmatch(r"\d{1,3}", raw, re.ASCII):
+            raise WizardError("pick one of the scenes shown")
+        index = int(raw)
+        job_dir = self.store.job_dir(state.job_id)
+        try:
+            plan = load_plan(job_dir)
+            shots = load_shots(job_dir)
+        except _PLAN_READ_ERRORS as exc:
+            raise WizardError(str(exc)) from exc
+        if plan is None:
+            raise WizardError("the segment settings are missing; pick the file again")
+        # The same check the scene strip makes, so a scene it shows as not
+        # reopenable is refused here too.
+        if shots is not None and len(shots.shots) != len(plan.recipes):
+            raise WizardError("the shots and their settings do not match")
+        if index >= len(plan.recipes) or index > state.approved_count:
+            raise WizardError(
+                f"scene {index + 1} cannot be opened yet; approve the scenes "
+                "before it first"
+            )
+        recipe = plan.recipes[index]
+        state.segment_index = index
+        # A scene previewed as it is now opens at once; one with changes
+        # still to preview is analyzed again first.
+        state.step = (
+            WizardStep.PREVIEW_SEGMENT
+            if recipe.rev and not recipe.stale
+            else WizardStep.ANALYZING
+        )
+        self._save(state)
+
+    def _job_summary(self, state: WizardState, busy: bool) -> dict[str, Any] | None:
+        """The open job for the page's stepper and scene strip, or ``None``.
+
+        Each file is read on its own, and one that cannot be read leaves its
+        part empty and says why in ``error``, so a damaged file never breaks
+        the whole view. Scenes are listed only from the scenes stage on.
+        """
+        if not state.job_id:
+            return None
+        job_id = state.job_id
+        job_dir = self.store.job_dir(job_id)
+        errors: list[str] = []
+        title = job_id
+        try:
+            title = _job_title(self.store.load(job_id).source_path)
+        except Exception as exc:  # noqa: BLE001 - shown in the summary
+            errors.append(str(exc) or type(exc).__name__)
+        found: SegmentList | None = None
+        try:
+            found = load_segment_list(job_dir)
+        except Exception as exc:  # noqa: BLE001 - shown in the summary
+            errors.append(str(exc) or type(exc).__name__)
+        shots: ShotList | None = None
+        plan: ShotPlan | None = None
+        try:
+            shots = load_shots(job_dir)
+            plan = load_plan(job_dir)
+        except Exception as exc:  # noqa: BLE001 - shown in the summary
+            errors.append(str(exc) or type(exc).__name__)
+            shots = plan = None
+        if (
+            shots is not None
+            and plan is not None
+            and len(shots.shots) != len(plan.recipes)
+        ):
+            errors.append("the shots and their settings do not match")
+            shots = plan = None
+        stills: list[SegmentStill] = []
+        try:
+            stills = load_segment_stills(job_dir)
+        except Exception as exc:  # noqa: BLE001 - shown in the summary
+            errors.append(str(exc) or type(exc).__name__)
+        try:
+            has_output = (job_dir / "output.mp4").is_file()
+        except OSError:
+            has_output = False
+
+        spans: list[tuple[float, float, str]] = []
+        if shots is not None and plan is not None:
+            spans = [(shot.start_s, shot.end_s, shot.label) for shot in shots.shots]
+        elif found is not None and found.approved:
+            spans = [(seg.start_s, seg.end_s, seg.label) for seg in found.segments]
+        count = len(spans)
+        approved = min(state.approved_count, count)
+        stage = _STEP_STAGES.get(state.step)
+        current: int | None = None
+        if (
+            state.step in {WizardStep.ANALYZING, WizardStep.PREVIEW_SEGMENT}
+            and state.segment_index < count
+        ):
+            current = state.segment_index
+        done = {
+            "file": True,
+            "segments": found is not None and found.approved and bool(found.segments),
+            "scenes": plan is not None and bool(plan.recipes) and approved == count,
+            "render": has_output,
+            "result": has_output,
+        }
+        stages = [
+            {
+                "key": key,
+                "status": (
+                    "current" if key == stage else "done" if done[key] else "pending"
+                ),
+            }
+            for key in JOB_STAGES
+        ]
+        scenes: list[dict[str, Any]] = []
+        # A failed pick, or the segments being redone, shows no strip.
+        if stage in {"scenes", "render", "result"}:
+            can_reopen = not busy and state.step in _REOPEN_STEPS and plan is not None
+            for index, (start_s, end_s, label) in enumerate(spans):
+                recipe = plan.recipes[index] if plan is not None else None
+                status = (
+                    "current"
+                    if index == current
+                    else "approved"
+                    if index < approved
+                    else "pending"
+                )
+                scenes.append(
+                    {
+                        "index": index,
+                        "start_s": start_s,
+                        "end_s": end_s,
+                        "label": label,
+                        "still_url": _nearest_still_url(stills, start_s, end_s),
+                        "status": status,
+                        "previewed": bool(
+                            recipe is not None and recipe.rev and not recipe.stale
+                        ),
+                        "reopenable": can_reopen
+                        and index <= state.approved_count
+                        and index != current,
+                    }
+                )
+        return {
+            "job_id": job_id,
+            "title": title,
+            "stage": stage,
+            "stages": stages,
+            "scene_count": count,
+            "approved_count": approved,
+            "current_index": current,
+            "scenes": scenes,
+            "error": "; ".join(errors) or None,
+        }
+
     def _ready_post(self, state: WizardState, fields: dict[str, list[str]]) -> None:
         """Start the full render from every approved segment."""
         if state.step is not WizardStep.READY_TO_RENDER or not state.job_id:
@@ -1974,6 +2195,13 @@ class WizardController:
             raise WizardError("the segment settings are missing; pick the file again")
         if fields.get("action", [""])[0] != "render":
             state.error = "send action=render to start the full render"
+            self._save(state)
+            return
+        stale = plan.stale_indexes()
+        if stale:
+            # A scene changed (or was reopened and redone) after its preview;
+            # render only what the editor has seen.
+            state.error = f"scene {stale[0] + 1} still has changes to preview"
             self._save(state)
             return
         raw = fields.get("scale", [""])[0]
@@ -2136,7 +2364,7 @@ class WizardController:
         (job_dir / _PLAN_BEFORE_NOTE).unlink(missing_ok=True)
         state.error = None
         state.notice = None
-        state.segment_index = 0
+        state.segment_index = state.approved_count = 0
         state.progress = None
         state.step = WizardStep.SAMPLING
         self._save(state)

@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 import threading
+from dataclasses import replace
 from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
@@ -22,12 +23,16 @@ from super_processor.review import (
     WizardServer,
     form_fields_from_body,
 )
+from super_processor.segment_loop import LoopSegment, SegmentList, save_segment_list
+from super_processor.shot_plan import finish, new_plan, save_plan
+from super_processor.shots import Shot, ShotList, save_shots
 from super_processor.upscale import FakeUpscaleEngine
 from super_processor.wizard import (
     WizardController,
     WizardError,
     WizardState,
     WizardStep,
+    save_job_wizard_state,
     save_session_state,
 )
 
@@ -467,5 +472,194 @@ def test_upload_refusals_save_nothing(tmp_path: Path) -> None:
         assert b"the upload stopped before the end" in reply
         assert not uploads.exists() or list(uploads.iterdir()) == []
         assert controller.current_state().step is WizardStep.INTRO
+    finally:
+        server.stop()
+
+
+def _job_on(tmp_path: Path, step: WizardStep, **state: Any) -> tuple[str, Path]:
+    """A job with two approved, previewed scenes and the wizard on ``step``.
+
+    The source is stand-in bytes, so this needs no FFmpeg.
+    """
+    source = tmp_path / "0123456789ab-My_Trailer.mp4"
+    source.write_bytes(b"not-a-real-video")
+    controller = WizardController(tmp_path)
+    job_id = controller.store.create(source).job_id
+    job_dir = controller.store.job_dir(job_id)
+    save_segment_list(
+        job_dir,
+        SegmentList(
+            segments=[LoopSegment(0.0, 3.0, "a"), LoopSegment(3.0, 6.0, "b")],
+            approved=True,
+        ),
+    )
+    shots = ShotList([Shot(0.0, 3.0, label="a"), Shot(3.0, 6.0, label="b")])
+    save_shots(job_dir, shots)
+    plan = finish(new_plan(shots, 2), [0, 1])
+    plan.recipes = [replace(recipe, rev=1) for recipe in plan.recipes]
+    save_plan(job_dir, plan)
+    saved = WizardState(step=step, job_id=job_id, **state)
+    save_job_wizard_state(job_dir, saved)
+    save_session_state(tmp_path, saved)
+    return job_id, job_dir
+
+
+def _stages(job: dict[str, Any]) -> dict[str, str]:
+    return {stage["key"]: stage["status"] for stage in job["stages"]}
+
+
+def test_the_job_summary_drives_the_stepper_and_scene_strip(tmp_path: Path) -> None:
+    job_id, _job_dir = _job_on(
+        tmp_path, WizardStep.PREVIEW_SEGMENT, segment_index=1, approved_count=1
+    )
+    server = WizardServer(tmp_path, token=TOKEN)
+    base = server.start()
+    try:
+        status, view, _origin = _json_request(base, "GET", "/api/state")
+        assert status == 200
+        job = view["job"]
+        assert set(job) == {
+            "job_id",
+            "title",
+            "stage",
+            "stages",
+            "scene_count",
+            "approved_count",
+            "current_index",
+            "scenes",
+            "error",
+        }
+        # The upload prefix is not part of the title.
+        assert (job["job_id"], job["title"]) == (job_id, "My_Trailer.mp4")
+        assert (job["stage"], job["scene_count"], job["approved_count"]) == (
+            "scenes",
+            2,
+            1,
+        )
+        assert job["current_index"] == 1 and job["error"] is None
+        assert _stages(job) == {
+            "file": "done",
+            "segments": "done",
+            "scenes": "current",
+            "render": "pending",
+            "result": "pending",
+        }
+        first, second = job["scenes"]
+        assert set(first) == {
+            "index",
+            "start_s",
+            "end_s",
+            "label",
+            "still_url",
+            "status",
+            "previewed",
+            "reopenable",
+        }
+        assert (first["index"], first["start_s"], first["end_s"]) == (0, 0.0, 3.0)
+        assert (first["label"], first["still_url"]) == ("a", None)
+        assert (first["status"], first["previewed"], first["reopenable"]) == (
+            "approved",
+            True,
+            True,
+        )
+        assert (second["status"], second["reopenable"]) == ("current", False)
+
+        status, view, _origin = _json_request(
+            base, "POST", "/api/scene", {"index": "0"}
+        )
+        assert status == 200
+        assert (view["step"], view["segment_index"]) == ("preview_segment", 0)
+        assert view["job"]["current_index"] == 0
+        status, refused, _origin = _json_request(
+            base, "POST", "/api/scene", {"index": "5"}
+        )
+        assert status == 400 and "cannot be opened yet" in refused["error"]
+
+        # Back on the segments the stepper follows, and the strip is hidden.
+        status, view, _origin = _json_request(
+            base, "POST", "/api/goto", {"to": "segments"}
+        )
+        assert status == 200 and view["step"] == "segments"
+        job = view["job"]
+        assert job["stage"] == "segments" and job["scenes"] == []
+        assert _stages(job) == {
+            "file": "done",
+            "segments": "current",
+            "scenes": "pending",
+            "render": "pending",
+            "result": "pending",
+        }
+    finally:
+        server.stop()
+
+
+def test_the_job_summary_marks_a_finished_job(tmp_path: Path) -> None:
+    _job_id, job_dir = _job_on(
+        tmp_path, WizardStep.RESULT, segment_index=2, approved_count=2
+    )
+    (job_dir / "output.mp4").write_bytes(b"video")
+    job = WizardController(tmp_path).api_view()["job"]
+    assert _stages(job) == {
+        "file": "done",
+        "segments": "done",
+        "scenes": "done",
+        "render": "done",
+        "result": "current",
+    }
+    assert [scene["status"] for scene in job["scenes"]] == ["approved"] * 2
+    # Only a scene preview and "Ready to render" can reopen a scene.
+    assert not any(scene["reopenable"] for scene in job["scenes"])
+
+
+def test_no_job_summary_before_a_job(tmp_path: Path) -> None:
+    assert WizardController(tmp_path).api_view()["job"] is None
+
+
+@pytest.mark.parametrize(
+    "step", [WizardStep.PREVIEW_SEGMENT, WizardStep.READY_TO_RENDER]
+)
+def test_a_half_written_shot_plan_still_gives_the_state(
+    tmp_path: Path, step: WizardStep
+) -> None:
+    _job_id, job_dir = _job_on(tmp_path, step, segment_index=1, approved_count=1)
+    (job_dir / "shot_plan.json").write_text('{"scale": 2, "reci', encoding="utf-8")
+    server = WizardServer(tmp_path, token=TOKEN)
+    base = server.start()
+    try:
+        status, view, _origin = _json_request(base, "GET", "/api/state")
+        assert status == 200 and view["step"] == step.value
+        job = view["job"]
+        assert "shot_plan.json is not valid JSON" in job["error"]
+        # The scenes fall back to the approved segments, none reopenable.
+        assert [scene["previewed"] for scene in job["scenes"]] == [False, False]
+        assert not any(scene["reopenable"] for scene in job["scenes"])
+        looks = view["segment_preview"] or view["looks"]
+        assert "shot_plan.json is not valid JSON" in looks["error"]
+    finally:
+        server.stop()
+
+
+def test_reopening_a_scene_needs_the_token(tmp_path: Path) -> None:
+    _job_on(tmp_path, WizardStep.READY_TO_RENDER, segment_index=2, approved_count=2)
+    server = WizardServer(tmp_path, token=TOKEN)
+    base = server.start()
+    try:
+        connection = _connection(base)
+        body = json.dumps({"index": "0"}).encode()
+        connection.request(
+            "POST",
+            "/api/scene",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "X-Wizard-Token": "wrong",
+            },
+        )
+        response = connection.getresponse()
+        assert response.status == 403
+        assert "wizard token" in json.loads(response.read().decode())["error"]
+        state = WizardController(tmp_path).current_state()
+        assert (state.step, state.segment_index) == (WizardStep.READY_TO_RENDER, 2)
     finally:
         server.stop()

@@ -353,14 +353,18 @@ def test_the_result_is_saved_while_the_run_still_counts_as_busy(
         controller._save(WizardState(step=WizardStep.RESULT, job_id="job00001"))
 
     controller._run_render = _render  # type: ignore[method-assign]
-    snapshots: list[tuple[bool, str | None]] = []
+    # Each snapshot reads busy before and after the run: the two reads are
+    # not taken together, so a worker can start between them. Only a run
+    # read as running with busy false on both sides breaks the rule.
+    snapshots: list[tuple[bool, str | None, bool]] = []
     stop = threading.Event()
 
     def _poll() -> None:
         while not stop.is_set():
-            busy = controller.busy()
+            before = controller.busy()
             run = controller._public_run(controller.current_state())
-            snapshots.append((busy, None if run is None else run["outcome"]))
+            after = controller.busy()
+            snapshots.append((before, None if run is None else run["outcome"], after))
 
     poller = threading.Thread(target=_poll)
     poller.start()
@@ -371,7 +375,7 @@ def test_the_result_is_saved_while_the_run_still_counts_as_busy(
         stop.set()
         poller.join(5)
     assert seen == [(True, "done")]
-    assert (False, "running") not in snapshots
+    assert (False, "running", False) not in snapshots
     final = controller._public_run(controller.current_state())
     assert final is not None and final["outcome"] == "done"
 

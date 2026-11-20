@@ -6,6 +6,7 @@ reads, so each test reaches its branch directly.
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
@@ -18,7 +19,13 @@ from super_processor.segment_loop import (
     load_segment_list,
     save_segment_list,
 )
-from super_processor.shot_plan import load_plan, new_plan, plan_path, save_plan
+from super_processor.shot_plan import (
+    finish,
+    load_plan,
+    new_plan,
+    plan_path,
+    save_plan,
+)
 from super_processor.shots import Shot, ShotList, save_shots, shots_path
 from super_processor.upscale import load_upscale_plan
 from super_processor.wizard import (
@@ -62,10 +69,14 @@ def _two_segments(job_dir: Path, *, approved: bool) -> None:
     )
 
 
-def _planned(job_dir: Path, scale: int = 2) -> None:
+def _planned(job_dir: Path, scale: int = 2, *, previewed: bool = False) -> None:
     shots = ShotList([Shot(0.0, 3.0), Shot(3.0, 6.0)])
     save_shots(job_dir, shots)
-    save_plan(job_dir, new_plan(shots, scale))
+    plan = new_plan(shots, scale)
+    if previewed:
+        # Every scene previewed as it is now, as on "Ready to render".
+        plan = finish(plan, list(range(len(plan.recipes))))
+    save_plan(job_dir, plan)
 
 
 # The pick ------------------------------------------------------------------
@@ -320,7 +331,7 @@ def test_a_bad_ready_post_does_not_start_the_render(
 ) -> None:
     controller = _job(tmp_path, WizardStep.READY_TO_RENDER)
     job_dir = _job_dir(controller)
-    _planned(job_dir)
+    _planned(job_dir, previewed=True)
     controller.handle_post("/ready", fields)
     state = controller.current_state()
     assert state.step is WizardStep.READY_TO_RENDER
@@ -335,7 +346,7 @@ def test_ready_post_writes_the_render_plan_at_the_chosen_scale(
 ) -> None:
     controller = _job(tmp_path, WizardStep.READY_TO_RENDER)
     job_dir = _job_dir(controller)
-    _planned(job_dir)
+    _planned(job_dir, previewed=True)
     controller.handle_post("/ready", {"action": ["render"], "scale": ["1"]})
     assert controller.current_state().step is WizardStep.RENDERING
     upscale = load_upscale_plan(job_dir)
@@ -488,3 +499,80 @@ def test_while_a_worker_runs_navigation_is_off_and_progress_is_live(
     save_session_state(controller.jobs_dir, state)
     save_job_wizard_state(_job_dir(controller), state)
     assert controller.api_view()["progress"] is None
+
+
+# Scenes approved so far ----------------------------------------------------
+
+
+def test_a_state_file_without_approved_count_counts_the_earlier_scenes(
+    tmp_path: Path,
+) -> None:
+    controller = _job(tmp_path, WizardStep.PREVIEW_SEGMENT, segment_index=1)
+    job_dir = _job_dir(controller)
+    _two_segments(job_dir, approved=True)
+    _planned(job_dir)
+    for path in (job_state_path(job_dir), session_state_path(controller.jobs_dir)):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["approved_count"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+    assert controller.current_state().approved_count == 1
+    job = controller.api_view()["job"]
+    assert [scene["status"] for scene in job["scenes"]] == ["approved", "current"]
+    assert job["approved_count"] == 1 and job["current_index"] == 1
+
+
+def test_an_approved_count_past_the_scenes_is_clamped(tmp_path: Path) -> None:
+    controller = _job(
+        tmp_path, WizardStep.READY_TO_RENDER, segment_index=2, approved_count=9
+    )
+    job_dir = _job_dir(controller)
+    _two_segments(job_dir, approved=True)
+    _planned(job_dir)
+    job = controller.api_view()["job"]
+    assert (job["scene_count"], job["approved_count"]) == (2, 2)
+    assert [scene["status"] for scene in job["scenes"]] == ["approved", "approved"]
+    with pytest.raises(WizardError, match="scene 3 cannot be opened yet"):
+        controller.handle_post("/scene", {"index": ["2"]})
+
+
+def test_a_rebuilt_plan_starts_again_from_the_first_scene(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _job(tmp_path, WizardStep.ANALYZING, segment_index=1, approved_count=2)
+    job_dir = _job_dir(controller)
+    _two_segments(job_dir, approved=True)
+    # shots.json and shot_plan.json are gone: the plan is measured again.
+    monkeypatch.setattr(
+        "super_processor.wizard.shots_from_segments",
+        lambda *args, **kwargs: ShotList([Shot(0.0, 3.0), Shot(3.0, 6.0)]),
+    )
+    worked: list[tuple[list[int], int, int]] = []
+    monkeypatch.setattr(
+        controller,
+        "_work_on",
+        lambda state, *args, **kwargs: worked.append(
+            (args[4], state.segment_index, state.approved_count)
+        ),
+    )
+    controller.run_analyze()
+    assert worked == [([0], 0, 0)]
+
+
+def test_a_failed_pick_shows_no_scene_strip(tmp_path: Path) -> None:
+    controller = _job(
+        tmp_path, WizardStep.READY_TO_RENDER, segment_index=2, approved_count=2
+    )
+    job_dir = _job_dir(controller)
+    _two_segments(job_dir, approved=True)
+    _planned(job_dir)
+    assert len(controller.api_view()["job"]["scenes"]) == 2
+    state = controller.current_state()
+    state.step = WizardStep.PICK_FILE
+    save_session_state(controller.jobs_dir, state)
+    save_job_wizard_state(job_dir, state)
+    controller.handle_post("/pick", {"path": [str(tmp_path / "missing.mp4")]})
+    view = controller.api_view()
+    assert view["step"] == "pick_file" and view["error"]
+    job = view["job"]
+    assert job["stage"] == "file" and job["scenes"] == []
+    assert job["current_index"] is None

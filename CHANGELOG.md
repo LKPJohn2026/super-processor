@@ -13,9 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run` (its kind, job, start and end times, and whether it finished,
   failed or was stopped), so a page can tell a crash from a success even
   after the step has moved on.
+- An approved scene can be opened again from a scene preview or from
+  "Ready to render" (`/api/scene` with its `index`), up to the first scene
+  not approved yet. Approving it goes back to the furthest scene reached,
+  so earlier approvals are not lost, and the overall progress bar does not
+  go back while it is looked at again. `/api/state` now has a `job`
+  summary for a stepper and scene strip: the job's title, each stage and
+  whether it is done, and each scene with its still, whether it is
+  approved, previewed, and can be reopened.
 
 ### Fixed
 
+- "Ready to render" refuses to start while a scene has changes that have
+  not been previewed yet, and says which scene.
+- A half-written or damaged `shot_plan.json` no longer breaks `/api/state`
+  on a scene preview or "Ready to render"; the error is shown instead.
 - A render now replaces `output.mp4` once, with a finished file that
   already has its audio. A render that failed while copying the audio (or
   a whole-video revise that failed partway) used to leave a silent new

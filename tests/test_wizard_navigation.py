@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,11 @@ import pytest
 from loop_driver import analyze, pick_and_segment, preview, to_ready
 
 from super_processor.file_dialog import FileDialogError, choose_video
+from super_processor.progress import overall_pct
 from super_processor.review import WizardServer
-from super_processor.shot_plan import load_plan, save_plan
+from super_processor.segment_loop import LoopSegment, SegmentList, save_segment_list
+from super_processor.shot_plan import load_plan, new_plan, save_plan
+from super_processor.shots import Shot, ShotList, save_shots
 from super_processor.upscale import (
     FakeUpscaleEngine,
     UpscaleRequest,
@@ -25,8 +29,10 @@ from super_processor.upscale import (
 )
 from super_processor.wizard import (
     WizardController,
+    WizardError,
     WizardState,
     WizardStep,
+    save_job_wizard_state,
     save_session_state,
 )
 from super_processor.wizard_pages import with_navigation
@@ -439,3 +445,188 @@ def test_ready_screen_offers_the_upscale_choice(tmp_path: Path) -> None:
         text=True,
     ).stdout.strip()
     assert size == "320,180"
+
+
+# Reopening a scene ---------------------------------------------------------
+
+
+def _scenes(
+    tmp_path: Path, step: WizardStep, *, previewed: int = 3, **state: Any
+) -> tuple[WizardController, Path]:
+    """A job seeded with three approved segments, the first ``previewed`` of
+    them previewed, and the wizard on ``step``. Needs no FFmpeg."""
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"not-a-real-video")
+    controller = WizardController(tmp_path / "jobs")
+    job_id = controller.store.create(source).job_id
+    job_dir = controller.store.job_dir(job_id)
+    spans = [(0.0, 3.0), (3.0, 6.0), (6.0, 9.0)]
+    save_segment_list(
+        job_dir,
+        SegmentList(
+            segments=[
+                LoopSegment(a, b, f"scene {i}") for i, (a, b) in enumerate(spans)
+            ],
+            approved=True,
+        ),
+    )
+    shots = ShotList([Shot(a, b, label=f"scene {i}") for i, (a, b) in enumerate(spans)])
+    save_shots(job_dir, shots)
+    plan = new_plan(shots, 2)
+    plan.recipes = [
+        replace(recipe, rev=1, stale=False) if i < previewed else recipe
+        for i, recipe in enumerate(plan.recipes)
+    ]
+    save_plan(job_dir, plan)
+    saved = WizardState(step=step, job_id=job_id, **state)
+    save_job_wizard_state(job_dir, saved)
+    save_session_state(controller.jobs_dir, saved)
+    return controller, job_dir
+
+
+def _scene_flags(controller: WizardController) -> list[tuple[str, bool]]:
+    job = controller.api_view()["job"]
+    return [(scene["status"], scene["reopenable"]) for scene in job["scenes"]]
+
+
+def test_a_reopened_scene_is_approved_back_to_the_furthest_scene(
+    tmp_path: Path,
+) -> None:
+    controller, _job_dir = _scenes(
+        tmp_path, WizardStep.PREVIEW_SEGMENT, segment_index=2, approved_count=2
+    )
+    controller.handle_post("/scene", {"index": ["0"]})
+    state = controller.current_state()
+    # A previewed scene opens at once; nothing is analyzed again.
+    assert (state.step, state.segment_index, state.approved_count) == (
+        WizardStep.PREVIEW_SEGMENT,
+        0,
+        2,
+    )
+    # The scene the editor left (the frontier) can be reopened again.
+    assert _scene_flags(controller) == [
+        ("current", False),
+        ("approved", True),
+        ("pending", True),
+    ]
+    controller.handle_post("/preview", {"action": ["approve"]})
+    state = controller.current_state()
+    assert (state.step, state.segment_index, state.approved_count) == (
+        WizardStep.ANALYZING,
+        2,
+        2,
+    )
+
+
+def test_reopening_from_ready_comes_back_to_ready(tmp_path: Path) -> None:
+    controller, _job_dir = _scenes(
+        tmp_path, WizardStep.READY_TO_RENDER, segment_index=3, approved_count=3
+    )
+    assert _scene_flags(controller) == [("approved", True)] * 3
+    controller.handle_post("/scene", {"index": ["1"]})
+    state = controller.current_state()
+    assert (state.step, state.segment_index) == (WizardStep.PREVIEW_SEGMENT, 1)
+    controller.handle_post("/preview", {"action": ["approve"]})
+    state = controller.current_state()
+    assert (state.step, state.segment_index, state.approved_count) == (
+        WizardStep.READY_TO_RENDER,
+        3,
+        3,
+    )
+
+
+def test_a_scene_not_previewed_yet_is_analyzed_when_reopened(tmp_path: Path) -> None:
+    controller, _job_dir = _scenes(
+        tmp_path,
+        WizardStep.PREVIEW_SEGMENT,
+        previewed=1,
+        segment_index=0,
+        approved_count=1,
+    )
+    controller.handle_post("/scene", {"index": ["1"]})
+    state = controller.current_state()
+    assert (state.step, state.segment_index) == (WizardStep.ANALYZING, 1)
+
+
+@pytest.mark.parametrize(
+    ("index", "error"),
+    [
+        ("2", "scene 3 cannot be opened yet"),
+        ("3", "scene 4 cannot be opened yet"),
+        ("-1", "pick one of the scenes shown"),
+        ("x", "pick one of the scenes shown"),
+        ("", "pick one of the scenes shown"),
+        ("1234", "pick one of the scenes shown"),
+    ],
+)
+def test_a_scene_past_the_frontier_is_refused(
+    tmp_path: Path, index: str, error: str
+) -> None:
+    controller, _job_dir = _scenes(
+        tmp_path, WizardStep.PREVIEW_SEGMENT, segment_index=1, approved_count=1
+    )
+    assert _scene_flags(controller)[2] == ("pending", False)
+    with pytest.raises(WizardError, match=error):
+        controller.handle_post("/scene", {"index": [index]})
+    state = controller.current_state()
+    assert (state.step, state.segment_index) == (WizardStep.PREVIEW_SEGMENT, 1)
+
+
+def test_no_scene_reopens_when_the_shots_and_plan_disagree(tmp_path: Path) -> None:
+    controller, job_dir = _scenes(
+        tmp_path, WizardStep.READY_TO_RENDER, segment_index=3, approved_count=3
+    )
+    save_shots(job_dir, ShotList([Shot(0.0, 9.0, label="scene 0")]))
+    # The strip offers nothing, and /scene agrees with it.
+    assert not any(open_ for _status, open_ in _scene_flags(controller))
+    with pytest.raises(WizardError, match="shots and their settings do not match"):
+        controller.handle_post("/scene", {"index": ["0"]})
+    assert controller.current_state().step is WizardStep.READY_TO_RENDER
+
+
+def test_no_scene_reopens_while_one_is_analyzed(tmp_path: Path) -> None:
+    controller, _job_dir = _scenes(
+        tmp_path, WizardStep.PREVIEW_SEGMENT, segment_index=1, approved_count=1
+    )
+    # A redo sends the scene to be analyzed again; until that is done the
+    # strip offers nothing and /scene is refused.
+    controller.handle_post("/preview", {"action": ["redo"], "note": ["less grain"]})
+    assert controller.current_state().step is WizardStep.ANALYZING
+    assert not any(open_ for _status, open_ in _scene_flags(controller))
+    with pytest.raises(WizardError, match="can be reopened from a scene preview"):
+        controller.handle_post("/scene", {"index": ["0"]})
+    assert controller.current_state().step is WizardStep.ANALYZING
+
+
+def test_ready_refuses_to_render_a_scene_with_changes_to_preview(
+    tmp_path: Path,
+) -> None:
+    controller, job_dir = _scenes(
+        tmp_path, WizardStep.READY_TO_RENDER, segment_index=3, approved_count=3
+    )
+    plan = load_plan(job_dir)
+    assert plan is not None
+    plan.recipes[1] = replace(plan.recipes[1], stale=True)
+    save_plan(job_dir, plan)
+    controller.handle_post("/ready", {"action": ["render"]})
+    state = controller.current_state()
+    assert state.step is WizardStep.READY_TO_RENDER
+    assert state.error == "scene 2 still has changes to preview"
+    assert load_upscale_plan(job_dir) is None
+    # The scene can be opened to preview it.
+    controller.handle_post("/scene", {"index": ["1"]})
+    assert controller.current_state().step is WizardStep.ANALYZING
+
+
+def test_overall_progress_does_not_go_back_for_a_reopened_scene(
+    tmp_path: Path,
+) -> None:
+    controller, _job_dir = _scenes(
+        tmp_path, WizardStep.ANALYZING, segment_index=0, approved_count=2
+    )
+    state = controller.current_state()
+    controller._progress(state, "analyzing", 0, "Planning")
+    assert state.progress is not None
+    frontier = overall_pct("analyzing", 0, segment_index=2, segment_count=3)
+    assert state.progress["overall"] == frontier
+    assert frontier > overall_pct("analyzing", 100, segment_index=0, segment_count=3)
