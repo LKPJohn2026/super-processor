@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A page left open on an old job could change the job another window had
   since opened. Such a request is now refused with "this job is no longer
   open in this window".
+- A stopped render or Gemini copy ends its FFmpeg (on Windows, the whole
+  process tree) within moments instead of leaving it encoding, removes its
+  half-written `.encoding.mp4` or part file, and releases the GPU, so the
+  next preview or render can start at once.
 
 ## [4.1.1] - 2026-11-17
 

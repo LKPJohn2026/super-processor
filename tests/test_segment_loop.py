@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from super_processor.cancel import Cancelled
 from super_processor.segment_loop import (
     END_MARGIN_S,
     MAX_LOOP_SEGMENTS,
@@ -569,3 +572,40 @@ def test_a_failed_gemini_copy_keeps_the_last_copy_and_names_the_last_error(
     assert seen == [1.0]
     assert previous.read_bytes() == b"earlier copy"
     assert not (tmp_path / "gemini_upload.part.mp4").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a shell script as ffmpeg")
+def test_a_stopped_gemini_copy_ends_ffmpeg_and_removes_the_part_file(
+    tmp_path: Path,
+) -> None:
+    # A stand-in ffmpeg that reports some progress, starts its output, and
+    # would then run until it is ended (shell builtins only: the release
+    # runs the tests with no PATH).
+    pid_file = tmp_path / "pid"
+    fake = tmp_path / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "for last; do :; done\n"
+        f"echo $$ > {pid_file}\n"
+        ': > "$last"\n'
+        "echo out_time_us=500000\n"
+        "while :; do :; done\n"
+    )
+    fake.chmod(0o755)
+    previous = tmp_path / "gemini_upload.mp4"
+    previous.write_bytes(b"earlier copy")
+
+    def stop(_share: float) -> None:
+        # The wizard's progress callback raises this once Stop is pressed.
+        raise Cancelled
+
+    started = time.monotonic()
+    with pytest.raises(Cancelled):
+        make_gemini_copy(
+            tmp_path / "in.mp4", tmp_path, 2.0, ffmpeg_bin=str(fake), on_progress=stop
+        )
+    assert time.monotonic() - started < 2.0
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text(encoding="utf-8")), 0)
+    assert not (tmp_path / "gemini_upload.part.mp4").exists()
+    assert previous.read_bytes() == b"earlier copy"

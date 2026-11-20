@@ -21,7 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .atomic_io import read_text_retrying, write_text_atomic
+from .atomic_io import read_text_retrying, unlink_quietly, write_text_atomic
+from .cancel import stop_process
 from .segments import SEGMENTS_FILE_NAME, STILLS_DIR_NAME, WIZARD_SEGMENTS_KIND
 from .shots import (
     CONTENTS,
@@ -204,15 +205,23 @@ def make_gemini_copy(
             ) as proc,
         ):
             assert proc.stdout is not None
-            for line in proc.stdout:
-                key, _, value = line.strip().partition("=")
-                if key == "out_time_us" and on_progress and duration_s > 0:
-                    try:
-                        done = int(value) / 1e6 / duration_s
-                    except ValueError:
-                        continue
-                    on_progress(min(1.0, max(0.0, done)))
-            proc.wait()
+            try:
+                for line in proc.stdout:
+                    key, _, value = line.strip().partition("=")
+                    if key == "out_time_us" and on_progress and duration_s > 0:
+                        try:
+                            done = int(value) / 1e6 / duration_s
+                        except ValueError:
+                            continue
+                        on_progress(min(1.0, max(0.0, done)))
+                proc.wait()
+            except BaseException:
+                # A stop (the wizard raises Cancelled from ``on_progress``)
+                # ends ffmpeg now, not when the copy is done, and throws the
+                # half-written copy away. The last finished copy stays.
+                stop_process(proc)
+                unlink_quietly(tmp)
+                raise
             err.seek(0)
             errors = err.read()
     except OSError as exc:

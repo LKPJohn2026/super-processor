@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import types
 from collections.abc import Callable
 from dataclasses import replace
@@ -24,6 +25,7 @@ from typing import Any
 import pytest
 
 from super_processor import span_sr, upscale
+from super_processor.cancel import Cancelled
 from super_processor.look import ShotLook
 from super_processor.span_sr import (
     SPAN_FILE,
@@ -765,6 +767,9 @@ class _Control:
         self.output = output
         self.refuse = refuse
         self.seen: list[bytes] = []
+
+    def check(self) -> None:
+        """Never asks to stop while FFmpeg runs; only the commit refuses."""
 
     def commit(self) -> None:
         self.seen.append(self.output.read_bytes())
@@ -1822,3 +1827,173 @@ def test_a_piped_encode_is_a_delivery_with_every_frame(tmp_path: Path) -> None:
     marker = json.loads(upscale.delivery_marker_path(dest).read_text("utf-8"))
     assert marker["blend"] == upscale._blend_record(0.4, ())
     assert marker["look"] == look.to_dict()
+
+
+class _StopAfter:
+    """A render control that says stop once ``event`` is set."""
+
+    def __init__(self, event: threading.Event | None = None) -> None:
+        self.event = event or threading.Event()
+        self.checks = 0
+
+    def check(self) -> None:
+        self.checks += 1
+        if self.event.is_set():
+            raise Cancelled
+
+    def commit(self) -> None:
+        self.check()
+
+
+def _stop(_share: float) -> None:
+    """An ``on_progress`` that stops the run, as the wizard's does."""
+    raise Cancelled
+
+
+def _gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+@needs_sh
+@pytest.mark.parametrize("how", ["control", "control-watched", "progress"])
+def test_a_stop_ends_a_slow_ffmpeg_at_once(tmp_path: Path, how: str) -> None:
+    pid_file = tmp_path / "pid"
+    # Shell builtins only: the release runs the tests with no PATH.
+    slow = _script(
+        tmp_path / "ffmpeg", f"echo $$ > {pid_file}; echo frame=1; while :; do :; done"
+    )
+    stop = threading.Event()
+    control = _StopAfter(stop)
+
+    def run() -> None:
+        with upscale.render_control(control):
+            if how == "control":
+                upscale._run_ffmpeg([slow])
+            else:
+                progress = _stop if how == "progress" else (lambda _share: None)
+                upscale._run_ffmpeg([slow], on_progress=progress, total_frames=10)
+
+    timer = threading.Timer(0.3, stop.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        raised = _within(10, run)
+    finally:
+        timer.cancel()
+    assert isinstance(raised, Cancelled)
+    assert time.monotonic() - started < 2.0
+    # FFmpeg itself is gone, not left encoding in the background.
+    assert _gone(int(pid_file.read_text(encoding="utf-8")))
+    if how != "progress":
+        assert control.checks >= 1
+
+
+@needs_sh
+def test_without_a_stop_a_controlled_ffmpeg_runs_to_its_end(tmp_path: Path) -> None:
+    go = tmp_path / "go"
+    script = _script(
+        tmp_path / "ffmpeg", f"while [ ! -e {go} ]; do :; done; echo frame=10"
+    )
+    seen: list[float] = []
+    control = _StopAfter()
+    timer = threading.Timer(0.3, go.touch)
+    timer.start()
+    with upscale.render_control(control):
+        upscale._run_ffmpeg([script], on_progress=seen.append, total_frames=10)
+    assert seen == [1.0]
+    # It was asked while FFmpeg ran, and said go on.
+    assert control.checks >= 1
+
+
+@needs_ffmpeg
+def test_a_stopped_delivery_encode_leaves_no_encoding_file(tmp_path: Path) -> None:
+    source = tmp_path / "in.mp4"
+    _tiny(source, seconds=2)
+    out = tmp_path / "out"
+    with pytest.raises(Cancelled):
+        upscale.plain_delivery(
+            UpscaleRequest(source, source, on_progress=_stop), out / "plain.mp4"
+        )
+    with pytest.raises(Cancelled):
+        encode_delivery(source, out / "blend.mp4", blend_with=source, on_progress=_stop)
+    assert sorted(p.name for p in out.iterdir()) == []
+
+
+@needs_ffmpeg
+def test_a_stopped_span_render_unloads_and_frees_the_gpu_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = fake_span(tmp_path, monkeypatch)
+    monkeypatch.setattr(upscale, "STREAM_BLOCK_BYTES", _yuv420(160, 90) * 5)
+    unloads: list[object] = []
+    real_unload = upscale._unload
+
+    def unload(loaded: Any) -> None:
+        unloads.append(loaded.model)
+        real_unload(loaded)
+
+    monkeypatch.setattr(upscale, "_unload", unload)
+    started = _started_processes(monkeypatch)
+    source = tmp_path / "in.mp4"
+    _tiny(source, seconds=4)
+    output = tmp_path / "out" / "clip.mp4"
+    raised = _within(
+        30,
+        lambda: SpanEngine().upscale(UpscaleRequest(source, output, on_progress=_stop)),
+    )
+    # A stop stays a stop: it is not turned into an UpscaleError.
+    assert isinstance(raised, Cancelled)
+    assert unloads == ["model"] and fake.loads == 1
+    assert not upscale._GPU_LOCK.locked()
+    assert all(process.poll() is not None for process in started)
+    assert not output.parent.exists() or sorted(output.parent.iterdir()) == []
+
+    # Between clips, the installed control is asked before each one.
+    stop = threading.Event()
+    stop.set()
+    with upscale.render_control(_StopAfter(stop)), pytest.raises(Cancelled):
+        SpanEngine().upscale_many([UpscaleRequest(source, output)])
+    assert len(unloads) == 2
+    assert not upscale._GPU_LOCK.locked()
+
+
+@needs_sh
+def test_a_stopped_piped_encode_stays_a_stop_when_ffmpeg_printed_errors(
+    tmp_path: Path,
+) -> None:
+    noisy = _script(
+        tmp_path / "ffmpeg",
+        "echo 'Conversion failed!' >&2; while read -r _line; do :; done",
+    )
+    dest = tmp_path / "clip.mp4"
+
+    def feed_then(exc: BaseException) -> Callable[[Any], None]:
+        def feed(pipe: Any) -> None:
+            pipe.write(b"x" * 64)
+            raise exc
+
+        return feed
+
+    with pytest.raises(Cancelled):
+        upscale._encode_piped(
+            (16, 16, "10/1", feed_then(Cancelled())),
+            dest,
+            ShotLook(),
+            noisy,
+            upscale._blend_record(1.0, ()),
+        )
+    # Any other failure still reports the encoder's own error.
+    with pytest.raises(UpscaleError, match="Conversion failed!"):
+        upscale._encode_piped(
+            (16, 16, "10/1", feed_then(RuntimeError("broken pipe"))),
+            dest,
+            ShotLook(),
+            noisy,
+            upscale._blend_record(1.0, ()),
+        )
+    assert not dest.exists()
+    assert not list(tmp_path.glob("*.encoding.mp4"))

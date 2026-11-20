@@ -39,6 +39,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import IO, Any, Protocol
 
+from .atomic_io import unlink_quietly
+from .cancel import Cancelled, stop_process
 from .look import LookError, ShotLook
 from .regions import Region, regions_from_dicts, strength_expr
 
@@ -564,27 +566,32 @@ def plain_delivery(
         _base_chain(out[0], out[1], request.look), request.look.finish_filter()
     )
     tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
-    _run_ffmpeg(
-        [
-            ffmpeg_bin,
-            *_QUIET,
-            "-y",
-            *(["-hwaccel", "cuda"] if cuda_decode_works(ffmpeg_bin) else []),
-            "-i",
-            str(request.source),
-            "-map",
-            "0:v:0",
-            "-vf",
-            picture,
-            *_delivery_codec(encoder, out, rate),
-            str(tmp),
-        ],
-        on_progress=request.on_progress,
-        total_frames=_count_frames(request.source, ffmpeg_bin)
-        if request.on_progress is not None
-        else 0,
-    )
-    tmp.replace(dest)
+    try:
+        _run_ffmpeg(
+            [
+                ffmpeg_bin,
+                *_QUIET,
+                "-y",
+                *(["-hwaccel", "cuda"] if cuda_decode_works(ffmpeg_bin) else []),
+                "-i",
+                str(request.source),
+                "-map",
+                "0:v:0",
+                "-vf",
+                picture,
+                *_delivery_codec(encoder, out, rate),
+                str(tmp),
+            ],
+            on_progress=request.on_progress,
+            total_frames=_count_frames(request.source, ffmpeg_bin)
+            if request.on_progress is not None
+            else 0,
+        )
+        tmp.replace(dest)
+    except BaseException:
+        # A failed or stopped encode leaves no half-written file behind.
+        unlink_quietly(tmp)
+        raise
     look = request.look
     _write_marker(
         dest,
@@ -676,16 +683,26 @@ class SpanEngine:
 
     def _run(self, backend: _Span, requests: list[UpscaleRequest]) -> list[Path]:
         failed: UpscaleError | None = None
+        stopped = False
         with _GPU_LOCK:
             loaded = _load(backend)
             try:
                 for request in requests:
+                    _check()
                     _stream_span(loaded, request)
+            except Cancelled as exc:
+                # Its traceback holds the frames' tensors: drop them before
+                # the GPU is released, and stop outside the lock.
+                _forget_frames(exc)
+                del exc
+                stopped = True
             except Exception as exc:  # noqa: BLE001 - becomes an UpscaleError
                 failed = _upscale_failure(exc)
                 del exc
             finally:
                 _unload(loaded)
+        if stopped:
+            raise Cancelled
         if failed is not None:
             raise failed from None
         missing = [r.output.name for r in requests if not r.output.is_file()]
@@ -922,6 +939,8 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
             decoded_all = False
             try:
                 while (block := blocks.get()) is not None:
+                    # A stop is seen between blocks, not only at progress.
+                    _check()
                     count = len(block) // frame_in
                     restored = _restore_span(
                         loaded,
@@ -1484,25 +1503,30 @@ def encode_delivery(
     elif finish:
         picture = ["-filter_complex", f"[0:v]{finish}[v]", "-map", "[v]"]
     tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
-    _run_ffmpeg(
-        [
-            ffmpeg_bin,
-            *_QUIET,
-            "-y",
-            *inputs,
-            *picture,
-            *_delivery_codec(encoder, size, rate),
-            str(tmp),
-        ],
-        on_progress=on_progress,
-        total_frames=_count_frames(
-            blend_with if blend_with is not None else None if concat else source,
-            ffmpeg_bin,
+    try:
+        _run_ffmpeg(
+            [
+                ffmpeg_bin,
+                *_QUIET,
+                "-y",
+                *inputs,
+                *picture,
+                *_delivery_codec(encoder, size, rate),
+                str(tmp),
+            ],
+            on_progress=on_progress,
+            total_frames=_count_frames(
+                blend_with if blend_with is not None else None if concat else source,
+                ffmpeg_bin,
+            )
+            if on_progress is not None
+            else 0,
         )
-        if on_progress is not None
-        else 0,
-    )
-    tmp.replace(dest)
+        tmp.replace(dest)
+    except BaseException:
+        # A failed or stopped encode leaves no half-written file behind.
+        unlink_quietly(tmp)
+        raise
     _write_marker(dest, encoder, blend=record, look=None if look.is_neutral() else look)
     return dest
 
@@ -1688,11 +1712,14 @@ def _encode_piped(
         try:
             feed(encoder.stdin)
             encoder.stdin.close()
-        except BaseException:
+        except BaseException as exc:
             # A feeder that fails because the encoder died reports the
             # encoder's own error instead (a broken pipe says nothing).
+            # A stop stays a stop, whatever the encoder printed as it ended.
             _stop_ffmpeg(encoder, encoder.stdin)
-            tmp.unlink(missing_ok=True)
+            unlink_quietly(tmp)
+            if isinstance(exc, Cancelled):
+                raise
             errors.seek(0)
             detail = errors.read().decode("utf-8", errors="replace").strip()
             if detail:
@@ -1841,6 +1868,11 @@ class RenderControl(Protocol):
     """What a caller can install around a render to stop it (see
     :func:`render_control`)."""
 
+    def check(self) -> None:
+        """Called often while FFmpeg or SPAN works; raises
+        :class:`~super_processor.cancel.Cancelled` once the user has asked to
+        stop. The running FFmpeg is then ended and the stop passes through."""
+
     def commit(self) -> None:
         """Called once, just before ``output`` is replaced. Raising here
         (the user stopped the render) leaves the old output in place;
@@ -1860,6 +1892,13 @@ def render_control(control: RenderControl) -> Iterator[None]:
         yield
     finally:
         _CONTROL.reset(token)
+
+
+def _check() -> None:
+    """Raise :class:`Cancelled` when the installed control says to stop."""
+    control = _CONTROL.get()
+    if control is not None:
+        control.check()
 
 
 def _commit() -> None:
@@ -2415,44 +2454,100 @@ def _concat(parts: list[Path], dest: Path, *, ffmpeg_bin: str) -> None:
     _run_ffmpeg(build_concat_argv(listing, dest, ffmpeg_bin=ffmpeg_bin))
 
 
+# How often a running FFmpeg is checked for a stop.
+_POLL_S = 0.1
+# How long the progress reader gets to finish once FFmpeg has been ended.
+_READER_JOIN_S = 5.0
+
+
 def _run_ffmpeg(
     command: list[str],
     *,
     on_progress: ProgressFn | None = None,
     total_frames: int = 0,
 ) -> None:
-    """Run ``command``; with ``on_progress``, report frames out of ``total_frames``."""
-    if on_progress is None or total_frames <= 0:
-        try:
-            completed = subprocess.run(command, check=False, capture_output=True)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
-        if completed.returncode != 0:
-            detail = (completed.stderr or b"").decode("utf-8", errors="replace")
-            raise UpscaleError(detail.strip() or "ffmpeg failed")
-        return
-    watched = [command[0], "-progress", "pipe:1", "-nostats", *command[1:]]
+    """Run ``command``; with ``on_progress``, report frames out of ``total_frames``.
+
+    The calling thread waits in short steps and asks the installed
+    :class:`RenderControl` (see :func:`render_control`) whether to stop each
+    time. A stop, or anything ``on_progress`` raises (the wizard raises
+    :class:`Cancelled` from it), ends FFmpeg and is raised here.
+    """
+    watched = on_progress is not None and total_frames > 0
+    if watched:
+        command = [command[0], "-progress", "pipe:1", "-nostats", *command[1:]]
     # Errors go to a file: read from a pipe only after the progress, a long
     # error output would fill it and stall ffmpeg.
-    try:
-        with (
-            tempfile.TemporaryFile() as errors,
-            subprocess.Popen(
-                watched, stdout=subprocess.PIPE, stderr=errors, text=True
-            ) as proc,
-        ):
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                key, _, value = line.strip().partition("=")
-                if key == "frame" and value.isdigit():
-                    on_progress(min(1.0, int(value) / total_frames))
-            proc.wait()
-            errors.seek(0)
-            detail = errors.read().decode("utf-8", errors="replace")
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
+    with tempfile.TemporaryFile() as errors:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE if watched else subprocess.DEVNULL,
+                stderr=errors,
+                text=watched,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
+        failures: list[BaseException] = []
+        reader: threading.Thread | None = None
+        if watched:
+            assert on_progress is not None
+            reader = threading.Thread(
+                target=_read_progress,
+                args=(proc, on_progress, total_frames, failures),
+                name="ffmpeg-progress",
+                daemon=True,
+            )
+            reader.start()
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=_POLL_S)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if failures:
+                    raise failures[0]
+                _check()
+            if reader is not None:
+                # The last progress lines are read before the result is.
+                reader.join()
+            if failures:
+                raise failures[0]
+        except BaseException:
+            stop_process(proc)
+            if reader is not None:
+                reader.join(timeout=_READER_JOIN_S)
+            raise
+        finally:
+            if proc.stdout is not None:
+                with contextlib.suppress(OSError):
+                    proc.stdout.close()
+        errors.seek(0)
+        detail = errors.read().decode("utf-8", errors="replace")
     if proc.returncode != 0:
         raise UpscaleError(detail.strip() or "ffmpeg failed")
+
+
+def _read_progress(
+    proc: subprocess.Popen[str],
+    on_progress: ProgressFn,
+    total_frames: int,
+    failures: list[BaseException],
+) -> None:
+    """Report FFmpeg's ``-progress`` frame lines until its output ends.
+
+    Runs on its own thread. What ``on_progress`` raises is kept in
+    ``failures`` for :func:`_run_ffmpeg` to raise on the calling thread.
+    """
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            key, _, value = line.strip().partition("=")
+            if key == "frame" and value.isdigit():
+                on_progress(min(1.0, int(value) / total_frames))
+    except BaseException as exc:  # noqa: BLE001 - re-raised by _run_ffmpeg
+        failures.append(exc)
 
 
 def _count_frames(video: Path | None, ffmpeg_bin: str) -> int:
