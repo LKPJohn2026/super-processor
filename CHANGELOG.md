@@ -92,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than 10 scenes. If another window changed the scenes first, the page
   shows them as they are now and says why, even when that takes it to
   another step.
+- The web app has an "All jobs" page, "Your videos", reachable from the
+  top bar on every step and shown first when the wizard would open on the
+  file pick and jobs exist. Each job shows its still, title, file name,
+  when it last changed and where it is ("Result ready", "Scenes · waiting
+  for you", "Render · stopped partway", "Busy in another window"), with a
+  link to watch its result. Opening one switches the wizard to it where
+  it was left; a job stopped partway opens on the Resume or Stop choice
+  and never starts work by itself. A job another window is working on,
+  or any other job while a run works here, cannot be opened and says why.
+  "Restore a new video" keeps the open job where it was.
 
 ### Changed
 

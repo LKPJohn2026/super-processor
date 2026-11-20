@@ -12,7 +12,9 @@ import {
 import {
   cancelFields,
   editSegments,
+  loadJobs,
   loadState,
+  openJob,
   outputSizeLine,
   outputSrc,
   postAction,
@@ -21,6 +23,7 @@ import {
   runAnalyze,
   runRender,
   runSegmenting,
+  type JobEntry,
   type LookShot,
   type Looks,
   type Progress,
@@ -51,6 +54,8 @@ import {
   steadyOverall,
   stripSummary,
 } from "./jobView";
+import { newVideoRoute, sortJobs, startsOnJobs } from "./jobsList";
+import { JobsHome } from "./JobsHome";
 import {
   STALE_SCENES_TEXT,
   STALE_SCENES_UNLOADED_TEXT,
@@ -114,6 +119,136 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   // Set after a scene is opened again: once its step has rendered, focus
   // moves to that step's heading (the button that was pressed is gone).
   const [headingFocus, setHeadingFocus] = useState(0);
+  // The "All jobs" home: "loading" while the page decides whether to open
+  // on it (it does when it would show the file pick and jobs exist).
+  const [home, setHome] = useState<"loading" | "shown" | "off">(() =>
+    view.step === "pick_file" && !view.busy && !view.error && !view.stopped ? "loading" : "off",
+  );
+  const [jobs, setJobs] = useState<JobEntry[] | null>(null);
+  const [jobsError, setJobsError] = useState<string | null>(null);
+  const [jobsReload, setJobsReload] = useState(0);
+  const [opening, setOpening] = useState<string | null>(null);
+  const [openError, setOpenError] = useState<string | null>(null);
+  const [jobsStatus, setJobsStatus] = useState("");
+  const latestView = useRef(view);
+  latestView.current = view;
+  const homeOn = home !== "off";
+  useEffect(() => {
+    if (!homeOn) return;
+    let cancelled = false;
+    let inFlight = false;
+    const load = () => {
+      if (inFlight) return;
+      inFlight = true;
+      loadJobs(origin)
+        .then((list) => {
+          if (cancelled) return;
+          const sorted = sortJobs(list);
+          setJobs(sorted);
+          setJobsError(null);
+          setHome((current) =>
+            current === "loading" ? (startsOnJobs(latestView.current, sorted) ? "shown" : "off") : current,
+          );
+        })
+        .catch((error: unknown) => {
+          if (cancelled) return;
+          setJobsError(error instanceof Error ? error.message : "the server did not answer");
+          // Opening on the list is only a convenience: without it, the file pick.
+          setHome((current) => (current === "loading" ? "off" : current));
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    load();
+    // Running jobs change status on their own, here or in another window.
+    const timer = window.setInterval(load, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [homeOn, origin, jobsReload]);
+
+  function showHome() {
+    setOpenError(null);
+    setJobsStatus("");
+    setHome("shown");
+    setJobsReload((value) => value + 1);
+    setHeadingFocus((value) => value + 1);
+  }
+
+  function leaveHome() {
+    setOpenError(null);
+    setHome("off");
+    setHeadingFocus((value) => value + 1);
+  }
+
+  // Set synchronously, so two clicks in one tick send one request.
+  const switching = useRef(false);
+
+  async function openFromList(entry: JobEntry) {
+    if (switching.current) return;
+    switching.current = true;
+    const current = connection.current;
+    setOpening(entry.job_id);
+    setOpenError(null);
+    setJobsStatus(`Opening ${entry.title}…`);
+    try {
+      const next = await openJob(origin, entry.job_id);
+      if (current?.signal.aborted) return;
+      // The opened job starts clean: nothing from the last one carries over.
+      carriedError.current = null;
+      overallShown.current = null;
+      setLocalError(null);
+      onView(next);
+      setJobsStatus(`Opened ${entry.title}.`);
+      leaveHome();
+    } catch (error) {
+      if (current?.signal.aborted) return;
+      const text = error instanceof Error ? error.message : "the server did not answer";
+      setOpenError(`Could not open ${entry.title}: ${text}`);
+      setJobsStatus(`Could not open ${entry.title}.`);
+      setJobsReload((value) => value + 1);
+    } finally {
+      switching.current = false;
+      setOpening(null);
+    }
+  }
+
+  async function newVideo() {
+    const route = newVideoRoute(view);
+    if (route === "close") {
+      leaveHome();
+      return;
+    }
+    if (route === "blocked" || switching.current) return;
+    switching.current = true;
+    const current = connection.current;
+    setOpening("");
+    setOpenError(null);
+    try {
+      // /new leaves the open job as it is on disk (its place is kept), and
+      // lands on the file pick, or on setup when there is no Gemini key.
+      const next = await postAction(origin, "new", withJob(view));
+      if (current?.signal.aborted) return;
+      carriedError.current = null;
+      overallShown.current = null;
+      setLocalError(null);
+      onView(next);
+      if (next.error || (next.step !== "pick_file" && next.step !== "setup")) {
+        setOpenError(next.error ?? "Could not start a new video.");
+      } else {
+        leaveHome();
+      }
+    } catch (error) {
+      if (current?.signal.aborted) return;
+      setOpenError(error instanceof Error ? error.message : "Could not start a new video.");
+    } finally {
+      switching.current = false;
+      setOpening(null);
+    }
+  }
+
   useEffect(() => {
     if (!headingFocus) return;
     const heading = document.querySelector<HTMLElement>(".panel h1");
@@ -240,9 +375,44 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
 
   const message = localError || view.error;
 
+  const topbar = (
+    <header className="topbar">
+      <p className="brand">Super Processor</p>
+      {home === "off" ? (
+        <button type="button" className="secondary small" onClick={showHome}>
+          All jobs
+        </button>
+      ) : null}
+    </header>
+  );
+
+  if (home !== "off") {
+    const listed = jobs?.some((entry) => entry.open) ?? false;
+    return (
+      <>
+        {topbar}
+        <JobsHome
+          origin={origin}
+          view={view}
+          jobs={jobs}
+          loadError={jobsError}
+          opening={opening}
+          openError={openError}
+          status={jobsStatus}
+          backLabel={view.job_id && !listed && home === "shown" ? "Back to this job" : null}
+          onOpen={(entry) => void openFromList(entry)}
+          onShowCurrent={leaveHome}
+          onNewVideo={() => void newVideo()}
+          onRefresh={() => setJobsReload((value) => value + 1)}
+          onDisconnect={onDisconnect}
+        />
+      </>
+    );
+  }
+
   return (
     <>
-      <p className="brand">Super Processor</p>
+      {topbar}
       <JobHeader view={view} busy={busy} onSend={send} />
       <div className="panel" aria-busy={busy}>
         <WizardStepView

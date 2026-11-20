@@ -879,3 +879,194 @@ button.small {
 .split-form .actions {
   margin-top: 0.5rem;
 }
+
+/* The top bar: the brand, and "All jobs" from any step. */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin: 0 0 0.75rem;
+}
+
+.topbar .brand {
+  margin: 0;
+}
+
+.topbar button.small {
+  margin-top: 0;
+}
+
+/* The "All jobs" home (mockup s1-jobs). */
+.jobs-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem 1rem;
+}
+
+.jobs-head h1 {
+  margin-top: 0;
+}
+
+.jobs-head p {
+  margin: 0.2rem 0 0;
+}
+
+.jobs-hint {
+  font-size: 0.9rem;
+}
+
+.jobs-home h2.overline {
+  margin: 1.4rem 0 0;
+  font-family: inherit;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 0;
+}
+
+.jobs-empty {
+  margin: 1.2rem 0 0;
+  padding: 1rem;
+  border: 1px dashed var(--line);
+  background: var(--sand);
+}
+
+.jobs-empty h2 {
+  margin: 0 0 0.3rem;
+  font-size: 1.1rem;
+  border-bottom: 0;
+}
+
+.jobs-empty p {
+  margin: 0;
+}
+
+.jobs-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.job-row {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr) auto;
+  gap: 0.4rem 1rem;
+  align-items: center;
+  margin: 0;
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.job-thumb {
+  display: block;
+  width: 7.5rem;
+  height: 4.5rem;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--sand);
+}
+
+.job-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.job-name {
+  margin: 0;
+  font-size: 1.05rem;
+  overflow-wrap: anywhere;
+}
+
+.job-here {
+  font-family: inherit;
+  font-weight: 400;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.job-meta {
+  font-size: 0.85rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.job-result {
+  font-size: 0.9rem;
+}
+
+.job-action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.25rem;
+  max-width: 13rem;
+}
+
+.job-reason {
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-align: right;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 650;
+}
+
+.badge.ok {
+  color: #1f5a2b;
+  background: rgba(47, 107, 58, 0.1);
+}
+
+.badge.working {
+  color: var(--focus);
+  background: rgba(11, 58, 130, 0.08);
+}
+
+.badge.waiting {
+  color: #6b4a10;
+  background: rgba(197, 139, 44, 0.14);
+}
+
+.badge.busy {
+  color: var(--muted);
+  background: var(--sand);
+}
+
+.badge.failed {
+  color: var(--err);
+  background: rgba(122, 30, 30, 0.08);
+}
+
+@media (max-width: 520px) {
+  .job-row {
+    grid-template-columns: 5.5rem minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .job-thumb {
+    width: 5.5rem;
+    height: 3.3rem;
+  }
+
+  .job-action {
+    grid-column: 1 / -1;
+    align-items: stretch;
+    max-width: none;
+  }
+
+  .job-reason {
+    text-align: left;
+  }
+}
