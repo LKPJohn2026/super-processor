@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The wizard's scene list, shot list, plan and Gemini chat are now saved
+  the same safe way as its state: through a temp file of their own that
+  replaces the old file in one step, retried while Windows briefly holds
+  the file open. A page refresh racing a save no longer fails the request
+  or reads a half-written file, and no `.tmp` file is left behind.
+
 ## [4.1.1] - 2026-11-17
 
 ### Fixed

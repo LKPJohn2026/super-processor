@@ -15,6 +15,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import read_text_retrying, write_text_atomic
 from .file_dialog import VIDEO_EXTENSIONS, FileDialogError, choose_video
 from .gemini import (
     ChatTurn,
@@ -261,28 +262,17 @@ def job_state_path(job_dir: Path) -> Path:
     return job_dir / WIZARD_STATE_FILE
 
 
-# On Windows, replacing a file that another thread has open (a page refresh
-# reading the state while the render worker saves it) fails with
-# PermissionError, and so does opening it mid-replace. Both clear within
-# milliseconds, so state reads and writes retry briefly instead of failing the
-# request.
-_STATE_RETRIES = 20
-_STATE_RETRY_S = 0.025
-
-
 def _read_state_file(path: Path, what: str) -> WizardState | None:
-    for attempt in range(_STATE_RETRIES):
-        try:
-            if not path.is_file():
-                return None
-            text = path.read_text(encoding="utf-8")
-            break
-        except PermissionError:
-            if attempt == _STATE_RETRIES - 1:
-                raise
-            time.sleep(_STATE_RETRY_S)
-        except UnicodeDecodeError as exc:
-            raise WizardError(f"corrupt {what}") from exc
+    # Retries a Windows sharing error from a save racing this read; see
+    # atomic_io.
+    try:
+        if not path.is_file():
+            return None
+        text = read_text_retrying(path)
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise WizardError(f"corrupt {what}") from exc
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, RecursionError) as exc:
@@ -297,21 +287,7 @@ def _read_state_file(path: Path, what: str) -> WizardState | None:
 
 
 def _write_state_file(path: Path, state: WizardState) -> None:
-    payload = json.dumps(state.to_dict(), indent=2) + "\n"
-    # One temp file per write, so two threads saving at once never share it.
-    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    try:
-        for attempt in range(_STATE_RETRIES):
-            try:
-                tmp.replace(path)
-                return
-            except PermissionError:
-                if attempt == _STATE_RETRIES - 1:
-                    raise
-                time.sleep(_STATE_RETRY_S)
-    finally:
-        tmp.unlink(missing_ok=True)
+    write_text_atomic(path, json.dumps(state.to_dict(), indent=2) + "\n")
 
 
 def load_session_state(jobs_dir: Path) -> WizardState:

@@ -246,7 +246,7 @@ def test_state_files_retry_windows_sharing_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A page read racing the worker's save must not fail the request."""
-    monkeypatch.setattr("super_processor.wizard._STATE_RETRY_S", 0)
+    monkeypatch.setattr("super_processor.atomic_io.RETRY_S", 0)
     save_session_state(tmp_path, WizardState(step=WizardStep.PICK_FILE))
 
     real_replace = Path.replace
@@ -305,7 +305,7 @@ def test_a_save_that_never_gets_the_file_keeps_the_old_state(
 ) -> None:
     """Retries are bounded: a file held open for good fails the save, and
     neither the old state nor a stray temp file is left broken behind it."""
-    monkeypatch.setattr("super_processor.wizard._STATE_RETRY_S", 0)
+    monkeypatch.setattr("super_processor.atomic_io.RETRY_S", 0)
     save_session_state(tmp_path, WizardState(step=WizardStep.PICK_FILE))
     real_replace = Path.replace
     attempts = {"replace": 0}

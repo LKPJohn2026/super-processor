@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import write_text_atomic
 from .regions import Region, regions_from_dicts
 from .upscale import UpscalePlan, UpscaleSpan
 
@@ -243,9 +244,10 @@ def shots_path(job_dir: Path) -> Path:
 
 
 def save_shots(job_dir: Path, shots: ShotList) -> Path:
-    path = shots_path(job_dir)
-    path.write_text(json.dumps(shots.to_dict(), indent=2) + "\n", encoding="utf-8")
-    return path
+    """Write ``shots.json`` atomically."""
+    return write_text_atomic(
+        shots_path(job_dir), json.dumps(shots.to_dict(), indent=2) + "\n"
+    )
 
 
 def load_shots(job_dir: Path) -> ShotList | None:

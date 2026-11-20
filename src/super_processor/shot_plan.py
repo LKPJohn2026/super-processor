@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import read_text_retrying, write_text_atomic
 from .look import LOOK_BOUNDS, ShotLook
 from .regions import MAX_REGIONS, Region, region_from_model
 from .shots import STILLS_DIR, Shot, ShotError, ShotList, extract_still
@@ -537,9 +538,10 @@ def plan_path(job_dir: Path) -> Path:
 
 
 def save_plan(job_dir: Path, plan: ShotPlan) -> Path:
-    path = plan_path(job_dir)
-    path.write_text(json.dumps(plan.to_dict(), indent=2) + "\n", encoding="utf-8")
-    return path
+    """Write ``shot_plan.json`` atomically."""
+    return write_text_atomic(
+        plan_path(job_dir), json.dumps(plan.to_dict(), indent=2) + "\n"
+    )
 
 
 def load_plan(job_dir: Path) -> ShotPlan | None:
@@ -547,7 +549,7 @@ def load_plan(job_dir: Path) -> ShotPlan | None:
     if not path.is_file():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_text_retrying(path))
     except json.JSONDecodeError as exc:
         raise ShotPlanError(f"shot_plan.json is not valid JSON: {exc}") from exc
     return ShotPlan.from_dict(data)

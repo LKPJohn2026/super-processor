@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from .atomic_io import write_text_atomic
 from .models import resolve_secret
 
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
@@ -803,10 +804,7 @@ def save_chat(job_dir: Path, turns: list[ChatTurn]) -> Path:
     job_dir.mkdir(parents=True, exist_ok=True)
     path = job_dir / CHAT_FILE_NAME
     payload = {"version": CHAT_VERSION, "turns": [turn.to_dict() for turn in turns]}
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
-    return path
+    return write_text_atomic(path, json.dumps(payload, indent=2) + "\n")
 
 
 def append_chat_turn(job_dir: Path, turn: ChatTurn) -> list[ChatTurn]:

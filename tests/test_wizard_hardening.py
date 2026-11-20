@@ -20,6 +20,12 @@ from super_processor.review import (
     allowed_origins,
     with_wizard_token,
 )
+from super_processor.segment_loop import (
+    LoopSegment,
+    SegmentList,
+    load_segment_list,
+    save_segment_list,
+)
 from super_processor.wizard import WizardController, WizardStep
 
 TOKEN = "test-token"
@@ -274,3 +280,38 @@ def test_label_shots_refuses_outside_still(
             contains=("faces",),
             job_dir=job,
         )
+
+
+def test_segment_list_save_and_load_retry_sharing_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """segments.json is written and read while a page refresh may hold it."""
+    monkeypatch.setattr("super_processor.atomic_io.RETRY_S", 0)
+    saved = SegmentList(
+        segments=[LoopSegment(0.0, 4.0, label="kitchen"), LoopSegment(4.0, 9.5)],
+        approved=True,
+    )
+    real_replace = Path.replace
+    real_read = Path.read_text
+    calls = {"replace": 0, "read": 0}
+
+    def flaky_replace(self: Path, target: Path) -> Path:
+        calls["replace"] += 1
+        if calls["replace"] < 3:
+            raise PermissionError(13, "file is open in another thread")
+        return real_replace(self, target)
+
+    def flaky_read(self: Path, *args: object, **kwargs: object) -> str:
+        calls["read"] += 1
+        if calls["read"] < 3:
+            raise PermissionError(13, "file is being replaced")
+        return real_read(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    save_segment_list(tmp_path, saved)
+    monkeypatch.setattr(Path, "read_text", flaky_read)
+    loaded = load_segment_list(tmp_path)
+    assert loaded is not None
+    assert loaded.to_dict() == saved.to_dict()
+    assert calls == {"replace": 3, "read": 3}
+    assert list(tmp_path.glob("*.tmp")) == []

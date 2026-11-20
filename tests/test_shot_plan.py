@@ -646,3 +646,34 @@ def test_payload_shows_current_settings_only_once_a_shot_has_a_recipe() -> None:
     assert shots_payload(shots, None, [2])[0]["contains"] == ["text"]
     with pytest.raises(ShotError, match="no shots"):
         new_plan(ShotList(shots=[]), 2)
+
+
+def test_save_plan_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A save racing a reader on Windows retries, and a save that never gets
+    the file leaves the old plan whole with no temp file behind."""
+    monkeypatch.setattr("super_processor.atomic_io.RETRY_S", 0)
+    old = ShotPlan(scale=2, recipes=[ShotRecipe(strength=0.5) for _ in range(2)])
+    save_plan(tmp_path, old)
+    real_replace = Path.replace
+    held = {"left": 2}
+
+    def flaky_replace(self: Path, target: Path) -> Path:
+        if held["left"] > 0:
+            held["left"] -= 1
+            raise PermissionError(13, "file is open in another thread")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    new = ShotPlan(scale=1, recipes=[ShotRecipe(strength=0.2) for _ in range(3)])
+    save_plan(tmp_path, new)
+    loaded = load_plan(tmp_path)
+    assert loaded is not None
+    assert loaded.to_dict() == new.to_dict()
+
+    held["left"] = 1000
+    with pytest.raises(PermissionError):
+        save_plan(tmp_path, old)
+    loaded = load_plan(tmp_path)
+    assert loaded is not None
+    assert loaded.to_dict() == new.to_dict()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["shot_plan.json"]

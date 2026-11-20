@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import read_text_retrying, write_text_atomic
 from .segments import SEGMENTS_FILE_NAME, STILLS_DIR_NAME, WIZARD_SEGMENTS_KIND
 from .shots import (
     CONTENTS,
@@ -326,10 +327,7 @@ def save_segment_list(job_dir: Path, segments: SegmentList) -> Path:
     """Write ``segments.json`` atomically."""
     path = job_dir / SEGMENTS_FILE_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(segments.to_dict(), indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
-    return path
+    return write_text_atomic(path, json.dumps(segments.to_dict(), indent=2) + "\n")
 
 
 def load_segment_list(job_dir: Path) -> SegmentList | None:
@@ -338,7 +336,7 @@ def load_segment_list(job_dir: Path) -> SegmentList | None:
     if not path.is_file():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_text_retrying(path))
     except (OSError, json.JSONDecodeError) as exc:
         raise SegmentLoopError(f"cannot read {SEGMENTS_FILE_NAME}: {exc}") from exc
     return SegmentList.from_dict(data)
