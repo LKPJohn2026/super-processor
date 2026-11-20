@@ -37,6 +37,7 @@ from super_processor.upscale import (
 from super_processor.wizard import (
     CANCEL_MARKER,
     GEMINI_VIDEO_FILE,
+    WORKER_PID_FILE,
     WizardConflict,
     WizardController,
     WizardError,
@@ -547,3 +548,70 @@ def test_only_running_steps_can_be_stopped(tmp_path: Path) -> None:
             controller.handle_post("/cancel", {})
         assert not (job_dir / CANCEL_MARKER).exists()
         assert controller.current_state().step is step
+
+
+# Server shutdown --------------------------------------------------------
+
+
+def test_a_server_shutdown_mid_render_ends_its_ffmpeg_and_keeps_the_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    monkeypatch.setattr("super_processor.wizard.render_plan", _slow_render(started))
+    controller, job_id, job_dir = _job(tmp_path, WizardStep.RENDERING)
+    controller.resume()
+    assert controller.start_render()
+    assert started.wait(5)
+    began = time.monotonic()
+    controller.shutdown(timeout=5)
+    # The render's FFmpeg was stopped, not left running for half a minute.
+    assert not controller.busy()
+    assert time.monotonic() - began < 3
+
+    # No stop was landed: the job keeps its step and asks to resume (Q1).
+    state = controller.current_state()
+    assert (state.step, state.job_id) == (WizardStep.RENDERING, job_id)
+    assert state.stopped is None
+    assert not (job_dir / CANCEL_MARKER).exists()
+    assert not (job_dir / WORKER_PID_FILE).exists()
+    again = WizardController(controller.jobs_dir, upscale_engine=FakeUpscaleEngine())
+    assert again.api_view()["interrupted"] is True
+    # And nothing starts behind the stopping server.
+    controller.prefetch = True
+    assert controller.start_prefetch() is False
+
+
+def test_a_shutdown_leaves_a_stop_the_editor_asked_for_to_land(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    monkeypatch.setattr("super_processor.wizard.render_plan", _slow_render(started))
+    controller, _job_id, _job_dir = _job(tmp_path, WizardStep.RENDERING)
+    monkeypatch.setattr(controller, "_approved_scene_count", lambda _job_dir: 3)
+    controller.resume()
+    assert controller.start_render()
+    assert started.wait(5)
+    controller.handle_post("/cancel", {})
+    controller.shutdown(timeout=5)
+    assert not controller.busy()
+    assert controller.current_state().step is WizardStep.READY_TO_RENDER
+
+
+def test_an_editor_stop_after_a_shutdown_began_is_still_landed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    monkeypatch.setattr("super_processor.wizard.render_plan", _slow_render(started))
+    controller, _job_id, _job_dir = _job(tmp_path, WizardStep.RENDERING)
+    monkeypatch.setattr(controller, "_approved_scene_count", lambda _job_dir: 3)
+    controller.resume()
+    assert controller.start_render()
+    assert started.wait(5)
+    run = controller._run
+    assert run is not None
+    # A shutdown marked the run abandoned, but its stop has not landed yet
+    # when the editor's own stop arrives.
+    run.abandoned = True
+    controller.handle_post("/cancel", {})
+    assert controller.wait_idle(5)
+    assert controller.current_state().step is WizardStep.READY_TO_RENDER

@@ -86,7 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - After new scenes are approved (a note to Gemini, a manual edit, or
   starting over from the result), the previews no longer show the old
   scenes' cached video: preview URLs now carry the plan's generation.
-
+- Stopping the wizard server in the middle of a render or a scene scan now
+  ends its FFmpeg and SPAN work too, instead of leaving it writing to the
+  job's work files. The job keeps its step, and the next start asks
+  whether to resume it.
 - "Ready to render" refuses to start while a scene has changes that have
   not been previewed yet, and says which scene.
 - A half-written or damaged `shot_plan.json` no longer breaks `/api/state`

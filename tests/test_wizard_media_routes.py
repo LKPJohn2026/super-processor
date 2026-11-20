@@ -10,6 +10,12 @@ import pytest
 
 from super_processor.gemini import credentials_path
 from super_processor.review import WizardServer
+from super_processor.segment_loop import (
+    LoopSegment,
+    SegmentList,
+    SegmentStill,
+    save_segment_list,
+)
 from super_processor.wizard import (
     WizardController,
     WizardState,
@@ -207,3 +213,50 @@ def test_setup_refuses_an_empty_key_and_saves_nothing(
     assert state.error == "API key is empty"
     assert not credentials_path().exists()
     assert "API key is empty" in controller.render()
+
+
+def test_the_job_summary_stills_name_their_job_and_are_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = WizardController(tmp_path / "jobs")
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"x")
+    job_id = controller.store.create(source).job_id
+    job_dir = controller.store.job_dir(job_id)
+    save_segment_list(
+        job_dir,
+        SegmentList(
+            segments=[LoopSegment(0.0, 4.0, "a"), LoopSegment(4.0, 8.0, "b")],
+            approved=True,
+        ),
+    )
+    stills = [
+        SegmentStill(t_s=t, path=f"segment_stills/t_{int(t * 1000):08d}.jpg")
+        for t in (2.0, 6.0)
+    ]
+    for still in stills:
+        (job_dir / still.path).parent.mkdir(parents=True, exist_ok=True)
+        (job_dir / still.path).write_bytes(still.path.encode())
+    monkeypatch.setattr(
+        "super_processor.wizard.load_segment_stills", lambda _job_dir: stills
+    )
+    save_session_state(
+        controller.jobs_dir,
+        WizardState(step=WizardStep.PREVIEW_SEGMENT, job_id=job_id),
+    )
+    scenes = controller.api_view()["job"]["scenes"]
+    urls = [scene["still_url"] for scene in scenes]
+    assert urls == [f"/jobs/{job_id}/{still.path}" for still in stills]
+
+    # Another window opens a different job: the URLs still show this one's.
+    other = controller.store.create(source).job_id
+    save_session_state(
+        controller.jobs_dir, WizardState(step=WizardStep.RESULT, job_id=other)
+    )
+    server = WizardServer(controller.jobs_dir, controller=controller)
+    base = server.start()
+    try:
+        for url, still in zip(urls, stills, strict=True):
+            assert _get(base, url) == (200, "image/jpeg", still.path.encode())
+    finally:
+        server.stop()

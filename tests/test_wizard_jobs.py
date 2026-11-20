@@ -19,11 +19,13 @@ from urllib.parse import urlparse
 
 import pytest
 
+from super_processor import atomic_io
 from super_processor.jobs import JobState
 from super_processor.review import WizardServer
 from super_processor.segment_loop import (
     LoopSegment,
     SegmentList,
+    SegmentStill,
     save_segment_list,
 )
 from super_processor.wizard import (
@@ -33,9 +35,12 @@ from super_processor.wizard import (
     WizardError,
     WizardState,
     WizardStep,
+    _nearest_still_url,
+    _worker_pid_text,
     load_job_wizard_state,
     save_job_wizard_state,
     save_session_state,
+    worker_pid,
 )
 
 TOKEN = "jobs-token"
@@ -547,3 +552,31 @@ def test_an_unreadable_process_id_file_is_ignored(tmp_path: Path, text: str) -> 
     (job_dir / WORKER_PID_FILE).write_text(text, encoding="utf-8")
     (entry,) = controller.jobs_view()
     assert entry["job_id"] == job_id and entry["status"] == "paused"
+
+
+def test_a_still_url_can_name_its_job() -> None:
+    stills = [SegmentStill(t_s=t, path=f"segment_stills/t_{t:08d}.jpg") for t in (1, 5)]
+    assert _nearest_still_url(stills, 4.0, 6.0) == "/segment_stills/t_00000005.jpg"
+    assert (
+        _nearest_still_url(stills, 4.0, 6.0, job_id="abcd1234")
+        == "/jobs/abcd1234/segment_stills/t_00000005.jpg"
+    )
+    assert _nearest_still_url([], 0.0, 1.0, job_id="abcd1234") is None
+
+
+def test_the_pid_file_read_retries_a_sharing_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / WORKER_PID_FILE).write_text(_worker_pid_text(), encoding="utf-8")
+    monkeypatch.setattr(atomic_io, "RETRY_S", 0.0)
+    real = Path.read_text
+    refused = [2]
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == WORKER_PID_FILE and refused[0]:
+            refused[0] -= 1
+            raise PermissionError("in use")
+        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    assert worker_pid(tmp_path) == os.getpid()

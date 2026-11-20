@@ -448,7 +448,9 @@ def worker_pid(job_dir: Path) -> int | None:
     given the same id (after a restart, say) does not count.
     """
     try:
-        raw = (job_dir / WORKER_PID_FILE).read_text(encoding="utf-8").split()
+        # Retried: on Windows a read that meets a run's replace of the
+        # file must not report the job as idle.
+        raw = read_text_retrying(job_dir / WORKER_PID_FILE).split()
     except (OSError, UnicodeDecodeError):
         return None
     if not raw or not raw[0].isdigit():
@@ -492,12 +494,23 @@ def _updated_epoch(manifest: JobManifest, job_dir: Path) -> float:
 
 
 def _nearest_still_url(
-    stills: list[SegmentStill], start_s: float, end_s: float
+    stills: list[SegmentStill],
+    start_s: float,
+    end_s: float,
+    *,
+    job_id: str | None = None,
 ) -> str | None:
-    """The URL of the sampled still nearest the middle of a span."""
+    """The URL of the sampled still nearest the middle of a span.
+
+    With ``job_id`` the URL names the job (``/jobs/<id>/...``), so a page
+    left on one job keeps showing its stills after another window opens a
+    different job.
+    """
     middle = (start_s + end_s) / 2
     nearest = min(stills, key=lambda s: abs(s.t_s - middle), default=None)
-    return f"/{nearest.path}" if nearest else None
+    if nearest is None:
+        return None
+    return f"/jobs/{job_id}/{nearest.path}" if job_id else f"/{nearest.path}"
 
 
 @dataclass(slots=True)
@@ -941,6 +954,9 @@ class _Run:
     rendered: bool = False
     # True once a stop has been landed (the state saved as stopped).
     landed: bool = False
+    # Stopped because the server is shutting down: its processes end, but
+    # no stop is landed, so the job is offered to resume (Q1).
+    abandoned: bool = False
     # The worker thread that owns the run; only it may mark the run failed.
     thread_id: int = field(default_factory=threading.get_ident)
     # The controller's cancel guard, so a stop and a commit never interleave.
@@ -1089,6 +1105,8 @@ class WizardController:
         # Guards the run record: setting it, reading it, stopping it.
         self._cancel_guard = threading.Lock()
         self._run: _Run | None = None
+        # Set by shutdown: no prefetch starts after it.
+        self._closed = False
         self._last_run: _Run | None = None
         # On a helper thread a run hands a Gemini call to (see _abandonable):
         # the run it works for. Its progress saves check that run, not
@@ -1182,7 +1200,7 @@ class WizardController:
             return False
         try:
             with self._worker_guard:
-                if self.busy():
+                if self.busy() or self._closed:
                     return False
                 state = self._state()
                 current = state.step
@@ -1275,7 +1293,12 @@ class WizardController:
                     return
                 yield run
             except Cancelled:
-                self._land_cancel(run)
+                if run.abandoned:
+                    # The server is stopping: leave the step as it was, so
+                    # the next server offers to resume it.
+                    run.outcome = "stopped"
+                else:
+                    self._land_cancel(run)
             except Exception as exc:  # noqa: BLE001 - surfaced on the page
                 self._land_failure(run, exc)
         finally:
@@ -1348,6 +1371,8 @@ class WizardController:
                     # covers a server that goes away before it lands.
                     with contextlib.suppress(OSError):
                         marker.touch()
+                    # The editor's stop wins over a shutdown's: it is landed.
+                    run.abandoned = False
                     run.cancel.set()
                     return
                 idle = not self.busy() and self._work_lock.acquire(blocking=False)
@@ -2603,8 +2628,9 @@ class WizardController:
             )
         except StabilityError as exc:
             report["error"] = f"The seam check could not run: {exc}"
-        (job_dir / RENDER_REPORT_FILE).write_text(
-            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        # Read on every result poll: never let a poll see half a file.
+        write_text_atomic(
+            job_dir / RENDER_REPORT_FILE, json.dumps(report, indent=2) + "\n"
         )
 
     def _looks_view(self, job_dir: Path) -> dict[str, Any]:
@@ -2887,7 +2913,7 @@ class WizardController:
     ) -> None:
         record = job_dir / GEMINI_VIDEO_FILE
         payload = {"video": video.to_dict() if video else None, "error": error}
-        record.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        write_text_atomic(record, json.dumps(payload, indent=2) + "\n")
 
     def _note_video_problem(
         self, job_dir: Path, detail: str, *, video: GeminiVideo | None = None
@@ -3181,7 +3207,7 @@ class WizardController:
         and when the next scene still needs a preview. A prefetch of
         another scene (or of an older plan) is dropped first.
         """
-        if not self.prefetch:
+        if not self.prefetch or self._closed:
             return False
         if not self._post_lock.acquire(timeout=_POST_WAIT_S):
             return False
@@ -3210,7 +3236,7 @@ class WizardController:
             with self._worker_guard:
                 # POSTs and worker starts wait for the post lock held here,
                 # so nothing has moved the wizard since the check above.
-                if self.busy() or self._prefetch is not None:
+                if self.busy() or self._prefetch is not None or self._closed:
                     return False
                 worker = threading.Thread(
                     target=self._run_prefetch,
@@ -3239,13 +3265,34 @@ class WizardController:
         return self._await_dropped(timeout=left)
 
     def shutdown(self, timeout: float = 5.0) -> None:
-        """Drop a prefetch in the making, for a server that is stopping.
+        """Stop background work, for a server that is stopping.
 
-        Only the prefetch is stopped. A run in progress is left alone on
-        purpose (product decision Q1): its thread dies with the process and
-        the job is offered to resume next time, not saved as stopped.
+        A prefetch in the making is dropped. A run in progress is stopped
+        too, so its FFmpeg, SPAN or Gemini work ends with it (on POSIX a
+        child process would otherwise outlive the server and keep writing
+        to the job's work files). No stop is landed (product decision Q1):
+        the job keeps its step and is offered to resume next time.
         """
+        deadline = time.monotonic() + timeout
+
+        def left() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        with self._worker_guard:
+            # Under the guard, so no worker or prefetch starts from here on.
+            self._closed = True
+        with self._cancel_guard:
+            run = self._run
+            if run is not None and run.cancellable and not run.cancel.is_set():
+                run.abandoned = True
+                run.cancel.set()
         self._drop_prefetch(timeout)
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(left())
+        # A prefetch the run was adopting is dropped as the run ends; wait
+        # for it too, so its FFmpeg does not outlive the server either.
+        self._await_dropped(timeout=left())
 
     def _prefetch_after(self, worker: threading.Thread) -> None:
         """Start a prefetch once ``worker`` has ended (see _run_worker)."""
@@ -3446,6 +3493,8 @@ class WizardController:
                 waiting = self._dropped[0] if self._dropped else None
             if waiting is None:
                 return True
+            if state is not None:
+                self._check_stop()
             if state is not None and round(waiting.pct) != shown:
                 shown = round(waiting.pct)
                 self._progress(
@@ -3482,6 +3531,8 @@ class WizardController:
             return False
         shown: tuple[int, str] | None = None
         while not ahead.done.wait(_ABANDON_POLL_S):
+            # Only a server shutdown stops an analysis (see shutdown).
+            self._check_stop()
             now = (round(ahead.pct), ahead.message)
             if now != shown:
                 shown = now
@@ -3721,7 +3772,9 @@ class WizardController:
                         "start_s": start_s,
                         "end_s": end_s,
                         "label": label,
-                        "still_url": _nearest_still_url(stills, start_s, end_s),
+                        "still_url": _nearest_still_url(
+                            stills, start_s, end_s, job_id=job_id
+                        ),
                         "status": status,
                         "previewed": bool(
                             recipe is not None and recipe.rev and not recipe.stale
@@ -4050,7 +4103,10 @@ class WizardController:
             state.notice = None
             state.step = WizardStep.RESULT
         except (UpscaleError, ProbeError, OSError, ValueError) as exc:
-            self._render_failed(state, str(exc))
+            # Under the state lock, like every other failure landing (see
+            # _land_failure), so no late progress save lands after it.
+            with self._state_lock:
+                self._render_failed(state, str(exc))
             return
         finally:
             sampled.set()
