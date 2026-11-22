@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import urllib.parse
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -113,8 +114,49 @@ def check_jobs_dir(jobs_dir: Path | None = None) -> CheckResult:
     )
 
 
-def check_model_endpoint(name: str, env_var: str) -> CheckResult:
-    """Report configured model endpoints without contacting the network."""
+# Shorter values are never shown in part: four characters of them would
+# give away too much.
+_MIN_TAIL_LEN = 12
+
+
+def mask_secret(value: str) -> str:
+    """How doctor shows a key: that it is set, and at most its last 4 characters.
+
+    The rest never appears, so a doctor report pasted into an issue or a
+    chat does not give the key away.
+    """
+    cleaned = value.strip()
+    if len(cleaned) < _MIN_TAIL_LEN:
+        return "set"
+    return f"set, ends in ...{cleaned[-4:]}"
+
+
+def safe_url(value: str) -> str:
+    """``value`` as scheme://host[:port]/path: no user name, password, query
+    or fragment, which may hold a token."""
+    try:
+        parts = urllib.parse.urlsplit(value.strip())
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return "unreadable URL"
+    if not parts.scheme or not host:
+        return "unreadable URL"
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def check_model_endpoint(
+    name: str, env_var: str, *, secret: bool | None = None
+) -> CheckResult:
+    """Report configured model endpoints without contacting the network.
+
+    A key (``secret``, the default for a ``*_API_KEY`` variable) is never
+    printed: only that it is set and its last 4 characters. A URL is shown
+    without credentials, query or fragment.
+    """
     value = os.environ.get(env_var)
     if not value:
         return CheckResult(
@@ -122,11 +164,42 @@ def check_model_endpoint(name: str, env_var: str) -> CheckResult:
             ok=True,
             detail=f"{env_var} unset (optional)",
         )
+    if secret is None:
+        secret = env_var.endswith(("_API_KEY", "_TOKEN", "_SECRET"))
+    if secret:
+        return CheckResult(
+            name=name,
+            ok=True,
+            detail=f"{env_var} configured ({mask_secret(value)})",
+        )
     return CheckResult(
         name=name,
         ok=True,
         detail=f"{env_var} configured",
-        path=value,
+        path=safe_url(value),
+    )
+
+
+def check_gemini_key() -> CheckResult:
+    """Where the Gemini key comes from, never the key itself."""
+    # Imported here: gemini imports models, which imports this module.
+    from .gemini import gemini_api_key_source, resolve_gemini_api_key
+
+    try:
+        key = resolve_gemini_api_key()
+        source = gemini_api_key_source()
+    except Exception:  # noqa: BLE001 - a broken keyring must not stop doctor
+        key, source = None, None
+    if not key:
+        return CheckResult(
+            name="gemini_api_key",
+            ok=True,
+            detail="not set (paste one on the wizard's setup screen)",
+        )
+    return CheckResult(
+        name="gemini_api_key",
+        ok=True,
+        detail=f"{mask_secret(key)}, from {source or 'an unknown place'}",
     )
 
 
@@ -266,6 +339,7 @@ def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
         ),
         check_player(),
         check_jobs_dir(jobs_dir),
+        check_gemini_key(),
         check_model_endpoint("local_llm", "SUPER_PROCESSOR_LLM_BASE_URL"),
         check_model_endpoint("openai_api_key", "OPENAI_API_KEY"),
         check_model_endpoint("anthropic_api_key", "ANTHROPIC_API_KEY"),

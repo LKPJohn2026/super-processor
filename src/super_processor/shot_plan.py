@@ -18,6 +18,7 @@ box, the whole shot is also capped at :data:`PROTECTED_STRENGTH`.
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import uuid
@@ -252,7 +253,8 @@ def _known(raw: Any, allowed: tuple[str, ...]) -> tuple[str, ...]:
 def _optional_number(raw: Any) -> float | None:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
-    return float(raw)
+    value = float(raw)
+    return value if math.isfinite(value) else None
 
 
 def _count(raw: Any) -> int:

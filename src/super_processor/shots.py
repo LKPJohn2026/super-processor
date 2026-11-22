@@ -28,7 +28,7 @@ from typing import Any
 
 from .atomic_io import write_text_atomic
 from .regions import Region, regions_from_dicts
-from .tools import FILE_INPUT, resolve_argv
+from .tools import FILE_INPUT, NO_METADATA, resolve_argv
 from .upscale import UpscalePlan, UpscaleSpan
 
 SHOTS_FILE = "shots.json"
@@ -459,6 +459,11 @@ def extract_still(
             str(source),
             "-frames:v",
             "1",
+            # Stills are sent to Gemini: the picture only, no metadata.
+            "-an",
+            "-sn",
+            "-dn",
+            *NO_METADATA,
             "-vf",
             f"scale={width}:-2",
             "-q:v",

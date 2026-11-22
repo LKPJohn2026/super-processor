@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import http.client
 import json
+import logging
+import math
 import os
+import re
 import sys
 import threading
 import time
@@ -84,6 +88,133 @@ _FILE_POLL_S = 2.0
 _FILE_ACTIVE_TIMEOUT_S = 600.0
 # Frames per second Gemini samples from a video (its own default).
 VIDEO_FPS = 1.0
+# The key goes in this header, never in a URL: URLs end up in logs, proxies
+# and error messages (http.client quotes the whole path in some errors).
+API_KEY_HEADER = "x-goog-api-key"
+# A File API name as Gemini hands it out (``files/abc-123``).
+_FILE_NAME = re.compile(r"files/[A-Za-z0-9][A-Za-z0-9_-]{0,127}", re.ASCII)
+# Said instead of the text of an error that may quote the request.
+_INVALID_REQUEST = "invalid request (check the API key on the setup screen)"
+_BAD_KEY_MESSAGE = (
+    "that does not look like a Gemini API key: it has spaces, line breaks or "
+    "other characters a key never has; copy it again from Google AI Studio"
+)
+
+_LOG = logging.getLogger(__name__)
+
+# Keys this process has seen, so any text it stores or shows can have them
+# taken out (see redact_secrets). Shorter strings are never treated as keys,
+# so a test key such as "k" does not blank out every letter k.
+_MIN_SECRET_LEN = 16
+_SECRETS: set[str] = set()
+_SECRETS_LOCK = threading.Lock()
+# A Gemini key (AIza and 35 more characters) standing on its own, and a
+# ``key=`` query parameter in a URL quoted by an error.
+_KEY_LIKE = re.compile(r"(?<![0-9A-Za-z_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])")
+_KEY_PARAM = re.compile(r"([?&](?:key|api_key)=)[^&\s'\"]+")
+REDACTED = "***"
+
+
+def remember_secret(value: str | None) -> None:
+    """Treat ``value`` as a secret from now on (see :func:`redact_secrets`)."""
+    if not value:
+        return
+    with _SECRETS_LOCK:
+        for item in (value, value.strip()):
+            if len(item) >= _MIN_SECRET_LEN:
+                _SECRETS.add(item)
+
+
+def redact_secrets(text: str) -> str:
+    """``text`` with every Gemini key in it replaced by ``***``.
+
+    It takes out the keys this process has used or saved, the key in the
+    environment, anything shaped like a Gemini key, and ``key=`` query
+    parameters. Used on every error, progress line and page the wizard
+    stores or shows, so a key never ends up in ``wizard_state.json``.
+    """
+    if not text:
+        return text
+    with _SECRETS_LOCK:
+        known = set(_SECRETS)
+    env = os.environ.get(GEMINI_API_KEY_ENV, "")
+    for item in (env, env.strip()):
+        if len(item) >= _MIN_SECRET_LEN:
+            known.add(item)
+    for secret in sorted(known, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, REDACTED)
+    text = _KEY_LIKE.sub(REDACTED, text)
+    return _KEY_PARAM.sub(lambda m: m.group(1) + REDACTED, text)
+
+
+def redact_payload(value: Any) -> Any:
+    """A copy of a JSON-like ``value`` with :func:`redact_secrets` applied
+    to every string in it (keys of objects included)."""
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {
+            redact_payload(key) if isinstance(key, str) else key: redact_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_payload(item) for item in value]
+    return value
+
+
+def key_looks_valid(api_key: str) -> bool:
+    """True when ``api_key`` holds only the visible ASCII a key is made of.
+
+    A key with a space or a line break in it (copied across a wrapped line)
+    never works, and used to end up quoted in error messages.
+    """
+    return bool(api_key) and all("!" <= char <= "~" for char in api_key)
+
+
+def _key_headers(api_key: str, **extra: str) -> dict[str, str]:
+    if not key_looks_valid(api_key):
+        raise GeminiError(_BAD_KEY_MESSAGE)
+    return {API_KEY_HEADER: api_key, **extra}
+
+
+def _file_id(name: str) -> str:
+    """The id part of a File API name; refuses anything else."""
+    if not _FILE_NAME.fullmatch(name):
+        raise GeminiError("that is not a Gemini file name")
+    return name.removeprefix("files/")
+
+
+def finite_json_number(text: str) -> float | None:
+    """``parse_float`` for model replies: a number too big for a float
+    (``1e999`` would read as infinity) is read as null."""
+    value = float(text)
+    return value if math.isfinite(value) else None
+
+
+def bounded_json_int(text: str) -> int | None:
+    """``parse_int`` for model replies: no reply field needs more than 20
+    digits, and a longer one could not become a float either."""
+    return int(text) if len(text.lstrip("-")) <= 20 else None
+
+
+def drop_json_constant(name: str) -> None:
+    """``parse_constant`` for model replies: ``NaN`` and ``Infinity`` are
+    not JSON, and Python's reader would otherwise accept them. They are
+    read as null, which every reader of a reply already treats as a
+    missing value (a span's strength then fails to validate)."""
+    return None
+
+
+def loads_finite(text: str) -> Any:
+    """``json.loads`` that reads NaN, Infinity and numbers out of range as
+    null, so no non-finite number ever reaches a plan."""
+    return json.loads(
+        text,
+        parse_constant=drop_json_constant,
+        parse_float=finite_json_number,
+        parse_int=bounded_json_int,
+    )
 
 
 class GeminiError(RuntimeError):
@@ -503,13 +634,13 @@ class UrllibGeminiTransport:
     ) -> dict[str, Any]:  # pragma: no cover - exercised via FakeTransport in tests
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={api_key}"
+            f"{urllib.parse.quote(model, safe='-._')}:generateContent"
         )
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=_key_headers(api_key, **{"Content-Type": "application/json"}),
             method="POST",
         )
         timeout = _VIDEO_REQUEST_TIMEOUT_S if _has_video(body) else _REQUEST_TIMEOUT_S
@@ -528,7 +659,12 @@ class UrllibGeminiTransport:
             OSError,
             json.JSONDecodeError,
         ) as exc:
-            raise GeminiError(f"Gemini request failed: {exc}") from exc
+            raise GeminiError(
+                f"Gemini request failed: {redact_secrets(str(exc))}"
+            ) from None
+        except (http.client.HTTPException, ValueError):
+            # An InvalidURL or a bad header value quotes the request.
+            raise GeminiError(f"Gemini request failed: {_INVALID_REQUEST}") from None
         if not isinstance(parsed, dict):
             raise GeminiError("Gemini response root must be an object")
         return parsed
@@ -545,15 +681,18 @@ class UrllibGeminiTransport:
         """Resumable File API upload, in pieces, reporting the share sent."""
         size = path.stat().st_size
         start = urllib.request.Request(
-            f"{_UPLOAD_URL}?key={api_key}",
+            _UPLOAD_URL,
             data=json.dumps({"file": {"display_name": display_name}}).encode(),
-            headers={
-                "X-Goog-Upload-Protocol": "resumable",
-                "X-Goog-Upload-Command": "start",
-                "X-Goog-Upload-Header-Content-Length": str(size),
-                "X-Goog-Upload-Header-Content-Type": mime_type,
-                "Content-Type": "application/json",
-            },
+            headers=_key_headers(
+                api_key,
+                **{
+                    "X-Goog-Upload-Protocol": "resumable",
+                    "X-Goog-Upload-Command": "start",
+                    "X-Goog-Upload-Header-Content-Length": str(size),
+                    "X-Goog-Upload-Header-Content-Type": mime_type,
+                    "Content-Type": "application/json",
+                },
+            ),
             method="POST",
         )
         try:
@@ -596,8 +735,12 @@ class UrllibGeminiTransport:
                 f"{summarize_gemini_error(status, detail)}",
                 status=status,
             ) from None
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-            raise GeminiError(f"Gemini upload failed: {exc}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise GeminiError(
+                f"Gemini upload failed: {redact_secrets(str(exc))}"
+            ) from None
+        except (http.client.HTTPException, ValueError):
+            raise GeminiError(f"Gemini upload failed: {_INVALID_REQUEST}") from None
         file = result.get("file") if isinstance(result, dict) else None
         if not isinstance(file, dict):
             raise GeminiError("Gemini upload returned no file")
@@ -607,7 +750,9 @@ class UrllibGeminiTransport:
         self, *, api_key: str, name: str
     ) -> dict[str, Any]:  # pragma: no cover - needs the network; faked in tests
         req = urllib.request.Request(
-            f"{_FILES_URL}/{name.removeprefix('files/')}?key={api_key}", method="GET"
+            f"{_FILES_URL}/{_file_id(name)}",
+            headers=_key_headers(api_key),
+            method="GET",
         )
         try:
             with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as response:
@@ -618,11 +763,42 @@ class UrllibGeminiTransport:
                 f"Gemini HTTP {status}: {summarize_gemini_error(status, detail)}",
                 status=status,
             ) from None
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-            raise GeminiError(f"Gemini request failed: {exc}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise GeminiError(
+                f"Gemini request failed: {redact_secrets(str(exc))}"
+            ) from None
+        except (http.client.HTTPException, ValueError):
+            raise GeminiError(f"Gemini request failed: {_INVALID_REQUEST}") from None
         if not isinstance(parsed, dict):
             raise GeminiError("Gemini file response root must be an object")
         return parsed
+
+    def delete_file(
+        self, *, api_key: str, name: str
+    ) -> None:  # pragma: no cover - needs the network; faked in tests
+        """Delete the File API file ``name``; one already gone counts as done."""
+        req = urllib.request.Request(
+            f"{_FILES_URL}/{_file_id(name)}",
+            headers=_key_headers(api_key),
+            method="DELETE",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            status, detail = _http_error_detail(exc)
+            if status == 404:
+                return
+            raise GeminiError(
+                f"Gemini HTTP {status}: {summarize_gemini_error(status, detail)}",
+                status=status,
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise GeminiError(
+                f"Gemini delete failed: {redact_secrets(str(exc))}"
+            ) from None
+        except (http.client.HTTPException, ValueError):
+            raise GeminiError(f"Gemini delete failed: {_INVALID_REQUEST}") from None
 
     def list_models(
         self, *, api_key: str
@@ -630,10 +806,12 @@ class UrllibGeminiTransport:
         models: list[dict[str, Any]] = []
         page_token = ""
         while True:
-            url = f"{_MODELS_URL}?key={api_key}&pageSize=100"
+            url = f"{_MODELS_URL}?pageSize=100"
             if page_token:
                 url += f"&pageToken={urllib.parse.quote(page_token)}"
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(
+                url, headers=_key_headers(api_key), method="GET"
+            )
             try:
                 with urllib.request.urlopen(req, timeout=60) as response:
                     parsed: object = json.loads(response.read().decode("utf-8"))
@@ -649,7 +827,13 @@ class UrllibGeminiTransport:
                 OSError,
                 json.JSONDecodeError,
             ) as exc:
-                raise GeminiError(f"Gemini list models failed: {exc}") from exc
+                raise GeminiError(
+                    f"Gemini list models failed: {redact_secrets(str(exc))}"
+                ) from None
+            except (http.client.HTTPException, ValueError):
+                raise GeminiError(
+                    f"Gemini list models failed: {_INVALID_REQUEST}"
+                ) from None
             if not isinstance(parsed, dict):
                 raise GeminiError("Gemini models.list root must be an object")
             batch = parsed.get("models") or []
@@ -753,11 +937,14 @@ def resolve_gemini_api_key() -> str | None:
     The environment wins so a key set for one run is used for that run. The
     keyring is only read, for keys saved by versions before the file.
     """
-    return (
-        os.environ.get(GEMINI_API_KEY_ENV)
+    key = (
+        os.environ.get(GEMINI_API_KEY_ENV, "").strip()
         or _stored_gemini_api_key()
-        or resolve_secret(GEMINI_API_KEY_ENV)
+        or (resolve_secret(GEMINI_API_KEY_ENV) or "").strip()
+        or None
     )
+    remember_secret(key)
+    return key
 
 
 def store_gemini_api_key(api_key: str) -> Path:
@@ -770,6 +957,9 @@ def store_gemini_api_key(api_key: str) -> Path:
     cleaned = api_key.strip()
     if not cleaned:
         raise GeminiError("API key is empty")
+    if not key_looks_valid(cleaned):
+        raise GeminiError(_BAD_KEY_MESSAGE)
+    remember_secret(cleaned)
     path = credentials_path()
     payload = json.dumps({_CREDENTIALS_KEY: cleaned}, indent=2) + "\n"
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -782,7 +972,9 @@ def store_gemini_api_key(api_key: str) -> Path:
     except OSError as exc:
         with contextlib.suppress(OSError):
             tmp.unlink()
-        raise GeminiError(f"could not save the API key to {path}: {exc}") from exc
+        raise GeminiError(
+            f"could not save the API key to {path}: {redact_secrets(str(exc))}"
+        ) from None
     os.environ[GEMINI_API_KEY_ENV] = cleaned
     return path
 
@@ -868,8 +1060,11 @@ def _extract_text(response: dict[str, Any]) -> str:
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
+    """The object in a model reply. NaN, Infinity and numbers too big for a
+    float are read as null here, once for every reply, so none reaches a
+    plan."""
     try:
-        data = json.loads(text)
+        data = loads_finite(text)
     except json.JSONDecodeError as exc:
         raise GeminiError(f"Gemini JSON parse failed: {exc}") from exc
     if not isinstance(data, dict):
@@ -1060,6 +1255,9 @@ class GeminiClient:
             raise GeminiError(
                 f"set {GEMINI_API_KEY_ENV} or paste a key in the wizard setup screen"
             )
+        if not key_looks_valid(self.api_key):
+            raise GeminiError(_BAD_KEY_MESSAGE)
+        remember_secret(self.api_key)
         self.model = model or os.environ.get(GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL)
         self.transport: GeminiTransport = transport or UrllibGeminiTransport()
         self._candidate_models: list[str] | None = None
@@ -1329,6 +1527,27 @@ class GeminiClient:
         except GeminiError:
             return False
         return str(file.get("state") or "") == "ACTIVE"
+
+    def delete_video(self, video: GeminiVideo) -> bool:
+        """Remove ``video`` from the File API, best effort.
+
+        True when it is gone (or the transport cannot delete, in which case
+        Google removes it after about 48 hours). A failure is logged without
+        the key and never raised: cleanup must not fail the job.
+        """
+        deleter = getattr(self.transport, "delete_file", None)
+        if not callable(deleter):
+            return False
+        try:
+            deleter(api_key=self.api_key, name=video.name)
+        except Exception as exc:  # noqa: BLE001 - best effort, logged
+            _LOG.warning(
+                "could not delete the Gemini upload %s: %s",
+                video.name,
+                redact_secrets(str(exc)) or type(exc).__name__,
+            )
+            return False
+        return True
 
     def propose_looks(
         self,

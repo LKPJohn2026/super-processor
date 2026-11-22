@@ -38,6 +38,8 @@ from .gemini import (
     append_chat_turn,
     append_chat_turns,
     gemini_api_key_source,
+    redact_payload,
+    redact_secrets,
     resolve_gemini_api_key,
     store_gemini_api_key,
 )
@@ -300,6 +302,12 @@ _UPLOAD_PREFIX = re.compile(r"[0-9a-f]{12}-")
 
 
 _T = TypeVar("_T")
+
+
+def _in_background(work: Callable[[], object]) -> None:
+    """Run best-effort ``work`` on a daemon thread, so a slow network never
+    holds up the page (and never keeps the server from stopping)."""
+    threading.Thread(target=work, name="gemini-cleanup", daemon=True).start()
 
 
 def _optional_str(value: object) -> str | None:
@@ -647,7 +655,9 @@ def _read_state_file(path: Path, what: str) -> WizardState | None:
 
 
 def _write_state_file(path: Path, state: WizardState) -> None:
-    write_text_atomic(path, json.dumps(state.to_dict(), indent=2) + "\n")
+    # No error or progress line may carry the Gemini key onto disk.
+    payload = redact_payload(state.to_dict())
+    write_text_atomic(path, json.dumps(payload, indent=2) + "\n")
 
 
 def load_session_state(jobs_dir: Path) -> WizardState:
@@ -1104,6 +1114,12 @@ class WizardController:
         # A full path from PATH, never a copy in the current folder.
         self.ffmpeg_bin = tool_path(ffmpeg_bin)
         self._gemini = gemini
+        # A client passed in (tests) is kept when the key changes; one this
+        # controller built is rebuilt, so a replaced key is used at once.
+        self._gemini_owned = gemini is None
+        # Runs best-effort cleanup (deleting a Gemini upload) off the
+        # request thread; tests replace it to run the work in place.
+        self.run_cleanup: Callable[[Callable[[], object]], None] = _in_background
         self._upscale = upscale_engine
         # One analyze or render at a time. The HTTP server is threaded, and a
         # reload or a second tab must not start a second GPU pass on the
@@ -1156,9 +1172,41 @@ class WizardController:
         self._dropped: list[_Prefetch] = []
 
     def gemini(self) -> GeminiClient:
-        if self._gemini is None:
-            self._gemini = GeminiClient()
-        return self._gemini
+        client = self._gemini
+        if client is None:
+            client = self._gemini = GeminiClient()
+        return client
+
+    def _forget_gemini_video(
+        self, job_dir: Path, client: GeminiClient | None = None
+    ) -> None:
+        """Delete the job's upload from the Gemini File API, best effort.
+
+        The record is cleared at once, so a later request uploads again;
+        the delete itself runs through :attr:`run_cleanup`, and a failure
+        is only logged (Google removes the file after about 48 hours).
+        ``client`` is the one that uploaded it, when the key is changing.
+        """
+        record = job_dir / GEMINI_VIDEO_FILE
+        try:
+            saved = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        known = GeminiVideo.from_dict(
+            saved.get("video") if isinstance(saved, dict) else None
+        )
+        if known is None:
+            return
+        with contextlib.suppress(OSError):
+            self._save_video_record(job_dir, None)
+        if client is None:
+            try:
+                client = self.gemini()
+            except GeminiError:
+                return
+        delete = getattr(client, "delete_video", None)
+        if callable(delete):
+            self.run_cleanup(lambda: delete(known))
 
     def upscale_engine(self) -> UpscaleEngine:
         if self._upscale is None:
@@ -1725,7 +1773,7 @@ class WizardController:
 
     def _land_failure(self, run: _Run | None, exc: Exception) -> None:
         """Save the failure screen for the step a run crashed on."""
-        detail = str(exc) or type(exc).__name__
+        detail = redact_secrets(str(exc)) or type(exc).__name__
         with self._state_lock:
             self._mark_failed(run)
             try:
@@ -2142,6 +2190,7 @@ class WizardController:
                 state.step = WizardStep.SETUP
                 self._save(state)
                 return
+            self._key_replaced(state, key.strip())
             state.step = WizardStep.PICK_FILE
             self._save(state)
             return
@@ -2174,11 +2223,31 @@ class WizardController:
             return
         raise WizardError(f"unknown action {path}")
 
+    def _key_replaced(self, state: WizardState, key: str) -> None:
+        """Use a new key from now on, not only after a restart.
+
+        The client built with the old key is dropped, and the job's upload
+        (in the old key's project, which the new key cannot see) is deleted
+        with the old key. A client passed in by a test is kept.
+        """
+        old = self._gemini
+        if not self._gemini_owned or old is None or old.api_key == key:
+            return
+        if state.job_id:
+            with contextlib.suppress(JobError, OSError):
+                self._forget_gemini_video(self.store.job_dir(state.job_id), old)
+        self._gemini = None
+
     def start_new_job(self) -> None:
         """Leave the current job as it is on disk and go back to picking a file.
 
-        Setup is skipped when a Gemini key is already available.
+        Setup is skipped when a Gemini key is already available. The job's
+        upload is deleted from the Gemini File API: nothing will use it.
         """
+        with contextlib.suppress(WizardError, JobError, OSError):
+            current = self._state()
+            if current.job_id:
+                self._forget_gemini_video(self.store.job_dir(current.job_id))
         step = WizardStep.PICK_FILE if resolve_gemini_api_key() else WizardStep.SETUP
         self._save(WizardState(step=step))
 
@@ -2927,7 +2996,10 @@ class WizardController:
         self, job_dir: Path, video: GeminiVideo | None, error: str | None = None
     ) -> None:
         record = job_dir / GEMINI_VIDEO_FILE
-        payload = {"video": video.to_dict() if video else None, "error": error}
+        payload = {
+            "video": video.to_dict() if video else None,
+            "error": redact_secrets(error) if error else error,
+        }
         write_text_atomic(record, json.dumps(payload, indent=2) + "\n")
 
     def _note_video_problem(
@@ -3847,6 +3919,12 @@ class WizardController:
             self._enter_running_step(state, WizardStep.RENDERING)
         except (ShotPlanError, OSError) as exc:
             state.error = str(exc)
+        else:
+            # Every scene is approved and previewed: nothing asks Gemini to
+            # watch the video any more (result notes send text), so its
+            # copy leaves the File API now. Going back to the scenes later
+            # uploads it again.
+            self._forget_gemini_video(job_dir)
         self._save(state)
 
     def _keep_plan_before_render(self, job_dir: Path) -> None:

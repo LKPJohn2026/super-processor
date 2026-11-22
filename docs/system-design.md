@@ -177,10 +177,16 @@ preview_segment) per segment → ready_to_render → rendering → result`.
 
 - **Gemini watches the video.** FFmpeg writes `gemini_upload.mp4` in the job
   folder: no audio, long edge shrunk to at most 960 px (even dimensions),
-  `libx264` veryfast CRF 28, original frame rate. It goes to the Gemini File
-  API with a resumable upload; Google deletes it after about 48 hours, and
-  `gemini_video.json` records it so later requests reuse it while it has at
-  least an hour left.
+  `libx264` veryfast CRF 28, original frame rate, and none of the source's
+  metadata or chapters (`-map_metadata -1 -map_chapters -1`, no subtitle,
+  data or attachment streams), so GPS location, title, author and
+  recording time stay local. It goes to the Gemini File API with a
+  resumable upload, and `gemini_video.json` records it so later requests
+  reuse it while it has at least an hour left. The wizard deletes it from
+  the File API (best effort, off the request thread, errors only logged)
+  when the render starts, on "new video", and with the old key when the key
+  is replaced, and clears the record so a later request uploads again;
+  otherwise Google deletes it after about 48 hours.
   Gemini samples it at 1 fps: the segment request gets the whole video, and
   each segment's settings request gets that segment's stretch
   (`startOffset`/`endOffset`) with one full-size still. Video requests wait
@@ -245,8 +251,9 @@ machine. The wizard accepts verified CFR inputs up to 1080p and 30 minutes;
 uploaded to Gemini, and no audio is ever sent.
 
 Gemini receives what the user has consented to send through the wizard: an
-audio-free copy of the whole video (long edge at most 960 px), kept on
-Google's File API about 48 hours; one still per segment, the stills it boxes
+audio-free copy of the whole video (long edge at most 960 px, no metadata),
+kept on Google's File API until the render starts (at most about 48 hours);
+one still per segment, the stills it boxes
 faces in, and a still from each preview pair; and, when the video cannot be
 used, the segment grid (480 pixels wide, at most 120).
 
@@ -501,8 +508,18 @@ may remain for compatibility; the wizard is the primary product path.
   folder keeps job data private.
 - An audio-free copy of the whole video (long edge at most 960 px), selected
   stills, preview stills, notes, and conversation context leave the machine
-  through Gemini after setup. The copy stays on Google's File API about 48
-  hours. Obtain permission for sensitive footage.
+  through Gemini after setup, without the source's metadata (GPS, title,
+  author, comments, creation time) or chapters. The copy is deleted from
+  Google's File API when the render starts, on a new video or a replaced
+  key, and Google removes it after about 48 hours in any case. Obtain
+  permission for sensitive footage.
+- The Gemini key is sent in the `x-goog-api-key` header, never in a URL.
+  Keys with spaces or line breaks are refused. Every error, progress line,
+  saved wizard state, API answer and page has known keys (and anything
+  shaped like a Gemini key or a `key=` parameter) replaced with `***`.
+  `doctor` shows only that a key is set and its last 4 characters.
+- Numbers in Gemini's answers must be finite: `NaN`, `Infinity` and
+  numbers too big for a float are refused when the answer is read.
   Local job JSON and chat logs may retain that context.
 - No telemetry implementation is present. An opt-in telemetry policy is not an
   implemented feature.

@@ -33,7 +33,7 @@ from .shots import (
     measure_range,
     shot_still,
 )
-from .tools import FILE_INPUT, resolve_argv
+from .tools import FILE_INPUT, NO_METADATA, resolve_argv
 
 MAX_STILLS = 120
 STILLS_PER_S = 1.0
@@ -146,6 +146,52 @@ def extract_segment_stills(
     return stills
 
 
+def gemini_copy_command(
+    source: Path, dest: Path, *, ffmpeg_bin: str = "ffmpeg"
+) -> list[str]:
+    """The FFmpeg command for the copy Gemini watches (see make_gemini_copy).
+
+    Only the first video stream goes in: no sound, subtitles, data or
+    attachments, and none of the source's metadata or chapters (a phone
+    video's GPS location, title, author, comments and creation time stay
+    on this computer).
+    """
+    edge = GEMINI_COPY_LONG_EDGE
+    # Shrink only, keep the aspect ratio, and keep even dimensions.
+    even = f"trunc(min({edge},%s)/2)*2"
+    fit = f"scale='if(gte(iw,ih),{even % 'iw'},-2)':'if(gte(iw,ih),-2,{even % 'ih'})'"
+    return [
+        ffmpeg_bin,
+        "-nostdin",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-y",
+        *FILE_INPUT,
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        *NO_METADATA,
+        "-vf",
+        f"{fit},format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "28",
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:1",
+        str(dest),
+    ]
+
+
 def make_gemini_copy(
     source: Path,
     job_dir: Path,
@@ -161,39 +207,7 @@ def make_gemini_copy(
     """
     out = job_dir / GEMINI_COPY_NAME
     tmp = out.with_suffix(".part.mp4")
-    edge = GEMINI_COPY_LONG_EDGE
-    # Shrink only, keep the aspect ratio, and keep even dimensions.
-    even = f"trunc(min({edge},%s)/2)*2"
-    fit = f"scale='if(gte(iw,ih),{even % 'iw'},-2)':'if(gte(iw,ih),-2,{even % 'ih'})'"
-    command = [
-        ffmpeg_bin,
-        "-nostdin",
-        "-hide_banner",
-        "-v",
-        "error",
-        "-y",
-        *FILE_INPUT,
-        "-i",
-        str(source),
-        "-map",
-        "0:v:0",
-        "-an",
-        "-sn",
-        "-dn",
-        "-vf",
-        f"{fit},format=yuv420p",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "28",
-        "-movflags",
-        "+faststart",
-        "-progress",
-        "pipe:1",
-        str(tmp),
-    ]
+    command = gemini_copy_command(source, tmp, ffmpeg_bin=ffmpeg_bin)
     # Errors go to a file, not a pipe: a damaged source can print more than
     # a pipe holds, and ffmpeg would then stall while we read its progress.
     try:

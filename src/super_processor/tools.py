@@ -34,6 +34,11 @@ _DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 # the "video" is really a playlist that names one.
 FILE_INPUT = ("-protocol_whitelist", "file")
 
+# Output options for anything sent to Gemini: none of the source's metadata
+# (a phone video's GPS location, title, author, comments, creation time)
+# and none of its chapters go into the file.
+NO_METADATA = ("-map_metadata", "-1", "-map_chapters", "-1")
+
 
 def _is_windows() -> bool:
     """True on Windows. Tests pass ``windows=`` instead of patching this."""

@@ -277,7 +277,11 @@ Live tests are a separate, explicit opt-in: with a test key configured, run
 `python -m pytest -m gemini_live --no-cov`. These contact Google, send test
 prompts/context, and consume API quota (potentially incurring charges).
 Wizard use also uploads an audio-free copy of the whole video (long edge at most
-960 px) to Google's File API, where it is kept about 48 hours, and sends
-selected stills, notes, and chat context; do not use sensitive footage without
-permission. See [CONTRIBUTING.md](CONTRIBUTING.md) for testing
+960 px, with the file's metadata such as GPS location, title and author
+removed) to Google's File API. The wizard deletes it there once the render
+starts, when you start a new video, or when you replace the key; otherwise
+Google removes it after about 48 hours. It also sends selected stills, notes,
+and chat context; do not use sensitive footage without permission. The key
+is sent in a request header, never in a URL, and `doctor` shows only its
+last 4 characters. See [CONTRIBUTING.md](CONTRIBUTING.md) for testing
 and packaging checks, and [CHANGELOG.md](CHANGELOG.md) for changes.

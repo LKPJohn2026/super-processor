@@ -26,6 +26,7 @@ import contextlib
 import contextvars
 import importlib
 import json
+import math
 import os
 import queue
 import subprocess
@@ -208,6 +209,8 @@ class UpscaleSpan:
         strength = _require_strength(self.strength)
         start = float(self.start_s)
         end = float(self.end_s)
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise UpscaleError("span start and end must be finite numbers")
         if start < 0 or end <= start:
             raise UpscaleError("span end must be greater than span start")
         if self.source != "original":
@@ -250,7 +253,9 @@ class UpscaleSpan:
                 use_upscale=data.get("use_upscale") is not False,
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise UpscaleError("upscale span is missing start_s or end_s") from exc
+            raise UpscaleError(
+                "upscale span needs numbers for start_s, end_s and strength"
+            ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -2597,6 +2602,7 @@ def _require_strength(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise UpscaleError("strength must be a number from 0.0 to 1.0")
     strength = float(value)
-    if strength < 0.0 or strength > 1.0:
+    # NaN fails every comparison, so it is refused by name.
+    if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
         raise UpscaleError("strength must be between 0.0 and 1.0")
     return strength

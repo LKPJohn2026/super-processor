@@ -52,6 +52,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are taken from PATH only, and PowerShell and `taskkill` from `System32`,
   so an `ffmpeg.exe` sitting in the folder you start the program from is
   never run in place of the real one.
+- The small copy of your video and the stills sent to Gemini no longer carry
+  the original file's metadata or chapters: a phone video's GPS location,
+  title, author, comments and recording time stay on your computer.
+- `super-processor doctor` no longer prints API keys. It shows only that a
+  key is set and its last 4 characters (in the text report and in
+  `--json`), shows `SUPER_PROCESSOR_LLM_BASE_URL` without any user name,
+  password or query, and now also says where the Gemini key comes from.
+- The Gemini key is sent in the `x-goog-api-key` header instead of the
+  address of each request, and a key with a space or line break in it is
+  refused on the setup screen. No error message, progress line, saved
+  `wizard_state.json`, API answer or page can show the key any more.
+- "Replace key" on the setup screen takes effect at once; before, the wizard
+  kept using the old key until it was restarted.
+- The copy uploaded to Gemini is deleted from Google's File API as soon as
+  nothing needs it: when the render starts, when you start a new video, and
+  when you replace the key. Before, it stayed there for about 48 hours.
+  Going back to the scenes afterwards uploads it again.
+- Gemini answers holding `NaN` or `Infinity` are refused, so a bad answer can
+  no longer turn part of the render black or break the result screen.
 
 ## [4.3.0] - 2026-11-22
 

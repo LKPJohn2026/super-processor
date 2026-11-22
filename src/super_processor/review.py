@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlpars
 
 from .atomic_io import open_private_new
 from .estimators import EstimatorError
+from .gemini import redact_payload, redact_secrets
 from .jobs import JobError
 from .segments import STILLS_DIR_NAME, SegmentError, load_segments
 from .shot_plan import PREVIEW_NAME, PREVIEWS_DIR
@@ -769,8 +770,10 @@ def _wizard_handler(
             self.end_headers()
 
         def _html(self, page: str, status: int = 200) -> None:
-            # Pages hold the token; the shared headers stop framing them.
-            body = with_wizard_token(page, token).encode()
+            # Pages hold the token; the shared headers stop framing them. No
+            # page may show the Gemini key (it is taken out before the
+            # token goes in, so the token is never touched).
+            body = with_wizard_token(redact_secrets(page), token).encode()
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -825,7 +828,8 @@ def _wizard_handler(
             return True
 
         def _json(self, payload: object, status: int = 200) -> None:
-            body = json.dumps(payload).encode()
+            # No error or progress line may carry the Gemini key out.
+            body = json.dumps(redact_payload(payload)).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

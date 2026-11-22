@@ -31,8 +31,12 @@ super-processor --jobs-dir .dogfood/jobs review
 
 Use footage you have permission to send to Gemini. Calls consume API quota
 and may incur charges. An audio-free copy of the whole video (long edge at
-most 960 px) is uploaded to Google's File API and kept there about 48 hours;
-selected stills/previews, notes, and chat context are sent too. The
+most 960 px, without the file's metadata such as GPS location, title or
+author) is uploaded to Google's File API. It is deleted there when the render
+starts, when you start a new video and when you replace the key, and Google
+removes it after about 48 hours in any case. Selected stills/previews, notes,
+and chat context are sent too. Replacing the key on the setup screen takes
+effect at once. The
 full-quality file and its audio stay local.
 
 Walk introduction → LLM type (Gemini) → setup → pick file → sampling/proposing
@@ -404,10 +408,13 @@ React shell counts the time down each second between polls. `progress` is
 ## Segments (loop 1)
 
 Gemini watches the video. FFmpeg writes `gemini_upload.mp4` in the job
-folder: the first video stream only, no audio, the long edge shrunk to at
-most 960 pixels with even dimensions, `libx264` veryfast CRF 28, at the
-source's frame rate. It is uploaded to the Gemini File API with a resumable
-upload. Google deletes uploads after about 48 hours; `gemini_video.json`
+folder: the first video stream only, no audio, no metadata or chapters, the
+long edge shrunk to at most 960 pixels with even dimensions, `libx264`
+veryfast CRF 28, at the source's frame rate. It is uploaded to the Gemini
+File API with a resumable upload. The wizard deletes it there when the
+render starts (going back to the scenes uploads it again), on a new video,
+and when the key is replaced; Google deletes uploads after about 48 hours
+in any case. `gemini_video.json`
 records the upload and the wizard reuses it while it has at least an hour
 left, uploading again for a job resumed later. Gemini samples it at 1 frame a second: the segment
 request gets the whole video, and each segment's settings request gets that
