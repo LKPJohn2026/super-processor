@@ -468,7 +468,8 @@ def test_streamed_fake_inference_reads_original_a_fixed_number_of_times(
         return original_run(command, **kwargs)
 
     def popen(command: list[str], *args: Any, **kwargs: Any) -> Any:
-        if Path(command[0]).name == "ffmpeg" and str(source) in command:
+        # The resolved tool path ends in ffmpeg.exe on Windows.
+        if Path(command[0]).stem == "ffmpeg" and str(source) in command:
             decodes.append(command)
         return original_popen(command, *args, **kwargs)
 

@@ -79,7 +79,8 @@ def _pair_before(command: list[str], flag: str, value: str, output: str) -> bool
 
 
 def test_the_gemini_copy_command_drops_metadata_chapters_and_other_streams() -> None:
-    out = "/tmp/x/gemini_upload.part.mp4"
+    # str(Path(...)) so the lookup matches on Windows, where it uses backslashes.
+    out = str(Path("/tmp/x/gemini_upload.part.mp4"))
     command = gemini_copy_command(Path("in.mov"), Path(out), ffmpeg_bin="ffmpeg")
     assert _pair_before(command, "-map_metadata", "-1", out)
     assert _pair_before(command, "-map_chapters", "-1", out)
