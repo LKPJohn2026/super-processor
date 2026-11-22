@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JetBrains Mono fonts. On each step change the heading takes focus and the
   tab title names the step, and run progress is read out at milestones.
   Below about 900 px wide the sidebar sits above the step.
+- The web app's first screen is one Welcome & setup page in place of the
+  introduction, the LLM choice and the Gemini key steps: "Choose a video",
+  what you need (with whether a Gemini key is found, and Replace key) and
+  what leaves your computer. The page shown with no wizard connected has
+  the same look, with the connect form beside it.
+- When the web app can't reach the wizard, the step stays on screen dimmed
+  with its buttons turned off, under a "Can't reach the wizard" banner with
+  Try again and Change address; anything typed is kept, and the page looks
+  again every few seconds until the wizard answers.
 
 ## [4.2.0] - 2026-11-21
 

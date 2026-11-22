@@ -11,6 +11,10 @@ export function App() {
   const [view, setView] = useState<WizardView | null>(null);
   const [checking, setChecking] = useState(true);
   const [connectError, setConnectError] = useState<string | null>(null);
+  // The address last tried, for "Can't reach the wizard at …".
+  const [tried, setTried] = useState(origin);
+  // Back here from "Change address": the address field takes focus.
+  const [changing, setChanging] = useState(false);
   const onView = useCallback((next: WizardView) => {
     setView(next);
   }, []);
@@ -38,6 +42,7 @@ export function App() {
     }
     setChecking(true);
     setConnectError(null);
+    setTried(nextOrigin);
     const next = await loadState(nextOrigin);
     setChecking(false);
     if (!next) {
@@ -56,12 +61,15 @@ export function App() {
       onDisconnect={() => {
         setView(null);
         setConnectError(null);
+        setChanging(true);
       }}
     />
   ) : (
     <StaticShell
       checking={checking}
       connectError={connectError}
+      tried={tried}
+      focusAddress={changing}
       onConnect={(url) => {
         void connect(url);
       }}

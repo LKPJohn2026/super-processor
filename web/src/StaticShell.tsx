@@ -1,67 +1,113 @@
-import { useState, type FormEvent } from "react";
-import { documentTitle } from "./shellView";
+import { useEffect, useId, useState, type FormEvent } from "react";
+import { documentTitle, originHost } from "./shellView";
 import { AppShell } from "./shell/AppShell";
 import { TopBar } from "./shell/TopBar";
 import { Banner, Button, Card, Field, Icon } from "./ui";
+import { PrivacyCard, WelcomeHero } from "./Welcome";
 
+const DEFAULT_ADDRESS = "http://127.0.0.1:45143";
+
+// The five steps of a job, in the sidebar's words (mockups 02–09).
 const TOUR = [
   {
-    id: "intro",
-    title: "Introduction",
-    body: "Super Processor enhances footage you already shot. SPAN adds fine detail as it upscales 2×, and strength sets how much (0 is a plain upscale). It keeps every frame and its timing and does not generate new scenes.",
+    id: "video",
+    title: "Video",
+    body: "Choose a video on the computer that runs the wizard, up to 1080p and 30 minutes. A video dropped on the page is copied into the jobs folder there.",
   },
   {
-    id: "llm",
-    title: "LLM choice",
-    body: "Choose Gemini with a Google AI Studio key, or the local-LLM placeholder. Media stays on this machine except for Gemini calls you authorize.",
-  },
-  {
-    id: "setup",
-    title: "Gemini setup",
-    body: "Create a key in Google AI Studio and paste it into the local wizard. The key is stored on your machine, not on this static page.",
-  },
-  {
-    id: "file",
-    title: "Pick a file",
-    body: "Give the absolute path of a video on the computer running the wizard. A local GPU model restores and upscales it. You set scale and strength.",
-  },
-  {
-    id: "segments",
-    title: "Segments",
-    body: "A small copy of the video, without its sound, is uploaded to Gemini, which watches it at one frame a second and splits it where the light, place, or picture quality changes. Gemini also chooses whether to upscale. You approve the segments, or say where the cuts should go.",
+    id: "scenes",
+    title: "Scenes",
+    body: "A small copy without its sound goes to Gemini, which splits the video where the light, the place or the picture quality changes. Move, merge or split the cuts, then approve them.",
   },
   {
     id: "previews",
     title: "Previews",
-    body: "One segment at a time, Gemini picks clean-up, strength, and finishing, or leaves the upscaler out where it would only harm. A few seconds of the segment are previewed before and after, and Gemini checks for wrong faces, hands, text, and fake texture. Approve it, or say what to change.",
+    body: "One scene at a time, Gemini suggests the clean-up and how much detail to add, and a few seconds are shown before and after. Approve each scene, or tell Gemini what to change.",
   },
   {
     id: "render",
     title: "Render",
-    body: "Choose whether to upscale: 2× with SPAN on the local GPU, or keep the size and apply only the clean-up and finishing. FFmpeg only trims, splices, and copies audio. A long clip is processed in pieces so it never has to fit in memory at once.",
+    body: "The whole video is restored on your graphics card, twice the size or at its own size, with its sound copied across unchanged. You can stop a render and start it again later.",
   },
   {
     id: "result",
     title: "Result",
-    body: "Watch output.mp4. Say you are happy, or describe a time range to restore again at a different strength. Lower strength means less invented texture.",
+    body: "Watch the restored video. Keep it, or say which stretch to restore again and what to change; earlier versions are kept.",
   },
 ] as const;
 
 type StaticShellProps = {
   checking: boolean;
   connectError: string | null;
+  // The address last tried ("" for this page's own server).
+  tried: string;
+  // Opened from "Change address": the address field takes focus.
+  focusAddress?: boolean;
   onConnect: (url: string) => void;
 };
 
-export function StaticShell({ checking, connectError, onConnect }: StaticShellProps) {
+/**
+ * The page with no wizard to talk to (a static build, or a wizard that is
+ * not running): what Super Processor does, a way to connect to the wizard,
+ * and a walk through the steps. Nothing here starts any work.
+ */
+export function StaticShell({ checking, connectError, tried, focusAddress, onConnect }: StaticShellProps) {
   const [index, setIndex] = useState(0);
-  const [url, setUrl] = useState("http://127.0.0.1:45143");
+  const [url, setUrl] = useState(() => tried || DEFAULT_ADDRESS);
   const step = TOUR[index];
+  const tourId = useId();
+
+  useEffect(() => {
+    if (focusAddress) document.getElementById("wizard-url")?.focus();
+  }, [focusAddress]);
 
   function submit(event: FormEvent) {
     event.preventDefault();
     onConnect(url.trim());
   }
+
+  const connect = (
+    <Card as="section" className="col gap16 connect-card" aria-labelledby="connect-heading">
+      <h2 id="connect-heading" className="h3">
+        Connect to your computer
+      </h2>
+      {checking ? (
+        <p role="status" className="row gap8 body-s">
+          <Icon name="clock" color="var(--focus)" />
+          Checking for a local wizard…
+        </p>
+      ) : (
+        <p role="status" className="row gap8 body-s">
+          <Icon name="wifi" color="var(--ink-subtle)" />
+          No live wizard is connected.
+        </p>
+      )}
+      <form onSubmit={submit} className="col gap12">
+        <Field
+          id="wizard-url"
+          name="wizard-url"
+          label="Local wizard address"
+          type="url"
+          inputMode="url"
+          value={url}
+          onChange={(event) => setUrl(event.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+          help="The address super-processor review prints, such as http://127.0.0.1:45143."
+        />
+        <div className="row gap12 wrap">
+          <Button type="submit" icon="wifi" disabled={checking}>
+            Connect to local wizard
+          </Button>
+        </div>
+      </form>
+      {connectError ? (
+        <Banner tone="error" role="alert" title={`Can’t reach the wizard at ${originHost(tried, DEFAULT_ADDRESS)}`}>
+          {connectError}
+        </Banner>
+      ) : null}
+    </Card>
+  );
 
   return (
     <AppShell
@@ -70,105 +116,83 @@ export function StaticShell({ checking, connectError, onConnect }: StaticShellPr
       headingKey="offline"
       wide
     >
-      <div className="welcome">
-        <div className="col gap20">
-          <p className="overline">Welcome</p>
-          <h1 className="display">Restore the video you already shot</h1>
-          <p className="muted">
-            This page is a static shell. It explains the wizard and stays usable when no GPU server is
-            attached. The live upscale runs only on your machine, after you start{" "}
-            <code>super-processor review</code>.
-          </p>
-          <p className="muted">
-            GitHub Pages cannot drive an RTX GPU. Open the localhost URL that command prints, or connect
-            this shell to that server from a local preview.
-          </p>
-        </div>
-        <Card className="col gap16">
-          <h2 className="h3">Connect to your computer</h2>
-          {checking ? (
-            <p role="status" className="row gap8 body-s">
-              <Icon name="clock" color="var(--focus)" />
-              Checking for a local wizard…
+      <div className="welcome-screen">
+        <WelcomeHero
+          actions={
+            <p className="caption subtle">
+              Start it with <code>super-processor review</code> on the computer with the graphics card.
             </p>
-          ) : (
-            <p role="status" className="row gap8 body-s">
-              <Icon name="wifi" color="var(--ink-subtle)" />
-              No live wizard is connected.
-            </p>
-          )}
-          <form onSubmit={submit} className="col gap12">
-            <Field
-              id="wizard-url"
-              name="wizard-url"
-              label="Local wizard URL"
-              type="url"
-              inputMode="url"
-              value={url}
-              onChange={(event) => setUrl(event.target.value)}
-              autoComplete="off"
-              help="The address super-processor review prints, such as http://127.0.0.1:45143."
-            />
+          }
+          aside={connect}
+        >
+          <p>
+            Pick a film or a home video. Gemini suggests settings scene by scene, you check every scene before
+            anything is rendered, and the full-quality video never leaves your computer.
+          </p>
+          <p>
+            This page only shows how it works. The restoring runs in the wizard on your own computer: open the
+            address it prints, or connect this page to it.
+          </p>
+        </WelcomeHero>
+        <div className="welcome-cards">
+          <Card as="section" className="col gap16 tour-card" aria-labelledby="tour-heading">
+            <div className="col gap4">
+              <h2 id="tour-heading" className="h3">
+                How a job goes
+              </h2>
+              <p className="caption subtle">Move through the steps with the buttons. Nothing here starts any work.</p>
+            </div>
+            <ol className="tour-steps" aria-label="Steps of a job">
+              {TOUR.map((item, itemIndex) => {
+                const state = itemIndex === index ? "current" : itemIndex < index ? "done" : "upcoming";
+                return (
+                  <li key={item.id}>
+                    <button
+                      type="button"
+                      className={`tour-step ${state}`}
+                      aria-current={state === "current" ? "step" : undefined}
+                      aria-controls={tourId}
+                      onClick={() => setIndex(itemIndex)}
+                    >
+                      <span className="marker" aria-hidden="true">
+                        {itemIndex + 1}
+                      </span>
+                      {item.title}
+                    </button>
+                  </li>
+                );
+              })}
+            </ol>
+            <div id={tourId} className="col gap8 tour-body" aria-live="polite">
+              <h3 className="h3">
+                <span className="sr-only">Step {index + 1} of {TOUR.length}: </span>
+                {step.title}
+              </h3>
+              <p className="body-s muted">{step.body}</p>
+            </div>
             <div className="row gap12 wrap">
-              <Button type="submit" icon="wifi">
-                Connect to local wizard
+              <Button
+                kind="secondary"
+                size="md"
+                icon="chevron-left"
+                onClick={() => setIndex((value) => Math.max(0, value - 1))}
+                disabled={index === 0}
+              >
+                Previous step
+              </Button>
+              <Button
+                kind="secondary"
+                size="md"
+                onClick={() => setIndex((value) => Math.min(TOUR.length - 1, value + 1))}
+                disabled={index === TOUR.length - 1}
+              >
+                Next step
+                <Icon name="chevron-right" size={16} />
               </Button>
             </div>
-          </form>
-          {connectError ? (
-            <Banner tone="error" role="alert" title="Can’t reach the wizard">
-              {connectError}
-            </Banner>
-          ) : null}
-        </Card>
-
-        <Card as="section" className="col gap16" aria-labelledby="tour-heading">
-          <div className="col gap4">
-            <h2 id="tour-heading" className="h2">
-              Wizard steps
-            </h2>
-            <p className="caption subtle" id="tour-help">
-              Move through the steps with the buttons. Nothing here starts an upscale.
-            </p>
-          </div>
-          <ol className="tour-steps" aria-label="Wizard steps">
-            {TOUR.map((item, itemIndex) => (
-              <li key={item.id}>
-                <button
-                  type="button"
-                  className={itemIndex === index ? "chip sel" : "chip"}
-                  aria-current={itemIndex === index ? "step" : undefined}
-                  onClick={() => setIndex(itemIndex)}
-                >
-                  {itemIndex === index ? <Icon name="check" size={14} color="var(--leaf)" /> : null}
-                  {item.title}
-                </button>
-              </li>
-            ))}
-          </ol>
-          <div className="col gap8" aria-live="polite">
-            <h3 className="h3">{step.title}</h3>
-            <p className="body-s muted">{step.body}</p>
-          </div>
-          <div className="row gap12 wrap">
-            <Button
-              kind="secondary"
-              size="md"
-              icon="chevron-left"
-              onClick={() => setIndex((value) => Math.max(0, value - 1))}
-              disabled={index === 0}
-            >
-              Previous step
-            </Button>
-            <Button
-              size="md"
-              onClick={() => setIndex((value) => Math.min(TOUR.length - 1, value + 1))}
-              disabled={index === TOUR.length - 1}
-            >
-              Next step
-            </Button>
-          </div>
-        </Card>
+          </Card>
+          <PrivacyCard />
+        </div>
       </div>
     </AppShell>
   );

@@ -89,6 +89,8 @@ import {
   versionsSummary,
 } from "./versions";
 import { JobsHome } from "./JobsHome";
+import { WelcomeStep } from "./Welcome";
+import { isWelcomeStep } from "./welcomeView";
 import {
   STALE_SCENES_TEXT,
   STALE_SCENES_UNLOADED_TEXT,
@@ -525,6 +527,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     };
   }, [origin, view.step, view.interrupted, onView, recovery]);
 
+  const lost = failures > 0;
   // Whether this page can reach the wizard, for the top bar's pill: a
   // quiet look at /api/state every 10 s (its answer is not applied, so it
   // never races the step's own requests). Skipped while the tab is hidden.
@@ -536,12 +539,14 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
       if (cancelled) return;
       setFailures((value) => (next ? 0 : value + 1));
     };
-    const timer = window.setInterval(() => void look(), 10_000);
+    // Once a look has failed, look sooner, so the page is usable again soon
+    // after the wizard comes back.
+    const timer = window.setInterval(() => void look(), lost ? 4_000 : 10_000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [origin]);
+  }, [origin, lost]);
 
   // Read out a run's progress at milestones only: each stage, each 10%.
   const runTitle =
@@ -568,6 +573,10 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   const homeShown = home !== "off";
   const failedStep = Boolean(view.error) && (renderFailed(view) || view.run?.outcome === "failed");
   const offline = runFailed || conn === "err";
+  // While the wizard can't be reached (S2) the step stays on screen, dimmed,
+  // with its actions turned off; what was typed into its fields stays (they
+  // are not disabled), to send once it is back.
+  const locked = busy || offline;
 
   const topBar = (
     <TopBar
@@ -606,12 +615,12 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     );
   }
 
-  const setupLink = Boolean(view.navigation?.setup) && !busy && !view.busy;
+  const setupLink = Boolean(view.navigation?.setup) && !locked && !view.busy;
   const sidebar = showsSidebar(view) ? (
     <Sidebar
       origin={origin}
       view={view}
-      busy={busy}
+      busy={locked}
       failed={failedStep}
       onGoto={(target) => void send("goto", { to: target })}
       links={
@@ -651,14 +660,19 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
             </>
           }
         >
-          It may have stopped. Your work is safe — anything that was running keeps running.
+          It may have stopped. Your work is safe — anything that was running keeps running. Anything you typed
+          stays on this page: send it once the wizard is back.
         </Banner>
       ) : null}
-      <div className="step-body">
+      <div
+        className={["step-body", isWelcomeStep(view.step) ? "welcome-body" : null, offline ? "offline-dim" : null]
+          .filter(Boolean)
+          .join(" ")}
+      >
         <WizardStepView
           origin={origin}
           view={view}
-          busy={busy}
+          busy={locked}
           message={message}
           onSend={send}
           onRequest={perform}
@@ -671,7 +685,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
         <SceneStrip
           origin={origin}
           view={view}
-          busy={busy}
+          busy={locked}
           onRequest={perform}
           onReopened={() => setHeadingFocus((value) => value + 1)}
         />
@@ -861,80 +875,8 @@ function WizardStepView({
   // "Notify me when it's done", for the long runs.
   notify?: ReactNode;
 }) {
-  if (view.step === "intro") {
-    return (
-      <>
-        <h1>Super Processor</h1>
-        <p className="lede">
-          Enhance the video you already shot. A local GPU model restores and
-          upscales it. You choose scale and strength. FFmpeg only trims,
-          splices, and copies audio.
-        </p>
-        <button type="button" disabled={busy} onClick={() => void onSend("intro", {})}>
-          Continue
-        </button>
-        {message ? <Alert text={message} /> : null}
-      </>
-    );
-  }
-
-  if (view.step === "llm_choice") {
-    return (
-      <>
-        <h1>What type of LLM do you have now?</h1>
-        <p className="lede">
-          Pick how diagnosis should run. Media stays on this machine except
-          for Gemini API calls you authorize.
-        </p>
-        {message ? <Alert text={message} /> : null}
-        <button
-          type="button"
-          className="choice"
-          disabled={busy}
-          onClick={() => void onSend("llm", { choice: "gemini" })}
-        >
-          <strong>A. I don’t have a local LLM</strong>
-          <span className="muted">Use a Google AI Studio (Gemini) API key</span>
-        </button>
-        <button
-          type="button"
-          className="choice"
-          disabled={busy}
-          onClick={() => void onSend("llm", { choice: "local" })}
-        >
-          <strong>B. I have a local LLM</strong>
-          <span className="muted">Configure a local model (coming later)</span>
-        </button>
-      </>
-    );
-  }
-
-  if (view.step === "local_llm_stub") {
-    return (
-      <>
-        <h1>Local LLM setup</h1>
-        <p className="lede">
-          Local models are not wired yet. Continue with Gemini to finish a job
-          today.
-        </p>
-        <ol>
-          <li>Choose a local runtime</li>
-          <li>Pull a multimodal model that accepts image frames</li>
-          <li>Point Super Processor at that endpoint</li>
-        </ol>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void onSend("local-llm", { action: "gemini" })}
-        >
-          Use Gemini instead
-        </button>
-      </>
-    );
-  }
-
-  if (view.step === "setup") {
-    return <SetupStep busy={busy} hasKey={view.has_gemini_key} message={message} onSend={onSend} />;
+  if (isWelcomeStep(view.step)) {
+    return <WelcomeStep view={view} busy={busy} message={message} onSend={onSend} />;
   }
 
   if (view.step === "pick_file") {
@@ -1258,76 +1200,6 @@ function Alert({ text }: { text: string }) {
     <p className="error" role="alert">
       {text}
     </p>
-  );
-}
-
-function SetupStep({
-  busy,
-  hasKey,
-  message,
-  onSend,
-}: {
-  busy: boolean;
-  hasKey: boolean;
-  message: string | null;
-  onSend: SendAction;
-}) {
-  const [apiKey, setApiKey] = useState("");
-
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    void onSend("setup", { api_key: apiKey });
-  }
-
-  return (
-    <>
-      <h1>Gemini API setup</h1>
-      <p>
-        {hasKey
-          ? "A Gemini API key is already configured on this machine."
-          : "Follow these steps, then paste your key below."}
-      </p>
-      <ol>
-        <li>
-          Open{" "}
-          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">
-            Google AI Studio
-          </a>
-        </li>
-        <li>Accept the terms if prompted</li>
-        <li>Create an API key and copy it</li>
-        <li>Paste it here</li>
-      </ol>
-      {message ? <Alert text={message} /> : null}
-      <form onSubmit={submit}>
-        <label htmlFor="api-key">
-          API key
-          <input
-            id="api-key"
-            name="api_key"
-            type="password"
-            autoComplete="off"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-          />
-        </label>
-        <div className="actions">
-          <button type="submit" disabled={busy}>
-            Save and continue
-          </button>
-          {hasKey ? (
-            <button
-              type="button"
-              className="secondary"
-              disabled={busy}
-              onClick={() => void onSend("setup", { skip: "1" })}
-            >
-              Use existing key
-            </button>
-          ) : null}
-        </div>
-      </form>
-    </>
   );
 }
 

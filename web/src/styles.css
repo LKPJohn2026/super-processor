@@ -193,6 +193,14 @@ a:hover {
   line-height: 18px;
 }
 
+/* A card's title is an h2 for the outline but h3 in the type scale. */
+.main h2.h3 {
+  font-family: var(--sans);
+  font-size: 18px;
+  line-height: 24px;
+  letter-spacing: 0;
+}
+
 .overline,
 .main h2.overline {
   font-family: var(--sans);
@@ -1006,18 +1014,229 @@ button.side-link:hover:not(:disabled) {
   text-decoration: underline;
 }
 
-/* ------------------------------------------------- welcome (static) */
-.welcome {
-  display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+/* ------------------------------------------ welcome & setup (01) */
+/* The live step and the static page share it. A column of 1040 px, the
+   hero (text and a 440 px picture or the connect card), then two cards. */
+.step-body.welcome-body {
+  max-width: none;
+}
+
+.welcome-screen {
+  display: flex;
+  flex-direction: column;
   gap: 32px;
-  align-items: start;
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
   padding-top: 24px;
 }
 
-.welcome > :first-child {
-  grid-column: 1 / -1;
-  max-width: 760px;
+.welcome-hero {
+  display: flex;
+  align-items: center;
+  gap: 32px;
+}
+
+.welcome-hero-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.welcome-lede {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.welcome-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.welcome-actions .btn.lg,
+.welcome-actions > button {
+  font-size: 17px;
+  line-height: 26px;
+  padding: 11px 20px;
+}
+
+/* The picture's place: an empty stage, no image (there is no job yet). */
+.welcome-frame {
+  position: relative;
+  flex: none;
+  width: 440px;
+}
+
+.welcome-frame-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: var(--stage);
+}
+
+.welcome-frame-half {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 50%;
+}
+
+.welcome-frame-half.before {
+  left: 0;
+  background: linear-gradient(160deg, #2a2b22 0%, #1a1c15 100%);
+}
+
+.welcome-frame-half.after {
+  right: 0;
+  background: linear-gradient(160deg, #223127 0%, #14170f 100%);
+}
+
+.welcome-frame-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(50% - 1px);
+  width: 2px;
+  background: var(--on-stage);
+  opacity: 0.7;
+}
+
+.tag {
+  position: absolute;
+  top: 16px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(20, 23, 15, 0.78);
+  color: var(--on-stage);
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 600;
+}
+
+.tag-left {
+  left: 16px;
+}
+
+.tag-right {
+  right: 16px;
+}
+
+.welcome-frame-icon {
+  position: absolute;
+  left: calc(50% - 18px);
+  top: calc(50% - 18px);
+  opacity: 0.5;
+}
+
+/* Over the foot of the stage, so the frame keeps the mockup's 4:3. */
+.welcome-frame-caption {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 16px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  text-align: center;
+  background: rgba(20, 23, 15, 0.86);
+  color: var(--on-stage);
+}
+
+.welcome-cards {
+  display: flex;
+  align-items: stretch;
+  gap: 24px;
+}
+
+.welcome-need,
+.tour-card {
+  flex: 1;
+  min-width: 0;
+}
+
+.welcome-privacy {
+  flex: 1.25;
+  min-width: 0;
+}
+
+.need-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.need-row > .icon {
+  align-self: flex-start;
+  margin-top: 1px;
+}
+
+.check-ok {
+  color: var(--ok);
+}
+
+.check-bad {
+  color: var(--err);
+}
+
+.key-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: var(--r-md);
+  background: var(--paper);
+}
+
+.privacy-split {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+}
+
+.privacy-box {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--r-md);
+}
+
+.privacy-box.stays {
+  background: var(--ok-tint);
+}
+
+.privacy-box.sent {
+  background: var(--info-tint);
+}
+
+.privacy-box.stays .privacy-title {
+  color: var(--ok);
+}
+
+.privacy-box.sent .privacy-title {
+  color: var(--focus);
+}
+
+.privacy-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* The static page: the connect card where the picture goes. */
+.connect-card {
+  flex: none;
+  width: 440px;
 }
 
 .tour-steps {
@@ -1025,7 +1244,72 @@ button.side-link:hover:not(:disabled) {
   padding: 0;
   display: flex;
   flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tour-step,
+button.tour-step {
   gap: 8px;
+  padding: 6px 12px 6px 6px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink-subtle);
+  font-weight: 400;
+}
+
+button.tour-step:hover:not(:disabled) {
+  background: var(--sand);
+  border-color: transparent;
+}
+
+.tour-step.current,
+button.tour-step.current:hover {
+  background: var(--leaf-tint);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.tour-step.done {
+  color: var(--ink-muted);
+}
+
+.tour-step .marker {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  border: 1.5px solid var(--line-strong);
+  color: var(--ink-subtle);
+}
+
+.tour-step.current .marker {
+  background: var(--leaf);
+  border-color: var(--leaf);
+  color: #fff;
+}
+
+.tour-step.done .marker {
+  background: var(--ok);
+  border-color: var(--ok);
+  color: #fff;
+}
+
+.tour-body {
+  min-height: 112px;
+}
+
+/* --------------------------------------------- connection lost (S2) */
+/* The step stays readable: its pictures and actions are dimmed (the
+   actions are also turned off), its words and fields are not. */
+.offline-dim :is(img, video, figure, .cut-track) {
+  opacity: 0.55;
 }
 
 /* -------------------------------------------------- all jobs (s1) */
@@ -1909,8 +2193,21 @@ video {
     padding: 24px 20px;
   }
 
-  .welcome {
-    grid-template-columns: minmax(0, 1fr);
+  .welcome-hero,
+  .welcome-cards {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .welcome-frame,
+  .connect-card {
+    width: 100%;
+    max-width: 560px;
+  }
+
+  .welcome-screen {
+    padding-top: 0;
+    gap: 24px;
   }
 }
 
@@ -2006,6 +2303,20 @@ video {
 
   .version-row {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .privacy-split {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  /* An action beside a check goes under its words. */
+  .need-row {
+    flex-wrap: wrap;
+  }
+
+  .need-row > .btn {
+    margin-left: 32px;
   }
 
   /* The scenes scroll sideways inside the strip, never the page. */

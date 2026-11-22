@@ -56,7 +56,7 @@ const page = await context.newPage();
 const failures = [];
 try {
   await page.goto(pageUrl, { waitUntil: "networkidle" });
-  await page.getByRole("heading", { level: 1, name: /Restore the video/ }).waitFor();
+  await page.getByRole("heading", { level: 1, name: /Make old video sharper/ }).waitFor();
   const offline = page.getByRole("status");
   const statusText = await offline.innerText();
   if (!/No live wizard is connected/i.test(statusText)) {
@@ -79,11 +79,11 @@ try {
     });
     focused.push(name.replace(/\s+/g, " ").trim());
   }
-  if (!focused.some((name) => /Connect to local wizard|Local wizard URL|Skip to content/i.test(name))) {
+  if (!focused.some((name) => /Connect to local wizard|Local wizard address|Skip to content/i.test(name))) {
     failures.push(`tab order did not reach a control: ${focused.join(" | ")}`);
   }
   await page.getByRole("button", { name: "Next step" }).click();
-  await page.getByRole("heading", { level: 2, name: "LLM choice" }).waitFor();
+  await page.getByRole("heading", { level: 3, name: /Scenes/ }).waitFor();
 } finally {
   await browser.close();
   server.close();
