@@ -71,6 +71,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Going back to the scenes afterwards uploads it again.
 - Gemini answers holding `NaN` or `Infinity` are refused, so a bad answer can
   no longer turn part of the render black or break the result screen.
+- The SPAN weights are now loaded from the exact bytes whose checksum was
+  checked. Before, the file was checked and then opened again, so a file
+  swapped in between (for example while a render waited for the GPU) could
+  be loaded.
+- The gpu extra now needs PyTorch 2.6 or newer. Older versions let a crafted
+  weights file run code even in the safe loading mode (CVE-2025-32434).
+  The README now creates the models folder private to you.
+- The "install the gpu extra" hint now names the real package,
+  `pip install "ancient-processor[gpu]"`. Before, it said
+  `super-processor[gpu]`, a different PyPI name that could install someone
+  else's code.
 
 ## [4.3.0] - 2026-11-22
 

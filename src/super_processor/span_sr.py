@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ._dist import GPU_INSTALL_HINT
 from .regions import FEATHER, KINDS, REGION_STRENGTH, Region
 from .upscale import UpscaleError, yuv420_frame_bytes
 
@@ -99,6 +101,50 @@ def batch_size(width: int, height: int) -> int:
     return max(1, min(_MAX_BATCH, round(_BATCH_PIXELS / pixels)))
 
 
+def read_verified_weights(path: Path) -> bytes:
+    """The weights file's bytes, read once and checked against
+    :data:`SPAN_SHA256`.
+
+    :func:`load_span` deserializes exactly these bytes, so a file swapped
+    after this check (or after :func:`resolve_span_weights`) is never loaded.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise SpanError(f"cannot read the SPAN weights at {path}: {exc}") from exc
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != SPAN_SHA256:
+        raise SpanError(
+            f"{path} is not the expected SPAN weights (sha256 {digest[:12]}..., "
+            f"expected {SPAN_SHA256[:12]}...). Download it again from {SPAN_URL}."
+        )
+    return data
+
+
+def import_gpu_modules() -> tuple[Any, Any]:
+    """``torch`` and ``spandrel``, or a :class:`SpanError` naming the extra."""
+    try:
+        torch = importlib.import_module("torch")
+        spandrel = importlib.import_module("spandrel")
+    except ImportError as exc:
+        raise SpanError(
+            f"SPAN needs PyTorch and spandrel. Install the gpu extra "
+            f"({GPU_INSTALL_HINT})."
+        ) from exc
+    return torch, spandrel
+
+
+def load_state(torch: Any, weights: Path) -> Any:
+    """The SPAN state dict, deserialized from the verified bytes in memory
+    (never from the path again), with tensors only (``weights_only``)."""
+    data = read_verified_weights(weights)
+    state = torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
+    for key in ("params_ema", "params", "state_dict"):
+        if isinstance(state, dict) and isinstance(state.get(key), dict):
+            return state[key]
+    return state
+
+
 def load_span(weights: Path) -> Any:  # pragma: no cover - needs CUDA and torch
     """The SPAN network on the GPU in half precision, ready to run.
 
@@ -106,19 +152,8 @@ def load_span(weights: Path) -> Any:  # pragma: no cover - needs CUDA and torch
     branches on every forward call in eval mode; fusing them once here makes
     the same picture about twice as fast.
     """
-    try:
-        torch = importlib.import_module("torch")
-        spandrel = importlib.import_module("spandrel")
-    except ImportError as exc:
-        raise SpanError(
-            "SPAN needs PyTorch and spandrel. Install the gpu extra "
-            "(pip install 'super-processor[gpu]')."
-        ) from exc
-    state = torch.load(weights, map_location="cpu", weights_only=True)
-    for key in ("params_ema", "params", "state_dict"):
-        if isinstance(state, dict) and isinstance(state.get(key), dict):
-            state = state[key]
-            break
+    torch, spandrel = import_gpu_modules()
+    state = load_state(torch, weights)
     described = spandrel.ModelLoader().load_from_state_dict(state)
     if described.scale != SPAN_SCALE:
         raise SpanError(f"{weights.name} is a {described.scale}x model, not 2x")

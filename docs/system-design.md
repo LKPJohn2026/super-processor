@@ -91,7 +91,11 @@ time, so a clip needs no padding to blocks and no extra frames; the frames go
 to the GPU in batches of about four megapixels of input (at most 8 frames),
 so GPU memory follows the batch, not the clip. The weights are checked by
 size and sha256 before loading (`SUPER_PROCESSOR_SPAN_WEIGHTS` points at
-another file). One lock keeps two wizard threads from loading it at once, and
+another file): `load_span` reads the file once, hashes those bytes and hands
+the same bytes to `torch.load(..., weights_only=True)`, so a file swapped
+after the check is never deserialized. The gpu extra needs torch 2.6 or
+newer, the first release where `weights_only=True` cannot be bypassed to run
+code (CVE-2025-32434). One lock keeps two wizard threads from loading it at once, and
 a batch of preview clips shares one load.
 
 It replaced FlashVSR v1.1 and FlashVSR+ outright. In a bake-off on an RTX

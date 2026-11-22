@@ -534,6 +534,7 @@ class _Loaded:
 def _span_ready(scale: int) -> _Span:
     """SPAN, checked for this scale, the GPU, and its weights, or a
     wizard-facing error."""
+    from ._dist import GPU_INSTALL_HINT
     from .span_sr import SPAN_SCALE, resolve_span_weights
 
     if scale != SPAN_SCALE:
@@ -541,7 +542,8 @@ def _span_ready(scale: int) -> _Span:
     if not cuda_available():
         raise UpscaleError(
             "SPAN needs an NVIDIA GPU with CUDA. Refusing to fall back to an "
-            "FFmpeg grade. Install the gpu extra and a driver."
+            "FFmpeg grade. Install the gpu extra "
+            f"({GPU_INSTALL_HINT}) and an NVIDIA driver."
         )
     return _Span(resolve_span_weights(models_dir()))
 

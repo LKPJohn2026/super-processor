@@ -10,6 +10,7 @@ from ._core import (
     sum_squares,
     variance_u8,
 )
+from ._dist import DIST_NAME
 from .jobs import (
     InvalidTransitionError,
     JobError,
@@ -23,7 +24,7 @@ from .probe import MediaFacts, ProbeError, StreamFacts, probe_file
 from .recipe import OpName, Recipe, RecipeError, empty_recipe
 
 try:
-    __version__ = version("ancient-processor")
+    __version__ = version(DIST_NAME)
 except PackageNotFoundError:  # pragma: no cover - source tree without installation
     __version__ = "0+unknown"
 

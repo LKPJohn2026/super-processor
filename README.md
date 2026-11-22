@@ -102,10 +102,18 @@ downloaded folder of videos is never run.
 
 ## GPU setup
 
-Install the GPU extra (PyTorch and spandrel, which loads the SPAN network):
+Install the GPU extra (PyTorch 2.6 or newer and spandrel, which loads the
+SPAN network). From a checkout:
 
 ```bash
 python -m pip install -e ".[dev,gpu]"
+```
+
+From PyPI the package is called `ancient-processor` (not `super-processor`,
+which is only the command's name):
+
+```bash
+python -m pip install "ancient-processor[gpu]"
 ```
 
 Download the weights, `2xLiveActionV1_SPAN_490000.pth` (about 9 MB), to where
@@ -114,7 +122,7 @@ from. The link is pinned to the commit that relicensed them as Apache-2.0
 (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)):
 
 ```bash
-mkdir -p .dogfood/models/SPAN
+mkdir -p -m 700 .dogfood .dogfood/models .dogfood/models/SPAN
 curl -L -o .dogfood/models/SPAN/2xLiveActionV1_SPAN_490000.pth \
   https://github.com/jcj83429/upscaling/raw/5d8cdd2e17750b64be39ccab3a8763d91128fe15/2xLiveActionV1_SPAN/2xLiveActionV1_SPAN_490000.pth
 sha256sum .dogfood/models/SPAN/2xLiveActionV1_SPAN_490000.pth
@@ -124,7 +132,10 @@ sha256sum .dogfood/models/SPAN/2xLiveActionV1_SPAN_490000.pth
 `SUPER_PROCESSOR_SPAN_WEIGHTS=/path/to/file.pth` reads the weights from
 another place; `SUPER_PROCESSOR_MODELS` moves the whole models folder (the
 file is then expected in its `SPAN/` folder). The wizard checks the file's
-sha256 before it loads it and names the expected one if it differs. Then
+sha256 before it loads it and names the expected one if it differs; it reads
+the file once and loads those same checked bytes, so a file replaced after
+the check is never used. Keep the models folder private to you (`700`, as
+above) and do not run from a folder other users can write to. Then
 check each piece:
 
 ```bash

@@ -38,7 +38,8 @@ dependencies = []
 [project.optional-dependencies]
 gpu = [
   "spandrel>=0.4.2,<0.5",
-  "torch>=2.4",
+  # 2.6 fixes CVE-2025-32434 (code execution through weights_only=True).
+  "torch>=2.6",
 ]
 dev = [
   "Cython>=3.0,<4",
