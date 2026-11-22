@@ -23,6 +23,10 @@ test("the tab title names the step, the scene and the app", () => {
   assert.equal(documentTitle(view("pick_file")), "Choose a video · Video · Super Processor");
   assert.equal(documentTitle(view("rendering")), "Rendering · Render · Super Processor");
   assert.equal(documentTitle(view("rendering", { interrupted: true })), "Waiting for you · Rendering · Render · Super Processor");
+  assert.equal(
+    documentTitle(view("rendering", { progress: { phase: "rendering", pct: 49.4, message: "m" } })),
+    "49% · Rendering · Super Processor",
+  );
   assert.equal(documentTitle(view("result"), true), "All jobs · Super Processor");
   assert.equal(documentTitle(null), "Connect · Super Processor");
 });

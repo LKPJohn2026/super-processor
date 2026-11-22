@@ -185,6 +185,7 @@ test("the sidebar's steps come from the job's stages, and a failed step is marke
   });
   assert.deepEqual(sidebarSteps(shown, false).map((i) => i.state), ["done", "done", "done", "current", "upcoming"]);
   assert.deepEqual(sidebarSteps(shown, false, true).map((i) => i.state), ["done", "done", "done", "error", "upcoming"]);
+  assert.equal(sidebarSteps(shown, false, true)[3].detail, "Didn’t finish");
 });
 
 test("Ready to render is the Render step, as the server still counts it in its scenes", () => {

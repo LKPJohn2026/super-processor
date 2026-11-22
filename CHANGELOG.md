@@ -56,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   button names the next scene ("Approve scene 3 — next: Night street"); a
   preview Gemini couldn't check is marked "Check this", with Try Gemini
   again and Approve anyway.
+- The web app's Render step has the redesign's look. Ready to render
+  offers the size as two cards, "Sharper and bigger" and "Same size,
+  cleaned up", with the real output size and a still from your previews,
+  beside your scenes with their AI detail and Start render. While it
+  renders it shows the time left, one bar, the render's stages, "Safe to
+  close this tab" and Cancel render, and the tab title shows the percentage.
+  A failed render marks Render in red, says why, and offers Try the render
+  again and Render without AI detail.
 
 ## [4.2.0] - 2026-11-21
 

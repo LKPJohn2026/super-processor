@@ -44,9 +44,13 @@ export function documentTitle(view: WizardView | null, home = false): string {
     case "ready_to_render":
       parts.push("Render");
       break;
-    case "rendering":
-      parts.push("Rendering", "Render");
+    case "rendering": {
+      // 07: "49% · Rendering · Super Processor", once the render reports.
+      const pct = view.progress && !view.interrupted ? Math.round(view.progress.pct) : null;
+      if (pct !== null && Number.isFinite(pct)) parts.push(`${Math.max(0, Math.min(100, pct))}%`, "Rendering");
+      else parts.push("Rendering", "Render");
       break;
+    }
     default:
       parts.push("Result");
   }

@@ -62,6 +62,16 @@ function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
 }
 
+/** "49% · about 3 min" while the render reports (07), else "Rendering…". */
+export function renderingDetail(view: Pick<WizardView, "step" | "progress">): string {
+  const progress = view.progress;
+  if (view.step !== "rendering" || !progress || !Number.isFinite(progress.pct)) return "Rendering…";
+  const pct = `${Math.max(0, Math.min(100, Math.round(progress.pct)))}%`;
+  const eta = progress.eta_s;
+  if (typeof eta !== "number" || !Number.isFinite(eta)) return pct;
+  return `${pct} · ${eta < 60 ? "under a minute" : `about ${Math.round(eta / 60)} min`}`;
+}
+
 function stageDetail(view: WizardView, key: StageKey, state: StepState): string {
   const job = view.job;
   if (!job) return "";
@@ -82,7 +92,7 @@ function stageDetail(view: WizardView, key: StageKey, state: StepState): string 
     return "";
   }
   if (key === "render") {
-    if (state === "current") return view.interrupted ? "Waiting for you" : "Rendering…";
+    if (state === "current") return view.interrupted ? "Waiting for you" : renderingDetail(view);
     return "";
   }
   if (state === "current" || state === "done") {
@@ -257,7 +267,14 @@ export function showsSidebar(view: WizardView): boolean {
  */
 export function sidebarSteps(view: WizardView, busy: boolean, failed = false): SideStep[] {
   const mark = (items: SideStep[]): SideStep[] =>
-    failed ? items.map((item) => (item.state === "current" ? { ...item, state: "error" } : item)) : items;
+    failed
+      ? items.map((item) =>
+          item.state === "current"
+            ? // S5: the render step says it did not finish (the server keeps no percentage).
+              { ...item, state: "error", detail: item.key === "render" ? "Didn’t finish" : item.detail }
+            : item,
+        )
+      : items;
   if (hasJobStages(view)) {
     let items: SideStep[] = stepperItems(view, busy);
     // The server counts "Ready to render" in its scenes stage; the design
@@ -285,7 +302,7 @@ export function sidebarSteps(view: WizardView, busy: boolean, failed = false): S
       let detail = "";
       if (index === 0 && state === "current") detail = "Pick a file";
       if (index === 1 && state === "current") detail = view.step === "segments" ? "Check the split" : "Finding scenes…";
-      if (index === 3 && view.step === "rendering") detail = "Rendering…";
+      if (index === 3 && view.step === "rendering") detail = view.interrupted ? "Waiting for you" : renderingDetail(view);
       return { key: SIDE_KEYS[index], label, state, detail, nav: navigable(SIDE_NAV[index]) };
     }),
   );

@@ -17,13 +17,11 @@ import {
   progressTiming,
   reopenScene,
   resumeRun,
-  scaleChoiceText,
   runAnalyze,
   runRender,
   runSegmenting,
   type JobEntry,
   type OutputVersion,
-  type Looks,
   type Progress,
   type Runner,
   type Navigation,
@@ -33,9 +31,7 @@ import {
 } from "./api";
 import {
   interruptedChoice,
-  offersRender,
   renderFailed,
-  readyText,
   resultTitle,
   stopControl,
   stoppedNote,
@@ -83,7 +79,8 @@ import { ChooseStep } from "./ChooseStep";
 import { FindingStep } from "./FindingStep";
 import { ScenesStep } from "./ScenesStep";
 import { PreviewStep } from "./PreviewStep";
-import { previewUnchecked, settingsSummary } from "./previewView";
+import { ReadyStep, RenderingStep } from "./RenderStep";
+import { previewUnchecked } from "./previewView";
 import { isWelcomeStep } from "./welcomeView";
 import {
   STALE_SCENES_TEXT,
@@ -972,29 +969,28 @@ function WizardStepView({
   if (view.step === "ready_to_render") {
     return (
       <ReadyStep
+        origin={origin}
         looks={view.looks ?? { scale: null, error: null, shots: [] }}
         busy={busy}
         message={message}
         onSend={onSend}
         view={view}
+        stopped={<StoppedNote view={view} />}
+        back={<Back view={view} to={["segments"]} busy={busy} onSend={onSend} />}
       />
     );
   }
 
   if (view.step === "rendering") {
     return (
-      <Busy
-        title="Upscaling"
-        progress={view.progress ?? null}
-        overallKey={overallKey(view)}
-        overallShown={overallShown}
+      <RenderingStep
+        view={view}
         message={message}
-        stop={<StopButton origin={origin} view={view} busy={busy} onRequest={onRequest} />}
+        stop={
+          <StopButton origin={origin} view={view} busy={busy} onRequest={onRequest} idleLabel="Cancel render" />
+        }
         notify={notify}
-      >
-        Restoring and upscaling on the local GPU. FFmpeg only trims, splices,
-        and copies audio. This can take several minutes.
-      </Busy>
+      />
     );
   }
 
@@ -1479,95 +1475,6 @@ function Interrupted({
           </button>
         ) : null}
       </div>
-    </>
-  );
-}
-
-function ReadyStep({
-  looks,
-  busy,
-  message,
-  onSend,
-  view,
-}: {
-  looks: Looks;
-  busy: boolean;
-  message: string | null;
-  onSend: SendAction;
-  view: WizardView;
-}) {
-  const scales = [...(looks.scales ?? [])].sort((a, b) => b - a);
-  const [scale, setScale] = useState<number | null>(
-    looks.scale !== null && scales.includes(looks.scale) ? looks.scale : (scales[0] ?? null),
-  );
-  const [width, height] = looks.source_size ?? [0, 0];
-  // After a failed render the error shows, and so does Render, to try again.
-  const text = readyText(view);
-  return (
-    <>
-      <h1>{text.title}</h1>
-      <p className="lede">{text.lede}</p>
-      <StoppedNote view={view} />
-      {message ? <Alert text={message} /> : null}
-      <ul className="summary">
-        {looks.shots.map((shot) => {
-          const summary = settingsSummary(shot.strength, shot.look);
-          return (
-            <li key={shot.index}>
-              {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
-              {shot.label || "Unlabelled scene"}:{" "}
-              {shot.use_upscale === false ? `No upscaling: resized only. ${summary}` : summary}
-            </li>
-          );
-        })}
-      </ul>
-      {looks.scale_reason ? <p className="muted">{scaleChoiceText(looks.scale, looks.scale_reason)}</p> : null}
-      {scales.length ? (
-        <fieldset className="options">
-          <legend>Upscale</legend>
-          {scales.map((option) => {
-            const size = width && height ? ` · ${width * option}×${height * option}` : "";
-            return (
-              <label key={option} className="option">
-                <input
-                  type="radio"
-                  name="scale"
-                  value={option}
-                  checked={scale === option}
-                  onChange={() => setScale(option)}
-                />
-                <span>
-                  {option === 1 ? (
-                    <>
-                      <strong>Don&apos;t upscale</strong>
-                      {size} · clean-up and finishing only, no upscaling
-                    </>
-                  ) : (
-                    <>
-                      <strong>Upscale {option}×</strong>
-                      {size} · SPAN on the GPU
-                    </>
-                  )}
-                </span>
-              </label>
-            );
-          })}
-        </fieldset>
-      ) : null}
-      {offersRender(view) ? (
-        <div className="actions">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() =>
-              void onSend("ready", scale === null ? { action: "render" } : { action: "render", scale: String(scale) })
-            }
-          >
-            {text.renderLabel}
-          </button>
-        </div>
-      ) : null}
-      <Back view={view} to={["segments"]} busy={busy} onSend={onSend} />
     </>
   );
 }
