@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.0] - 2026-11-22
+
 ### Changed
 
 - The web app has the redesign's look: a top bar with the job's title, a
