@@ -47,7 +47,8 @@ export function documentTitle(view: WizardView | null, home = false): string {
     case "rendering": {
       // 07: "49% · Rendering · Super Processor", once the render reports.
       const pct = view.progress && !view.interrupted ? Math.round(view.progress.pct) : null;
-      if (pct !== null && Number.isFinite(pct)) parts.push(`${Math.max(0, Math.min(100, pct))}%`, "Rendering");
+      if (view.interrupted) parts.push("Render");
+      else if (pct !== null && Number.isFinite(pct)) parts.push(`${Math.max(0, Math.min(100, pct))}%`, "Rendering");
       else parts.push("Rendering", "Render");
       break;
     }
@@ -101,8 +102,10 @@ export type Milestone = { key: string; text: string };
 
 /**
  * What to read out for a run's progress, only at milestones (s9): a new
- * stage, or each 10% of the job. Null when nothing new is worth saying.
- * `previous` is the milestone said last.
+ * stage, or each 10% of this step. The number is the one on the bar
+ * (`pct`), and the stage is said without the counts in it, so what is read
+ * out never disagrees with what is shown. Null when nothing new is worth
+ * saying. `previous` is the milestone said last.
  */
 export function progressMilestone(
   previous: Milestone | null,
@@ -110,7 +113,7 @@ export function progressMilestone(
   progress: Progress | null | undefined,
 ): Milestone | null {
   if (!progress) return null;
-  const value = typeof progress.overall === "number" ? progress.overall : progress.pct;
+  const value = progress.pct;
   const tens = Math.max(0, Math.min(10, Math.floor((Number.isFinite(value) ? value : 0) / 10)));
   const stage = (progress.message || progress.phase || "").trim();
   // A stage is its words without the counts in them ("Saving still 12 of
@@ -120,8 +123,18 @@ export function progressMilestone(
   if (previous && previous.key === key) return null;
   const sameStage = previous ? previous.key.startsWith(`${title}|${stageKey}|`) : false;
   const pct = `${tens * 10}%`;
-  const text = sameStage || !stage ? `${title}: ${pct}` : `${title}: ${stage}, ${pct}`;
+  const label = stageLabel(stage);
+  const text = sameStage || !label ? `${title}: ${pct}` : `${title}: ${label}, ${pct}`;
   return { key, text };
+}
+
+/**
+ * A stage's words up to its first count or colon ("Upscaling on the GPU: 9%
+ * of the work" → "Upscaling on the GPU"), so a screen with a bar shows one
+ * number, the bar's.
+ */
+export function stageLabel(text: string): string {
+  return text.split(/[:(]|[0-9]/)[0].replace(/[\s·,–-]+$/, "").trim();
 }
 
 function stageWords(text: string): string {

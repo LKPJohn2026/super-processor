@@ -9,7 +9,7 @@ const { outputText } = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 });
 assert.ok(!/from\s+["']\.\/api["']/.test(outputText), "shellView.ts must import only types");
-const { connectionState, connectionText, documentTitle, headingKey, originHost, progressMilestone } = await import(
+const { connectionState, connectionText, documentTitle, headingKey, originHost, progressMilestone, stageLabel } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`
 );
 
@@ -24,7 +24,7 @@ test("the tab title names the step, the scene and the app", () => {
   assert.equal(documentTitle(view("result")), "Result · Super Processor");
   assert.equal(documentTitle(view("done")), "Saved · Result · Super Processor");
   assert.equal(documentTitle(view("rendering")), "Rendering · Render · Super Processor");
-  assert.equal(documentTitle(view("rendering", { interrupted: true })), "Waiting for you · Rendering · Render · Super Processor");
+  assert.equal(documentTitle(view("rendering", { interrupted: true })), "Waiting for you · Render · Super Processor");
   assert.equal(
     documentTitle(view("rendering", { progress: { phase: "rendering", pct: 49.4, message: "m" } })),
     "49% · Rendering · Super Processor",
@@ -56,15 +56,23 @@ test("the host the banner names", () => {
 
 test("progress is read out at each stage and each 10%, not on every poll", () => {
   const p = (pct, message, overall) => ({ phase: "rendering", pct, message, overall });
-  const first = progressMilestone(null, "Render", p(5, "Upscaling on the GPU", 31));
+  // The number read out is the bar's (pct), not the whole job's.
+  const first = progressMilestone(null, "Render", p(31, "Upscaling on the GPU: 9% of the work", 5));
   assert.equal(first.text, "Render: Upscaling on the GPU, 30%");
-  assert.equal(progressMilestone(first, "Render", p(6, "Upscaling on the GPU", 33)), null);
-  const next = progressMilestone(first, "Render", p(20, "Upscaling on the GPU", 41));
+  assert.equal(progressMilestone(first, "Render", p(33, "Upscaling on the GPU: 12% of the work", 6)), null);
+  const next = progressMilestone(first, "Render", p(41, "Upscaling on the GPU: 20% of the work", 20));
   assert.equal(next.text, "Render: 40%");
   // A count in the words is not a new stage.
-  const a = progressMilestone(null, "Finding the scenes", p(10, "Saving still 3 of 60", 12));
-  assert.equal(progressMilestone(a, "Finding the scenes", p(12, "Saving still 9 of 60", 14)), null);
-  const b = progressMilestone(a, "Finding the scenes", p(40, "Uploading the video to Gemini", 15));
+  const a = progressMilestone(null, "Finding the scenes", p(12, "Saving still 3 of 60", 10));
+  assert.equal(a.text, "Finding the scenes: Saving still, 10%");
+  assert.equal(progressMilestone(a, "Finding the scenes", p(14, "Saving still 9 of 60", 12)), null);
+  const b = progressMilestone(a, "Finding the scenes", p(15, "Uploading the video to Gemini", 40));
   assert.equal(b.text, "Finding the scenes: Uploading the video to Gemini, 10%");
   assert.equal(progressMilestone(null, "Render", null), null);
+});
+
+test("a stage is named without its own counts, so the bar's number is the only one", () => {
+  assert.equal(stageLabel("Upscaling on the GPU: 9% of the work"), "Upscaling on the GPU");
+  assert.equal(stageLabel("Saving still 3 of 60"), "Saving still");
+  assert.equal(stageLabel("Joining the scenes"), "Joining the scenes");
 });

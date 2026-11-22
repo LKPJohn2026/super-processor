@@ -64,6 +64,8 @@ test("jobStatus: the badge says where each job is, in the mockup's words", () =>
   });
   // A step's own error on a readable job is not an unreadable job.
   assert.equal(jobStatus(entry({ error: "Gemini said no" })).text, "Scenes · waiting for you");
+  // All scenes approved: the backend's stage is still "scenes", the wait is for the render.
+  assert.equal(jobStatus(entry({ stage: "scenes", step: "ready_to_render" })).text, "Render · waiting for you");
   // An interrupted job that also has a kept result still says it stopped partway.
   assert.equal(
     jobStatus(entry({ status: "result", stage: "render", interrupted: true })).text,

@@ -129,15 +129,18 @@ export function findingStages(
 export function findingTime(
   progress: Progress | null | undefined,
   sinceS = 0,
-): { big: string; forStage: boolean; spent: string } {
+): { big: string; stageLeft: string } {
+  // The server's time left is for the running stage only, never the whole
+  // wait, so it is the caption and the time spent is the big number.
   const spent =
     typeof progress?.elapsed_s === "number" ? `${shortClock(progress.elapsed_s + sinceS)} so far` : "";
+  let stageLeft = "";
   if (typeof progress?.eta_s === "number") {
     const left = Math.max(0, progress.eta_s - sinceS);
     const words = left >= 90 ? `${Math.round(left / 60)} min` : `${Math.max(1, Math.round(left))} s`;
-    return { big: `About ${words} left`, forStage: true, spent };
+    stageLeft = `About ${words} left in this stage`;
   }
-  return { big: spent || "Starting…", forStage: false, spent: "" };
+  return { big: spent || stageLeft || "Starting…", stageLeft: spent ? stageLeft : "" };
 }
 
 /** `14:02`, the local time a run started (epoch seconds). */

@@ -9,11 +9,14 @@ export function Chip({
   selected,
   disabled,
   onToggle,
+  label,
   children,
 }: {
   selected: boolean;
   disabled?: boolean;
   onToggle: (selected: boolean) => void;
+  // The name read out, when the words shown would repeat another button's.
+  label?: string;
   children: ReactNode;
 }) {
   return (
@@ -21,6 +24,7 @@ export function Chip({
       type="button"
       className={selected ? "chip sel" : "chip"}
       aria-pressed={selected}
+      aria-label={label}
       disabled={disabled}
       onClick={() => onToggle(!selected)}
     >

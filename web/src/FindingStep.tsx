@@ -48,7 +48,7 @@ export function FindingStep({
   const stages = findingStages(view, clock.current, Date.now());
   const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : 0;
   const started = view.run?.kind === "segmenting" ? startedAt(view.run.started_at) : "";
-  const caption = [time.forStage ? "For this stage" : "", started ? `Started ${started}` : "", time.spent]
+  const caption = [time.stageLeft, started ? `Started ${started}` : ""]
     .filter(Boolean)
     .join(" · ");
   const again = view.step === "proposing" && Boolean(view.segments?.note);

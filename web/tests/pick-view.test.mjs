@@ -100,10 +100,10 @@ test("stage times come only from what the page saw", () => {
   assert.equal(late.started.upload, null);
 });
 
-test("time left only when the server measures it, else the time spent", () => {
-  assert.deepEqual(finding.findingTime({ eta_s: 130, elapsed_s: 63 }), { big: "About 2 min left", forStage: true, spent: "1:03 so far" });
-  assert.equal(finding.findingTime({ eta_s: 40 }, 10).big, "About 30 s left");
-  assert.deepEqual(finding.findingTime({ eta_s: null, elapsed_s: 63 }), { big: "1:03 so far", forStage: false, spent: "" });
+test("the time spent is the big number; the stage's time left is only a caption", () => {
+  assert.deepEqual(finding.findingTime({ eta_s: 130, elapsed_s: 63 }), { big: "1:03 so far", stageLeft: "About 2 min left in this stage" });
+  assert.deepEqual(finding.findingTime({ eta_s: 40 }, 10), { big: "About 30 s left in this stage", stageLeft: "" });
+  assert.deepEqual(finding.findingTime({ eta_s: null, elapsed_s: 63 }), { big: "1:03 so far", stageLeft: "" });
   assert.equal(finding.findingTime(null).big, "Starting…");
   assert.match(finding.startedAt(1_795_324_000), /^\d\d:\d\d$/);
   assert.equal(finding.startedAt(null), "");

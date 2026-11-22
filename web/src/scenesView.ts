@@ -6,12 +6,17 @@ import type { Segment, SegmentList } from "./api";
 
 type Span = Pick<Segment, "start_s" | "end_s">;
 
-/** The H1: how many scenes Gemini found, or that its split did not work. */
-export function scenesHeading(list: Pick<SegmentList, "segments" | "error">): string {
+/**
+ * The H1: how many scenes Gemini found, or that its split did not work.
+ * Only Gemini's first split (revision 0) is said to be Gemini's: any later
+ * list may have been changed by hand.
+ */
+export function scenesHeading(list: Pick<SegmentList, "segments" | "error" | "revision">): string {
   const count = list.segments.length;
   if (list.error) return count === 1 ? "The whole video is one scene for now" : "Check the scenes";
   if (!count) return "No scenes yet";
-  return `Gemini found ${count} ${count === 1 ? "scene" : "scenes"}`;
+  const scenes = `${count} ${count === 1 ? "scene" : "scenes"}`;
+  return list.revision ? `Your video has ${scenes}` : `Gemini found ${scenes}`;
 }
 
 export type SourceNote = { kind: "video" | "stills"; text: string };

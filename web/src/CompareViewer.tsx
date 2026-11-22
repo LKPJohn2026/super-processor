@@ -218,6 +218,8 @@ export function CompareViewer({
       if (owner === "field") return;
       if (owner === "control" && (action === "play" || action === "back" || action === "forward")) return;
       if (!root.current?.isConnected) return;
+      // A modal dialog (the start-over confirm) makes the page behind it inert.
+      if (root.current.closest("[inert]") || document.querySelector("dialog[open]")) return;
       event.preventDefault();
       if (action === "play") togglePlay();
       else if (action === "back") step(-1);

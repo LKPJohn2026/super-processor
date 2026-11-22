@@ -601,6 +601,8 @@ export function ScenesStep({
                     selected={chosen.includes(chip.key)}
                     disabled={locked}
                     onToggle={(on) => setChosen((value) => toggleChip(value, chip.key, on))}
+                    // "Split scene 4" is also a scene row's button; this one only asks Gemini.
+                    label={`Ask Gemini: ${chip.note}`}
                   >
                     {chip.text}
                   </Chip>

@@ -78,6 +78,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copy, a still of one scene before and after, and the versions. All jobs
   shows each job's status beside its button, and Refresh and Disconnect
   move into its More menu.
+- The screens shown while a scene is looked at, and when a run was
+  interrupted, have the same look as the other steps. A progress screen
+  shows and reads out one number, the bar's; the line under the bar names
+  the stage without its own count. Finding the scenes shows the time spent
+  in large type and the stage's time left beside it. The Scenes step keeps
+  "Looks right — preview scenes" on screen while its list scrolls, and
+  says "Your video has N scenes" once the list has changed. All jobs says
+  Render for a job whose scenes are all approved. The Welcome page no
+  longer offers a local model, which can't be used yet.
 
 ## [4.2.0] - 2026-11-21
 

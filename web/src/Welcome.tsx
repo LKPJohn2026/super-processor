@@ -296,17 +296,8 @@ export function WelcomeStep({
             <NeedRow
               icon="info"
               tone="plain"
+              // Only the words (01): a button here would lead to a step with nothing behind it.
               detail="Gemini watches the video and suggests settings. Local models: coming later."
-              action={
-                <Button
-                  kind="ghost"
-                  size="md"
-                  disabled={busy}
-                  onClick={() => void onSend("llm", { choice: "local" })}
-                >
-                  I have a local model
-                </Button>
-              }
             />
           )}
         </Card>

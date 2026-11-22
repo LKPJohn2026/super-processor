@@ -22,6 +22,8 @@ test("the heading says how many scenes Gemini found, or that its split did not w
   assert.equal(scenesHeading({ segments: [seg(0, 9)], error: null }), "Gemini found 1 scene");
   assert.equal(scenesHeading({ segments: [seg(0, 9)], error: "quota" }), "The whole video is one scene for now");
   assert.equal(scenesHeading({ segments: [], error: null }), "No scenes yet");
+  // After a change (by hand or a new split), the count is no longer only Gemini's.
+  assert.equal(scenesHeading({ segments: FIVE, error: null, revision: 2 }), "Your video has 5 scenes");
 });
 
 test("the source note says whether Gemini watched the video or worked from stills, and why", () => {

@@ -46,7 +46,9 @@ export function unreadable(entry: JobEntry): boolean {
  * works on it in this window.
  */
 export function jobStatus(entry: JobEntry, pct?: number | null): JobStatus {
-  const stage = entry.stage ? STAGE_NAMES[entry.stage] : null;
+  // The backend still counts a job ready to render as on its previews
+  // (every scene approved), but what waits for the editor is the render.
+  const stage = entry.step === "ready_to_render" ? "Render" : entry.stage ? STAGE_NAMES[entry.stage] : null;
   if (entry.status === "running") {
     const doing = (entry.step && WORKING[entry.step]) || "Working on it";
     const shown = typeof pct === "number" && Number.isFinite(pct) ? ` · ${Math.round(pct)}%` : "";

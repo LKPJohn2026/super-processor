@@ -47,12 +47,13 @@ import {
   headingKey,
   originHost,
   progressMilestone,
+  stageLabel,
   type Milestone,
 } from "./shellView";
 import { AppShell } from "./shell/AppShell";
 import { Sidebar } from "./shell/Sidebar";
 import { TopBar } from "./shell/TopBar";
-import { Banner, Button, Icon, Toggle } from "./ui";
+import { Badge, Banner, Button, Card, Icon, Progress as ProgressBar, Toggle } from "./ui";
 import { newVideoRoute, sortJobs, startsOnJobs } from "./jobsList";
 import {
   notifyPermission,
@@ -928,7 +929,8 @@ function WizardStepView({
     const count = view.job?.scene_count || view.segments?.segments.length;
     return (
       <Busy
-        title={`Scene ${(view.segment_index ?? 0) + 1}${count ? ` of ${count}` : ""}`}
+        title={`Looking at scene ${(view.segment_index ?? 0) + 1}${count ? ` of ${count}` : ""}`}
+        overline="Step 3 of 5 · Previews"
         progress={view.progress ?? null}
         overallKey={overallKey(view)}
         overallShown={overallShown}
@@ -1016,8 +1018,14 @@ function WizardStepView({
   );
 }
 
+/**
+ * Step 3 · a scene being looked at (between approving one scene and seeing
+ * the next preview): the same card as Finding and Render, with this step's
+ * bar and the whole job's share as a caption.
+ */
 function Busy({
   title,
+  overline,
   progress,
   overallKey: steadyKey,
   overallShown,
@@ -1027,6 +1035,7 @@ function Busy({
   children,
 }: {
   title: string;
+  overline: string;
   progress: Progress | null;
   // The run the whole job's percentage is kept steady for.
   overallKey?: string;
@@ -1037,7 +1046,7 @@ function Busy({
   notify?: ReactNode;
   children: ReactNode;
 }) {
-  const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
+  const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : 0;
   // The whole job's percentage never goes back while one run works, even
   // when a poll arrives late or a phase reports a lower estimate.
   const own = useRef<SteadyOverall | null>(null);
@@ -1062,37 +1071,41 @@ function Busy({
   }, [progress]);
   const since = tick.of === progress ? tick.since : 0;
   const timing = progress ? progressTiming(progress, since) : "";
-  const step = progress ? `${pct}% · ${progress.message}${timing ? ` · ${timing}` : ""}` : "";
+  const big = timing ? timing.charAt(0).toUpperCase() + timing.slice(1) : "Starting…";
   return (
-    <>
-      <h1>{title}</h1>
-      <p className="lede" role="status">
-        {children}
-      </p>
-      {overall !== null ? (
-        <>
-          <p className="progress">
-            <progress max={100} value={overall} aria-label={`Whole job: ${overall}%`}>
-              {overall}%
-            </progress>{" "}
-            <strong>{overall}% of the job</strong>
-          </p>
-          <p className="progress muted">This step: {step}</p>
-        </>
-      ) : pct !== null ? (
-        <p className="progress">
-          <progress max={100} value={pct} aria-label={`${title}: ${pct}%`}>
-            {pct}%
-          </progress>{" "}
-          {step}
-        </p>
+    <div className="finding-step">
+      <header className="step-head">
+        <p className="overline">{overline}</p>
+        <h1>{title}</h1>
+        <p className="muted">{children}</p>
+      </header>
+      {message ? (
+        <Banner tone="error" role="alert" title="Something went wrong">
+          {message}
+        </Banner>
       ) : null}
+      <Card as="section" className="col gap16 finding-card" aria-label="Progress">
+        <div className="row between wrap finding-time">
+          <span className="display">{big}</span>
+          {overall !== null ? <span className="caption subtle">{overall}% of the whole job</span> : null}
+        </div>
+        <ProgressBar value={pct} label={`${title}: ${pct}%`} />
+        <p className="body-s muted">{(progress && stageLabel(progress.message)) || "Starting…"}</p>
+      </Card>
       {/* Always in the page, so a note that appears is read out. */}
-      <div role="status">{progress?.note ? <p className="notice">{progress.note}</p> : null}</div>
-      {message ? <Alert text={message} /> : null}
+      <div role="status">
+        {progress?.note ? (
+          <Banner tone="warning" title="Note">
+            {progress.note}
+          </Banner>
+        ) : null}
+      </div>
+      <Banner tone="info" title="You can close this tab">
+        This keeps running on this computer. Open the wizard link again to come back to it.
+      </Banner>
       {notify}
       {stop}
-    </>
+    </div>
   );
 }
 
@@ -1195,60 +1208,90 @@ function Interrupted({
 }) {
   // What the last "Check again" found, read out.
   const [checked, setChecked] = useState<string | null>(null);
+  const overline = interruptedOverline(view);
+  const error = message ? (
+    <Banner tone="error" role="alert" title="Something went wrong">
+      {message}
+    </Banner>
+  ) : null;
   // Nothing runs until the editor chooses, so reopening a job never spends
   // GPU time or Gemini quota by itself.
   if (view.running_elsewhere) {
     return (
-      <>
-        <h1>Working in another window</h1>
-        <p className="lede">
-          Another Super Processor window on this computer is working on this job.
-          Wait for it to finish there, then check again.
-        </p>
-        {message ? <Alert text={message} /> : null}
-        <p className="muted" role="status">
-          {checked}
-        </p>
-        <div className="actions">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              setChecked(null);
-              void onCheckAgain().then((ok) => {
-                if (ok) setChecked(`Still working there (checked at ${new Date().toLocaleTimeString()}).`);
-              });
-            }}
-          >
-            {busy ? "Checking…" : "Check again"}
-          </button>
-        </div>
-      </>
+      <div className="finding-step">
+        <header className="step-head">
+          <p className="overline">{overline}</p>
+          <h1>Working in another window</h1>
+        </header>
+        {error}
+        <Card as="section" className="col gap16">
+          <p>
+            Another Super Processor window on this computer is working on this job. Wait for it to finish there,
+            then check again.
+          </p>
+          <p className="body-s muted" role="status">
+            {checked}
+          </p>
+          <div className="row gap12 wrap">
+            <Button
+              kind="primary"
+              size="md"
+              disabled={busy}
+              onClick={() => {
+                setChecked(null);
+                void onCheckAgain().then((ok) => {
+                  if (ok) setChecked(`Still working there (checked at ${new Date().toLocaleTimeString()}).`);
+                });
+              }}
+            >
+              {busy ? "Checking…" : "Check again"}
+            </Button>
+          </div>
+        </Card>
+      </div>
     );
   }
   const choice = interruptedChoice(view);
   return (
-    <>
-      <h1>{choice.title}</h1>
-      <p className="lede">{choice.lede}</p>
-      {view.cancellable ? <p className="muted">{choice.stopHint}</p> : null}
-      {message ? <Alert text={message} /> : null}
-      <div className="actions">
-        <button type="button" disabled={busy} onClick={() => void onRequest((shown) => resumeRun(origin, shown))}>
-          {choice.resumeLabel}
-        </button>
-        {view.cancellable ? (
-          <button
-            type="button"
-            className="secondary"
+    <div className="finding-step">
+      <header className="step-head">
+        <p className="overline">{overline}</p>
+        <h1>{choice.title}</h1>
+      </header>
+      {error}
+      <Card as="section" className="col gap16">
+        <Badge tone="warning">Waiting for you</Badge>
+        <p>{choice.lede}</p>
+        {view.cancellable ? <p className="body-s muted">{choice.stopHint}</p> : null}
+        <div className="row gap12 wrap">
+          <Button
+            kind="primary"
+            size="md"
             disabled={busy}
-            // No run works on an interrupted step, so no run_id is sent.
-            onClick={() => void onRequest((shown) => cancelRun(origin, shown))}
+            onClick={() => void onRequest((shown) => resumeRun(origin, shown))}
           >
-            {choice.stopLabel}
-          </button>
-        ) : null}
-      </div>
-    </>
+            {choice.resumeLabel}
+          </Button>
+          {view.cancellable ? (
+            <Button
+              kind="secondary"
+              size="md"
+              disabled={busy}
+              // No run works on an interrupted step, so no run_id is sent.
+              onClick={() => void onRequest((shown) => cancelRun(origin, shown))}
+            >
+              {choice.stopLabel}
+            </Button>
+          ) : null}
+        </div>
+      </Card>
+    </div>
   );
+}
+
+/** The "Step x of 5" label over an interrupted run, by the step it stopped on. */
+function interruptedOverline(view: WizardView): string {
+  if (view.step === "rendering") return "Step 4 of 5 · Render";
+  if (view.step === "analyzing") return "Step 3 of 5 · Previews";
+  return "Step 2 of 5 · Scenes";
 }

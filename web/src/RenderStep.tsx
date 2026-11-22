@@ -1,3 +1,4 @@
+import { stageLabel } from "./shellView";
 import { useEffect, useState, type ReactNode } from "react";
 import { outputSrc, scaleChoiceText, type Looks, type Progress as RunProgress, type WizardView } from "./api";
 import { startedAt } from "./findingView";
@@ -238,7 +239,7 @@ export function RenderingStep({
           {caption ? <span className="caption subtle">{caption}</span> : null}
         </div>
         <Progress value={pct} label={`Render: ${pct}%`} />
-        <p className="body-s muted">{progress?.message || "Starting the render…"}</p>
+        <p className="body-s muted">{(progress && stageLabel(progress.message)) || "Starting the render…"}</p>
         <div className="divider" />
         <ul className="stage-list" aria-label="Stages">
           {stages.map((stage) => (
