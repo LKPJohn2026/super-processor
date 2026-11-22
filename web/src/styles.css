@@ -1871,22 +1871,88 @@ video {
   line-height: 18px;
 }
 
-/* Editing the cuts by hand on the scenes step */
-.cut-editor {
+/* ------------------------------------------------------ scenes (04) */
+.step-body.scenes-body {
+  max-width: none;
+}
+
+.scenes-step {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: stretch;
+  gap: 24px;
+}
+
+.scenes-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.scenes-main > * {
+  margin: 0;
+}
+
+.scenes-side {
+  width: 300px;
+  flex: none;
+}
+
+.scenes-side form > .btn {
+  align-self: flex-start;
+}
+
+.scenes-side .field .input {
+  width: 100%;
+}
+
+.scenes-approve > .btn {
+  width: 100%;
+}
+
+.source-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.source-note.video {
+  color: var(--focus);
+}
+
+.source-note.stills {
+  color: var(--warn);
+}
+
+.scale-note {
+  max-width: 760px;
+}
+
+/* An empty status line takes no room. */
+.edit-status:empty {
+  display: none;
+}
+
+.main .cut-editor h2 {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .cut-timeline {
-  margin: 16px 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .cut-track {
   position: relative;
   height: 76px;
   border-radius: var(--r-md);
-  background: var(--stage);
+  background: #000;
   touch-action: none;
 }
 
@@ -1895,12 +1961,19 @@ video {
   top: 0;
   bottom: 0;
   overflow: hidden;
-  background: var(--leaf);
-  border-right: 2px solid var(--panel);
+  background: #000;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
 
-.cut-block:nth-child(even) {
-  background: #35503d;
+.cut-block.first {
+  border-left: 1px solid var(--line);
+  border-radius: var(--r-md) 0 0 var(--r-md);
+}
+
+.cut-block.last {
+  border-right: 1px solid var(--line);
+  border-radius: 0 var(--r-md) var(--r-md) 0;
 }
 
 .cut-block img {
@@ -1908,28 +1981,31 @@ video {
   height: 100%;
   object-fit: cover;
   opacity: 0.92;
+  display: block;
 }
 
 .cut-number {
   position: absolute;
   left: 8px;
   bottom: 6px;
-  padding: 0 6px;
-  border-radius: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
   font-size: 13px;
   line-height: 18px;
   font-weight: 600;
   color: #fff;
-  background: rgba(20, 23, 15, 0.78);
+  background: rgba(20, 23, 15, 0.55);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  white-space: nowrap;
 }
 
-/* A wide, transparent hit area (at least 32 px); the bar drawn is ::before. */
+/* A wide, transparent hit area (at least 32 px); the 8 px handle drawn is ::before. */
 .cut-handle {
   position: absolute;
   top: -8px;
   bottom: -8px;
-  width: max(2.25rem, 32px);
-  margin-left: min(-1.125rem, -16px);
+  width: 32px;
+  margin-left: -16px;
   cursor: ew-resize;
   touch-action: none;
   z-index: 1;
@@ -1955,6 +2031,16 @@ video {
   border-color: var(--leaf);
 }
 
+/* The focus ring goes round the handle drawn, not the hit area. */
+.cut-handle:focus-visible {
+  outline: none;
+}
+
+.cut-handle:focus-visible::before {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
 .cut-handle:hover,
 .cut-handle:focus,
 .cut-handle.moving {
@@ -1968,17 +2054,17 @@ video {
 .cut-time {
   display: none;
   position: absolute;
-  bottom: calc(100% + 4px);
+  bottom: calc(100% + 6px);
   left: 50%;
   transform: translateX(-50%);
   padding: 6px 10px;
   border-radius: 4px;
   white-space: nowrap;
-  font-family: var(--mono);
   font-size: 13px;
   line-height: 18px;
   color: #fff;
   background: var(--ink);
+  z-index: 3;
 }
 
 .cut-handle:hover .cut-time,
@@ -1988,13 +2074,29 @@ video {
 }
 
 .cut-scale {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 6px;
+  position: relative;
+  height: 18px;
   font-family: var(--mono);
   font-size: 13px;
   line-height: 18px;
   color: var(--ink-subtle);
+}
+
+.cut-scale .mark {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.cut-scale .mark.start {
+  left: 0;
+  transform: none;
+}
+
+.cut-scale .mark.end {
+  right: 0;
+  transform: none;
 }
 
 .cut-help,
@@ -2002,10 +2104,65 @@ video {
   font-size: 13px;
   line-height: 18px;
   color: var(--ink-subtle);
+  margin: 0;
+}
+
+.scene-rows {
+  list-style: none;
+  padding: 0 !important;
+  margin: 0;
+}
+
+.scene-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  max-width: none !important;
+}
+
+.scene-row-main {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.scene-thumb {
+  width: 96px;
+  height: 60px;
+  flex: none;
+  object-fit: cover;
+  border-radius: 4px;
+  background: var(--sand);
+  display: block;
+}
+
+.scene-row-text {
+  flex: 1 1 180px;
+}
+
+.main .scene-row-text h3 {
+  font-size: 15px;
+  line-height: 22px;
+  margin: 0;
+}
+
+.scene-badges {
+  list-style: none;
+  padding: 0 !important;
+  margin: 0;
+  justify-content: flex-end;
+  flex: 0 1 auto;
+}
+
+.scene-badges li {
+  max-width: none;
+}
+
+.scene-row-actions {
+  flex: none;
 }
 
 .scene-edits {
-  gap: 8px;
+  margin: 10px 0 2px 112px;
 }
 
 .split-form {
@@ -2018,8 +2175,80 @@ video {
   background: var(--sand);
 }
 
+.split-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 600;
+}
+
 .split-form input {
   max-width: 9rem;
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 15px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.split-form .error {
+  margin: 0;
+}
+
+@media (max-width: 1100px) {
+  .scenes-step {
+    flex-direction: column;
+  }
+
+  .scenes-side {
+    width: auto;
+  }
+
+  .scenes-side > .grow {
+    display: none;
+  }
+
+  .scenes-approve > .btn {
+    width: auto;
+    align-self: flex-start;
+  }
+}
+
+@media (max-width: 600px) {
+  .scene-row-main {
+    flex-wrap: wrap;
+    gap: 8px 12px;
+  }
+
+  .scene-thumb {
+    width: 80px;
+    height: 50px;
+  }
+
+  .scene-row-text {
+    flex: 1 1 calc(100% - 92px);
+  }
+
+  .scene-badges {
+    justify-content: flex-start;
+    flex: 1 1 100%;
+  }
+
+  .scene-row-actions {
+    flex: 1 1 100%;
+  }
+
+  .scene-edits {
+    margin-left: 0;
+  }
+
+  .scenes-approve > .btn {
+    width: 100%;
+  }
 }
 
 /* "Notify me when it's done" under a long run */

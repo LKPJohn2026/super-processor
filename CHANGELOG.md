@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used up, its split failed or it returned no scenes, the Scenes step says
   so with "Try again" (after the wait Gemini gave) or "Ask Gemini again",
   and "Use the whole video as one scene".
+- The Scenes step has the redesign's layout: "Gemini found N scenes" with
+  whether Gemini watched the video or worked from stills (and why), the
+  timeline with a handle on each cut ("Drag to move this cut") and a time
+  ruler, and a row per scene with its still, times, length and what is
+  handled gently (faces, hands, text, fine pattern). Merge, split and move
+  cut are under each scene's Edit. On the right, "Suggest different cuts"
+  chips (merge, split, fewer or more scenes) and your own words go to
+  Gemini with "Ask Gemini to re-split", above "Looks right — preview
+  scenes".
 
 ## [4.2.0] - 2026-11-21
 
