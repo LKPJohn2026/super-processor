@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import pytest
+from wizard_client import get
 
 from super_processor.gemini import GeminiClient
 from super_processor.review import (
@@ -128,6 +129,7 @@ def test_api_state_and_cors_before_a_job(tmp_path: Path) -> None:
             headers={
                 "Content-Type": "application/json",
                 "Content-Length": str(len(raw)),
+                "X-Wizard-Token": TOKEN,
             },
         )
         bad_json = broken.getresponse()
@@ -261,9 +263,9 @@ def test_json_api_drives_upscale_flow(
         # This transport cannot plan either, so the measurements set the look.
         assert "could not propose" in view["error"]
         assert shot["check"]["ok"] is None
-        with urlopen(base + shot["after_url"]) as response:
+        with get(base + shot["after_url"], TOKEN) as response:
             assert response.headers.get_content_type() == "video/mp4"
-        with urlopen(base + shot["before_url"]) as response:
+        with get(base + shot["before_url"], TOKEN) as response:
             assert response.headers.get_content_type() == "video/mp4"
         for bad in (
             "/previews/work/shot_000_in.mp4",
@@ -272,7 +274,7 @@ def test_json_api_drives_upscale_flow(
             "/shot_stills/1.jpg",
         ):
             with pytest.raises(HTTPError) as missing:
-                urlopen(base + bad)
+                get(base + bad, TOKEN)
             assert missing.value.code == 404
             missing.value.close()
         _status, ready, _origin = _json_request(
@@ -296,7 +298,7 @@ def test_json_api_drives_upscale_flow(
         assert result["scale"] == 2
         assert result["strength"] == 0.5
         assert result["strength_summary"] == "strength 0.50"
-        with urlopen(base + "/output.mp4") as response:
+        with get(base + "/output.mp4", TOKEN) as response:
             assert response.headers.get_content_type() == "video/mp4"
         _status, again, _origin = _json_request(
             base,
@@ -316,7 +318,7 @@ def test_json_api_drives_upscale_flow(
         assert done["step"] == "done"
         assert done["output_ready"] is True
         assert controller.current_state().step is WizardStep.DONE
-        page = urlopen(base + "/")
+        page = get(base + "/", TOKEN)
         html = page.read().decode()
         assert "<h1>Done</h1>" in html
         unknown, err, _origin = _json_request(base, "POST", "/api/nope", {})
@@ -453,8 +455,9 @@ def test_upload_refusals_save_nothing(tmp_path: Path) -> None:
         status, data = _upload(base, too_big)
         assert (status, data["error"]) == (413, "the file is too large to upload")
         # The token must be a header: a dropped file has no form to carry it.
+        # Without it the upload is refused before a byte of it is read.
         status, _data = _upload(base, {"X-File-Name": "clip.mp4"}, b"x")
-        assert status == 403
+        assert status == 401
         with controller._work_lock:
             status, data = _upload(base, named, b"x")
         assert (status, data["error"]) == (409, "the last step is still running")
@@ -663,8 +666,9 @@ def test_reopening_a_scene_needs_the_token(tmp_path: Path) -> None:
             },
         )
         response = connection.getresponse()
-        assert response.status == 403
-        assert "wizard token" in json.loads(response.read().decode())["error"]
+        # A wrong token is no token: refused before anything is read.
+        assert response.status == 401
+        assert "token" in json.loads(response.read().decode())["error"]
         state = WizardController(tmp_path).current_state()
         assert (state.step, state.segment_index) == (WizardStep.READY_TO_RENDER, 2)
     finally:

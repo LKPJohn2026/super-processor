@@ -411,7 +411,8 @@ def test_output_url_with_a_version_serves_the_file(
     base = server.start()
     try:
         request = Request(
-            base + _output_url(controller), headers={"Range": "bytes=0-3"}
+            base + _output_url(controller),
+            headers={"Range": "bytes=0-3", "X-Wizard-Token": server.token},
         )
         with urlopen(request) as response:
             assert response.status == 206

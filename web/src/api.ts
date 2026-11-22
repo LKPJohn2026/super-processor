@@ -291,39 +291,168 @@ const STEPS: readonly string[] = [
   "done",
 ];
 
+// The wizard only ever runs on the user's own computer. Any other address
+// (a link with ?api=https://… or a pasted one) could be a look-alike server
+// collecting the Gemini key and the video, so it is refused.
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+export const LOOPBACK_ONLY =
+  "Only a wizard on this computer can be used: an address like http://127.0.0.1:PORT, as super-processor review prints it.";
+
+/** The origin of a wizard address on this computer, or null for anything else. */
+export function loopbackOrigin(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.username || url.password) return null;
+  if (!LOOPBACK_HOSTS.has(url.hostname)) return null;
+  return url.origin;
+}
+
+export type WizardAddress = { origin: string; token: string } | { error: string };
+
+/**
+ * A typed or pasted wizard address: the printed launch URL
+ * (`http://127.0.0.1:PORT/?token=…`), or just its origin. Only a loopback
+ * address is accepted.
+ */
+export function parseWizardAddress(raw: string): WizardAddress {
+  const text = raw.trim();
+  if (!text) return { error: "Enter the URL printed by super-processor review." };
+  const origin = loopbackOrigin(text);
+  if (origin === null) return { error: LOOPBACK_ONLY };
+  const url = new URL(text);
+  const hash = new URLSearchParams(url.hash.replace(/^#/, ""));
+  return { origin, token: url.searchParams.get("token") || hash.get("token") || "" };
+}
+
+let originProblem: string | null = null;
+
+/** Why the address this page was opened with was refused, if it was. */
+export function configuredOriginProblem(): string | null {
+  return originProblem;
+}
+
 export function configuredOrigin(): string {
+  originProblem = null;
   const params = new URLSearchParams(window.location.search);
   if (params.has("api")) {
-    return (params.get("api") ?? "").replace(/\/$/, "");
+    const raw = params.get("api") ?? "";
+    // An explicit empty ?api= means the page's own origin.
+    if (!raw.trim()) return "";
+    const origin = loopbackOrigin(raw);
+    if (origin === null) {
+      originProblem = `Ignored the address in this link (${raw.trim().slice(0, 80)}). ${LOOPBACK_ONLY}`;
+      return "";
+    }
+    return origin;
   }
   if (params.get("live") === "1") {
     const port = params.get("port") || "45143";
-    return `http://127.0.0.1:${port}`;
+    if (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+      originProblem = `Ignored port ${port}: it is not a port number.`;
+      return "";
+    }
+    return `http://127.0.0.1:${Number(port)}`;
   }
   const fromEnv = import.meta.env.VITE_API_ORIGIN;
   if (typeof fromEnv === "string" && fromEnv.trim()) {
-    return fromEnv.trim().replace(/\/$/, "");
+    const origin = loopbackOrigin(fromEnv);
+    if (origin === null) {
+      originProblem = `Ignored VITE_API_ORIGIN. ${LOOPBACK_ONLY}`;
+      return "";
+    }
+    return origin;
   }
   return "";
 }
 
 // Connections can overlap (including a failed attempt to connect elsewhere).
-// Never send one server's token to another server.
+// Never send one server's token to another server. Kept for this tab too
+// (sessionStorage), so a reload stays connected; never in the address bar.
 const wizardTokens = new Map<string, string>();
+const TOKEN_STORE = "super-processor.wizard-token:";
+// The last /api/state answer per server, to tell "needs its token" apart.
+const stateStatus = new Map<string, number>();
 
 function originKey(origin: string): string {
   return new URL(origin || window.location.origin).origin;
 }
 
-function remember(origin: string, view: WizardView): WizardView {
-  if (typeof view.token === "string" && view.token) {
-    wizardTokens.set(originKey(origin), view.token);
+function tabStore(): Storage | null {
+  try {
+    return globalThis.sessionStorage ?? null;
+  } catch {
+    return null;
   }
+}
+
+/** Keep `token` for the wizard at `origin` (memory, and this tab's storage). */
+export function setToken(origin: string, token: string): void {
+  if (!token) return;
+  const key = originKey(origin);
+  wizardTokens.set(key, token);
+  try {
+    tabStore()?.setItem(TOKEN_STORE + key, token);
+  } catch {
+    // Private mode or blocked storage: the token lives in memory only.
+  }
+}
+
+function remember(origin: string, view: WizardView): WizardView {
+  if (typeof view.token === "string" && view.token) setToken(origin, view.token);
   return view;
 }
 
 function tokenFor(origin: string): string {
-  return wizardTokens.get(originKey(origin)) ?? "";
+  const key = originKey(origin);
+  const known = wizardTokens.get(key);
+  if (known) return known;
+  try {
+    const stored = tabStore()?.getItem(TOKEN_STORE + key) ?? "";
+    if (stored) wizardTokens.set(key, stored);
+    return stored;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Take the token the page was opened with (`?token=` or `#token=`, as the
+ * CLI prints it) for the wizard at `origin`, then drop it from the address
+ * bar so it stays out of history, bookmarks and screenshots.
+ */
+export function adoptLaunchToken(origin: string): void {
+  const { location, history } = window;
+  const search = new URLSearchParams(location.search);
+  const hash = new URLSearchParams((location.hash ?? "").replace(/^#/, ""));
+  const token = search.get("token") || hash.get("token") || "";
+  if (!search.has("token") && !hash.has("token")) return;
+  setToken(origin, token);
+  search.delete("token");
+  hash.delete("token");
+  const query = search.toString();
+  const fragment = hash.toString();
+  const clean = `${location.pathname}${query ? `?${query}` : ""}${fragment ? `#${fragment}` : ""}`;
+  try {
+    history?.replaceState(history.state, "", clean);
+  } catch {
+    // Nothing to tidy where there is no history (tests, odd embeds).
+  }
+}
+
+/** True when the wizard at `origin` last refused this page for want of its token. */
+export function needsToken(origin: string): boolean {
+  return stateStatus.get(originKey(origin)) === 401;
+}
+
+function authHeaders(origin: string): Record<string, string> {
+  const token = tokenFor(origin);
+  return token ? { "X-Wizard-Token": token } : {};
 }
 
 function isWizardView(value: unknown): value is WizardView {
@@ -358,13 +487,15 @@ async function readView(origin: string, response: Response): Promise<WizardView>
 export async function loadState(origin: string): Promise<WizardView | null> {
   try {
     const response = await fetch(`${origin}/api/state`, {
-      headers: { Accept: "application/json" },
+      headers: { Accept: "application/json", ...authHeaders(origin) },
       signal: AbortSignal.timeout(2500),
     });
+    stateStatus.set(originKey(origin), response.status);
     if (!response.ok) return null;
     const data: unknown = await response.json();
     return isWizardView(data) ? remember(origin, data) : null;
   } catch {
+    stateStatus.delete(originKey(origin));
     return null;
   }
 }
@@ -567,12 +698,23 @@ export const runSegmenting: Runner = (origin, onProgress, signal) =>
 export const runAnalyze: Runner = (origin, onProgress, signal) =>
   once(origin, "analyze", ["analyzing"], onProgress, signal);
 
+/**
+ * A media URL the page can put in `<video>` or `<img>`. Those cannot send a
+ * header, and a shell on another origin (or behind the Vite proxy) has no
+ * wizard cookie, so the wizard's own paths carry the token as `?t=`, which
+ * the wizard accepts for media only. Absolute URLs (another host) never get it.
+ */
 export function outputSrc(origin: string, outputUrl: string | null): string | null {
   if (!outputUrl) return null;
   if (outputUrl.startsWith("http://") || outputUrl.startsWith("https://")) {
     return outputUrl;
   }
-  return `${origin}${outputUrl}`;
+  const token = tokenFor(origin);
+  if (!token) return `${origin}${outputUrl}`;
+  const cut = outputUrl.search(/#|$/);
+  const path = outputUrl.slice(0, cut);
+  const joiner = path.includes("?") ? "&" : "?";
+  return `${origin}${path}${joiner}t=${encodeURIComponent(token)}${outputUrl.slice(cut)}`;
 }
 
 /** `fields` plus the job the page shows, so a stale tab cannot act on another job. */
@@ -656,7 +798,7 @@ function isJobEntry(value: unknown): value is JobEntry {
 /** Every job, most recently changed first; throws when the server cannot say. */
 export async function loadJobs(origin: string): Promise<JobEntry[]> {
   const response = await fetch(`${origin}/api/jobs`, {
-    headers: { Accept: "application/json" },
+    headers: { Accept: "application/json", ...authHeaders(origin) },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) {

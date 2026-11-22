@@ -290,7 +290,7 @@ def test_dropped_file_is_uploaded_and_picked(tmp_path: Path) -> None:
     base = server.start()
     try:
         status, data = _upload(base, b"x", "a.mp4", token="wrong")
-        assert status == 403
+        assert status == 401
         status, data = _upload(base, b"x", "notes.txt")
         assert status == 415 and "only video files" in data["error"]
         status, data = _upload(base, b"not a video", "broken.mp4")

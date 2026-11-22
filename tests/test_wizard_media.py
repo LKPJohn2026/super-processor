@@ -53,12 +53,17 @@ def _job_with_output(tmp_path: Path, payload: bytes) -> WizardController:
     return controller
 
 
+TOKEN = "media-token"
+
+
 def _request(
     base: str, method: str, path: str, headers: dict[str, str] | None = None
 ) -> tuple[int, dict[str, str], bytes]:
     parsed = urlparse(base)
     connection = HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port)
-    connection.request(method, path, headers=headers or {})
+    connection.request(
+        method, path, headers={"X-Wizard-Token": TOKEN, **(headers or {})}
+    )
     response = connection.getresponse()
     body = response.read()
     return response.status, dict(response.getheaders()), body
@@ -67,7 +72,7 @@ def _request(
 def test_output_is_streamed_with_ranges(tmp_path: Path) -> None:
     payload = os.urandom(3 * 1024 * 1024 + 17)  # spans several stream chunks
     controller = _job_with_output(tmp_path, payload)
-    server = WizardServer(controller.jobs_dir, controller=controller)
+    server = WizardServer(controller.jobs_dir, controller=controller, token=TOKEN)
     base = server.start()
     try:
         status, headers, body = _request(base, "GET", "/output.mp4")

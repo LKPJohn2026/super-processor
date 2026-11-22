@@ -49,7 +49,7 @@ from .recipe import (
 )
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
 from .render import RenderError, ensure_encoder, render_chosen_plan
-from .review import ReviewError, ReviewServer, WizardServer
+from .review import ReviewError, ReviewServer, WizardServer, launch_url
 from .segments import (
     SegmentError,
     TimelineSegment,
@@ -550,10 +550,19 @@ def run_review_command(arguments: argparse.Namespace) -> int:
     else:
         store.ensure_root()
         server = WizardServer(store.root, prefetch=prefetch)
-    print(server.start(), flush=True)
+    base = server.start()
+    print(base, flush=True)
     if server.token:
-        # For scripts: send it as X-Wizard-Token on posts and ?run=1 requests.
+        # For scripts and the React shell: every request needs it, as the
+        # X-Wizard-Token header (or the cookie the open-in-browser URL sets).
         print(f"wizard token: {server.token}", flush=True)
+        print(f"open in your browser: {launch_url(base, server.token)}", flush=True)
+        if not job_id:
+            print(
+                f"React shell (in web/): VITE_PROXY_TARGET={base} npm run dev, "
+                f"then open http://localhost:5173/#token={server.token}",
+                flush=True,
+            )
     try:
         server.wait()
     except KeyboardInterrupt:

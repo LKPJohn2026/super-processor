@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The wizard now needs its token on every page, API call and video or still,
+  not just on changes. `super-processor review` prints an
+  `open in your browser: http://127.0.0.1:PORT/?token=…` address; opening it
+  logs the browser in with a cookie and removes the token from the address
+  bar. Anything else gets 401, so other programs or users on the same
+  computer can no longer read the token, list your jobs, download your
+  videos or replace your Gemini key.
+- A page on the Vite dev or preview port (5173, 4173), such as another
+  project's dev server, no longer gets the wizard's token or any state
+  without it.
+- Another website can no longer show the wizard's videos or stills inside
+  its own page: a cross-site load needs the token.
+- The split review page of `review JOB_ID` has a token too and can no longer
+  be shown inside another site's frame.
+- A connection that stays silent is closed after 60 seconds, and at most 64
+  are served at once, so idle connections can no longer tie up the wizard.
+- Every wizard response tells the browser not to frame it, not to guess file
+  types, and not to cache it.
+- The web app only connects to a wizard on this computer (`127.0.0.1`,
+  `localhost` or `[::1]`). A link with `?api=` pointing anywhere else is
+  ignored with a message, so it cannot collect your Gemini key or video.
+- The web app takes the token from the address the CLI prints
+  (`#token=…`), keeps it for the tab and sends it with each request.
+- The web app refuses to run inside another site's frame, so its buttons
+  cannot be clicked through a hidden frame.
+
 ## [4.3.0] - 2026-11-22
 
 ### Changed

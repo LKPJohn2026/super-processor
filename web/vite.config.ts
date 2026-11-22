@@ -7,12 +7,18 @@ const proxy = Object.fromEntries(
     (prefix) => [prefix, { target: proxyTarget, changeOrigin: true }],
   ),
 );
+// Another site must not frame the shell and steer its clicks (the static
+// Pages build, which cannot send headers, checks for a frame in main.tsx).
+export const frameGuard = {
+  "X-Frame-Options": "DENY",
+  "Content-Security-Policy": "frame-ancestors 'none'",
+};
 
 export default defineConfig(({ command, isPreview }) => ({
   // `vite preview` also reports command "serve", but it serves the production
   // build, whose asset URLs carry the Pages base.
   base: command === "serve" && !isPreview ? "/" : "/super-processor/",
   plugins: [react()],
-  server: { proxy },
-  preview: { proxy },
+  server: { proxy, headers: frameGuard },
+  preview: { proxy, headers: frameGuard },
 }));

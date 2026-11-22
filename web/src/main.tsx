@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { FRAMED_NOTICE, isFramed } from "./frameGuard";
 // Self-hosted fonts (no Google Fonts requests): the design's three faces.
 import "@fontsource/source-sans-3/400.css";
 import "@fontsource/source-sans-3/600.css";
@@ -14,8 +15,13 @@ if (!root) {
   throw new Error("missing root");
 }
 
-createRoot(root).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+if (isFramed(window)) {
+  // Not mounted, so nothing reads the address, its token or the wizard.
+  root.textContent = FRAMED_NOTICE;
+} else {
+  createRoot(root).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  );
+}

@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pytest
+from wizard_client import get
 
 from super_processor.gemini import GeminiClient
 from super_processor.jobs import JobState
@@ -213,7 +214,7 @@ def test_wizard_website_full_flow_intro_to_done(
         # The plan's generation keeps a cached preview of an older plan away.
         assert 'src="/previews/shot_000_r1_after.mp4?g=' in looks
         assert 'poster="/previews/shot_000_r1_after.jpg?g=' in looks
-        with urlopen(base + "/previews/shot_000_r1_after.jpg") as response:
+        with get(base + "/previews/shot_000_r1_after.jpg", TOKEN) as response:
             assert response.headers.get_content_type() == "image/jpeg"
 
         ready = _post(base, "/preview", {"action": "approve"})
@@ -236,7 +237,7 @@ def test_wizard_website_full_flow_intro_to_done(
         output = controller.store.job_dir(job_id) / "output.mp4"
         primary = probe_file(output).primary_video()
         assert primary is not None and (primary.width, primary.height) == (320, 180)
-        with urlopen(base + "/output.mp4") as response:
+        with get(base + "/output.mp4", TOKEN) as response:
             assert response.headers.get_content_type() == "video/mp4"
             assert len(response.read()) > 0
 
@@ -268,7 +269,7 @@ def test_wizard_website_full_flow_intro_to_done(
         assert [v["name"] for v in versions] == ["v001.mp4", "v002.mp4"]
         assert versions[1]["note"] == "reduce artificial detail from 2s to 5s"
         assert versions[1]["current"] is True
-        with urlopen(base + versions[0]["url"]) as response:
+        with get(base + versions[0]["url"], TOKEN) as response:
             assert response.headers.get_content_type() == "video/mp4"
             assert len(response.read()) > 0
 

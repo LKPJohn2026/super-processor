@@ -24,6 +24,8 @@ function mockGlobal(t, name, value) {
 async function fixture(t, fetcher) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   mockGlobal(t, "window", { location: { origin: "http://ui.test", search: "" } });
+  // Node may have a process-wide sessionStorage; tokens must not leak across tests.
+  mockGlobal(t, "sessionStorage", undefined);
   t.mock.method(globalThis, "fetch", fetcher);
   // Fresh module state isolates token and in-flight maps between tests.
   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}#${moduleId++}`);
@@ -341,18 +343,18 @@ test("scale lines say what Gemini chose", async (t) => {
 
 test("the API origin comes from ?api, then ?live, then VITE_API_ORIGIN, else same origin", async (t) => {
   const api = await fixture(t, async () => Response.json({}));
-  mockGlobal(t, "__viteEnv", { VITE_API_ORIGIN: " https://gpu.example:9000/ " });
+  mockGlobal(t, "__viteEnv", { VITE_API_ORIGIN: " http://localhost:9000/ " });
   const from = (search) => {
     window.location.search = search;
     return api.configuredOrigin();
   };
-  assert.equal(from("?api=http://box.test:8000/"), "http://box.test:8000");
+  assert.equal(from("?api=http://127.0.0.1:8000/"), "http://127.0.0.1:8000");
   // An explicit empty ?api= means the page's own origin, even with an env origin.
   assert.equal(from("?api="), "");
-  assert.equal(from("?api=http://box.test&live=1"), "http://box.test");
+  assert.equal(from("?api=http://[::1]:8000&live=1"), "http://[::1]:8000");
   assert.equal(from("?live=1"), "http://127.0.0.1:45143");
   assert.equal(from("?live=1&port=5001"), "http://127.0.0.1:5001");
-  assert.equal(from(""), "https://gpu.example:9000");
+  assert.equal(from(""), "http://localhost:9000");
   globalThis.__viteEnv = { VITE_API_ORIGIN: "   " };
   assert.equal(from(""), "");
   globalThis.__viteEnv = {};

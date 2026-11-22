@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.request import urlopen
 
 import pytest
+from wizard_client import get
 
 from super_processor.gemini import credentials_path, resolve_gemini_api_key
 from super_processor.review import WizardServer
@@ -32,7 +32,7 @@ def test_wizard_server_serves_intro(tmp_path: Path) -> None:
     server = WizardServer(tmp_path)
     base = server.start()
     try:
-        with urlopen(base + "/") as response:
+        with get(base + "/", server.token) as response:
             body = response.read().decode()
     finally:
         server.stop()

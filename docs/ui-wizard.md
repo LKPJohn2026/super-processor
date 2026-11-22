@@ -56,23 +56,53 @@ matrix. For an intentional local API check, configure a test key and run
 
 ## Local-only server
 
-The wizard answers only requests whose `Host` is `127.0.0.1`, `localhost`, or
-`[::1]`. A request carrying an `Origin` must come from the wizard itself or the
-Vite dev or preview server (`:5173`, `:4173`). The published React shell on
-GitHub Pages is not allowed by default; to drive a local wizard from it, start
-the wizard with
-`SUPER_PROCESSOR_ALLOWED_ORIGINS=https://lkpjohn2026.github.io`. Add other
-origins the same way, comma separated; `*`, `null`, and anything that is not a
-plain `http(s)` origin are ignored. A cross-site GET that would start work (for
-example an image tag pointing at `/render?run=1`) is refused.
+Each run makes a random token. `super-processor review` prints the address,
+`wizard token: …`, and `open in your browser: http://127.0.0.1:PORT/?token=…`.
+**Every** route needs the token: the pages, `/api/*`, `/output.mp4`, the stills,
+the previews and `/jobs/<id>/…`, for GET, HEAD and POST alike. Without it the
+answer is 401 with a short note to open the printed address. Loopback has no
+per-user access control, so this is what keeps another local user or program
+from reading your jobs, replacing your Gemini key or starting work. A request
+proves it holds the token in one of three ways:
 
-Each run also makes a random token and prints it after the URL. Every POST and
-every `?run=1` request must carry it, as an `X-Wizard-Token` header or a
-`token` field. The wizard puts it in its own forms and links, and `/api/state`
-returns it as `token`, which only the wizard's pages and allowed origins can
-read. So a page on another site cannot drive the wizard even in a browser that
-sends no `Origin` header. Scripts send the printed token. Bodies over 256 KiB
-get 413, and a bad `Content-Length` gets 400.
+- the `X-Wizard-Token` header (scripts, and the React shell);
+- the cookie `sp_wizard_<port>`, which `GET <any page>?token=<token>` sets
+  (`HttpOnly; SameSite=Strict; Path=/`) before a 303 to the same address
+  without the token. A wrong token sets nothing. The cookie counts only on a
+  same-origin request (or one without `Sec-Fetch-Site`), because browsers send
+  cookies to every port of a host;
+- `?t=<token>` on a GET or HEAD of a video or still only, since `<video>` and
+  `<img>` cannot send a header. The React shell adds it to the media URLs it
+  builds.
+
+On top of the token, every POST and every `?run=1` request must also carry it
+as the header or a `token` field (the wizard puts it in its own forms and
+links), so the cookie a browser sends by itself never forges one. `/api/state`
+returns `token` only to a request that already proved it has it.
+
+The browser checks stay as a second layer. The wizard answers only requests
+whose `Host` is `127.0.0.1`, `localhost`, or `[::1]`. A request carrying an
+`Origin` must come from the wizard itself or the Vite dev or preview server
+(`:5173`, `:4173`); a page there still needs the token, so another project's
+dev server gets nothing. The published React shell on GitHub Pages is not
+allowed by default; to drive a local wizard from it, start the wizard with
+`SUPER_PROCESSOR_ALLOWED_ORIGINS=https://lkpjohn2026.github.io`. Note that
+every project page of a GitHub account shares that one `https://<user>.github.io`
+origin; prefer the Vite proxy. Add other origins the same way, comma
+separated; `*`, `null`, and anything that is not a plain `http(s)` origin are
+ignored. A cross-site GET that would start work (for example an image tag
+pointing at `/render?run=1`) is refused, and so is a cross-site load of a
+video or still that is not signed with `?t=`.
+
+Every response sends `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Content-Security-Policy: frame-ancestors 'none'`, `Referrer-Policy: same-origin`,
+`Cache-Control: no-store` and `Cross-Origin-Resource-Policy: same-site`
+(`cross-origin` for media signed with `?t=`). The split review page of
+`review JOB_ID` follows the same rules, with its own token. A connection that
+sends or takes no byte for 60 seconds is closed (each read and write, not a
+whole download), and at most 64 connections are served at once, so idle
+connections cannot pin the server's threads. Bodies over 256 KiB get 413, and
+a bad `Content-Length` gets 400.
 
 Upscale runs on a single worker thread. `GET /render?run=1` and
 `GET /api/render?run=1` start a pass when none is running and return at once.
@@ -81,9 +111,22 @@ The page refreshes, and the React shell polls `/api/state` (which reports
 
 ## React shell connection and recovery
 
-`super-processor review` binds an **ephemeral backend port** and prints its URL
-(and a separate token). Keep that process running. `45143` is only the React
-shell's historical fallback, not a guaranteed backend port.
+`super-processor review` binds an **ephemeral backend port** and prints its URL,
+its token, and a ready-made `React shell` line. Keep that process running.
+`45143` is only the React shell's historical fallback, not a guaranteed
+backend port.
+
+The shell takes the token from the address it is opened with (`?token=` or
+`#token=`; the fragment never reaches a server), keeps it in memory and in
+the tab's `sessionStorage` so a reload stays connected, removes it from the
+address bar at once, and sends it as `X-Wizard-Token` on every request. Media
+URLs it builds carry it as `?t=`. Without a token the shell says so and asks
+for the printed address. The shell only ever talks to a wizard on this
+computer: an `?api=`, a typed address or `VITE_API_ORIGIN` that is not `http(s)`
+on `127.0.0.1`, `localhost` or `[::1]` is refused with a message and never
+contacted. The shell also refuses to run inside another page's frame (dev and
+preview send `X-Frame-Options: DENY`; the static Pages build checks in the
+page).
 
 For same-origin proxy mode, start the backend, then in `web/`:
 
@@ -96,17 +139,19 @@ npm run build
 VITE_PROXY_TARGET=http://127.0.0.1:54321 npm run preview
 ```
 
-Open the Vite URL (`http://localhost:5173` for dev,
-`http://localhost:4173/super-processor/` for preview) without an `api` override.
+Open the Vite URL with the token (`http://localhost:5173/#token=TOKEN` for
+dev, `http://localhost:4173/super-processor/#token=TOKEN` for preview) without
+an `api` override.
 Both servers proxy `/api` (including uploads), `/output.mp4`, `/segment_stills`,
 `/shot_stills`, and `/previews` to `VITE_PROXY_TARGET`. Restart Vite with the new
 target if restarting the backend changes its port. `VITE_PROXY_TARGET` is read
 from the environment when dev/preview starts; it is not a URL baked into the
 published static app.
 
-For a **direct connection**, enter the backend URL in the shell's connection
-form, or use `http://localhost:5173/?api=http://127.0.0.1:54321` (preview:
-`http://localhost:4173/super-processor/?api=http://127.0.0.1:54321`). A build-time
+For a **direct connection**, paste the printed `open in your browser` address
+(it carries the token) into the shell's connection form, or use
+`http://localhost:5173/?api=http://127.0.0.1:54321#token=TOKEN` (preview:
+`http://localhost:4173/super-processor/?api=http://127.0.0.1:54321#token=TOKEN`). A build-time
 `VITE_API_ORIGIN` also selects a direct backend; omit it for proxy mode. Direct
 requests use the backend's CORS allowlist above, including upload preflight
 for `Content-Type`, `X-Wizard-Token`, and `X-File-Name`. Keep Vite on the allowed

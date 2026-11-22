@@ -155,10 +155,19 @@ def test_server_refuses_other_sites(tmp_path: Path) -> None:
             base, "GET", "/", headers={"Host": "rebound.example"}
         )
         assert status == 403
-        status, _body, allow = _request(
-            base, "GET", "/api/state", headers={"Origin": "http://localhost:5173"}
+        # The React dev shell's origin is allowed, but a page there still
+        # needs the token: it gets neither the state nor the token without it.
+        dev = {"Origin": "http://localhost:5173"}
+        status, body, allow = _request(base, "GET", "/api/state", headers=dev)
+        assert status == 401
+        assert server.token.encode() not in body
+        status, body, allow = _request(
+            base,
+            "GET",
+            "/api/state",
+            headers={**dev, "X-Wizard-Token": server.token},
         )
-        assert status == 200
+        assert status == 200 and json.loads(body)["token"] == server.token
         assert allow == "http://localhost:5173"
         status, _body, _allow = _request(
             base,

@@ -54,6 +54,13 @@ super-processor doctor
 super-processor review
 ```
 
+`review` prints the wizard's address, its token, and an
+`open in your browser: http://127.0.0.1:PORT/?token=…` line. Open that last
+address: the wizard swaps the token for a browser cookie and drops it from
+the address bar. The plain address without the token answers 401, as does
+every other route, so other programs and users on the machine cannot read
+your jobs or drive the wizard.
+
 The wizard walks through Gemini setup, file pick (up to 1080p and 30 minutes),
 segment review, a before/after preview of each segment in turn, a SPAN
 upscale on an NVIDIA GPU, and a result screen where a note re-runs one time
@@ -213,13 +220,20 @@ Start `super-processor review` first and copy its printed backend URL: the
 server chooses an ephemeral port, not necessarily `45143`. In `web/`, install
 with `npm ci`, then run `VITE_PROXY_TARGET=http://127.0.0.1:PRINTED_PORT npm run dev`
 (replace `PRINTED_PORT` with the actual port). This proxies API, uploads, stills,
-previews, and output. For a built app, use the same variable with
-`npm run preview` after `npm run build`. The fallback proxy target
-`http://127.0.0.1:45143` works only if that is the backend's actual address.
+previews, and output. Open `http://localhost:5173/#token=PRINTED_TOKEN`
+(`review` prints this line for you): the shell keeps the token for the tab,
+removes it from the address bar and sends it with every request. For a built
+app, use the same variable with `npm run preview` after `npm run build`. The
+fallback proxy target `http://127.0.0.1:45143` works only if that is the
+backend's actual address.
 
-Alternatively, enter the printed backend URL in the local shell's connection
-form or open `http://localhost:5173/?api=http://127.0.0.1:PRINTED_PORT` for a
-direct connection (preview uses port `4173`). See
+Alternatively, paste the printed `open in your browser` address into the
+local shell's connection form, or open
+`http://localhost:5173/?api=http://127.0.0.1:PRINTED_PORT#token=PRINTED_TOKEN`
+for a direct connection (preview uses port `4173`). The shell only connects
+to a wizard on this computer (`127.0.0.1`, `localhost` or `[::1]`); any other
+address is refused, so a link cannot send your Gemini key or video elsewhere.
+See
 [frontend connection and recovery](docs/ui-wizard.md#react-shell-connection-and-recovery)
 for CORS, HTTPS restrictions, and retry behavior. Offline frontend regressions:
 `cd web && npm test && npm run build` (no API key, GPU, or browser required).

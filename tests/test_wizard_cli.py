@@ -6,9 +6,9 @@ import argparse
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.request import urlopen
 
 import pytest
+from wizard_client import get
 
 from super_processor.cli import build_parser, run_review_command
 from super_processor.jobs import JobError, JobStore
@@ -74,6 +74,9 @@ def test_review_without_a_job_serves_the_wizard_and_prints_its_token(
     assert capsys.readouterr().out.splitlines() == [
         "http://127.0.0.1:9",
         "wizard token: tok-123",
+        "open in your browser: http://127.0.0.1:9/?token=tok-123",
+        "React shell (in web/): VITE_PROXY_TARGET=http://127.0.0.1:9 npm run dev, "
+        "then open http://localhost:5173/#token=tok-123",
     ]
 
 
@@ -87,7 +90,6 @@ def test_review_of_a_job_serves_that_job(
     source = tmp_path / "a.mp4"
     source.write_bytes(b"x")
     job_id = store.create(source).job_id
-    monkeypatch.setattr(_Server, "token", None)
     code = run_review_command(argparse.Namespace(jobs_dir=tmp_path, job_id=job_id))
     assert code == 0
     (server,) = servers.made
@@ -97,8 +99,12 @@ def test_review_of_a_job_serves_that_job(
         "job_id": job_id,
         "prefetch": False,
     }
-    # A split review page has no token to print.
-    assert capsys.readouterr().out.splitlines() == ["http://127.0.0.1:9"]
+    # A split review page needs the token too; there is no React shell for it.
+    assert capsys.readouterr().out.splitlines() == [
+        "http://127.0.0.1:9",
+        "wizard token: tok-123",
+        "open in your browser: http://127.0.0.1:9/?token=tok-123",
+    ]
 
 
 def test_prefetch_is_off_unless_review_is_asked_for_it(
@@ -187,20 +193,20 @@ def test_render_run_link_starts_the_render_only_on_the_render_step(
     try:
         # The removed enhance step's run link is gone.
         with pytest.raises(HTTPError) as retired:
-            urlopen(base + f"/enhance?run=1&token={TOKEN}")
+            get(base + f"/enhance?run=1&token={TOKEN}", TOKEN)
         assert retired.value.code == 404
         retired.value.close()
         # On any other step the link only shows the page.
         save_session_state(tmp_path, WizardState(step=WizardStep.PICK_FILE))
-        with urlopen(base + f"/render?run=1&token={TOKEN}") as response:
+        with get(base + f"/render?run=1&token={TOKEN}", TOKEN) as response:
             response.read()
         assert controller.wait_idle(timeout=10) and renders == []
         save_session_state(tmp_path, WizardState(step=WizardStep.RENDERING))
-        with urlopen(base + f"/render?run=1&token={TOKEN}") as response:
+        with get(base + f"/render?run=1&token={TOKEN}", TOKEN) as response:
             response.read()
         assert controller.wait_idle(timeout=10)
         assert renders == [WizardStep.RENDERING]
-        with urlopen(base + "/") as response:
+        with get(base + "/", TOKEN) as response:
             assert "<h1>Done</h1>" in response.read().decode()
     finally:
         server.stop()

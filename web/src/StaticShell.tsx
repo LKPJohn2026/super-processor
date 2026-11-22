@@ -93,7 +93,7 @@ export function StaticShell({ checking, connectError, tried, focusAddress, onCon
           onChange={(event) => setUrl(event.target.value)}
           autoComplete="off"
           spellCheck={false}
-          help="The address super-processor review prints, such as http://127.0.0.1:45143."
+          help="The address super-processor review prints after “open in your browser”, such as http://127.0.0.1:45143/?token=…"
         />
         <div className="row gap12 wrap">
           <Button type="submit" icon="wifi" disabled={checking}>

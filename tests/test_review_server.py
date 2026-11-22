@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import pytest
+from wizard_client import auth, get
 
 from super_processor.jobs import JobState, JobStore
 from super_processor.review import ReviewServer
@@ -50,17 +51,19 @@ def test_segments_route_returns_the_list_and_the_still(tmp_path: Path) -> None:
     server = ReviewServer(_job(tmp_path))
     base = server.start()
     try:
-        with urlopen(f"{base}/segments") as response:
+        with get(f"{base}/segments", server.token) as response:
             payload = json.load(response)
         assert payload["segments"][0]["problem"] == "noisy"
         still_url = payload["segments"][0]["still_url"]
         assert still_url == "/segment_stills/seg_00.ppm"
-        with urlopen(f"{base}{still_url}") as response:
+        with get(f"{base}{still_url}", server.token) as response:
             body = response.read()
         assert body.startswith(b"P5\n")
         parsed = urlparse(base)
         connection = HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port)
-        connection.request("GET", "/segment_stills/../segments.json")
+        connection.request(
+            "GET", "/segment_stills/../segments.json", headers=auth(server.token)
+        )
         missing = connection.getresponse().status
     finally:
         server.stop()
@@ -155,9 +158,9 @@ def test_reopened_wizard_uses_requested_job(
     )
     base = server.start()
     try:
-        with urlopen(base + "/api/state") as response:
+        with get(base + "/api/state", server.token) as response:
             assert json.load(response)["job_id"] == requested_id
-        with urlopen(base + "/output.mp4") as response:
+        with get(base + "/output.mp4", server.token) as response:
             assert response.read() == requested_id.encode()
 
         # Another window selecting a different job must not redirect this one.
@@ -200,7 +203,7 @@ def test_a_job_reopened_mid_render_waits_to_be_resumed(tmp_path: Path) -> None:
             view = json.load(response)
         assert view["interrupted"] is True and view["busy"] is False
         assert view["step"] == "rendering"
-        with urlopen(base + "/") as response:
+        with get(base + "/", server.token) as response:
             assert 'action="/resume"' in response.read().decode()
     finally:
         server.stop()
@@ -243,19 +246,28 @@ def test_split_page_accepts_and_applies_a_note(tmp_path: Path) -> None:
     )
     base = server.start()
     try:
-        with urlopen(base + "/") as response:
+        with get(base + "/", server.token) as response:
             page = response.read().decode()
         assert "Accept" in page
         assert "background: #fff" in page
         assert "noisy" in page
         assert 'src="/segment_stills/seg_00.bmp"' in page
-        with urlopen(base + "/segment_stills/seg_00.bmp") as response:
+        with get(base + "/segment_stills/seg_00.bmp", server.token) as response:
             assert response.read().startswith(b"BM")
-        request = Request(base + "/note", data=b"note=too+many", method="POST")
+        token = server.token or ""
+        request = Request(
+            base + "/note",
+            data=f"note=too+many&token={token}".encode(),
+            headers=auth(token),
+            method="POST",
+        )
         with urlopen(request) as response:
             assert response.status == 200
         assert len(load_segments(store.job_dir(job_id))) == 1
-        accepted = Request(base + "/accept", data=b"", method="POST")
+        accepted = Request(
+            base + "/accept", data=f"token={token}".encode(), method="POST"
+        )
+        accepted.add_header("X-Wizard-Token", token)
         with urlopen(accepted) as response:
             assert response.status == 200
         assert store.load(job_id).state is JobState.SPLIT_ACCEPTED

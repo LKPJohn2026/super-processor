@@ -305,13 +305,13 @@ def test_segment_loop_over_the_json_api(
         assert view["step"] == "segments" and len(view["segments"]["segments"]) == 2
         still = view["segments"]["segments"][0]["still_url"]
         connection = HTTPConnection("127.0.0.1", urlparse(base).port)
-        connection.request("GET", still)
+        connection.request("GET", still, headers={"X-Wizard-Token": TOKEN})
         response = connection.getresponse()
         assert response.status == 200
         assert response.getheader("Content-Type") == "image/jpeg"
         response.read()
         for bad in ("/segment_stills/../segments.json", "/segment_stills/t_1.jpg"):
-            connection.request("GET", bad)
+            connection.request("GET", bad, headers={"X-Wizard-Token": TOKEN})
             refused = connection.getresponse()
             refused.read()
             assert refused.status == 404

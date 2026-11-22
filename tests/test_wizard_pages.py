@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from super_processor.review import WizardServer
+from super_processor.review import WizardServer, wizard_cookie_name
 from super_processor.wizard import WizardController, WizardStep
 from super_processor.wizard_pages import (
     render_done,
@@ -122,14 +122,17 @@ def test_ready_page_offers_both_sizes_with_the_plan_scale_chosen() -> None:
 
 
 def test_wizard_server_post_intro_with_the_form_token(tmp_path: Path) -> None:
-    # A plain HTML form sends the token as a field, not a header.
+    # A plain HTML form sends the token as a field, not a header; the
+    # browser adds the cookie the launch URL set.
     controller = WizardController(tmp_path)
     server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
+    cookie = f"{wizard_cookie_name(int(base.rsplit(':', 1)[1]))}={TOKEN}"
     try:
         req = Request(
             base + "/intro",
             data=urlencode({"token": TOKEN}).encode(),
+            headers={"Cookie": cookie},
             method="POST",
         )
         with urlopen(req) as response:

@@ -23,12 +23,14 @@ from super_processor.wizard import (
     save_session_state,
 )
 
+TOKEN = "media-token"
+
 
 def _get(base: str, path: str, method: str = "GET") -> tuple[int, str | None, bytes]:
     parsed = urlparse(base)
     connection = HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port)
     try:
-        connection.request(method, path)
+        connection.request(method, path, headers={"X-Wizard-Token": TOKEN})
         response = connection.getresponse()
         return response.status, response.getheader("Content-Type"), response.read()
     finally:
@@ -60,7 +62,7 @@ def test_media_routes_serve_only_the_current_jobs_named_files(
     outside.write_bytes(b"secret")
     (job_dir / "segment_stills" / "t_00002000.jpg").symlink_to(outside)
 
-    server = WizardServer(controller.jobs_dir, controller=controller)
+    server = WizardServer(controller.jobs_dir, controller=controller, token=TOKEN)
     base = server.start()
     try:
         # Before a job is picked there is nothing to serve.
@@ -118,7 +120,7 @@ def test_job_scoped_routes_serve_any_jobs_files_by_its_id(tmp_path: Path) -> Non
     save_session_state(
         controller.jobs_dir, WizardState(step=WizardStep.RESULT, job_id=shown)
     )
-    server = WizardServer(controller.jobs_dir, controller=controller)
+    server = WizardServer(controller.jobs_dir, controller=controller, token=TOKEN)
     base = server.start()
     try:
         served = {
@@ -166,7 +168,7 @@ def test_a_file_that_cannot_be_opened_is_a_404(
     source.write_bytes(b"x")
     job_id = controller.store.create(source).job_id
     (controller.store.job_dir(job_id) / "output.mp4").write_bytes(b"video")
-    server = WizardServer(controller.jobs_dir, controller=controller)
+    server = WizardServer(controller.jobs_dir, controller=controller, token=TOKEN)
     base = server.start()
     real_open = Path.open
 
@@ -186,7 +188,7 @@ def test_a_file_that_cannot_be_opened_is_a_404(
 
 
 def test_api_errors_are_json(tmp_path: Path) -> None:
-    server = WizardServer(tmp_path / "jobs")
+    server = WizardServer(tmp_path / "jobs", token=TOKEN)
     base = server.start()
     try:
         status, kind, body = _get(base, "/api/nothing-here")
@@ -253,7 +255,7 @@ def test_the_job_summary_stills_name_their_job_and_are_served(
     save_session_state(
         controller.jobs_dir, WizardState(step=WizardStep.RESULT, job_id=other)
     )
-    server = WizardServer(controller.jobs_dir, controller=controller)
+    server = WizardServer(controller.jobs_dir, controller=controller, token=TOKEN)
     base = server.start()
     try:
         for url, still in zip(urls, stills, strict=True):

@@ -118,6 +118,7 @@ def test_oversized_post_is_rejected_without_reading(
             headers={
                 "Content-Type": "application/json",
                 "Content-Length": str(MAX_BODY_BYTES + 1),
+                "X-Wizard-Token": TOKEN,
             },
             body=b"{}",  # smaller than the claimed length; must not hang
         )
@@ -191,31 +192,45 @@ def test_state_changes_need_the_run_token(tmp_path: Path) -> None:
     controller = WizardController(tmp_path)
     server = WizardServer(tmp_path, controller=controller, token=TOKEN)
     base = server.start()
+    port = urlparse(base).port
     form = {"Content-Type": "application/x-www-form-urlencoded"}
     try:
         # No Origin and no Sec-Fetch-Site: only the token stops these.
-        assert _request(base, "POST", "/intro", headers=form, body=b"x=1")[0] == 403
+        assert _request(base, "POST", "/intro", headers=form, body=b"x=1")[0] == 401
         wrong = {**form, "X-Wizard-Token": "guess"}
-        assert _request(base, "POST", "/intro", headers=wrong, body=b"x=1")[0] == 403
+        assert _request(base, "POST", "/intro", headers=wrong, body=b"x=1")[0] == 401
         status, body = _request(base, "GET", "/render?run=1")
         assert status == 403 and b"wizard token" in body
+        # The page itself (which embeds the token) needs it too.
+        assert _request(base, "GET", "/")[0] == 401
         assert controller.current_state().step is WizardStep.INTRO
 
-        # The page embeds the token in its forms; a form field is enough.
-        status, page = _request(base, "GET", "/")
+        # The printed launch URL swaps the token for a cookie.
+        connection = HTTPConnection("127.0.0.1", port)
+        connection.request("GET", f"/?token={TOKEN}")
+        launched = connection.getresponse()
+        launched.read()
+        assert launched.status == 303
+        cookie = (launched.getheader("Set-Cookie") or "").split(";", 1)[0]
+        assert cookie == f"sp_wizard_{port}={TOKEN}"
+        browser = {**form, "Cookie": cookie}
+        status, page = _request(base, "GET", "/", headers=browser)
         assert status == 200
-        connection = HTTPConnection("127.0.0.1", urlparse(base).port)
-        connection.request("GET", "/")
+        connection = HTTPConnection("127.0.0.1", port)
+        connection.request("GET", "/", headers=browser)
         framed = connection.getresponse()
         framed.read()
         assert framed.getheader("X-Frame-Options") == "DENY"
         assert f'name="token" value="{TOKEN}"'.encode() in page
+        # The cookie comes along by itself, so a post also needs the
+        # page's own token field.
+        assert _request(base, "POST", "/intro", headers=browser, body=b"x=1")[0] == 403
         field = f"token={TOKEN}".encode()
-        assert _request(base, "POST", "/intro", headers=form, body=field)[0] == 303
+        assert _request(base, "POST", "/intro", headers=browser, body=field)[0] == 303
         assert controller.current_state().step is WizardStep.LLM_CHOICE
 
         # The API hands the token to the shell, which sends it as a header.
-        status, body = _request(base, "GET", "/api/state")
+        status, body = _request(base, "GET", "/api/state", headers=browser)
         assert json.loads(body)["token"] == TOKEN
         status, _body = _request(
             base,
@@ -341,7 +356,7 @@ def test_stopping_a_run_needs_the_token_and_an_allowed_origin(
     stop = json.dumps({"job_id": job_id}).encode()
     try:
         plain = {"Content-Type": "application/json"}
-        assert _request(base, "POST", "/api/cancel", headers=plain, body=stop)[0] == 403
+        assert _request(base, "POST", "/api/cancel", headers=plain, body=stop)[0] == 401
         foreign = {
             **plain,
             "Origin": "https://evil.example",
@@ -394,7 +409,9 @@ def test_starting_a_prefetch_needs_the_token_and_the_run_link(
         status, _body = _request(base, "GET", "/api/prefetch?run=1&token=guess")
         assert status == 403
         # Without the run link it is not an endpoint at all.
-        status, _body = _request(base, "GET", f"/api/prefetch?token={TOKEN}")
+        status, _body = _request(
+            base, "GET", "/api/prefetch", headers={"X-Wizard-Token": TOKEN}
+        )
         assert status == 404
         assert started == []
         status, body = _request(base, "GET", f"/api/prefetch?run=1&token={TOKEN}")
