@@ -8,7 +8,8 @@ untouched until the run's own landing code catches it.
 :func:`stop_process` ends an ffmpeg (or any other) child that a stopped run
 leaves behind. On Windows it ends the whole process tree with ``taskkill``,
 because ffmpeg started through a wrapper would otherwise keep encoding after
-its parent is gone.
+its parent is gone. taskkill is run from Windows' System32 folder by full
+path, so a ``taskkill.exe`` in the current folder is never run instead.
 
 This module imports only the standard library, so any module may use it.
 """
@@ -19,6 +20,8 @@ import os
 import subprocess
 from contextlib import suppress
 from typing import Any
+
+from .tools import resolve_argv, windows_system_tool
 
 TASKKILL_TIMEOUT_S = 10.0
 
@@ -58,11 +61,16 @@ def stop_process(proc: subprocess.Popen[Any], grace_s: float = 1.0) -> None:
     proc.wait()
 
 
+def _taskkill() -> str:
+    """Windows' own taskkill, by full path, never one in the current folder."""
+    return windows_system_tool("taskkill.exe")
+
+
 def _taskkill_tree(proc: subprocess.Popen[Any]) -> None:
     """End ``proc`` and its children on Windows, falling back to a kill."""
     try:
         completed = subprocess.run(  # noqa: S603 - argv list, no shell
-            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],  # noqa: S607
+            resolve_argv([_taskkill(), "/T", "/F", "/PID", str(proc.pid)]),
             capture_output=True,
             check=False,
             timeout=TASKKILL_TIMEOUT_S,

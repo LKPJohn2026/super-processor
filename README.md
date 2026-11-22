@@ -77,6 +77,29 @@ interim safety limit, not VFR support.
 Without a GPU, the wizard works up to the Segments screen (the still grid and
 Gemini's segments). The segment previews and the upscale need SPAN on CUDA.
 
+Only real video files are used: MP4/MOV, MKV/WebM, AVI, MPEG-TS and MPEG
+program streams, judged by what is in the file, not its name. A playlist
+(`.m3u8`, DASH) or an FFmpeg concat script, even one named `.mp4`, is refused
+at the pick (and by `job probe` and `diagnose`), because it would make FFmpeg
+read other files on your disk as the video.
+
+Job folders are private to you. On Linux and macOS
+`~/.super-processor` and its `jobs` folder are kept at 0700 (folders an older
+version made 0755 are tightened on the next start), each job folder and
+`uploads/` are 0700, and the wizard's state, chat log and uploads are 0600,
+so other accounts on the computer cannot list or copy your videos, outputs
+or Gemini notes. A folder you choose with `--jobs-dir` or
+`SUPER_PROCESSOR_JOBS_DIR` is made 0700 when the program creates it; one
+that already exists keeps its own mode (it may be shared on purpose), its job
+folders are still private, and one that every user may change (without the
+sticky bit) is refused. Windows has no such mode bits; job folders there
+live in your profile, which only you can open.
+
+On Windows, `ffmpeg`, `ffprobe` and the other tools are taken from PATH only,
+never from the folder the terminal is open in, and PowerShell and `taskkill`
+are run from `System32` by full path, so an `ffmpeg.exe` that came with a
+downloaded folder of videos is never run.
+
 ## GPU setup
 
 Install the GPU extra (PyTorch and spandrel, which loads the SPAN network):

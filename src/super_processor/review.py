@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import ClassVar
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlparse
 
+from .atomic_io import open_private_new
 from .estimators import EstimatorError
 from .jobs import JobError
 from .segments import STILLS_DIR_NAME, SegmentError, load_segments
@@ -995,7 +996,7 @@ def _wizard_handler(
                 return
             left = length
             try:
-                with dest.open("xb") as out:
+                with open_private_new(dest) as out:
                     while left:
                         chunk = self.rfile.read(min(_UPLOAD_CHUNK, left))
                         if not chunk:

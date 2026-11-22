@@ -64,15 +64,15 @@ def test_concurrent_writers_never_share_a_temp_file(
 ) -> None:
     target = tmp_path / "segments.json"
     temps: list[str] = []
-    real_write = Path.write_text
+    real_write = atomic_io._write_private
     seen = threading.Lock()
 
-    def recording_write(self: Path, data: str, *args: object, **kwargs: object) -> int:
+    def recording_write(path: Path, data: str) -> None:
         with seen:
-            temps.append(self.name)
-        return real_write(self, data, *args, **kwargs)  # type: ignore[arg-type]
+            temps.append(path.name)
+        real_write(path, data)
 
-    monkeypatch.setattr(Path, "write_text", recording_write)
+    monkeypatch.setattr(atomic_io, "_write_private", recording_write)
     errors: list[BaseException] = []
 
     def hammer(text: str) -> None:

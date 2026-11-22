@@ -122,7 +122,7 @@ def _done(code: int, out: str = "", err: str = "") -> subprocess.CompletedProces
 def test_linux_dialog_goes_through_the_portal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(
-        "super_processor.file_dialog.shutil.which", lambda name: f"/usr/bin/{name}"
+        "super_processor.file_dialog.find_tool", lambda name: f"/usr/bin/{name}"
     )
     seen: list[tuple[list[str], dict[str, str]]] = []
 
@@ -132,7 +132,7 @@ def test_linux_dialog_goes_through_the_portal(monkeypatch: pytest.MonkeyPatch) -
 
     assert choose_video(Path("/videos"), run=run) == Path("/videos/trailer.mp4")
     argv, env = seen[0]
-    assert argv[0] == "zenity" and "--file-selection" in argv
+    assert argv[0] == "/usr/bin/zenity" and "--file-selection" in argv
     assert env["GTK_USE_PORTAL"] == "1"
     assert any("*.mp4" in arg for arg in argv)
 
@@ -140,7 +140,7 @@ def test_linux_dialog_goes_through_the_portal(monkeypatch: pytest.MonkeyPatch) -
 def test_dialog_cancel_falls_back_and_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(
-        "super_processor.file_dialog.shutil.which", lambda name: f"/usr/bin/{name}"
+        "super_processor.file_dialog.find_tool", lambda name: f"/usr/bin/{name}"
     )
     assert choose_video(run=lambda argv, **kw: _done(1)) is None
 
@@ -148,21 +148,25 @@ def test_dialog_cancel_falls_back_and_fails(monkeypatch: pytest.MonkeyPatch) -> 
 
     def broken(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append(argv[0])
-        if argv[0] == "zenity":
+        if argv[0] == "/usr/bin/zenity":
             raise OSError("no display")
         return _done(0, "/v/b.mkv")
 
     assert choose_video(run=broken) == Path("/v/b.mkv")
-    assert calls == ["zenity", "kdialog"]
+    assert calls == ["/usr/bin/zenity", "/usr/bin/kdialog"]
     with pytest.raises(FileDialogError, match="dialog failed"):
         choose_video(run=lambda argv, **kw: _done(2, err="cannot open display"))
-    monkeypatch.setattr("super_processor.file_dialog.shutil.which", lambda name: None)
+    monkeypatch.setattr("super_processor.file_dialog.find_tool", lambda name: None)
     with pytest.raises(FileDialogError, match="no system file dialog"):
         choose_video(run=lambda argv, **kw: _done(0, "x"))
 
 
 @pytest.mark.parametrize(
-    ("platform", "program"), [("darwin", "osascript"), ("win32", "powershell")]
+    ("platform", "program"),
+    [
+        ("darwin", "/usr/bin/osascript"),
+        ("win32", r"\System32\WindowsPowerShell\v1.0\powershell.exe"),
+    ],
 )
 def test_other_desktops_have_their_own_dialog(
     monkeypatch: pytest.MonkeyPatch, platform: str, program: str
@@ -175,7 +179,9 @@ def test_other_desktops_have_their_own_dialog(
         return _done(0, "/Users/me/clip.mov")
 
     assert choose_video(Path("/Users/me"), run=run) == Path("/Users/me/clip.mov")
-    assert seen == [program]
+    # By full path, never a program of that name in the current folder.
+    assert len(seen) == 1
+    assert seen[0].endswith(program)
 
 
 # Navigation ----------------------------------------------------------------

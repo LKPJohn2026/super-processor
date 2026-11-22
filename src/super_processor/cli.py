@@ -37,7 +37,13 @@ from .plans import (
     revise_plans,
     write_plans,
 )
-from .probe import ProbeError, load_media_facts, probe_file, write_media_facts
+from .probe import (
+    ProbeError,
+    load_media_facts,
+    probe_file,
+    require_video_container,
+    write_media_facts,
+)
 from .qa import analyze_preview, write_qa_report
 from .recipe import (
     OpName,
@@ -70,6 +76,7 @@ from .templates import (
     build_ffmpeg_plan,
     default_output_path,
 )
+from .tools import guard_windows_search, resolve_argv
 from .treatments import (
     FAULT_PROBLEMS,
     Treatment,
@@ -381,6 +388,7 @@ def run_diagnose_command(arguments: argparse.Namespace) -> int:
     source = Path(arguments.source)
     manifest = store.create(source, job_id=arguments.job_id)
     facts = probe_file(Path(manifest.source_path))
+    require_video_container(facts, name=source.name)
     write_media_facts(store.job_dir(manifest.job_id), facts)
     store.transition(
         manifest.job_id,
@@ -755,7 +763,7 @@ def _open_preview(path: Path, player: str) -> None:
     if exe is None:
         raise JobError(f"player not found: {chosen}")
     subprocess.Popen(  # noqa: S603 - argv list, no shell
-        [exe, str(path)],
+        resolve_argv([exe, str(path)]),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -910,6 +918,7 @@ def run_job_probe(store: JobStore, job_id: str) -> int:
             f"(current: {manifest.state.value})"
         )
     facts = probe_file(Path(manifest.source_path))
+    require_video_container(facts, name=Path(manifest.source_path).name)
     write_media_facts(store.job_dir(job_id), facts)
     notes = {
         "has_video": facts.has_video,
@@ -1115,6 +1124,9 @@ def run_job_run(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI."""
+    # Windows must never run an ffmpeg.exe (or any other tool) that sits in
+    # the folder the terminal is open in; tools.find_tool skips it too.
+    guard_windows_search()
     arguments = build_parser().parse_args(argv)
     command = str(arguments.command)
     try:

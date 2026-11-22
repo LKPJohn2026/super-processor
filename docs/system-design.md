@@ -471,6 +471,34 @@ may remain for compatibility; the wizard is the primary product path.
   from logs; the file is a local secret, not an encrypted credential vault.
 - The validator accepts only declared operations and bounded parameters.
 - User-selected paths are normalized and passed without invoking a shell.
+- Inputs must be real video containers. `probe.container_refusal` accepts a
+  file only when every name in ffprobe's `format_name` is one of mov, mp4,
+  m4a, 3gp, 3g2, mj2, matroska, webm, avi, mpegts or mpeg; concat, hls,
+  dash, image2, lavfi, tee, sdp and every other reader are refused by the
+  wizard pick (`input_limit_error`), `job probe` and `diagnose`, because a
+  concat script named `.mp4` or a playlist makes FFmpeg decode other local
+  files as the video. Every ffprobe of a file, and every FFmpeg `-i` of a
+  file, is preceded by `-protocol_whitelist file` (`tools.FILE_INPUT`), so no
+  input can reach a URL.
+- Every program is started by full path. `tools.resolve_argv` wraps every
+  subprocess argv in the package (a test scans for any that does not); it
+  looks a bare name up on PATH with `tools.find_tool`, which skips empty,
+  `.` and relative PATH entries, so on Windows an `ffmpeg.exe` in the current
+  folder is never picked (Windows and `shutil.which` would otherwise look
+  there first). PowerShell and `taskkill` come from `%SystemRoot%\System32`.
+  The CLI also sets `NoDefaultCurrentDirectoryInExePath=1` on Windows, as a
+  backstop for a tool that is not on PATH at all.
+- Job data is private to the user on POSIX: `~/.super-processor` and its
+  `jobs` folder are 0700 (tightened when an older version left them 0755),
+  each job folder, `uploads/` and `outputs/` are created 0700, a job folder
+  is tightened when opened, and files the program writes itself
+  (`write_text_atomic`: wizard state, chat log, segment and plan JSON, pid
+  files; the manifest; uploads) are 0600. FFmpeg's own outputs keep the
+  umask's mode but sit in those 0700 folders. A `--jobs-dir` /
+  `SUPER_PROCESSOR_JOBS_DIR` folder that already exists keeps its mode, and
+  one that is world-writable without the sticky bit is refused. Windows has
+  no POSIX mode bits; these steps are skipped there and the user's profile
+  folder keeps job data private.
 - An audio-free copy of the whole video (long edge at most 960 px), selected
   stills, preview stills, notes, and conversation context leave the machine
   through Gemini after setup. The copy stays on Google's File API about 48

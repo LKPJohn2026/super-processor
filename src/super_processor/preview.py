@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .recipe import OpName
 from .segments import MIN_SEGMENT_S, TimelineSegment
+from .tools import FILE_INPUT, resolve_argv
 from .treatments import Treatment, TreatmentError
 
 PREVIEW_SPAN_S = 3.0
@@ -144,6 +145,7 @@ def build_preview_argv(
         "-y",
         "-ss",
         f"{start:.3f}",
+        *FILE_INPUT,
         "-i",
         str(source),
         "-t",
@@ -214,7 +216,7 @@ def encode_preview(
     )
     try:
         completed = subprocess.run(
-            command, check=False, capture_output=True, timeout=60
+            resolve_argv(command), check=False, capture_output=True, timeout=60
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PreviewError(f"failed to encode preview: {exc}") from exc

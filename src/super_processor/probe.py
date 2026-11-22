@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .jobs import JobError
+from .tools import FILE_INPUT, find_tool, resolve_argv, tool_path
 
 MEDIA_FACTS_NAME = "media_facts.json"
 MEDIA_FACTS_SCHEMA_VERSION = 1
@@ -23,6 +23,62 @@ class ProbeError(JobError):
 
 class UnsupportedTimingError(ProbeError):
     """The decoded timeline cannot safely use the renderer's CFR clock."""
+
+
+class UnsupportedContainerError(ProbeError):
+    """The file is not a real video file (a playlist, a script, a stream)."""
+
+
+# The kinds of file a video can come in. FFmpeg picks how to read a file from
+# what is in it, not from its name, so a ".mp4" can really be a concat script
+# or a playlist that makes FFmpeg read other files. ffprobe names the reader
+# it used with a comma list ("mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm"), and
+# every name in it must be one of these; concat, hls, dash, image2, lavfi,
+# tee, sdp and the rest are refused.
+VIDEO_CONTAINERS = frozenset(
+    {
+        "mov",
+        "mp4",
+        "m4a",
+        "3gp",
+        "3g2",
+        "mj2",
+        "matroska",
+        "webm",
+        "avi",
+        "mpegts",
+        "mpeg",
+    }
+)
+_LIST_READERS = frozenset(
+    {"concat", "ffconcat", "hls", "applehttp", "m3u8", "dash", "sdp", "rtp", "tee"}
+)
+
+
+def container_refusal(
+    format_name: str | None, *, name: str = "this file"
+) -> str | None:
+    """Why ``format_name`` is not a video file to work on, or ``None``."""
+    parts = [part.strip().lower() for part in (format_name or "").split(",")]
+    parts = [part for part in parts if part]
+    if parts and all(part in VIDEO_CONTAINERS for part in parts):
+        return None
+    if any(part in _LIST_READERS for part in parts):
+        kind = "a playlist or a list of other files, not a video file"
+    else:
+        kind = "not a video file this app can use"
+    shown = format_name or "unknown"
+    return (
+        f"{name} is {kind} (FFmpeg reads it as {shown}); "
+        "choose a real MP4, MOV, MKV, WebM, AVI or MPEG-TS video"
+    )
+
+
+def require_video_container(facts: MediaFacts, *, name: str = "this file") -> None:
+    """Raise :class:`UnsupportedContainerError` unless ``facts`` is a video file."""
+    refusal = container_refusal(facts.format_name, name=name)
+    if refusal is not None:
+        raise UnsupportedContainerError(refusal)
 
 
 _TIMING_ADVICE = (
@@ -48,7 +104,8 @@ def require_cfr_timing(source: Path, *, ffprobe: str | None = None) -> None:
     try:
         resolved = source.expanduser().resolve()
         identity = _timing_identity(resolved)
-        _check_cfr_timing(resolved, identity, ffprobe or find_ffprobe())
+        program = tool_path(ffprobe) if ffprobe else find_ffprobe()
+        _check_cfr_timing(resolved, identity, program)
     except UnsupportedTimingError:
         raise
     except (OSError, ProbeError) as exc:
@@ -61,27 +118,30 @@ def require_cfr_timing(source: Path, *, ffprobe: str | None = None) -> None:
 def _check_cfr_timing(source: Path, identity: _TimingIdentity, ffprobe: str) -> None:
     try:
         completed = subprocess.run(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                # Decoded frames' timestamps do not depend on the thread
-                # count (byte-identical JSON for 1, 8, and all threads on
-                # three test films). One thread took 203 s for 20 minutes of
-                # 1440x1080; 8 took 42 s with the CPU at 86 C, and all 32
-                # took 23 s but ran it to 94 C.
-                "-threads",
-                "8",
-                "-select_streams",
-                "v:0",
-                "-show_frames",
-                "-show_entries",
-                "frame=pts,duration,pkt_duration:"
-                "stream=r_frame_rate,time_base,start_pts,duration_ts",
-                "-of",
-                "json",
-                str(source),
-            ],
+            resolve_argv(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    # Decoded frames' timestamps do not depend on the thread
+                    # count (byte-identical JSON for 1, 8, and all threads on
+                    # three test films). One thread took 203 s for 20 minutes of
+                    # 1440x1080; 8 took 42 s with the CPU at 86 C, and all 32
+                    # took 23 s but ran it to 94 C.
+                    "-threads",
+                    "8",
+                    "-select_streams",
+                    "v:0",
+                    "-show_frames",
+                    "-show_entries",
+                    "frame=pts,duration,pkt_duration:"
+                    "stream=r_frame_rate,time_base,start_pts,duration_ts",
+                    "-of",
+                    "json",
+                    *FILE_INPUT,
+                    str(source),
+                ]
+            ),
             check=False,
             capture_output=True,
             text=True,
@@ -259,7 +319,7 @@ class MediaFacts:
 
 def find_ffprobe() -> str:
     """Return the absolute path to ffprobe or raise."""
-    found = shutil.which("ffprobe")
+    found = find_tool("ffprobe")
     if found is None:
         raise ProbeError("ffprobe not found on PATH")
     return str(Path(found).resolve())
@@ -280,11 +340,12 @@ def run_ffprobe_json(source: Path, *, ffprobe: str | None = None) -> dict[str, A
         "json",
         "-show_format",
         "-show_streams",
+        *FILE_INPUT,
         str(resolved),
     ]
     try:
         completed = subprocess.run(
-            command,
+            resolve_argv(command),
             check=False,
             capture_output=True,
             text=True,

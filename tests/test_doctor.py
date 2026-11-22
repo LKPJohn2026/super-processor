@@ -11,7 +11,7 @@ from super_processor import cli, doctor
 
 
 def test_which_and_check_tool_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("super_processor.doctor.shutil.which", lambda _: None)
+    monkeypatch.setattr("super_processor.doctor.find_tool", lambda _: None)
     assert doctor.which("ffmpeg") is None
     result = doctor.check_tool("ffmpeg", "ffmpeg", "-version")
     assert result.ok is False
@@ -23,7 +23,7 @@ def test_check_tool_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     fake.write_text("#!/bin/sh\n", encoding="utf-8")
     fake.chmod(0o755)
 
-    monkeypatch.setattr("super_processor.doctor.shutil.which", lambda _: str(fake))
+    monkeypatch.setattr("super_processor.doctor.find_tool", lambda _: str(fake))
 
     class Completed:
         returncode = 0
@@ -51,7 +51,7 @@ def test_check_player_prefers_vlc(
     def fake_which(command: str) -> str | None:
         return str(vlc) if command == "vlc" else None
 
-    monkeypatch.setattr("super_processor.doctor.shutil.which", fake_which)
+    monkeypatch.setattr("super_processor.doctor.find_tool", fake_which)
 
     class Completed:
         returncode = 0
@@ -79,7 +79,7 @@ def test_collect_doctor_report_json(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr("super_processor.doctor.shutil.which", lambda _: None)
+    monkeypatch.setattr("super_processor.doctor.find_tool", lambda _: None)
     monkeypatch.delenv("SUPER_PROCESSOR_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -252,7 +252,7 @@ def test_doctor_cli_json(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr("super_processor.doctor.shutil.which", lambda _: None)
+    monkeypatch.setattr("super_processor.doctor.find_tool", lambda _: None)
     code = cli.main(["--jobs-dir", str(tmp_path / "jobs"), "doctor", "--json"])
     assert code == 1
     payload = capsys.readouterr().out

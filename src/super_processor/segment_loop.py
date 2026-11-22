@@ -33,6 +33,7 @@ from .shots import (
     measure_range,
     shot_still,
 )
+from .tools import FILE_INPUT, resolve_argv
 
 MAX_STILLS = 120
 STILLS_PER_S = 1.0
@@ -171,6 +172,7 @@ def make_gemini_copy(
         "-v",
         "error",
         "-y",
+        *FILE_INPUT,
         "-i",
         str(source),
         "-map",
@@ -198,7 +200,7 @@ def make_gemini_copy(
         with (
             tempfile.TemporaryFile(mode="w+") as err,
             subprocess.Popen(
-                command,
+                resolve_argv(command),
                 stdout=subprocess.PIPE,
                 stderr=err,
                 text=True,

@@ -13,6 +13,7 @@ from typing import Any
 
 from .doctor import which
 from .recipe import OpName, Recipe, RecipeOp, TargetMode
+from .tools import FILE_INPUT, resolve_argv
 
 PREVIEW_FILE_NAME = "preview.mp4"
 OUTPUT_FILE_NAME = "output.mp4"
@@ -33,7 +34,7 @@ def ffmpeg_has_filter(name: str, *, ffmpeg_bin: str | None = None) -> bool:
         _FILTER_CACHE = {}
         try:
             completed = subprocess.run(
-                [binary, "-hide_banner", "-filters"],
+                resolve_argv([binary, "-hide_banner", "-filters"]),
                 check=False,
                 capture_output=True,
                 text=True,
@@ -332,6 +333,7 @@ def build_ffmpeg_plan(
             "-hide_banner",
             "-y",
             *preview_seek,
+            *FILE_INPUT,
             "-i",
             str(input_path),
             "-vf",
@@ -364,6 +366,7 @@ def build_ffmpeg_plan(
         "pipe:1",
         "-nostats",
         *preview_seek,
+        *FILE_INPUT,
         "-i",
         str(input_path),
     ]

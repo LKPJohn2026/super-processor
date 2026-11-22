@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from .atomic_io import (
+    make_private_dir,
     read_text_retrying,
     rmtree_quietly,
     unlink_quietly,
@@ -51,7 +52,7 @@ from .output_versions import (
     current_version,
     list_versions,
 )
-from .probe import MediaFacts, ProbeError, probe_file
+from .probe import MediaFacts, ProbeError, container_refusal, probe_file
 from .progress import StepClock, overall_pct
 from .regions import MAX_REGIONS, REGION_STRENGTH
 from .segment_loop import (
@@ -121,6 +122,7 @@ from .shots import (
     shots_path,
 )
 from .stability import StabilityError, find_seams, seam_candidates
+from .tools import resolve_argv, tool_path
 from .upscale import (
     UPSCALE_PLAN_FILE,
     SpanEngine,
@@ -403,7 +405,7 @@ def _linux_process_start(pid: int) -> str | None:
 def _ps_process_start(pid: int) -> str | None:  # pragma: no cover - macOS/BSD
     try:
         done = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
+            resolve_argv(["ps", "-o", "lstart=", "-p", str(pid)]),
             capture_output=True,
             text=True,
             timeout=5,
@@ -581,8 +583,15 @@ class WizardState:
         )
 
 
-def input_limit_error(facts: MediaFacts) -> str | None:
-    """Why the wizard refuses this file, or ``None`` when it fits the limits."""
+def input_limit_error(facts: MediaFacts, *, name: str = "this file") -> str | None:
+    """Why the wizard refuses this file, or ``None`` when it fits the limits.
+
+    A file that is not a real video file (a concat script or a playlist
+    named .mp4, which would make FFmpeg read other files) is refused first.
+    """
+    container = container_refusal(facts.format_name, name=name)
+    if container is not None:
+        return container
     video = facts.primary_video()
     if not facts.has_video or video is None:
         return "this file has no video stream"
@@ -647,7 +656,7 @@ def load_session_state(jobs_dir: Path) -> WizardState:
 
 
 def save_session_state(jobs_dir: Path, state: WizardState) -> None:
-    jobs_dir.mkdir(parents=True, exist_ok=True)
+    JobStore(jobs_dir).ensure_root()
     _write_state_file(session_state_path(jobs_dir), state)
 
 
@@ -1081,13 +1090,19 @@ class WizardController:
     ) -> None:
         self.store = JobStore(jobs_dir)
         self.jobs_dir = self.store.root
+        # A jobs folder that is already there is made private (or refused,
+        # when every user may change it) before anything is written in it.
+        # One that is not there yet is made private when it is first used.
+        if self.store.root.is_dir():
+            self.store.ensure_root()
         # An explicitly reopened job must not follow another window's session.
         self._session_state: WizardState | None = None
         if job_id is not None:
             self._session_state = load_job_wizard_state(self.store.job_dir(job_id))
             if self._session_state is None:
                 raise WizardError(f"no wizard state for job {job_id}")
-        self.ffmpeg_bin = ffmpeg_bin
+        # A full path from PATH, never a copy in the current folder.
+        self.ffmpeg_bin = tool_path(ffmpeg_bin)
         self._gemini = gemini
         self._upscale = upscale_engine
         # One analyze or render at a time. The HTTP server is threaded, and a
@@ -2333,8 +2348,8 @@ class WizardController:
                 "only video files can be uploaded (" + ", ".join(VIDEO_EXTENSIONS) + ")"
             )
         safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in base)[-120:]
-        folder = self.jobs_dir / "uploads"
-        folder.mkdir(parents=True, exist_ok=True)
+        self.store.ensure_root()
+        folder = make_private_dir(self.jobs_dir / "uploads")
         return folder / f"{uuid.uuid4().hex[:12]}-{safe}"
 
     def pick_upload(self, path: Path, name: str) -> None:
@@ -2363,7 +2378,7 @@ class WizardController:
             return
         try:
             facts = probe_file(source)
-            refusal = input_limit_error(facts)
+            refusal = input_limit_error(facts, name=shown_name or source.name)
             if refusal is not None:
                 state.error = refusal
                 state.step = WizardStep.PICK_FILE

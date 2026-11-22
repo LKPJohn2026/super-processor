@@ -406,6 +406,7 @@ def test_the_title_is_the_picked_name_without_the_upload_prefix(
         width, height = 640, 480
 
     class _Facts:
+        format_name = "mov,mp4,m4a,3gp,3g2,mj2"
         has_video = True
         duration_s = 8.0
 

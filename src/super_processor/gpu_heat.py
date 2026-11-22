@@ -16,6 +16,8 @@ import subprocess
 from collections import deque
 from dataclasses import dataclass
 
+from .tools import resolve_argv
+
 UNDERVOLT_NOTE = (
     "Your GPU is running hot and the render has slowed down to keep it cool. "
     "Undervolting the GPU (a lower voltage curve or power limit in your GPU "
@@ -56,7 +58,13 @@ def read_gpu_heat(nvidia_smi: str = "nvidia-smi") -> GpuHeat | None:
         )
         try:
             completed = subprocess.run(
-                [nvidia_smi, f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+                resolve_argv(
+                    [
+                        nvidia_smi,
+                        f"--query-gpu={fields}",
+                        "--format=csv,noheader,nounits",
+                    ]
+                ),
                 capture_output=True,
                 text=True,
                 timeout=10,

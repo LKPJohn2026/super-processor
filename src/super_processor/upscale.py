@@ -43,6 +43,7 @@ from .atomic_io import unlink_quietly
 from .cancel import Cancelled, stop_process
 from .look import LookError, ShotLook
 from .regions import Region, regions_from_dicts, strength_expr
+from .tools import FILE_INPUT, resolve_argv, tool_path
 
 UPSCALE_PLAN_FILE = "upscale_plan.json"
 CHUNK_SECONDS = 8.0
@@ -479,6 +480,7 @@ class FakeUpscaleEngine:
                 "-loglevel",
                 "error",
                 "-y",
+                *FILE_INPUT,
                 "-i",
                 str(request.source),
                 "-vf",
@@ -573,6 +575,7 @@ def plain_delivery(
                 *_QUIET,
                 "-y",
                 *(["-hwaccel", "cuda"] if cuda_decode_works(ffmpeg_bin) else []),
+                *FILE_INPUT,
                 "-i",
                 str(request.source),
                 "-map",
@@ -835,10 +838,11 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
     slack = max(FRAME_SLACK, int(want * 0.02))
     clean = request.look.clean_filter()
     decode = [
-        "ffmpeg",
+        tool_path("ffmpeg"),
         *_QUIET,
         "-nostdin",
         *(["-hwaccel", "cuda"] if cuda_decode_works() else []),
+        *FILE_INPUT,
         "-i",
         str(source),
         *(["-vf", clean] if clean else []),
@@ -868,7 +872,7 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
     with tempfile.TemporaryFile() as decode_errors:
         try:
             decoder = subprocess.Popen(
-                decode, stdout=subprocess.PIPE, stderr=decode_errors
+                resolve_argv(decode), stdout=subprocess.PIPE, stderr=decode_errors
             )
         except OSError as exc:
             raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
@@ -1144,19 +1148,22 @@ def video_stream_facts(video: Path, *, ffprobe_bin: str = "ffprobe") -> tuple[in
     """Frame count (packets, no decode) and ``r_frame_rate`` of the video."""
     try:
         completed = subprocess.run(
-            [
-                ffprobe_bin,
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-count_packets",
-                "-show_entries",
-                "stream=nb_read_packets,r_frame_rate",
-                "-of",
-                "json",
-                str(video),
-            ],
+            resolve_argv(
+                [
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-count_packets",
+                    "-show_entries",
+                    "stream=nb_read_packets,r_frame_rate",
+                    "-of",
+                    "json",
+                    *FILE_INPUT,
+                    str(video),
+                ]
+            ),
             check=False,
             capture_output=True,
         )
@@ -1202,6 +1209,7 @@ def trim_source(
             f"{start_s:.6f}",
             "-to",
             f"{end_s:.6f}",
+            *FILE_INPUT,
             "-i",
             str(source),
             *filters,
@@ -1472,9 +1480,10 @@ def encode_delivery(
     marker = delivery_marker_path(dest)
     marker.unlink(missing_ok=True)
     inputs = (
-        ["-f", "concat", "-safe", "0", "-i", str(source)]
+        ["-f", "concat", "-safe", "0", *FILE_INPUT, "-i", str(source)]
         if concat
         else [
+            *FILE_INPUT,
             "-i",
             str(source),
         ]
@@ -1491,7 +1500,7 @@ def encode_delivery(
         if base_size is None:
             raise UpscaleError(f"could not read the frame size of {blend_with}")
         sigma = STRUCTURE_SIGMA * size[0] / base_size[0]
-        inputs.extend(["-i", str(blend_with)])
+        inputs.extend([*FILE_INPUT, "-i", str(blend_with)])
         picture = [
             "-filter_complex",
             blend_filter(
@@ -1552,7 +1561,7 @@ def _succeeds(command: list[str]) -> bool:
     """
     try:
         completed = subprocess.run(
-            command,
+            resolve_argv(command),
             check=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -1705,7 +1714,9 @@ def _encode_piped(
     # Errors go to a file: nothing reads the encoder's stderr while it runs.
     with tempfile.TemporaryFile() as errors:
         try:
-            encoder = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=errors)
+            encoder = subprocess.Popen(
+                resolve_argv(command), stdin=subprocess.PIPE, stderr=errors
+            )
         except OSError as exc:
             raise UpscaleError(f"failed to start ffmpeg: {exc}") from exc
         assert encoder.stdin is not None
@@ -1751,20 +1762,23 @@ def keyframe_times(video: Path, *, ffprobe_bin: str = "ffprobe") -> list[float]:
     """Presentation times of the video keyframes, ascending."""
     try:
         completed = subprocess.run(
-            [
-                ffprobe_bin,
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-skip_frame",
-                "nokey",
-                "-show_entries",
-                "frame=pts_time",
-                "-of",
-                "csv=p=0",
-                str(video),
-            ],
+            resolve_argv(
+                [
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-skip_frame",
+                    "nokey",
+                    "-show_entries",
+                    "frame=pts_time",
+                    "-of",
+                    "csv=p=0",
+                    *FILE_INPUT,
+                    str(video),
+                ]
+            ),
             check=False,
             capture_output=True,
         )
@@ -1807,7 +1821,7 @@ def _ffprobe_for(ffmpeg_bin: str) -> str:
         sibling = path.with_name(path.name.replace("ffmpeg", "ffprobe"))
         if sibling.is_file():
             return str(sibling)
-    return "ffprobe"
+    return tool_path("ffprobe")
 
 
 def _copy_range(
@@ -1822,7 +1836,7 @@ def _copy_range(
     command = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
     if start_s > 0:
         command.extend(["-ss", f"{start_s:.6f}"])
-    command.extend(["-i", str(video)])
+    command.extend([*FILE_INPUT, "-i", str(video)])
     if end_s is not None:
         command.extend(["-t", f"{end_s - start_s:.6f}"])
     command.extend(
@@ -2349,18 +2363,21 @@ def _audio_codec(source: Path, *, ffprobe_bin: str) -> str | None:
     """The first audio stream's codec name, or None with no audio."""
     try:
         completed = subprocess.run(
-            [
-                ffprobe_bin,
-                "-v",
-                "error",
-                "-select_streams",
-                "a:0",
-                "-show_entries",
-                "stream=codec_name",
-                "-of",
-                "csv=p=0",
-                str(source),
-            ],
+            resolve_argv(
+                [
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "csv=p=0",
+                    *FILE_INPUT,
+                    str(source),
+                ]
+            ),
             check=False,
             capture_output=True,
             # ffprobe echoes paths in its own bytes; a strict locale decode
@@ -2378,20 +2395,23 @@ def _audio_decodes(video: Path, *, ffmpeg_bin: str) -> bool:
     """True when ``video``'s audio decodes from end to end without an error."""
     try:
         completed = subprocess.run(
-            [
-                ffmpeg_bin,
-                "-hide_banner",
-                "-v",
-                "error",
-                "-xerror",
-                "-i",
-                str(video),
-                "-map",
-                "0:a:0?",
-                "-f",
-                "null",
-                "-",
-            ],
+            resolve_argv(
+                [
+                    ffmpeg_bin,
+                    "-hide_banner",
+                    "-v",
+                    "error",
+                    "-xerror",
+                    *FILE_INPUT,
+                    "-i",
+                    str(video),
+                    "-map",
+                    "0:a:0?",
+                    "-f",
+                    "null",
+                    "-",
+                ]
+            ),
             check=False,
             capture_output=True,
         )
@@ -2406,32 +2426,36 @@ def _mux_audio(
     """``video``'s picture with ``source``'s audio as ``codec``, or None."""
     mixed = video.with_suffix(".mux.mp4")
     completed = subprocess.run(
-        [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(video),
-            "-i",
-            str(source),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0?",
-            "-c:v",
-            "copy",
-            "-c:a",
-            codec,
-            "-t",
-            f"{float(length):.6f}",
-            # moov at the front, so a browser can start playing and seeking
-            # before the whole file has been read.
-            "-movflags",
-            "+faststart",
-            str(mixed),
-        ],
+        resolve_argv(
+            [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                *FILE_INPUT,
+                "-i",
+                str(video),
+                *FILE_INPUT,
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0?",
+                "-c:v",
+                "copy",
+                "-c:a",
+                codec,
+                "-t",
+                f"{float(length):.6f}",
+                # moov at the front, so a browser can start playing and seeking
+                # before the whole file has been read.
+                "-movflags",
+                "+faststart",
+                str(mixed),
+            ]
+        ),
         check=False,
         capture_output=True,
     )
@@ -2481,7 +2505,7 @@ def _run_ffmpeg(
     with tempfile.TemporaryFile() as errors:
         try:
             proc = subprocess.Popen(
-                command,
+                resolve_argv(command),
                 stdout=subprocess.PIPE if watched else subprocess.DEVNULL,
                 stderr=errors,
                 text=watched,

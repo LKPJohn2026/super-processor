@@ -6,12 +6,15 @@ import json
 import os
 import re
 import secrets
+import stat
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from .atomic_io import make_private_dir, tighten
 
 JOB_ID_PATTERN = re.compile(r"^[a-z0-9]{8,32}$")
 MANIFEST_NAME = "manifest.json"
@@ -88,12 +91,38 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def home_jobs_root() -> Path:
+    """The jobs folder in the user's home: ``~/.super-processor/jobs``."""
+    return (Path.home() / ".super-processor" / "jobs").resolve()
+
+
 def default_jobs_root() -> Path:
     """Resolve the default jobs directory from env or the user home."""
     override = os.environ.get(DEFAULT_JOBS_DIR_ENV)
     if override:
         return Path(override).expanduser().resolve()
-    return (Path.home() / ".super-processor" / "jobs").resolve()
+    return home_jobs_root()
+
+
+def _refuse_open_root(root: Path) -> None:
+    """Refuse a jobs folder that every user may change.
+
+    Anyone could then add, swap or link job folders in it. A shared folder
+    with the sticky bit (like /tmp) only lets each user change their own
+    entries, so it is allowed.
+    """
+    if os.name != "posix":
+        return
+    try:
+        mode = root.stat().st_mode
+    except OSError:
+        return
+    if mode & stat.S_IWOTH and not mode & stat.S_ISVTX:
+        raise JobError(
+            f"the jobs folder {root} can be changed by every user on this "
+            "computer; choose a private folder with --jobs-dir or "
+            f"{DEFAULT_JOBS_DIR_ENV}"
+        )
 
 
 def generate_job_id() -> str:
@@ -149,8 +178,24 @@ class JobStore:
         self.root = (root or default_jobs_root()).resolve()
 
     def ensure_root(self) -> None:
-        """Create the jobs root directory if needed."""
-        self.root.mkdir(parents=True, exist_ok=True)
+        """Create the jobs root directory if needed, private to this user.
+
+        The home root (``~/.super-processor/jobs``) and its
+        ``.super-processor`` folder are always kept at 0700, which also
+        tightens folders an older version made 0755. A folder chosen with
+        --jobs-dir or the environment is made 0700 when it is created here;
+        one that was already there keeps its mode (it may be shared on
+        purpose), but every job folder in it is private, and one that every
+        user may change is refused.
+        """
+        if self.root == home_jobs_root():
+            make_private_dir(self.root.parent)
+            make_private_dir(self.root)
+            return
+        if not self.root.is_dir():
+            make_private_dir(self.root)
+            return
+        _refuse_open_root(self.root)
 
     def job_dir(self, job_id: str) -> Path:
         """Return the directory path for a job id."""
@@ -180,7 +225,7 @@ class JobStore:
             created_at=now,
             updated_at=now,
         )
-        destination.mkdir(parents=True, exist_ok=False)
+        make_private_dir(destination, exist_ok=False)
         self._write_manifest(manifest)
         return manifest
 
@@ -189,6 +234,8 @@ class JobStore:
         path = self.manifest_path(job_id)
         if not path.is_file():
             raise JobNotFoundError(f"job not found: {job_id}")
+        # A job folder an older version made 0755 is made private on open.
+        tighten(path.parent)
         with path.open(encoding="utf-8") as handle:
             data = json.load(handle)
         if not isinstance(data, dict):
@@ -250,7 +297,7 @@ class JobStore:
     def _write_manifest(self, manifest: JobManifest) -> None:
         """Atomically write a job manifest to disk."""
         path = self.manifest_path(manifest.job_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        make_private_dir(path.parent)
         payload = json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n"
         fd, tmp_name = tempfile.mkstemp(
             prefix=".manifest-",

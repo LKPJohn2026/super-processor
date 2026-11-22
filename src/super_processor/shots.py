@@ -28,6 +28,7 @@ from typing import Any
 
 from .atomic_io import write_text_atomic
 from .regions import Region, regions_from_dicts
+from .tools import FILE_INPUT, resolve_argv
 from .upscale import UpscalePlan, UpscaleSpan
 
 SHOTS_FILE = "shots.json"
@@ -264,7 +265,9 @@ def load_shots(job_dir: Path) -> ShotList | None:
 def _run(command: list[str]) -> str:
     """Run FFmpeg and return its log (stderr), where ``metadata`` prints."""
     try:
-        completed = subprocess.run(command, check=False, capture_output=True)
+        completed = subprocess.run(
+            resolve_argv(command), check=False, capture_output=True
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ShotError(f"failed to start ffmpeg: {exc}") from exc
     log = (completed.stderr or b"").decode("utf-8", errors="replace")
@@ -307,6 +310,7 @@ def detect_cuts(source: Path, *, ffmpeg_bin: str = "ffmpeg") -> list[float]:
             "-nostats",
             "-loglevel",
             "info",
+            *FILE_INPUT,
             "-i",
             str(source),
             "-an",
@@ -339,6 +343,7 @@ def measure_range(
             f"{start_s:.6f}",
             "-t",
             f"{duration:.6f}",
+            *FILE_INPUT,
             "-i",
             str(source),
             "-an",
@@ -449,6 +454,7 @@ def extract_still(
             "-y",
             "-ss",
             f"{max(0.0, at_s):.6f}",
+            *FILE_INPUT,
             "-i",
             str(source),
             "-frames:v",

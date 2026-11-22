@@ -4,21 +4,27 @@ The wizard runs on the editor's machine, so the server can open the system
 file chooser and get the real path back; nothing is copied. On Linux zenity
 goes through the XDG desktop portal (``GTK_USE_PORTAL=1``), so the dialog
 is the desktop's own; kdialog is tried next. macOS uses ``osascript`` and
-Windows a PowerShell ``OpenFileDialog``.
+Windows a PowerShell ``OpenFileDialog``. Every one is run by its full path
+(System32's PowerShell, ``/usr/bin/osascript``, zenity and kdialog from
+PATH), never from the current folder.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from .tools import find_tool, resolve_argv, windows_system_tool
+
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mts", ".ts")
 DIALOG_TIMEOUT_S = 15 * 60
 _TITLE = "Choose a video for Super Processor"
+# Each dialog program is started by full path, never found in the current
+# folder (see tools.py).
+OSASCRIPT = "/usr/bin/osascript"
 
 
 class FileDialogError(RuntimeError):
@@ -36,7 +42,7 @@ def _commands(start: Path) -> list[tuple[list[str], dict[str, str]]]:
             f'POSIX path of (choose file with prompt "{_TITLE}" '
             f'default location POSIX file "{start}")'
         )
-        found.append((["osascript", "-e", script], {}))
+        found.append(([OSASCRIPT, "-e", script], {}))
     elif sys.platform == "win32":
         filters = ";".join(f"*{ext}" for ext in VIDEO_EXTENSIONS)
         script = (
@@ -46,13 +52,15 @@ def _commands(start: Path) -> list[tuple[list[str], dict[str, str]]]:
             f"$d.InitialDirectory = '{start}';"
             "if ($d.ShowDialog() -eq 'OK') { $d.FileName }"
         )
-        found.append((["powershell", "-NoProfile", "-STA", "-Command", script], {}))
+        powershell = windows_system_tool("WindowsPowerShell", "v1.0", "powershell.exe")
+        found.append(([powershell, "-NoProfile", "-STA", "-Command", script], {}))
     else:
-        if shutil.which("zenity"):
+        zenity = find_tool("zenity")
+        if zenity:
             found.append(
                 (
                     [
-                        "zenity",
+                        zenity,
                         "--file-selection",
                         f"--title={_TITLE}",
                         f"--filename={start}/",
@@ -61,11 +69,12 @@ def _commands(start: Path) -> list[tuple[list[str], dict[str, str]]]:
                     {"GTK_USE_PORTAL": "1"},
                 )
             )
-        if shutil.which("kdialog"):
+        kdialog = find_tool("kdialog")
+        if kdialog:
             found.append(
                 (
                     [
-                        "kdialog",
+                        kdialog,
                         "--title",
                         _TITLE,
                         "--getopenfilename",
@@ -92,7 +101,7 @@ def choose_video(
     for argv, extra in commands:
         try:
             done = run(
-                argv,
+                resolve_argv(argv),
                 capture_output=True,
                 text=True,
                 timeout=DIALOG_TIMEOUT_S,

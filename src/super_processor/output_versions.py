@@ -36,7 +36,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from .atomic_io import read_text_retrying, unlink_quietly, write_text_atomic
+from .atomic_io import (
+    make_private_dir,
+    read_text_retrying,
+    unlink_quietly,
+    write_text_atomic,
+)
 from .jobs import utc_now_iso
 from .upscale import delivery_marker_path
 
@@ -208,7 +213,7 @@ def archive_output(
         if kept is not None:
             return kept
         folder = outputs_dir(job_dir)
-        folder.mkdir(exist_ok=True)
+        make_private_dir(folder)
         part = folder / f".{uuid.uuid4().hex}.part"
         try:
             if move:

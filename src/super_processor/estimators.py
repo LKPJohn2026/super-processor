@@ -14,6 +14,7 @@ from . import mean_luma, percentile_u8, sad_u8
 from .doctor import check_ffmpeg_capability, which
 from .encoders import HARDWARE_DECODERS, decoder_input_args
 from .probe import MediaFacts, parse_frame_rate
+from .tools import FILE_INPUT, resolve_argv
 
 ESTIMATES_FILE_NAME = "estimates.json"
 ESTIMATES_SCHEMA_VERSION = 1
@@ -247,6 +248,7 @@ def _gray_frames(
             *decoder_input_args(attempt),
             "-ss",
             f"{at_s:g}",
+            *FILE_INPUT,
             "-i",
             str(source),
             "-frames:v",
@@ -265,7 +267,7 @@ def _gray_frames(
         ]
         try:
             completed = subprocess.run(
-                cmd,
+                resolve_argv(cmd),
                 check=False,
                 capture_output=True,
                 timeout=30,
@@ -320,6 +322,7 @@ def extract_rgb_means(
             *decoder_input_args(attempt),
             "-ss",
             f"{at_s:g}",
+            *FILE_INPUT,
             "-i",
             str(source),
             "-frames:v",
@@ -334,7 +337,7 @@ def extract_rgb_means(
         ]
         try:
             completed = subprocess.run(
-                cmd, check=False, capture_output=True, timeout=30
+                resolve_argv(cmd), check=False, capture_output=True, timeout=30
             )
         except (OSError, subprocess.SubprocessError):
             if attempt is not None:

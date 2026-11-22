@@ -108,7 +108,7 @@ def test_probe_file_uses_ffprobe(
         return Completed()
 
     monkeypatch.setattr(
-        "super_processor.probe.shutil.which",
+        "super_processor.probe.find_tool",
         lambda _: str(tmp_path / "ffprobe"),
     )
     monkeypatch.setattr("super_processor.probe.subprocess.run", fake_run)
@@ -141,7 +141,7 @@ def test_a_broken_ffprobe_answer_is_a_probe_error(
     source.write_bytes(b"fake")
     answer = SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
     monkeypatch.setattr(
-        "super_processor.probe.shutil.which", lambda _: str(tmp_path / "ffprobe")
+        "super_processor.probe.find_tool", lambda _: str(tmp_path / "ffprobe")
     )
     monkeypatch.setattr(
         "super_processor.probe.subprocess.run", lambda *_a, **_k: answer
@@ -156,7 +156,7 @@ def test_probe_file_missing_ffprobe(
 ) -> None:
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"fake")
-    monkeypatch.setattr("super_processor.probe.shutil.which", lambda _: None)
+    monkeypatch.setattr("super_processor.probe.find_tool", lambda _: None)
     with pytest.raises(ProbeError, match="ffprobe not found"):
         probe_file(source)
 

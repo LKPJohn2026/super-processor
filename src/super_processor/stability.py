@@ -28,6 +28,7 @@ from pathlib import Path
 
 from .probe import ProbeError, probe_file
 from .shots import ShotError, parse_metadata_log
+from .tools import FILE_INPUT, resolve_argv
 from .upscale import (
     STRUCTURE_SIGMA,
     UpscalePlan,
@@ -56,21 +57,24 @@ def _metadata_means(
 ) -> list[float]:
     try:
         completed = subprocess.run(
-            [
-                ffmpeg_bin,
-                "-hide_banner",
-                "-nostats",
-                "-loglevel",
-                "info",
-                "-i",
-                str(video),
-                "-an",
-                "-filter_complex",
-                graph + ",signalstats,metadata=mode=print",
-                "-f",
-                "null",
-                "-",
-            ],
+            resolve_argv(
+                [
+                    ffmpeg_bin,
+                    "-hide_banner",
+                    "-nostats",
+                    "-loglevel",
+                    "info",
+                    *FILE_INPUT,
+                    "-i",
+                    str(video),
+                    "-an",
+                    "-filter_complex",
+                    graph + ",signalstats,metadata=mode=print",
+                    "-f",
+                    "null",
+                    "-",
+                ]
+            ),
             check=False,
             capture_output=True,
         )
@@ -199,23 +203,26 @@ def _gray_frames(
 ) -> tuple[list[bytes], int]:
     try:
         completed = subprocess.run(
-            [
-                ffmpeg_bin,
-                "-v",
-                "error",
-                "-ss",
-                f"{max(0.0, start_s):.6f}",
-                "-t",
-                f"{seconds:.6f}",
-                "-i",
-                str(video),
-                "-an",
-                "-vf",
-                f"scale={SEAM_WIDTH}:-2:flags=area,format=gray",
-                "-f",
-                "rawvideo",
-                "-",
-            ],
+            resolve_argv(
+                [
+                    ffmpeg_bin,
+                    "-v",
+                    "error",
+                    "-ss",
+                    f"{max(0.0, start_s):.6f}",
+                    "-t",
+                    f"{seconds:.6f}",
+                    *FILE_INPUT,
+                    "-i",
+                    str(video),
+                    "-an",
+                    "-vf",
+                    f"scale={SEAM_WIDTH}:-2:flags=area,format=gray",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ]
+            ),
             check=False,
             capture_output=True,
         )

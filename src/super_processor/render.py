@@ -9,6 +9,7 @@ from .doctor import check_ffmpeg_capability
 from .encoders import ALLOWED_ENCODERS, SOFTWARE_ENCODER, encoder_rate_args
 from .preview import kept_range, preview_filters
 from .segments import TimelineSegment
+from .tools import FILE_INPUT, resolve_argv
 from .treatments import Treatment
 
 
@@ -36,6 +37,7 @@ def build_segment_argv(
         "-y",
         "-ss",
         f"{start:.3f}",
+        *FILE_INPUT,
         "-i",
         str(source),
         "-t",
@@ -81,6 +83,7 @@ def build_concat_argv(
         "concat",
         "-safe",
         "0",
+        *FILE_INPUT,
         "-i",
         str(concat_list),
         "-c",
@@ -92,7 +95,7 @@ def build_concat_argv(
 def _run_ffmpeg(command: list[str]) -> None:
     try:
         completed = subprocess.run(
-            command, check=False, capture_output=True, timeout=120
+            resolve_argv(command), check=False, capture_output=True, timeout=120
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise RenderError(f"failed to start ffmpeg: {exc}") from exc

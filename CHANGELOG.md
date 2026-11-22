@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`#token=…`), keeps it for the tab and sends it with each request.
 - The web app refuses to run inside another site's frame, so its buttons
   cannot be clicked through a hidden frame.
+- Your jobs are private to you on Linux and macOS. `~/.super-processor`,
+  the jobs folder, each job folder and the uploads folder are now readable
+  by you only (0700), and the wizard's state, the Gemini chat log and
+  uploaded videos are 0600, so other accounts on a shared computer can no
+  longer list or copy your videos, outputs or Gemini notes. Folders an older
+  version left open are tightened the next time you start. A folder you
+  choose with `--jobs-dir` keeps its own mode, but the jobs inside it are
+  private, and a folder that every user may change is refused.
+- Only real video files can be picked. A playlist (`.m3u8`) or an FFmpeg
+  concat script disguised as an `.mp4` is refused with a clear message in
+  the wizard, `job probe` and `diagnose`, so a crafted download can no
+  longer make the app read, upload to Gemini or restore another video from
+  your disk. FFmpeg may also no longer open anything but local files for
+  any input.
+- On Windows, `ffmpeg`, `ffprobe`, `nvidia-smi` and the file dialog's tools
+  are taken from PATH only, and PowerShell and `taskkill` from `System32`,
+  so an `ffmpeg.exe` sitting in the folder you start the program from is
+  never run in place of the real one.
 
 ## [4.3.0] - 2026-11-22
 

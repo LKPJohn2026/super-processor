@@ -117,7 +117,9 @@ def test_windows_stop_ends_the_tree_with_taskkill(
     monkeypatch.setattr(subprocess, "run", fake_run)
     proc = _FakeProc()
     stop_process(proc)  # type: ignore[arg-type]
-    assert seen == [["taskkill", "/T", "/F", "/PID", "4242"]]
+    # Windows' own taskkill, by full path: never one in the current folder.
+    assert seen == [[cancel._taskkill(), "/T", "/F", "/PID", "4242"]]
+    assert seen[0][0].lower().endswith(r"\system32\taskkill.exe")
     assert proc.calls == ["wait"]
 
 

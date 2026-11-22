@@ -12,6 +12,7 @@ from typing import Any
 
 from .encoders import HARDWARE_DECODERS, HARDWARE_ENCODERS, SOFTWARE_ENCODER
 from .jobs import default_jobs_root
+from .tools import find_tool, resolve_argv
 
 
 @dataclass(slots=True)
@@ -25,8 +26,12 @@ class CheckResult:
 
 
 def which(command: str) -> str | None:
-    """Return the absolute path of ``command`` if it is on PATH."""
-    found = shutil.which(command)
+    """Return the absolute path of ``command`` if it is on PATH.
+
+    The search never looks in the current folder (see tools.find_tool), so
+    an ``ffmpeg.exe`` left in a downloaded folder is not picked up.
+    """
+    found = find_tool(command)
     return str(Path(found).resolve()) if found else None
 
 
@@ -37,7 +42,7 @@ def run_version(command: str, *args: str) -> str | None:
         return None
     try:
         completed = subprocess.run(
-            [executable, *args],
+            resolve_argv([executable, *args]),
             check=False,
             capture_output=True,
             text=True,
@@ -132,7 +137,7 @@ def _ffmpeg_listing(kind: str) -> str:
         return ""
     try:
         completed = subprocess.run(
-            [path, "-hide_banner", f"-{kind}"],
+            resolve_argv([path, "-hide_banner", f"-{kind}"]),
             check=False,
             capture_output=True,
             text=True,

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .templates import FFmpegPlan, FFmpegStep, TemplateError
+from .tools import resolve_argv
 
 
 class WorkerError(RuntimeError):
@@ -248,7 +249,7 @@ class FFmpegWorker:
 
         try:
             proc = subprocess.Popen(
-                argv,
+                resolve_argv(argv),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
