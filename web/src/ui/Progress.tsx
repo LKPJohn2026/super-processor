@@ -18,9 +18,14 @@ export function Progress({ value, label }: { value: number; label: string }) {
   );
 }
 
-export type StageState = "done" | "running" | "waiting";
+export type StageState = "done" | "running" | "waiting" | "skipped";
 
-const STATE_WORD: Record<StageState, string> = { done: "Done", running: "Working", waiting: "Waiting" };
+const STATE_WORD: Record<StageState, string> = {
+  done: "Done",
+  running: "Working",
+  waiting: "Waiting",
+  skipped: "Skipped",
+};
 
 /**
  * One line of a stage list (gen.py `stage()`): an icon, the label and a
@@ -32,6 +37,8 @@ export function StageRow({ state, label, meta }: { state: StageState; label: Rea
       <Icon name="check-circle" color="var(--ok)" />
     ) : state === "running" ? (
       <Icon name="clock" color="var(--focus)" />
+    ) : state === "skipped" ? (
+      <Icon name="info" color="var(--ink-subtle)" />
     ) : (
       <Icon name="clock" color="var(--line-strong)" />
     );

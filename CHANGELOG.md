@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with its buttons turned off, under a "Can't reach the wizard" banner with
   Try again and Change address; anything typed is kept, and the page looks
   again every few seconds until the wizard answers.
+- Choose a video has the redesign's drop area ("Browse this computer…",
+  "Type a path instead", or a file chosen in the browser), and a file
+  dropped or chosen in the browser gets a file card with its frame, size,
+  picture size and length checked before "Find the scenes". A file the
+  wizard refuses shows which check failed and why, with "Choose another
+  video".
+- Finding the scenes shows the time left (or spent), one bar, and its
+  stages (stills, the silent copy, the upload, Gemini) with their times,
+  saying so when Gemini works from the stills instead; "You can close this
+  tab", the notify switch and Cancel sit under it. When Gemini's quota is
+  used up, its split failed or it returned no scenes, the Scenes step says
+  so with "Try again" (after the wait Gemini gave) or "Ask Gemini again",
+  and "Use the whole video as one scene".
 
 ## [4.2.0] - 2026-11-21
 

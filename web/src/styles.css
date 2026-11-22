@@ -413,6 +413,10 @@ button:disabled,
 .badge.error {
   background: var(--err-tint);
   color: var(--err);
+  /* Not the older full-width .error message. */
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 999px;
 }
 
 .badge.info {
@@ -2103,6 +2107,201 @@ video {
   margin-top: 8px;
 }
 
+/* ------------------------------- choose a video (02) and S4 refused */
+.step-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.step-head > * {
+  margin: 0;
+}
+
+.choose-step {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 860px;
+}
+
+.drop-area {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 28px;
+  text-align: center;
+  border: 2px dashed var(--line-strong);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+}
+
+.drop-area.over {
+  border-color: var(--leaf);
+  background: var(--leaf-tint);
+}
+
+.drop-area > * {
+  margin: 0;
+}
+
+.drop-or {
+  justify-content: center;
+}
+
+.drop-hint {
+  max-width: 640px;
+}
+
+/* An action written as a link, inside a line of text. */
+button.text-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--leaf);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  white-space: normal;
+}
+
+button.text-link:hover:not(:disabled) {
+  background: none;
+  color: var(--leaf-hover);
+}
+
+button.text-link:disabled {
+  color: var(--ink-subtle);
+  cursor: default;
+}
+
+.path-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.path-form .input {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 15px;
+}
+
+.privacy-line {
+  align-items: flex-start;
+  margin: 0;
+}
+
+.privacy-line > .icon {
+  margin-top: 2px;
+}
+
+.check-list {
+  list-style: none;
+  padding: 0 !important;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.check-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px 24px;
+}
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.check-row > .icon {
+  margin-top: 1px;
+}
+
+.file-card-head {
+  align-items: flex-start;
+}
+
+.file-thumb {
+  width: 160px;
+  height: 120px;
+  flex: none;
+  object-fit: cover;
+  border-radius: var(--r-md);
+  background: var(--stage);
+  display: block;
+}
+
+.file-card-text > *,
+.refused-card h2 {
+  margin: 0;
+}
+
+.file-name,
+.refused-name {
+  overflow-wrap: anywhere;
+}
+
+.refused-card:focus {
+  outline: none;
+}
+
+/* ------------------------------------------ finding the scenes (03) */
+.finding-step {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  max-width: 720px;
+}
+
+.finding-time {
+  align-items: flex-end;
+  gap: 8px 16px;
+}
+
+/* An empty live region takes no room between the parts. */
+.finding-step > [role="status"]:empty {
+  margin-top: -24px;
+}
+
+.stage-row.skipped {
+  color: var(--ink-muted);
+}
+
+.stage-row .caption {
+  white-space: nowrap;
+}
+
+.finding-step .notify-toggle,
+.finding-step .actions {
+  margin: 0;
+}
+
+/* S3 and S8 on the scenes step */
+.problem-card {
+  max-width: 640px;
+}
+
+.problem-card > *,
+.quota-wait {
+  margin: 0;
+}
+
+.quota-wait {
+  align-items: center;
+}
+
+.empty-card {
+  align-items: flex-start;
+}
+
 /* ------------------------------------------------------- responsive */
 
 /* Below ~900 px the sidebar becomes a compact block above the main area. */
@@ -2330,6 +2529,40 @@ video {
   .scene-strip .scene-pill {
     flex: 0 0 13.5rem;
     scroll-snap-align: start;
+  }
+}
+
+@media (max-width: 600px) {
+  .check-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .file-card-head {
+    flex-direction: column;
+  }
+
+  .file-thumb {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 4 / 3;
+  }
+
+  .path-form {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .drop-area {
+    padding: 20px 16px;
+  }
+
+  .drop-or {
+    flex-wrap: wrap;
+  }
+
+  .finding-time .display {
+    font-size: 30px;
+    line-height: 36px;
   }
 }
 

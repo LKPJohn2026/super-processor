@@ -2,7 +2,6 @@ import {
   useEffect,
   useRef,
   useState,
-  type DragEvent,
   type FormEvent,
   type KeyboardEvent,
   type MutableRefObject,
@@ -37,7 +36,6 @@ import {
   type Navigation,
   type SegmentEdit,
   type SegmentPreview,
-  uploadVideo,
   withJob,
   type WizardView,
 } from "./api";
@@ -90,6 +88,9 @@ import {
 } from "./versions";
 import { JobsHome } from "./JobsHome";
 import { WelcomeStep } from "./Welcome";
+import { ChooseStep } from "./ChooseStep";
+import { FindingStep, ScenesProblemCard } from "./FindingStep";
+import { scenesProblem } from "./findingView";
 import { isWelcomeStep } from "./welcomeView";
 import {
   STALE_SCENES_TEXT,
@@ -881,13 +882,14 @@ function WizardStepView({
 
   if (view.step === "pick_file") {
     return (
-      <PickStep
+      <ChooseStep
         origin={origin}
-        view={view}
         busy={busy}
         message={message}
         onSend={onSend}
         onView={onView}
+        stopped={<StoppedNote view={view} />}
+        back={<Back view={view} to={["setup", "segments"]} busy={busy} onSend={onSend} />}
       />
     );
   }
@@ -907,20 +909,14 @@ function WizardStepView({
 
   if (view.step === "sampling" || view.step === "proposing") {
     return (
-      <Busy
-        title="Finding the scenes"
-        progress={view.progress ?? null}
-        overallKey={overallKey(view)}
-        overallShown={overallShown}
+      <FindingStep
+        view={view}
         message={message}
-        stop={<StopButton origin={origin} view={view} busy={busy} onRequest={onRequest} />}
+        stop={
+          <StopButton origin={origin} view={view} busy={busy} onRequest={onRequest} idleLabel="Cancel" />
+        }
         notify={notify}
-      >
-        A small copy of the video, without its sound, is uploaded to Gemini,
-        which watches it at one frame a second and splits it where the light,
-        place, or picture quality changes. If the upload fails, Gemini works
-        from stills FFmpeg saves on this computer.
-      </Busy>
+      />
     );
   }
 
@@ -1130,28 +1126,32 @@ function StopButton({
   view,
   busy,
   onRequest,
+  idleLabel,
 }: {
   origin: string;
   view: WizardView;
   busy: boolean;
   onRequest: RequestAction;
+  // The mockup's word for the button while nothing is stopping (03: "Cancel").
+  idleLabel?: string;
 }) {
   const control = stopControl(view, busy);
+  const stopping = Boolean(view.cancel_requested) || busy;
   return (
     <>
       {/* Always in the page, so the "Stopping" line is announced when it appears. */}
       <div role="status">{control.status ? <p className="stopped-note">{control.status}</p> : null}</div>
       {control.shown ? (
         <div className="actions">
-          <button
-            type="button"
-            className="secondary"
+          <Button
+            kind="secondary"
+            size="md"
             disabled={control.disabled}
             // The run the page shows, so a late click never stops a newer one.
             onClick={() => void onRequest((shown) => cancelRun(origin, shown))}
           >
-            {control.label}
-          </button>
+            {idleLabel && !stopping ? idleLabel : control.label}
+          </Button>
         </div>
       ) : null}
     </>
@@ -1200,119 +1200,6 @@ function Alert({ text }: { text: string }) {
     <p className="error" role="alert">
       {text}
     </p>
-  );
-}
-
-function PickStep({
-  origin,
-  view,
-  busy,
-  message,
-  onSend,
-  onView,
-}: {
-  origin: string;
-  view: WizardView;
-  busy: boolean;
-  message: string | null;
-  onSend: SendAction;
-  onView: (view: WizardView) => void;
-}) {
-  const [path, setPath] = useState("");
-  const [over, setOver] = useState(false);
-  const [upload, setUpload] = useState<{ name: string; pct: number } | null>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    void onSend("pick", { path });
-  }
-
-  function send(file: File | undefined) {
-    if (!file) return;
-    setUploadError(null);
-    setUpload({ name: file.name, pct: 0 });
-    uploadVideo(origin, file, (pct) => setUpload({ name: file.name, pct }))
-      .then(onView)
-      .catch((error: unknown) => {
-        setUploadError(error instanceof Error ? error.message : "The upload failed.");
-      })
-      .finally(() => setUpload(null));
-  }
-
-  function drop(event: DragEvent<HTMLLabelElement>) {
-    event.preventDefault();
-    setOver(false);
-    send(event.dataTransfer.files[0]);
-  }
-
-  return (
-    <>
-      <h1>Pick a video file</h1>
-      <p className="lede">
-        Choose a video on this computer. Gemini splits it into scenes, you
-        approve a short before/after preview of each, and then you choose
-        whether to upscale the whole video 2× on your GPU.
-      </p>
-      <p className="muted">Up to 1080p and 30 minutes.</p>
-      <StoppedNote view={view} />
-      {message ? <Alert text={message} /> : null}
-      <div className="actions">
-        <button type="button" disabled={busy || upload !== null} onClick={() => void onSend("browse", {})}>
-          Choose a file…
-        </button>
-      </div>
-      <label
-        className={over ? "dropzone over" : "dropzone"}
-        onDragEnter={(event) => {
-          event.preventDefault();
-          setOver(true);
-        }}
-        onDragOver={(event) => event.preventDefault()}
-        onDragLeave={() => setOver(false)}
-        onDrop={drop}
-      >
-        <strong>…or drop a video here</strong>
-        <span className="muted">A dropped file is copied into the jobs folder on this computer.</span>
-        <input
-          type="file"
-          accept="video/*,.mkv,.mts,.ts"
-          hidden
-          disabled={busy || upload !== null}
-          onChange={(event) => send(event.target.files?.[0])}
-        />
-        {upload ? (
-          <span className="progress" role="status">
-            <progress max={100} value={upload.pct} aria-label={`Copying ${upload.name}`} />{" "}
-            {upload.pct}% · Copying {upload.name}
-          </span>
-        ) : null}
-      </label>
-      {uploadError ? <Alert text={uploadError} /> : null}
-      <details className="fallback">
-        <summary>Type a path instead</summary>
-        <form onSubmit={submit}>
-          <label htmlFor="video-path">
-            Absolute path to video
-            <input
-              id="video-path"
-              name="path"
-              type="text"
-              value={path}
-              autoComplete="off"
-              onChange={(event) => setPath(event.target.value)}
-              placeholder="/home/you/clip.mp4"
-            />
-          </label>
-          <div className="actions">
-            <button type="submit" className="secondary" disabled={busy}>
-              Use this path
-            </button>
-          </div>
-        </form>
-      </details>
-      <Back view={view} to={["setup", "segments"]} busy={busy} onSend={onSend} />
-    </>
   );
 }
 
@@ -1891,9 +1778,13 @@ function SegmentsStep({
       </p>
       <StoppedNote view={view} />
       {message ? <Alert text={message} /> : null}
+      <ScenesProblemCard list={list} locked={locked} onEdit={onEdit} />
       <Notice
         text={
-          [list.error, list.video_problem ? `Gemini saw stills instead of the video: ${list.video_problem}.` : ""]
+          [
+            scenesProblem(list) ? "" : list.error,
+            list.video_problem ? `Gemini saw stills instead of the video: ${list.video_problem}.` : "",
+          ]
             .filter(Boolean)
             .join(" ") || null
         }
