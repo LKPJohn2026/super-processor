@@ -105,8 +105,11 @@ WIZARD_COOKIE_PREFIX = "sp_wizard_"
 # download or upload is unaffected; a paused player just asks again with a
 # Range request.
 SOCKET_TIMEOUT_S = 60.0
-# More connections than this at once are closed straight away.
-MAX_CONNECTIONS = 64
+# More connections than this at once are closed straight away. It stays
+# well under the usual 1024 open-file limit, so the server never runs out of
+# descriptors, yet high enough that a local process holding idle sockets
+# must open hundreds of them to crowd out the browser's own requests.
+MAX_CONNECTIONS = 512
 UNAUTHENTICATED_MESSAGE = (
     "This wizard needs its token. Open the address that super-processor review "
     "printed (it ends in ?token=...), or send the printed token as the "
