@@ -327,8 +327,16 @@ def test_the_job_list_is_read_only_and_empty_without_a_folder(tmp_path: Path) ->
     assert not (tmp_path / "jobs").exists()
 
 
-def test_the_job_list_shows_each_wizard_job_newest_first(tmp_path: Path) -> None:
+def test_the_job_list_shows_each_wizard_job_newest_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     controller = WizardController(tmp_path / "jobs")
+    # Manifest times count whole seconds, so jobs made "now" would all tie
+    # and outrank the state times set below. Date them long ago while
+    # the jobs are set up; the order then comes from the state times.
+    monkeypatch.setattr(
+        "super_processor.jobs.utc_now_iso", lambda: "2000-01-01T00:00:00+00:00"
+    )
     paused, paused_dir = _job(controller, tmp_path, WizardStep.SEGMENTS, name="a.mp4")
     done, done_dir = _job(controller, tmp_path, WizardStep.RESULT, name="b.mp4")
     (done_dir / "output.mp4").write_bytes(b"video")
@@ -349,6 +357,7 @@ def test_the_job_list_shows_each_wizard_job_newest_first(tmp_path: Path) -> None
     for age, job_id in enumerate(order):
         stamp = time.time() - age * 100
         os.utime(controller.store.job_dir(job_id) / "wizard_state.json", (stamp, stamp))
+    monkeypatch.undo()
     controller.store.update_notes(failed, {})  # manifest time is now: newest
     jobs = controller.jobs_view()
     assert [job["job_id"] for job in jobs] == order
