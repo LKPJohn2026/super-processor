@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chips (merge, split, fewer or more scenes) and your own words go to
   Gemini with "Ask Gemini to re-split", above "Looks right — preview
   scenes".
+- A scene's preview is one large comparison of the real before and after
+  clips, kept in step: Wipe (drag the handle or use the arrow keys), Side by
+  side or A/B, one play button and scrubber, frame steps and a 100% view,
+  with the protected boxes labelled. Keys: Space plays, B flips, ←/→ step a
+  frame, Z zooms. Beside it: Gemini's check, what the scene gets in plain
+  words, AI detail Off or on, "Something off?" chips that add to your note
+  for "Redo this preview", and Advanced settings with the raw numbers. The
+  button names the next scene ("Approve scene 3 — next: Night street"); a
+  preview Gemini couldn't check is marked "Check this", with Try Gemini
+  again and Approve anyway.
 
 ## [4.2.0] - 2026-11-21
 

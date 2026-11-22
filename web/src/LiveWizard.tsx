@@ -12,7 +12,6 @@ import {
   loadJobs,
   loadState,
   openJob,
-  outputSizeLine,
   outputSrc,
   postAction,
   progressTiming,
@@ -23,15 +22,12 @@ import {
   runRender,
   runSegmenting,
   type JobEntry,
-  type LookShot,
   type OutputVersion,
   type Looks,
   type Progress,
-  type Region,
   type Runner,
   type Navigation,
   type SegmentEdit,
-  type SegmentPreview,
   withJob,
   type WizardView,
 } from "./api";
@@ -75,7 +71,6 @@ import {
 } from "./runNotify";
 import {
   downloadName,
-  prefetchNote,
   versionLabel,
   versionMeta,
   versionNote,
@@ -87,6 +82,8 @@ import { WelcomeStep } from "./Welcome";
 import { ChooseStep } from "./ChooseStep";
 import { FindingStep } from "./FindingStep";
 import { ScenesStep } from "./ScenesStep";
+import { PreviewStep } from "./PreviewStep";
+import { previewUnchecked, settingsSummary } from "./previewView";
 import { isWelcomeStep } from "./welcomeView";
 import {
   STALE_SCENES_TEXT,
@@ -613,6 +610,20 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     />
   ) : null;
 
+  // The preview places the strip between its heading and the viewer (05).
+  const stripInStep = view.step === "preview_segment";
+  const strip = (
+    <SceneStrip
+      origin={origin}
+      view={view}
+      busy={locked}
+      onRequest={perform}
+      onReopened={() => setHeadingFocus((value) => value + 1)}
+      bare={stripInStep}
+      attention={stripInStep && previewUnchecked(view) ? (view.segment_preview?.index ?? null) : null}
+    />
+  );
+
   return (
     <AppShell
       topBar={topBar}
@@ -648,6 +659,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           "step-body",
           isWelcomeStep(view.step) ? "welcome-body" : null,
           view.step === "segments" ? "scenes-body" : null,
+          view.step === "preview_segment" ? "preview-body" : null,
           offline ? "offline-dim" : null,
         ]
           .filter(Boolean)
@@ -665,14 +677,9 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           onView={onView}
           overallShown={overallShown}
           notify={<NotifyToggle on={notifyOn} onChange={changeNotify} />}
+          strip={stripInStep ? strip : undefined}
         />
-        <SceneStrip
-          origin={origin}
-          view={view}
-          busy={locked}
-          onRequest={perform}
-          onReopened={() => setHeadingFocus((value) => value + 1)}
-        />
+        {stripInStep ? null : strip}
       </div>
     </AppShell>
   );
@@ -752,12 +759,18 @@ function SceneStrip({
   busy,
   onRequest,
   onReopened,
+  bare,
+  attention,
 }: {
   origin: string;
   view: WizardView;
   busy: boolean;
   onRequest: RequestAction;
   onReopened: () => void;
+  // Inside a step that says the count itself: the heading is for screen readers only.
+  bare?: boolean;
+  // The scene Gemini could not check (S6): "Check this".
+  attention?: number | null;
 }) {
   const scenes = sceneStrip(view);
   const list = useRef<HTMLOListElement | null>(null);
@@ -784,8 +797,8 @@ function SceneStrip({
     if (await onRequest((shown) => reopenScene(origin, shown, index))) onReopened();
   }
   return (
-    <section className="scene-strip" aria-labelledby="scene-strip-title">
-      <div className="strip-head">
+    <section className={bare ? "scene-strip bare" : "scene-strip"} aria-labelledby="scene-strip-title">
+      <div className={bare ? "sr-only" : "strip-head"}>
         <h2 id="scene-strip-title">Scenes</h2>
         <p className="muted" role="status">
           {summary}
@@ -794,11 +807,12 @@ function SceneStrip({
       <ol ref={list} tabIndex={0} aria-label="Scenes of this job">
         {scenes.map((scene) => {
           const still = outputSrc(origin, scene.stillUrl);
+          const flagged = attention === scene.index && scene.status === "current";
           return (
             <li
               key={scene.index}
               data-scene={scene.index}
-              className={`scene-pill ${scene.status}`}
+              className={`scene-pill ${scene.status}${flagged ? " attention" : ""}`}
               aria-current={scene.status === "current" ? "step" : undefined}
             >
               {still ? <img src={still} alt="" loading="lazy" /> : <span className="still-gap" aria-hidden="true" />}
@@ -807,7 +821,7 @@ function SceneStrip({
                 <span className="scene-range">{scene.range}</span>
                 <span className="scene-status">
                   <span className="sdot" aria-hidden="true" />
-                  {scene.statusText}
+                  {flagged ? "Check this" : scene.statusText}
                   {scene.previewed && scene.status !== "pending" ? (
                     <span className="previewed"> · preview ready</span>
                   ) : null}
@@ -845,6 +859,7 @@ function WizardStepView({
   onView,
   overallShown,
   notify,
+  strip,
 }: {
   origin: string;
   view: WizardView;
@@ -858,6 +873,8 @@ function WizardStepView({
   overallShown: MutableRefObject<SteadyOverall | null>;
   // "Notify me when it's done", for the long runs.
   notify?: ReactNode;
+  // The scene strip, for a step that places it itself (the preview).
+  strip?: ReactNode;
 }) {
   if (isWelcomeStep(view.step)) {
     return <WelcomeStep view={view} busy={busy} message={message} onSend={onSend} />;
@@ -946,6 +963,8 @@ function WizardStepView({
         message={message}
         onSend={onSend}
         view={view}
+        strip={strip}
+        back={<Back view={view} to={["segments"]} busy={busy} onSend={onSend} />}
       />
     );
   }
@@ -1368,73 +1387,6 @@ function VersionRow({
   );
 }
 
-function words(items: string[]): string {
-  return items.map((item) => item.replace(/_/g, " ")).join(", ");
-}
-
-function Notice({ text }: { text: string | null }) {
-  if (!text) return null;
-  return (
-    <p className="notice" role="status">
-      {text}
-    </p>
-  );
-}
-
-const NEUTRAL: Record<string, number> = {
-  deblock: 0,
-  denoise: 0,
-  contrast: 1,
-  brightness: 0,
-  saturation: 1,
-  gamma: 1,
-  grain: 0,
-};
-
-export function settingsSummary(strength: number, look: Record<string, number>): string {
-  const parts = [`strength ${strength.toFixed(2)}`];
-  for (const [name, neutral] of Object.entries(NEUTRAL)) {
-    const value = look[name] ?? neutral;
-    if (Math.abs(value - neutral) > 1e-6) parts.push(`${name} ${value.toFixed(2)}`);
-  }
-  return parts.join(" · ");
-}
-
-function Boxes({ regions }: { regions: Region[] }) {
-  return (
-    <>
-      {regions.map((region, i) => (
-        <span
-          key={`${region.kind}-${i}`}
-          className={`box ${region.kind}`}
-          title={region.kind}
-          style={{
-            left: `${region.x0 * 100}%`,
-            top: `${region.y0 * 100}%`,
-            width: `${(region.x1 - region.x0) * 100}%`,
-            height: `${(region.y1 - region.y0) * 100}%`,
-          }}
-        />
-      ))}
-    </>
-  );
-}
-
-function Protected({ regions, contains }: { regions: Region[]; contains: string[] }) {
-  const kinds = [...new Set(regions.map((region) => region.kind))].sort();
-  if (kinds.length) {
-    return <p className="muted">Protected inside the boxes: {kinds.join(", ")}.</p>;
-  }
-  const flagged = contains.filter((item) => ["faces", "hands", "text"].includes(item));
-  if (!flagged.length) return null;
-  return (
-    <p className="muted">
-      Contains {flagged.join(", ")} but no boxes were placed, so the whole shot
-      is held to a lower strength.
-    </p>
-  );
-}
-
 function SeamNote({
   seams,
   error,
@@ -1528,196 +1480,6 @@ function Interrupted({
         ) : null}
       </div>
     </>
-  );
-}
-
-function poster(videoUrl: string | null): string | null {
-  // Each preview has a still of the same name, saved for the check. The
-  // query (the plan's generation) stays on the still's URL too.
-  return videoUrl ? videoUrl.replace(/\.mp4(\?|$)/, ".jpg$1") : null;
-}
-
-function checkSummary(check: LookShot["check"]): string {
-  let note = (check.note || "").trim();
-  if (note && !/[.!?]$/.test(note)) note += ".";
-  if (check.ok === null) return "Not checked.";
-  if (check.ok) return note ? `Check passed. ${note}` : "Check passed.";
-  let text = `Check found: ${words(check.problems) || "a problem"}.`;
-  if (note) text += ` ${note}`;
-  if (check.adjusted) text += " Settings were adjusted and the preview redone.";
-  return text;
-}
-
-function LookCard({ origin, shot }: { origin: string; shot: LookShot }) {
-  const summary = settingsSummary(shot.strength, shot.look);
-  return (
-    <>
-      <h2>
-        {shot.index + 1}. {formatTime(shot.start_s)}–{formatTime(shot.end_s)} ·{" "}
-        {shot.label || "Unlabelled scene"}
-      </h2>
-      {shot.after_url ? (
-        <div className="pair">
-          <figure>
-            <figcaption>Before</figcaption>
-            <div className="frame">
-              <video
-                controls
-                muted
-                loop
-                preload="metadata"
-                src={outputSrc(origin, shot.before_url) ?? undefined}
-                poster={outputSrc(origin, poster(shot.before_url)) ?? undefined}
-                aria-label={`Scene ${shot.index + 1} before`}
-              />
-              <Boxes regions={shot.regions ?? []} />
-            </div>
-          </figure>
-          <figure>
-            <figcaption>After</figcaption>
-            <div className="frame">
-              <video
-                controls
-                muted
-                loop
-                preload="metadata"
-                src={outputSrc(origin, shot.after_url) ?? undefined}
-                poster={outputSrc(origin, poster(shot.after_url)) ?? undefined}
-                aria-label={`Scene ${shot.index + 1} after`}
-              />
-              <Boxes regions={shot.regions ?? []} />
-            </div>
-          </figure>
-        </div>
-      ) : null}
-      <p>
-        <strong>
-          {shot.use_upscale === false ? `No upscaling: resized only. ${summary}` : summary}
-        </strong>
-      </p>
-      <Protected regions={shot.regions ?? []} contains={shot.contains} />
-      <p>{shot.reason}</p>
-      <p className="muted">
-        {checkSummary(shot.check)}
-        {typeof shot.shimmer === "number"
-          ? ` Texture stability: ${shot.shimmer.toFixed(1)}× as jumpy as the source.`
-          : ""}
-      </p>
-    </>
-  );
-}
-
-function PreviewStep({
-  origin,
-  preview,
-  busy,
-  message,
-  onSend,
-  view,
-}: {
-  origin: string;
-  preview: SegmentPreview;
-  busy: boolean;
-  message: string | null;
-  onSend: SendAction;
-  view: WizardView;
-}) {
-  const [note, setNote] = useState("");
-  const [resample, setResample] = useState(false);
-  const last = preview.index + 1 >= preview.count;
-
-  function redo(event: FormEvent) {
-    event.preventDefault();
-    void onSend("preview", { action: "redo", note, resample: resample ? "1" : "" });
-  }
-
-  return (
-    <>
-      <h1>
-        Scene {preview.index + 1} of {preview.count}
-      </h1>
-      <p className="lede">
-        A few seconds of this scene, before and after. Approve it, or tell me
-        what to change.
-      </p>
-      {preview.scale ? (
-        <p className="muted">{outputSizeLine(preview.scale)}</p>
-      ) : null}
-      {message ? <Alert text={message} /> : null}
-      <Notice text={preview.error} />
-      {preview.shot ? <LookCard origin={origin} shot={preview.shot} /> : null}
-      {/* Always in the page, so a change is read out; empty without --prefetch. */}
-      <p className="muted prefetch-note" role="status">
-        {prefetchNote(preview)}
-      </p>
-      <div className="actions">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void onSend("preview", { action: "approve" })}
-        >
-          {last ? "Approve and finish" : "Approve and go to the next scene"}
-        </button>
-      </div>
-      <form onSubmit={redo}>
-        <label htmlFor="preview-note">
-          Not right? Tell me what to change in this scene
-          <input
-            id="preview-note"
-            type="text"
-            value={note}
-            placeholder="e.g. skin looks waxy, keep it softer"
-            onChange={(event) => setNote(event.target.value)}
-          />
-        </label>
-        <label htmlFor="preview-resample" className="inline">
-          <input
-            id="preview-resample"
-            type="checkbox"
-            checked={resample}
-            onChange={(event) => setResample(event.target.checked)}
-          />
-          Preview a different part
-        </label>
-        <div className="actions">
-          <button type="submit" className="secondary" disabled={busy}>
-            Redo this scene
-          </button>
-        </div>
-      </form>
-      {preview.shot && preview.scale !== 1 ? (
-        <UpscaleToggle shot={preview.shot} busy={busy} onSend={onSend} />
-      ) : null}
-      <Back view={view} to={["segments"]} busy={busy} onSend={onSend} />
-    </>
-  );
-}
-
-function UpscaleToggle({
-  shot,
-  busy,
-  onSend,
-}: {
-  shot: LookShot;
-  busy: boolean;
-  onSend: SendAction;
-}) {
-  const on = shot.use_upscale !== false;
-  const who = typeof shot.upscale_override === "boolean" ? "You" : "Gemini";
-  return (
-    <div className="actions">
-      <p className="muted">
-        {who} chose: this scene {on ? "uses upscaling" : "skips upscaling (plain resize)"}.
-      </p>
-      <button
-        type="button"
-        className="secondary"
-        disabled={busy}
-        onClick={() => void onSend("preview", { action: "upscale", on: on ? "0" : "1" })}
-      >
-        {on ? "Skip upscaling for this scene" : "Use upscaling for this scene"}
-      </button>
-    </div>
   );
 }
 
