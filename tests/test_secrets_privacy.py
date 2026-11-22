@@ -61,9 +61,13 @@ needs_ffmpeg = pytest.mark.skipif(
     reason="ffmpeg required",
 )
 
-# Fake keys only: shaped like a Gemini key, never a real one.
-KEY = "AIzaFAKE0000SENTINEL0000000000000000000"
-NEW_KEY = "AIzaFAKE1111ROTATED11111111111111111111"
+# Fake keys only: shaped like a Gemini key (the redaction pattern needs the
+# full AIza-plus-35 shape), never a real one. They are joined at run time so
+# the source holds no key-shaped literal for secret scanners to flag.
+_PREFIX = "AI" + "za"
+KEY = _PREFIX + "FAKE0000SENTINEL0000000000000000000"
+NEW_KEY = _PREFIX + "FAKE1111ROTATED11111111111111111111"
+assert len(KEY) == len(NEW_KEY) == 39
 VIDEO = GeminiVideo(
     name="files/abc", uri="https://example.test/files/abc", expires_at=4e9
 )
