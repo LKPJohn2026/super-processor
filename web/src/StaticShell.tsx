@@ -1,4 +1,8 @@
 import { useState, type FormEvent } from "react";
+import { documentTitle } from "./shellView";
+import { AppShell } from "./shell/AppShell";
+import { TopBar } from "./shell/TopBar";
+import { Banner, Button, Card, Field, Icon } from "./ui";
 
 const TOUR = [
   {
@@ -60,91 +64,112 @@ export function StaticShell({ checking, connectError, onConnect }: StaticShellPr
   }
 
   return (
-    <>
-      <p className="brand">Super Processor</p>
-      <div className="panel">
-        <h1>Restore the video you already shot</h1>
-        <p className="lede">
-          This page is a static shell. It explains the wizard and stays usable
-          when no GPU server is attached. The live upscale runs only on your
-          machine, after you start <code>super-processor review</code>.
-        </p>
-        <p>
-          GitHub Pages cannot drive an RTX GPU. Open the localhost URL that
-          command prints, or connect this shell to that server from a local
-          preview.
-        </p>
-        {checking ? (
-          <p role="status">Checking for a local wizard…</p>
-        ) : (
-          <p role="status">No live wizard is connected.</p>
-        )}
-        <form onSubmit={submit}>
-          <label htmlFor="wizard-url">
-            Local wizard URL
-            <input
+    <AppShell
+      topBar={<TopBar jobTitle={null} connection={connectError ? "err" : null} onAllJobs={null} />}
+      title={documentTitle(null)}
+      headingKey="offline"
+      wide
+    >
+      <div className="welcome">
+        <div className="col gap20">
+          <p className="overline">Welcome</p>
+          <h1 className="display">Restore the video you already shot</h1>
+          <p className="muted">
+            This page is a static shell. It explains the wizard and stays usable when no GPU server is
+            attached. The live upscale runs only on your machine, after you start{" "}
+            <code>super-processor review</code>.
+          </p>
+          <p className="muted">
+            GitHub Pages cannot drive an RTX GPU. Open the localhost URL that command prints, or connect
+            this shell to that server from a local preview.
+          </p>
+        </div>
+        <Card className="col gap16">
+          <h2 className="h3">Connect to your computer</h2>
+          {checking ? (
+            <p role="status" className="row gap8 body-s">
+              <Icon name="clock" color="var(--focus)" />
+              Checking for a local wizard…
+            </p>
+          ) : (
+            <p role="status" className="row gap8 body-s">
+              <Icon name="wifi" color="var(--ink-subtle)" />
+              No live wizard is connected.
+            </p>
+          )}
+          <form onSubmit={submit} className="col gap12">
+            <Field
               id="wizard-url"
               name="wizard-url"
+              label="Local wizard URL"
               type="url"
               inputMode="url"
               value={url}
               onChange={(event) => setUrl(event.target.value)}
               autoComplete="off"
+              help="The address super-processor review prints, such as http://127.0.0.1:45143."
             />
-          </label>
-          <div className="actions">
-            <button type="submit">Connect to local wizard</button>
-          </div>
-        </form>
-        {connectError ? (
-          <p className="error" role="alert">
-            {connectError}
-          </p>
-        ) : null}
+            <div className="row gap12 wrap">
+              <Button type="submit" icon="wifi">
+                Connect to local wizard
+              </Button>
+            </div>
+          </form>
+          {connectError ? (
+            <Banner tone="error" role="alert" title="Can’t reach the wizard">
+              {connectError}
+            </Banner>
+          ) : null}
+        </Card>
 
-        <h2 id="tour-heading">Wizard steps</h2>
-        <p className="muted" id="tour-help">
-          Move through the steps with the buttons. Nothing here starts an
-          upscale.
-        </p>
-        <ol className="steps" aria-label="Wizard steps">
-          {TOUR.map((item, itemIndex) => (
-            <li key={item.id} className={itemIndex === index ? "active" : undefined}>
-              <button
-                type="button"
-                className="secondary"
-                aria-current={itemIndex === index ? "step" : undefined}
-                onClick={() => setIndex(itemIndex)}
-              >
-                {item.title}
-              </button>
-            </li>
-          ))}
-        </ol>
-        <section aria-labelledby="tour-heading">
-          <h2>{step.title}</h2>
-          <p>{step.body}</p>
-          <div className="actions">
-            <button
-              type="button"
-              className="secondary"
+        <Card as="section" className="col gap16" aria-labelledby="tour-heading">
+          <div className="col gap4">
+            <h2 id="tour-heading" className="h2">
+              Wizard steps
+            </h2>
+            <p className="caption subtle" id="tour-help">
+              Move through the steps with the buttons. Nothing here starts an upscale.
+            </p>
+          </div>
+          <ol className="tour-steps" aria-label="Wizard steps">
+            {TOUR.map((item, itemIndex) => (
+              <li key={item.id}>
+                <button
+                  type="button"
+                  className={itemIndex === index ? "chip sel" : "chip"}
+                  aria-current={itemIndex === index ? "step" : undefined}
+                  onClick={() => setIndex(itemIndex)}
+                >
+                  {itemIndex === index ? <Icon name="check" size={14} color="var(--leaf)" /> : null}
+                  {item.title}
+                </button>
+              </li>
+            ))}
+          </ol>
+          <div className="col gap8" aria-live="polite">
+            <h3 className="h3">{step.title}</h3>
+            <p className="body-s muted">{step.body}</p>
+          </div>
+          <div className="row gap12 wrap">
+            <Button
+              kind="secondary"
+              size="md"
+              icon="chevron-left"
               onClick={() => setIndex((value) => Math.max(0, value - 1))}
               disabled={index === 0}
             >
               Previous step
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                setIndex((value) => Math.min(TOUR.length - 1, value + 1))
-              }
+            </Button>
+            <Button
+              size="md"
+              onClick={() => setIndex((value) => Math.min(TOUR.length - 1, value + 1))}
               disabled={index === TOUR.length - 1}
             >
               Next step
-            </button>
+            </Button>
           </div>
-        </section>
+        </Card>
       </div>
-    </>
+    </AppShell>
   );
 }

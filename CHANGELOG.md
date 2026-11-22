@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The web app has the redesign's look: a top bar with the job's title, a
+  connection pill and All jobs; a sidebar with the video's still, its facts
+  and the five steps; and self-hosted Source Sans 3, Source Serif 4 and
+  JetBrains Mono fonts. On each step change the heading takes focus and the
+  tab title names the step, and run progress is read out at milestones.
+  Below about 900 px wide the sidebar sits above the step.
+
 ## [4.2.0] - 2026-11-21
 
 ### Added

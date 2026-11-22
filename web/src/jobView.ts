@@ -222,3 +222,126 @@ export function overallKey(view: WizardView): string {
   if (view.step === "analyzing") return `${view.job_id ?? ""}:previews`;
   return `${view.job_id ?? ""}:${view.run?.id ?? view.step}`;
 }
+
+// ---------------------------------------------------------------- sidebar
+
+/** A step of the sidebar's stepper: a StepItem that can also have failed. */
+export type SideStep = Omit<StepItem, "state"> & { state: StepState | "error" };
+
+const SIDE_LABELS = ["Video", "Scenes", "Previews", "Render", "Result"] as const;
+const SIDE_KEYS: readonly StageKey[] = ["file", "segments", "scenes", "render", "result"];
+const SIDE_NAV: Partial<Record<number, keyof Navigation>> = { 0: "file", 1: "segments" };
+
+/** The design's five steps, for a step: null before a file is picked (setup). */
+export function sideIndex(step: WizardView["step"]): number | null {
+  if (step === "intro" || step === "llm_choice" || step === "local_llm_stub" || step === "setup") {
+    return null;
+  }
+  if (step === "pick_file") return 0;
+  if (step === "sampling" || step === "proposing" || step === "segments") return 1;
+  if (step === "analyzing" || step === "preview_segment") return 2;
+  if (step === "ready_to_render" || step === "rendering") return 3;
+  return 4;
+}
+
+/** True when the page shows the job's sidebar: from picking the file on. */
+export function showsSidebar(view: WizardView): boolean {
+  return sideIndex(view.step) !== null;
+}
+
+/**
+ * The sidebar's stepper (mockups 02–09): the job's own stages when the
+ * server sends them, else the five steps followed from the step. The
+ * current step turns to "error" when `failed` (a step that failed, such as
+ * a render that did not finish).
+ */
+export function sidebarSteps(view: WizardView, busy: boolean, failed = false): SideStep[] {
+  const mark = (items: SideStep[]): SideStep[] =>
+    failed ? items.map((item) => (item.state === "current" ? { ...item, state: "error" } : item)) : items;
+  if (hasJobStages(view)) {
+    let items: SideStep[] = stepperItems(view, busy);
+    // The server counts "Ready to render" in its scenes stage; the design
+    // puts it on Render (mockup 06), once every scene is approved.
+    if (view.step === "ready_to_render") {
+      items = items.map((item) =>
+        item.key === "scenes" && item.state === "current"
+          ? { ...item, state: "done" }
+          : item.key === "render" && item.state === "upcoming"
+            ? { ...item, state: "current", detail: "Choose the size" }
+            : item,
+      );
+    }
+    if (items[0]?.key === "file" && !items[0].detail && view.step === "pick_file") {
+      items[0] = { ...items[0], detail: "Pick a file" };
+    }
+    return mark(items);
+  }
+  const active = sideIndex(view.step) ?? 0;
+  const navigable = (target: keyof Navigation | undefined) =>
+    target !== undefined && !busy && !view.busy && view.navigation?.[target] ? target : null;
+  return mark(
+    SIDE_LABELS.map((label, index) => {
+      const state: StepState = index < active ? "done" : index === active ? "current" : "upcoming";
+      let detail = "";
+      if (index === 0 && state === "current") detail = "Pick a file";
+      if (index === 1 && state === "current") detail = view.step === "segments" ? "Check the split" : "Finding scenes…";
+      if (index === 3 && view.step === "rendering") detail = "Rendering…";
+      return { key: SIDE_KEYS[index], label, state, detail, nav: navigable(SIDE_NAV[index]) };
+    }),
+  );
+}
+
+/** The video's length in seconds, from what the server sent, or null. */
+export function videoLength(view: WizardView): number | null {
+  const fromList = view.segments?.duration_s;
+  if (typeof fromList === "number" && fromList > 0) return fromList;
+  const segments = view.segments?.segments;
+  if (Array.isArray(segments) && segments.length) {
+    const end = segments[segments.length - 1].end_s;
+    if (end > 0) return end;
+  }
+  const scenes = view.job?.scenes;
+  if (Array.isArray(scenes) && scenes.length) {
+    const end = scenes[scenes.length - 1].end_s;
+    if (end > 0) return end;
+  }
+  return null;
+}
+
+/**
+ * The facts under the file name ("640×480 · 22:01"): only what the server
+ * sent. Frame rate and sound are not in the API, so they are not shown.
+ */
+export function sourceFacts(view: WizardView): string {
+  const parts: string[] = [];
+  const size = view.looks?.source_size;
+  if (Array.isArray(size) && size.length === 2 && size[0] > 0 && size[1] > 0) {
+    parts.push(`${size[0]}×${size[1]}`);
+  }
+  const length = videoLength(view);
+  if (length !== null) parts.push(clockTime(length));
+  const count = view.job?.scene_count ?? 0;
+  if (count > 0) parts.push(plural(count, "scene", "scenes"));
+  return parts.join(" · ");
+}
+
+/** The job's still for the sidebar: the job list's thumbnail, by job id. */
+export function sourceThumbUrl(view: WizardView): string | null {
+  const id = view.job?.job_id ?? view.job_id;
+  return id ? `/jobs/${encodeURIComponent(id)}/thumb.jpg` : null;
+}
+
+/**
+ * Stills to try in turn for the sidebar: the job's thumbnail, then the
+ * middle scene's still (the job list's thumbnail is the middle still too).
+ */
+export function sourceStills(view: WizardView): string[] {
+  const out: string[] = [];
+  const thumb = sourceThumbUrl(view);
+  if (thumb) out.push(thumb);
+  const fromScenes = (view.job?.scenes ?? []).map((scene) => scene.still_url).filter(Boolean) as string[];
+  const fromList = (view.segments?.segments ?? []).map((segment) => segment.still_url).filter(Boolean) as string[];
+  const stills = fromScenes.length ? fromScenes : fromList;
+  if (stills.length) out.push(stills[Math.floor(stills.length / 2)]);
+  return out;
+}

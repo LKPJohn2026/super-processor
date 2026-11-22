@@ -44,6 +44,7 @@ import {
 import {
   interruptedChoice,
   offersRender,
+  renderFailed,
   readyText,
   resultTitle,
   stopControl,
@@ -53,10 +54,22 @@ import {
   jobTitle,
   overallKey,
   sceneStrip,
-  stepperItems,
+  showsSidebar,
   steadyOverall,
   stripSummary,
 } from "./jobView";
+import {
+  connectionState,
+  documentTitle,
+  headingKey,
+  originHost,
+  progressMilestone,
+  type Milestone,
+} from "./shellView";
+import { AppShell } from "./shell/AppShell";
+import { Sidebar } from "./shell/Sidebar";
+import { TopBar } from "./shell/TopBar";
+import { Banner, Button, Icon, Toggle } from "./ui";
 import { newVideoRoute, sortJobs, startsOnJobs } from "./jobsList";
 import {
   notifyPermission,
@@ -131,6 +144,11 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
   const [localError, setLocalError] = useState<string | null>(null);
   const [runFailed, setRunFailed] = useState(false);
   const [recovery, setRecovery] = useState(0);
+  // Failed polls in a row (the connection pill): 0 since the last answer.
+  const [failures, setFailures] = useState(0);
+  // Progress milestones, read out once each (s9).
+  const [announce, setAnnounce] = useState("");
+  const milestone = useRef<Milestone | null>(null);
   const connection = useRef<AbortController | null>(null);
   // An error to keep when the step it was said for renders: a refused
   // change reloads the job, which may land on another step, and the step
@@ -303,7 +321,7 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
 
   useEffect(() => {
     if (!headingFocus) return;
-    const heading = document.querySelector<HTMLElement>(".panel h1");
+    const heading = document.querySelector<HTMLElement>("#main h1");
     if (heading) {
       heading.tabIndex = -1;
       heading.focus();
@@ -324,9 +342,11 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     if (current?.signal.aborted) return;
     setBusy(false);
     if (!next) {
+      setFailures((value) => Math.max(value + 1, 2));
       setLocalError("Still unable to reach the wizard. Check its printed URL, then retry or disconnect.");
       return;
     }
+    setFailures(0);
     carriedError.current = null;
     onView(next);
     setRunFailed(false);
@@ -357,8 +377,11 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     carriedError.current = null;
     try {
       onView(await request(view));
+      setFailures(0);
       return true;
     } catch (error) {
+      // A request that never reached the server (fetch rejects with a TypeError).
+      if (error instanceof TypeError) setFailures((value) => value + 1);
       const text = error instanceof Error ? error.message : "Request failed";
       const status = (error as { status?: unknown } | null)?.status;
       if (status !== 409 || !(await showCurrent(text))) setLocalError(text);
@@ -476,15 +499,20 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     const subscription = new AbortController();
     // Each poll while the worker runs carries its progress.
     const progress = (next: WizardView) => {
-      if (!cancelled) onView(next);
+      if (cancelled) return;
+      setFailures(0);
+      onView(next);
     };
     run(origin, progress, subscription.signal)
       .then((next) => {
-        if (!cancelled) onView(next);
+        if (cancelled) return;
+        setFailures(0);
+        onView(next);
       })
       .catch((error: unknown) => {
         if (!cancelled) {
           setRunFailed(true);
+          setFailures((value) => Math.max(value, 2));
           const detail = error instanceof Error ? error.message : "The step failed";
           setLocalError(
             `Progress updates stopped: ${detail}. Work may still be running on the server. Retry the connection to refresh its state.`,
@@ -497,24 +525,68 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
     };
   }, [origin, view.step, view.interrupted, onView, recovery]);
 
-  const message = localError || view.error;
+  // Whether this page can reach the wizard, for the top bar's pill: a
+  // quiet look at /api/state every 10 s (its answer is not applied, so it
+  // never races the step's own requests). Skipped while the tab is hidden.
+  useEffect(() => {
+    let cancelled = false;
+    const look = async () => {
+      if (document.hidden) return;
+      const next = await loadState(origin);
+      if (cancelled) return;
+      setFailures((value) => (next ? 0 : value + 1));
+    };
+    const timer = window.setInterval(() => void look(), 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [origin]);
 
-  const topbar = (
-    <header className="topbar">
-      <p className="brand">Super Processor</p>
-      {home === "off" ? (
-        <button type="button" className="secondary small" onClick={showHome}>
-          All jobs
-        </button>
-      ) : null}
-    </header>
+  // Read out a run's progress at milestones only: each stage, each 10%.
+  const runTitle =
+    view.interrupted || !RUNNERS[view.step]
+      ? null
+      : view.step === "rendering"
+        ? "Render"
+        : view.step === "analyzing"
+          ? `Scene ${(view.segment_index ?? 0) + 1}`
+          : "Finding the scenes";
+  useEffect(() => {
+    if (!runTitle) {
+      milestone.current = null;
+      return;
+    }
+    const next = progressMilestone(milestone.current, runTitle, view.progress);
+    if (!next) return;
+    milestone.current = next;
+    setAnnounce(next.text);
+  }, [runTitle, view.progress]);
+
+  const message = localError || view.error;
+  const conn = connectionState(failures);
+  const homeShown = home !== "off";
+  const failedStep = Boolean(view.error) && (renderFailed(view) || view.run?.outcome === "failed");
+  const offline = runFailed || conn === "err";
+
+  const topBar = (
+    <TopBar
+      jobTitle={homeShown ? null : jobTitle(view)}
+      connection={conn}
+      onAllJobs={homeShown ? null : showHome}
+    />
   );
 
-  if (home !== "off") {
+  if (homeShown) {
     const listed = jobs?.some((entry) => entry.open) ?? false;
     return (
-      <>
-        {topbar}
+      <AppShell
+        topBar={topBar}
+        title={documentTitle(view, true)}
+        headingKey={headingKey(view, true)}
+        announce={announce}
+        wide
+      >
         <JobsHome
           origin={origin}
           view={view}
@@ -530,15 +602,59 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           onRefresh={() => setJobsReload((value) => value + 1)}
           onDisconnect={onDisconnect}
         />
-      </>
+      </AppShell>
     );
   }
 
+  const setupLink = Boolean(view.navigation?.setup) && !busy && !view.busy;
+  const sidebar = showsSidebar(view) ? (
+    <Sidebar
+      origin={origin}
+      view={view}
+      busy={busy}
+      failed={failedStep}
+      onGoto={(target) => void send("goto", { to: target })}
+      links={
+        setupLink ? (
+          <button type="button" className="side-link" onClick={() => void send("goto", { to: "setup" })}>
+            <Icon name="key" size={18} />
+            Gemini key settings
+          </button>
+        ) : null
+      }
+    />
+  ) : null;
+
   return (
-    <>
-      {topbar}
-      <JobHeader view={view} busy={busy} onSend={send} />
-      <div className="panel" aria-busy={busy}>
+    <AppShell
+      topBar={topBar}
+      sidebar={sidebar}
+      title={documentTitle(view)}
+      headingKey={headingKey(view)}
+      announce={announce}
+      busy={busy}
+      wide={!sidebar}
+    >
+      {offline ? (
+        <Banner
+          tone="error"
+          role="alert"
+          title={`Can’t reach the wizard at ${originHost(origin, window.location.origin)}`}
+          actions={
+            <>
+              <Button kind="primary" size="md" icon="rotate" disabled={busy} onClick={() => void recover()}>
+                {busy ? "Reconnecting…" : "Try again"}
+              </Button>
+              <Button kind="secondary" size="md" onClick={onDisconnect}>
+                Change address
+              </Button>
+            </>
+          }
+        >
+          It may have stopped. Your work is safe — anything that was running keeps running.
+        </Banner>
+      ) : null}
+      <div className="step-body">
         <WizardStepView
           origin={origin}
           view={view}
@@ -559,18 +675,8 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           onRequest={perform}
           onReopened={() => setHeadingFocus((value) => value + 1)}
         />
-        <div className="actions">
-          {runFailed && (
-            <button type="button" disabled={busy} onClick={() => void recover()}>
-              {busy ? "Reconnecting…" : "Retry connection"}
-            </button>
-          )}
-          <button type="button" className="secondary" onClick={onDisconnect}>
-            Disconnect
-          </button>
-        </div>
       </div>
-    </>
+    </AppShell>
   );
 }
 
@@ -624,93 +730,20 @@ function NotifyToggle({ on, onChange }: { on: boolean; onChange: (on: boolean) =
   const hint = toggle.hint ?? (refused ? "Notifications stay off: the browser was not allowed to show them." : null);
   return (
     <div className="notify-toggle">
-      <label htmlFor="notify-done" className="inline">
-        <input
-          id="notify-done"
-          type="checkbox"
-          checked={toggle.checked}
-          disabled={toggle.disabled}
-          aria-describedby="notify-hint"
-          onChange={(event) => void change(event.target.checked)}
-        />
+      <Toggle
+        id="notify-done"
+        checked={toggle.checked}
+        disabled={toggle.disabled}
+        hintId="notify-hint"
+        onChange={(checked) => void change(checked)}
+      >
+        <Icon name="bell" size={18} />
         Notify me when it’s done
-      </label>
+      </Toggle>
       <p id="notify-hint" className="muted notify-hint" role="status">
         {hint}
       </p>
     </div>
-  );
-}
-
-/** The job's title and its stepper (or the plain rail before a job exists). */
-function JobHeader({ view, busy, onSend }: { view: WizardView; busy: boolean; onSend: SendAction }) {
-  const title = jobTitle(view);
-  const items = stepperItems(view, busy);
-  const fromJob = items.length > 0 && items[0].key === "file";
-  const setupLink = fromJob && view.navigation?.setup && !busy && !view.busy;
-  return (
-    <>
-      {title ? (
-        <p className="job-title">
-          <span className="sr-only">Job: </span>
-          {title}
-        </p>
-      ) : null}
-      <nav aria-label={fromJob ? "Steps of this job" : "Progress"}>
-        <ol className={fromJob ? "stepper" : "steps"}>
-          {items.map((item, index) => {
-            const label = item.nav ? (
-              <button
-                type="button"
-                className="step-link"
-                aria-label={`${item.label}: ${BACK_TEXT[item.nav].toLowerCase()}`}
-                onClick={() => void onSend("goto", { to: item.nav! })}
-              >
-                {item.label}
-              </button>
-            ) : (
-              item.label
-            );
-            if (!fromJob) {
-              return (
-                <li
-                  key={item.key}
-                  className={item.state === "current" ? "active" : undefined}
-                  aria-current={item.state === "current" ? "step" : undefined}
-                >
-                  {label}
-                </li>
-              );
-            }
-            return (
-              <li
-                key={item.key}
-                className={`stage ${item.state}`}
-                aria-current={item.state === "current" ? "step" : undefined}
-              >
-                <span className="marker" aria-hidden="true">
-                  {item.state === "done" ? "✓" : index + 1}
-                </span>
-                <span className="stage-text">
-                  <span className="stage-label">{label}</span>
-                  <span className="sr-only">
-                    {item.state === "done" ? ", done" : item.state === "current" ? ", now" : ", to come"}
-                  </span>
-                  {item.detail ? <span className="stage-detail">{item.detail}</span> : null}
-                </span>
-              </li>
-            );
-          })}
-        </ol>
-      </nav>
-      {setupLink ? (
-        <p className="setup-link">
-          <button type="button" className="link" onClick={() => void onSend("goto", { to: "setup" })}>
-            Gemini key settings
-          </button>
-        </p>
-      ) : null}
-    </>
   );
 }
 

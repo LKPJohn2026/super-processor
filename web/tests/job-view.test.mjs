@@ -13,6 +13,10 @@ assert.ok(!/from\s+["']\.\/api["']/.test(outputText), "jobView.ts must import on
 const {
   clockTime,
   hasJobStages,
+  showsSidebar,
+  sidebarSteps,
+  sourceFacts,
+  sourceStills,
   jobTitle,
   overallKey,
   sceneStrip,
@@ -157,4 +161,57 @@ test("clock times for scene ranges", () => {
   assert.equal(clockTime(0), "0:00");
   assert.equal(clockTime(272.9), "4:32");
   assert.equal(clockTime(3725), "1:02:05");
+});
+
+test("the sidebar shows from picking the file on, not during setup", () => {
+  assert.equal(showsSidebar(view("setup", { job_id: null })), false);
+  assert.equal(showsSidebar(view("intro", { job_id: null })), false);
+  assert.equal(showsSidebar(view("pick_file", { job_id: null })), true);
+  assert.equal(showsSidebar(view("result")), true);
+});
+
+test("the sidebar's steps follow the step before a job summary exists", () => {
+  const items = sidebarSteps(view("pick_file", { job_id: null }), false);
+  assert.deepEqual(items.map((i) => i.label), ["Video", "Scenes", "Previews", "Render", "Result"]);
+  assert.deepEqual(items.map((i) => i.state), ["current", "upcoming", "upcoming", "upcoming", "upcoming"]);
+  assert.equal(items[0].detail, "Pick a file");
+  const ready = sidebarSteps(view("ready_to_render", { job_id: null }), false);
+  assert.deepEqual(ready.map((i) => i.state), ["done", "done", "done", "current", "upcoming"]);
+});
+
+test("the sidebar's steps come from the job's stages, and a failed step is marked", () => {
+  const shown = view("ready_to_render", {
+    job: job({ stage: "render", stages: stages("render", ["file", "segments", "scenes"]) }),
+  });
+  assert.deepEqual(sidebarSteps(shown, false).map((i) => i.state), ["done", "done", "done", "current", "upcoming"]);
+  assert.deepEqual(sidebarSteps(shown, false, true).map((i) => i.state), ["done", "done", "done", "error", "upcoming"]);
+});
+
+test("Ready to render is the Render step, as the server still counts it in its scenes", () => {
+  const shown = view("ready_to_render", {
+    job: job({ approved_count: 3, stages: stages("scenes", ["file", "segments"]) }),
+  });
+  const items = sidebarSteps(shown, false);
+  assert.deepEqual(items.map((i) => i.state), ["done", "done", "done", "current", "upcoming"]);
+  assert.equal(items[3].detail, "Choose the size");
+});
+
+test("the source facts say only what the server sent", () => {
+  assert.equal(sourceFacts(view("pick_file", { job_id: null })), "");
+  assert.equal(
+    sourceFacts(view("ready_to_render", { looks: { scale: 2, error: null, shots: [], source_size: [640, 480] }, job: job() })),
+    "640×480 · 2:48 · 3 scenes",
+  );
+  assert.equal(
+    sourceFacts(view("segments", { segments: { segments: [], error: null, note: "", duration_s: 1321 } })),
+    "22:01",
+  );
+});
+
+test("the sidebar's still is the job's thumbnail, then the middle scene's still", () => {
+  assert.deepEqual(sourceStills(view("pick_file", { job_id: null })), []);
+  assert.deepEqual(sourceStills(view("preview_segment", { job: job() })), [
+    "/jobs/abcdef12/thumb.jpg",
+    "/jobs/abcdef12/segments/still-1.jpg",
+  ]);
 });

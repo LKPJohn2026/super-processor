@@ -48,32 +48,23 @@ export function App() {
     setView(next);
   }
 
-  return (
-    <>
-      <a className="skip" href="#main">
-        Skip to content
-      </a>
-      <main id="main" className="shell">
-        {view ? (
-          <LiveWizard
-            origin={origin}
-            view={view}
-            onView={onView}
-            onDisconnect={() => {
-              setView(null);
-              setConnectError(null);
-            }}
-          />
-        ) : (
-          <StaticShell
-            checking={checking}
-            connectError={connectError}
-            onConnect={(url) => {
-              void connect(url);
-            }}
-          />
-        )}
-      </main>
-    </>
+  return view ? (
+    <LiveWizard
+      origin={origin}
+      view={view}
+      onView={onView}
+      onDisconnect={() => {
+        setView(null);
+        setConnectError(null);
+      }}
+    />
+  ) : (
+    <StaticShell
+      checking={checking}
+      connectError={connectError}
+      onConnect={(url) => {
+        void connect(url);
+      }}
+    />
   );
 }

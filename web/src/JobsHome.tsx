@@ -1,6 +1,16 @@
 import { useEffect, useState } from "react";
 import { outputSrc, type JobEntry, type WizardView } from "./api";
-import { busyHere, jobAction, jobMeta, jobStatus, newVideoRoute } from "./jobsList";
+import { busyHere, jobAction, jobMeta, jobStatus, newVideoRoute, type JobStatus } from "./jobsList";
+import { Badge, Banner, Button, Card, Icon, type BadgeTone } from "./ui";
+
+// The list's tones in the design's badge colours.
+const TONE: Record<JobStatus["tone"], BadgeTone> = {
+  ok: "success",
+  working: "info",
+  waiting: "warning",
+  busy: "neutral",
+  failed: "error",
+};
 
 type JobsHomeProps = {
   origin: string;
@@ -65,15 +75,17 @@ export function JobsHome({
   const pct = view.progress?.overall ?? view.progress?.pct ?? null;
 
   return (
-    <section className="panel jobs-home" aria-labelledby="jobs-title" aria-busy={jobs === null || working}>
+    <section className="jobs-home" aria-labelledby="jobs-title" aria-busy={jobs === null || working}>
       <div className="jobs-head">
-        <div>
-          <h1 id="jobs-title">Your videos</h1>
+        <div className="col gap4">
+          <h1 id="jobs-title" className="h1">
+            Your videos
+          </h1>
           <p className="muted">Pick up where you left off, or start a new one.</p>
         </div>
-        <button type="button" disabled={route === "blocked" || working} onClick={onNewVideo}>
+        <Button icon="film" disabled={route === "blocked" || working} onClick={onNewVideo}>
           Restore a new video
-        </button>
+        </Button>
       </div>
       {route === "blocked" ? (
         <p className="muted jobs-hint">
@@ -83,25 +95,25 @@ export function JobsHome({
       <p className="sr-only" role="status" aria-live="polite">
         {status}
       </p>
-      {openError ? (
-        <p className="error" role="alert">
-          {openError}
-        </p>
-      ) : null}
+      {openError ? <Banner tone="error" role="alert" title={openError} /> : null}
       {loading && slow ? <p className="muted">Looking for your videos…</p> : null}
       {loadError ? (
-        <div className="notice">
-          <p>Could not list your videos: {loadError}</p>
-          <div className="actions">
-            <button type="button" className="secondary" onClick={onRefresh}>
+        <Banner
+          tone="warning"
+          title="Could not list your videos"
+          actions={
+            <Button kind="secondary" size="md" icon="rotate" onClick={onRefresh}>
               Try again
-            </button>
-          </div>
-        </div>
+            </Button>
+          }
+        >
+          {loadError}
+        </Banner>
       ) : null}
       {jobs !== null && jobs.length === 0 ? (
         <div className="jobs-empty">
-          <h2>No videos yet</h2>
+          <Icon name="film" size={28} color="var(--leaf)" />
+          <h2 className="h3">No videos yet</h2>
           <p className="muted">
             Each video you restore shows up here, with its result, so you can pick up where you
             left off.
@@ -109,7 +121,7 @@ export function JobsHome({
         </div>
       ) : null}
       {jobs !== null && jobs.length > 0 ? (
-        <>
+        <Card className="jobs-card">
           <h2 className="overline">Recent jobs</h2>
           <ul className="jobs-list">
             {jobs.map((entry) => {
@@ -128,15 +140,14 @@ export function JobsHome({
                     <span className="job-thumb still-gap" aria-hidden="true" />
                   )}
                   <div className="job-text">
-                    <h3 className="job-name">
+                    <h3 className="job-name h3">
                       {entry.title}
                       {entry.open ? <span className="job-here"> · open here</span> : null}
                     </h3>
                     {meta ? <span className="job-meta">{meta}</span> : null}
-                    <span className={`badge ${badge.tone}`}>
-                      <span className="sr-only">Status: </span>
+                    <Badge tone={TONE[badge.tone]} srPrefix="Status: ">
                       {badge.text}
-                    </span>
+                    </Badge>
                     {result ? (
                       <a className="job-result" href={result} target="_blank" rel="noreferrer">
                         Watch the result<span className="sr-only"> of {entry.title} (opens a new tab)</span>
@@ -144,16 +155,16 @@ export function JobsHome({
                     ) : null}
                   </div>
                   <div className="job-action">
-                    <button
-                      type="button"
-                      className="secondary"
+                    <Button
+                      kind="secondary"
+                      size="md"
                       disabled={action.kind === "none" || working}
                       aria-describedby={action.reason ? reasonId : undefined}
                       onClick={() => (action.kind === "show" ? onShowCurrent() : onOpen(entry))}
                     >
                       {isOpening ? "Opening…" : action.label}
                       <span className="sr-only"> {entry.title}</span>
-                    </button>
+                    </Button>
                     {action.reason ? (
                       <span id={reasonId} className="job-reason">
                         {action.reason}
@@ -164,20 +175,20 @@ export function JobsHome({
               );
             })}
           </ul>
-        </>
+        </Card>
       ) : null}
-      <div className="actions">
+      <div className="row gap12 wrap">
         {backLabel ? (
-          <button type="button" className="secondary" onClick={onShowCurrent}>
+          <Button kind="secondary" size="md" icon="chevron-left" onClick={onShowCurrent}>
             {backLabel}
-          </button>
+          </Button>
         ) : null}
-        <button type="button" className="secondary" disabled={jobs === null && !loadError} onClick={onRefresh}>
+        <Button kind="ghost" size="md" icon="rotate" disabled={jobs === null && !loadError} onClick={onRefresh}>
           Refresh the list
-        </button>
-        <button type="button" className="secondary" onClick={onDisconnect}>
+        </Button>
+        <Button kind="ghost" size="md" icon="wifi" onClick={onDisconnect}>
           Disconnect
-        </button>
+        </Button>
       </div>
     </section>
   );
