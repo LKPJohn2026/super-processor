@@ -82,6 +82,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pip install "ancient-processor[gpu]"`. Before, it said
   `super-processor[gpu]`, a different PyPI name that could install someone
   else's code.
+- Every GitHub Action in CI, Pages and the release is now pinned to a fixed
+  commit instead of a tag or branch the action's owner could move. The
+  GitHub Release is created with GitHub's own `gh` tool instead of a
+  third-party action, so no outside code holds the token that can write
+  releases.
+- The PyPI upload token and the release-writing token are now given only to
+  the one job that needs each, and the PyPI job runs only for `v*` tags in
+  the `pypi` environment. CONTRIBUTING.md lists the GitHub settings to turn
+  on by hand (protected `main`, a reviewer on `pypi`, a `v*` tag rule).
+- The Pages build, including every pull-request run, now has a read-only
+  token. Only the deploy step, on pushes to `main`, can publish the site.
+- Release builds no longer fetch the newest setuptools, Cython,
+  setuptools-scm, build, cibuildwheel, twine or pytest at tag time. They are
+  exact versions installed from files with checksums, and the build uses
+  only those, so a bad new release of one of them cannot end up in the
+  wheels published to PyPI. The `wheel` package is no longer needed.
+- Dependabot now also watches the web app's npm packages and the pinned
+  release tools, and keeps the pinned actions up to date.
 
 ## [4.3.0] - 2026-11-22
 

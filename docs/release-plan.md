@@ -103,7 +103,10 @@ implementation commits is not authorization to create a public release.
    wheel builds/tests, metadata checks, then a **public GitHub Release**. PyPI
    additionally requires `PYPI_PUBLISH=true` and the trusted-publisher environment.
    Inspect publication settings before tagging; disabling PyPI does not disable
-   the GitHub Release.
+   the GitHub Release. Actions are pinned to commit SHAs and the build tools are
+   installed from hash-checked files; check the GitHub-side settings listed under
+   [Supply chain](../CONTRIBUTING.md#supply-chain) (required reviewer on `pypi`,
+   `v*` tag ruleset, protected `main`) before the first release.
 5. Verify workflow success, attached artifacts, installation/self-test from a
    released artifact, and release notes. Repair a failed release with a new
    commit/version, never by moving an existing tag.

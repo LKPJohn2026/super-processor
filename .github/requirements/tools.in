@@ -1,0 +1,4 @@
+# Release tools run on the CI runner itself (installed with --require-hashes).
+build==1.6.1
+cibuildwheel==3.4.1
+twine==7.0.0

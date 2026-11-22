@@ -8,6 +8,18 @@ updates:
       development-dependencies:
         dependency-type: development
 
+  # Hash-pinned release toolchain (build.txt, tools.txt). Regenerate both files
+  # with the uv pip compile command in their headers if a bump PR fails CI.
+  - package-ecosystem: pip
+    directory: /.github/requirements
+    schedule:
+      interval: weekly
+    groups:
+      release-toolchain:
+        patterns: ["*"]
+
+  # Actions are pinned to commit SHAs with a "# vX.Y.Z" comment; Dependabot
+  # bumps the SHA and the comment together.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -15,3 +27,15 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+
+  # The web app. Runtime and dev dependencies are grouped apart so a react or
+  # react-dom fix is not held up behind a tooling bump.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    groups:
+      web-runtime:
+        dependency-type: production
+      web-tooling:
+        dependency-type: development

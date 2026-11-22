@@ -78,7 +78,8 @@ reports, caches, or `*.egg-info` directories.
 ### Packaging smoke check
 
 `python -m build` builds the sdist, then a wheel from that sdist, using the
-build dependencies declared in `pyproject.toml`; `twine check` validates their
+exactly pinned build dependencies declared in `pyproject.toml` (CI and the
+release use the hash-checked copies instead; see [Supply chain](#supply-chain)); `twine check` validates their
 metadata without uploading anything. The sdist must also retain the tracked
 `web/` sources, especially `web/index.html`. Only generated Cython annotation
 HTML under `src/super_processor/` is excluded, not all HTML in the repository.
@@ -124,3 +125,54 @@ The release workflow builds and tests source and wheel distributions before
 creating a GitHub Release. PyPI trusted publishing remains disabled unless the
 repository variable `PYPI_PUBLISH` is set to `true` and the `pypi` environment
 has been configured with a matching PyPI trusted publisher.
+
+### Supply chain
+
+The release workflow can publish to PyPI and write GitHub Releases, so
+everything it runs is pinned:
+
+- Every action in `.github/workflows/` is pinned to a full commit SHA with the
+  version as a comment (`uses: actions/checkout@<sha> # v7.0.1`). Dependabot's
+  `github-actions` entry bumps the SHA and the comment together. Never go back
+  to a tag or branch such as `@v7` or `@release/v1`.
+- Workflow-level `permissions` are read-only. Only the jobs that need more get
+  it: `github-release` (`contents: write`, runs only GitHub's own actions and
+  the `gh` CLI), `pypi` (`id-token: write`, in the `pypi` environment) and the
+  Pages `deploy` job (`pages: write`, `id-token: write`, in `github-pages`, on
+  pushes to `main` only). Pull-request runs never get a write token.
+- The build toolchain is exact. `[build-system].requires` in `pyproject.toml`
+  uses `==` pins that match `.github/requirements/build.in`. The release (and
+  the CI `package` job) installs `.github/requirements/build.txt` and
+  `tools.txt` with `pip install --require-hashes` and builds with
+  `--no-isolation`, so nothing is resolved fresh from PyPI when a tag is
+  pushed. cibuildwheel does the same through `CIBW_BEFORE_BUILD`,
+  `CIBW_BEFORE_TEST` and `CIBW_BUILD_FRONTEND: "build; args: --no-isolation"`.
+- `tests/test_workflow_hardening.py` fails if any of this regresses: an
+  unpinned `uses:`, a workflow-level write permission, `${{ github.event.* }}`
+  inside a `run:` script, an unhashed `pip install` in `release.yml`, or
+  build-system requirements that are not exact pins matching `build.txt`.
+
+To change a build tool version, edit `pyproject.toml` and
+`.github/requirements/build.in` (or `tools.in`) together, then regenerate the
+locks with the commands at the top of `build.txt` and `tools.txt` (run them
+from the repository root; `uv pip compile` only writes the output file and
+does not touch `.venv`). Bump the `--exclude-newer` date in both commands to
+about two weeks before today, so a release that appeared only days ago is not
+picked up.
+
+These settings live in GitHub, not in the repository, and must be set by a
+maintainer:
+
+- **Branch protection for `main`**: block force pushes and deletion, and
+  require pull requests with the CI checks (`Quality`, `Test (...)`,
+  `Frontend regressions and build`, `Build distributions`) to pass.
+- **Tag ruleset for `v*`**: only maintainers may create tags, and no one may
+  move or delete them.
+- **`pypi` environment**: add a required reviewer and limit deployments to
+  tags matching `v*`. Bind the PyPI trusted publisher to the workflow
+  `release.yml` and the environment `pypi`.
+- **`github-pages` environment**: limit deployments to the `main` branch.
+- **Actions settings**: turn on "Require actions to be pinned to a full-length
+  commit SHA".
+- **Security settings**: turn on Dependabot alerts and Dependabot security
+  updates (version updates in `.github/dependabot.yml` do not replace them).

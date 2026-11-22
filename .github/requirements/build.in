@@ -1,0 +1,7 @@
+# Build backend and test runner for release builds (installed with --require-hashes).
+# Keep these versions identical to [build-system].requires in pyproject.toml.
+build==1.6.1
+cython==3.3.0
+pytest==9.2.0
+setuptools==84.2.1
+setuptools-scm[toml]==10.3.4

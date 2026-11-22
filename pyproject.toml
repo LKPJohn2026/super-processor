@@ -1,9 +1,12 @@
 [build-system]
+# Exact pins, kept identical to .github/requirements/build.in. Releases install
+# these from the hash-checked .github/requirements/build.txt and build with
+# --no-isolation; tests/test_workflow_hardening.py checks the two match.
+# setuptools builds wheels itself, so "wheel" is not needed.
 requires = [
-  "Cython>=3.0,<4",
-  "setuptools>=77",
-  "setuptools-scm[toml]>=8,<11",
-  "wheel",
+  "Cython==3.3.0",
+  "setuptools==84.2.1",
+  "setuptools-scm[toml]==10.3.4",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -47,6 +50,8 @@ dev = [
   "mypy>=1.11",
   "pytest>=8.3",
   "pytest-cov>=6",
+  # tests/test_workflow_hardening.py parses the workflow files.
+  "PyYAML>=6",
   "ruff>=0.11",
   "setuptools>=77",
   "twine>=5.1",
