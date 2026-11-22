@@ -129,6 +129,8 @@ test("the viewer's keys, wipe and clock", () => {
   assert.equal(viewerKey("ArrowLeft"), "back");
   assert.equal(viewerKey("Z"), "zoom");
   assert.equal(viewerKey("x"), null);
+  assert.equal(viewerKey("i"), "markStart");
+  assert.equal(viewerKey("O"), "markEnd");
   assert.equal(wipeKey("ArrowRight", 50), 55);
   assert.equal(wipeKey("ArrowLeft", 2), 0);
   assert.equal(wipeKey("End", 10), 100);

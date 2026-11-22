@@ -51,6 +51,9 @@ export function documentTitle(view: WizardView | null, home = false): string {
       else parts.push("Rendering", "Render");
       break;
     }
+    case "done":
+      parts.push("Saved", "Result");
+      break;
     default:
       parts.push("Result");
   }

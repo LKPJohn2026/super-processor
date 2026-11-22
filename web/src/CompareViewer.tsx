@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent,
+  type ReactNode,
+} from "react";
 import type { Region } from "./api";
 import {
   clampWipe,
@@ -39,7 +47,12 @@ function keyOwner(target: EventTarget | null): "field" | "control" | null {
  * after previews kept in step, with one play/pause, one scrubber and frame
  * steps; Wipe (a draggable, keyboard handle), Side by side or A/B; a 100%
  * view; the protect boxes with their labels. Keys (s9): Space plays, ←/→
- * step a frame, B flips before/after, Z zooms to 100%.
+ * step a frame, B flips before/after, Z zooms to 100%; with `onMark`, I
+ * and O mark the start and end of a part at the player's time.
+ *
+ * Without `beforeSrc` (the Result: the wizard serves no copy of the
+ * original) it plays the restored video alone, with the same controls but
+ * no Wipe, Side by side or A/B.
  */
 export function CompareViewer({
   beforeSrc,
@@ -50,8 +63,12 @@ export function CompareViewer({
   afterLabel,
   sceneName,
   onDuration,
+  onTime,
+  onMark,
+  timeline,
+  positionLabel = "Position in the preview",
 }: {
-  beforeSrc: string;
+  beforeSrc?: string | null;
   afterSrc: string;
   beforePoster?: string;
   afterPoster?: string;
@@ -59,7 +76,15 @@ export function CompareViewer({
   afterLabel: string;
   sceneName: string;
   onDuration?: (seconds: number) => void;
+  // The player's time, as it changes.
+  onTime?: (seconds: number) => void;
+  // I / O: the start or end of a part, at the player's time.
+  onMark?: (which: "start" | "end", seconds: number) => void;
+  // Drawn between the picture and the controls (the Result's seams).
+  timeline?: ReactNode;
+  positionLabel?: string;
 }) {
+  const single = !beforeSrc;
   const root = useRef<HTMLDivElement | null>(null);
   const picture = useRef<HTMLDivElement | null>(null);
   const before = useRef<HTMLVideoElement | null>(null);
@@ -128,41 +153,46 @@ export function CompareViewer({
   const togglePlay = useCallback(() => {
     const a = after.current;
     const b = before.current;
-    if (!a || !b) return;
+    if (!a || (!b && !single)) return;
     if (a.paused) {
-      b.currentTime = a.currentTime;
+      if (b) b.currentTime = a.currentTime;
       void a.play().catch(() => setPlaying(false));
-      void b.play().catch(() => undefined);
+      if (b) void b.play().catch(() => undefined);
       setPlaying(true);
     } else {
       a.pause();
-      b.pause();
-      b.currentTime = a.currentTime;
+      if (b) {
+        b.pause();
+        b.currentTime = a.currentTime;
+      }
       setPlaying(false);
       setTime(a.currentTime);
     }
-  }, []);
+  }, [single]);
 
-  const seek = useCallback((to: number) => {
-    const a = after.current;
-    const b = before.current;
-    if (!a || !b) return;
-    a.currentTime = to;
-    b.currentTime = to;
-    setTime(to);
-  }, []);
+  const seek = useCallback(
+    (to: number) => {
+      const a = after.current;
+      const b = before.current;
+      if (!a || (!b && !single)) return;
+      a.currentTime = to;
+      if (b) b.currentTime = to;
+      setTime(to);
+    },
+    [single],
+  );
 
   const step = useCallback(
     (frames: number) => {
       const a = after.current;
       const b = before.current;
-      if (!a || !b) return;
+      if (!a || (!b && !single)) return;
       a.pause();
-      b.pause();
+      b?.pause();
       setPlaying(false);
       seek(stepTime(a.currentTime, a.duration || duration, frames, frameS.current));
     },
-    [duration, seek],
+    [duration, seek, single],
   );
 
   const flip = useCallback(() => {
@@ -182,6 +212,8 @@ export function CompareViewer({
       if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
       const action = viewerKey(event.key);
       if (!action) return;
+      if ((action === "markStart" || action === "markEnd") && !onMark) return;
+      if (action === "flip" && single) return;
       const owner = keyOwner(event.target);
       if (owner === "field") return;
       if (owner === "control" && (action === "play" || action === "back" || action === "forward")) return;
@@ -191,11 +223,17 @@ export function CompareViewer({
       else if (action === "back") step(-1);
       else if (action === "forward") step(1);
       else if (action === "flip") flip();
+      else if (action === "markStart") onMark?.("start", after.current?.currentTime ?? 0);
+      else if (action === "markEnd") onMark?.("end", after.current?.currentTime ?? 0);
       else setZoom((value) => !value);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, step, flip]);
+  }, [togglePlay, step, flip, onMark, single]);
+
+  useEffect(() => {
+    onTime?.(time);
+  }, [time, onTime]);
 
   // Entering the 100% view: start at the middle of the picture.
   useEffect(() => {
@@ -217,7 +255,7 @@ export function CompareViewer({
     "--stage-h": `${STAGE_H}px`,
     ...(zoom && size ? { width: `${size[0]}px` } : null),
   } as CSSProperties;
-  const stacked = mode !== "side";
+  const stacked = single || mode !== "side";
   const tag = (text: string, side: "left" | "right") => <span className={`vtag ${side}`}>{text}</span>;
   const boxes = regions.map((region, index) => (
     <span
@@ -266,6 +304,7 @@ export function CompareViewer({
         {stacked ? null : tag(afterLabel, "left")}
         {stacked ? null : boxes}
       </div>
+      {single ? null : (
       <div className="vframe v-before" style={beforeFrameStyle}>
         <video
           ref={before}
@@ -281,7 +320,13 @@ export function CompareViewer({
         {stacked ? null : tag("Original", "left")}
         {stacked ? null : boxes}
       </div>
-      {stacked ? (
+      )}
+      {single ? (
+        <div className="vframe v-overlay" style={frameStyle}>
+          {boxes}
+          {tag(afterLabel, "left")}
+        </div>
+      ) : stacked ? (
         <div
           className={mode === "wipe" ? "vframe v-overlay wiping" : "vframe v-overlay"}
           style={frameStyle}
@@ -338,13 +383,19 @@ export function CompareViewer({
   );
 
   return (
-    <div ref={root} className="viewer" role="group" aria-label={`Before and after: ${sceneName}`}>
+    <div
+      ref={root}
+      className="viewer"
+      role="group"
+      aria-label={single ? sceneName : `Before and after: ${sceneName}`}
+    >
       <div
         ref={picture}
         className={["picture", mode === "side" ? "side" : null, zoom ? "zoomed" : null].filter(Boolean).join(" ")}
       >
         {stage}
       </div>
+      {timeline}
       <p className="sr-only" role="status">
         {mode === "ab" ? (showAfter ? `Showing ${afterLabel}` : "Showing the original") : ""}
       </p>
@@ -370,12 +421,12 @@ export function CompareViewer({
           max={duration || 0}
           step={0.01}
           value={Math.min(time, duration || 0)}
-          aria-label="Position in the preview"
+          aria-label={positionLabel}
           aria-valuetext={playerTime(time, duration)}
           style={{ "--played": `${duration ? (time / duration) * 100 : 0}%` } as CSSProperties}
           onChange={(event) => seek(Number(event.target.value))}
         />
-        <Segmented label="Compare" dark options={MODES} value={mode} onChange={setMode} />
+        {single ? null : <Segmented label="Compare" dark options={MODES} value={mode} onChange={setMode} />}
         <button
           type="button"
           className="vzoom"

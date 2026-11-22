@@ -68,7 +68,12 @@ export function versionNote(version: Pick<OutputVersion, "note" | "number" | "ki
 /** The file name a download is saved as: "Cat – version 2.mp4". */
 export function downloadName(title: string | null | undefined, version: Pick<OutputVersion, "number">): string {
   // Characters most file systems refuse, and leading dots, are dropped.
-  const base = (title ?? "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, " ").replace(/^\.+/, "").trim();
+  // A title that is the picked file's name loses its video extension.
+  const base = (title ?? "")
+    .replace(/\.(mp4|m4v|mov|mkv|avi|webm|mpe?g|wmv|ts)$/i, "")
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, " ")
+    .replace(/^\.+/, "")
+    .trim();
   const name = (base || "Restored video").slice(0, 80).trim();
   return `${name} – version ${version.number}.mp4`;
 }

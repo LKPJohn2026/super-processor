@@ -232,7 +232,7 @@ export function wipeKey(key: string, value: number, big = false): number | null 
   return null;
 }
 
-export type ViewerAction = "play" | "back" | "forward" | "flip" | "zoom";
+export type ViewerAction = "play" | "back" | "forward" | "flip" | "zoom" | "markStart" | "markEnd";
 
 /** The viewer's keys (s9): Space plays, ←/→ step a frame, B flips before/after, Z zooms to 100%. */
 export function viewerKey(key: string): ViewerAction | null {
@@ -241,6 +241,9 @@ export function viewerKey(key: string): ViewerAction | null {
   if (key === "ArrowRight") return "forward";
   if (key === "b" || key === "B") return "flip";
   if (key === "z" || key === "Z") return "zoom";
+  // Only a viewer that marks a range (the Result) acts on these.
+  if (key === "i" || key === "I") return "markStart";
+  if (key === "o" || key === "O") return "markEnd";
   return null;
 }
 

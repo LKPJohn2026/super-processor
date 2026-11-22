@@ -64,6 +64,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close this tab" and Cancel render, and the tab title shows the percentage.
   A failed render marks Render in red, says why, and offers Try the render
   again and Render without AI detail.
+- The Result step is "Watch the restored film": the restored video in the
+  viewer with the scene seams and any possible seam drawn under it, and
+  "Keep this video". "Fix part of it" marks a part from the player (Mark
+  start / Mark end, or I and O while it plays), adds fixes as chips (less AI
+  detail, smoother, sharper, fix a seam) and your words, shows the note
+  Gemini reads, and re-renders that part. "Changes so far" lists the notes
+  behind each version. "Start over from the scenes…" moves into a More menu
+  with "Restore another video", behind a dialog that says what is deleted
+  and what is kept.
+- After "Keep this video" the page says "Your restored video is ready",
+  with the file's name, picture size, length and size, Copy link, Save a
+  copy, a still of one scene before and after, and the versions. All jobs
+  shows each job's status beside its button, and Refresh and Disconnect
+  move into its More menu.
 
 ## [4.2.0] - 2026-11-21
 

@@ -41,7 +41,7 @@ test("a stopped view is not shown as success", () => {
     assert.equal(stoppedNote(stopped), note, step);
   }
   assert.equal(resultTitle(view("result", { stopped: KEPT })), "Render stopped");
-  assert.equal(resultTitle(view("result")), "Result");
+  assert.equal(resultTitle(view("result")), "Watch the restored film");
   assert.equal(readyText(view("ready_to_render", { stopped: RENDER_STOPPED })).title, "Render stopped");
 });
 

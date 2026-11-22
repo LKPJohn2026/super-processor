@@ -21,6 +21,8 @@ test("the tab title names the step, the scene and the app", () => {
     "Scene 3 of 5 · Previews · Super Processor",
   );
   assert.equal(documentTitle(view("pick_file")), "Choose a video · Video · Super Processor");
+  assert.equal(documentTitle(view("result")), "Result · Super Processor");
+  assert.equal(documentTitle(view("done")), "Saved · Result · Super Processor");
   assert.equal(documentTitle(view("rendering")), "Rendering · Render · Super Processor");
   assert.equal(documentTitle(view("rendering", { interrupted: true })), "Waiting for you · Rendering · Render · Super Processor");
   assert.equal(

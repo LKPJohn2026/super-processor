@@ -216,3 +216,12 @@ test("the sidebar's still is the job's thumbnail, then the middle scene's still"
     "/jobs/abcdef12/segments/still-1.jpg",
   ]);
 });
+
+test("the Result step says the version, and Kept once the video is kept", () => {
+  const versions = [{ number: 1, current: false }, { number: 2, current: true }];
+  const done = job({ stage: "result", stages: stages("result", ["file", "segments", "scenes", "render"]) });
+  const last = (step) => sidebarSteps(view(step, { job: done, versions }), false).at(-1).detail;
+  assert.equal(last("result"), "Version 2");
+  assert.equal(last("done"), "Kept · version 2");
+  assert.equal(sidebarSteps(view("done", { job: done, versions }), false).at(-1).state, "done");
+});

@@ -113,7 +113,7 @@ export function readyText(view: WizardView): ReadyText {
 export function resultTitle(view: WizardView): string {
   const tone = viewTone(view);
   if (tone === "stopped") return "Render stopped";
-  return "Result";
+  return "Watch the restored film";
 }
 
 export type InterruptedChoice = {

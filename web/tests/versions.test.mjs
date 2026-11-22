@@ -103,6 +103,7 @@ test("a download is named after the job and the version", () => {
   assert.equal(downloadName("Private Life of a Cat", version(2)), "Private Life of a Cat – version 2.mp4");
   assert.equal(downloadName(null, version(1)), "Restored video – version 1.mp4");
   assert.equal(downloadName("../a/b:c", version(1)), "a b c – version 1.mp4");
+  assert.equal(downloadName("PrivateL1947.mp4", version(2)), "PrivateL1947 – version 2.mp4");
 });
 
 test("the background preview note shows only for the next scene", () => {

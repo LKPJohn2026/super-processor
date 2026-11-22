@@ -37,15 +37,26 @@ type LinkButtonProps = {
   size?: ButtonSize;
   icon?: IconName;
   newTab?: boolean;
+  // Saves the file under this name instead of opening it.
+  download?: string;
   className?: string;
   children: ReactNode;
 };
 
 /** A link drawn as a button, for a real place to go (a video file, a download). */
-export function LinkButton({ href, kind = "secondary", size = "md", icon, newTab, className, children }: LinkButtonProps) {
+export function LinkButton({
+  href,
+  kind = "secondary",
+  size = "md",
+  icon,
+  newTab,
+  download,
+  className,
+  children,
+}: LinkButtonProps) {
   const classes = ["btn", kind, size, className].filter(Boolean).join(" ");
   return (
-    <a className={classes} href={href} target={newTab ? "_blank" : undefined} rel={newTab ? "noreferrer" : undefined}>
+    <a className={classes} href={href} target={newTab ? "_blank" : undefined} rel={newTab ? "noreferrer" : undefined} download={download}>
       {icon ? <Icon name={icon} size={size === "lg" ? 18 : 16} /> : null}
       {children}
     </a>

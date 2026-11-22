@@ -97,7 +97,9 @@ function stageDetail(view: WizardView, key: StageKey, state: StepState): string 
   }
   if (state === "current" || state === "done") {
     const current = view.versions?.find((version) => version.current);
-    return current ? `Version ${current.number}` : state === "current" ? "Review it" : "";
+    if (!current) return state === "current" ? "Review it" : "";
+    // 09: once kept ("I am happy"), the sidebar says so.
+    return view.step === "done" ? `Kept · version ${current.number}` : `Version ${current.number}`;
   }
   return "";
 }
@@ -287,6 +289,10 @@ export function sidebarSteps(view: WizardView, busy: boolean, failed = false): S
             ? { ...item, state: "current", detail: "Choose the size" }
             : item,
       );
+    }
+    // 09: once the video is kept, every step is done.
+    if (view.step === "done") {
+      items = items.map((item) => (item.key === "result" && item.state === "current" ? { ...item, state: "done" } : item));
     }
     if (items[0]?.key === "file" && !items[0].detail && view.step === "pick_file") {
       items[0] = { ...items[0], detail: "Pick a file" };

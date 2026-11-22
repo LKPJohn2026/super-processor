@@ -2,7 +2,6 @@ import {
   useEffect,
   useRef,
   useState,
-  type FormEvent,
   type MutableRefObject,
   type ReactNode,
 } from "react";
@@ -21,7 +20,6 @@ import {
   runRender,
   runSegmenting,
   type JobEntry,
-  type OutputVersion,
   type Progress,
   type Runner,
   type Navigation,
@@ -32,7 +30,6 @@ import {
 import {
   interruptedChoice,
   renderFailed,
-  resultTitle,
   stopControl,
   stoppedNote,
 } from "./runStates";
@@ -65,14 +62,6 @@ import {
   savedChoice,
   shouldNotify,
 } from "./runNotify";
-import {
-  downloadName,
-  versionLabel,
-  versionMeta,
-  versionNote,
-  versionsNewestFirst,
-  versionsSummary,
-} from "./versions";
 import { JobsHome } from "./JobsHome";
 import { WelcomeStep } from "./Welcome";
 import { ChooseStep } from "./ChooseStep";
@@ -80,12 +69,12 @@ import { FindingStep } from "./FindingStep";
 import { ScenesStep } from "./ScenesStep";
 import { PreviewStep } from "./PreviewStep";
 import { ReadyStep, RenderingStep } from "./RenderStep";
+import { ResultStep, SavedStep } from "./ResultStep";
 import { previewUnchecked } from "./previewView";
 import { isWelcomeStep } from "./welcomeView";
 import {
   STALE_SCENES_TEXT,
   STALE_SCENES_UNLOADED_TEXT,
-  formatTime,
   isStaleScenes,
 } from "./sceneEdit";
 
@@ -657,6 +646,8 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           isWelcomeStep(view.step) ? "welcome-body" : null,
           view.step === "segments" ? "scenes-body" : null,
           view.step === "preview_segment" ? "preview-body" : null,
+          view.step === "result" ? "result-body" : null,
+          view.step === "done" ? "saved-body" : null,
           offline ? "offline-dim" : null,
         ]
           .filter(Boolean)
@@ -676,7 +667,8 @@ export function LiveWizard({ origin, view, onView, onDisconnect }: LiveWizardPro
           notify={<NotifyToggle on={notifyOn} onChange={changeNotify} />}
           strip={stripInStep ? strip : undefined}
         />
-        {stripInStep ? null : strip}
+        {/* 08 and 09 show no strip: the scenes can't be opened again from there. */}
+        {stripInStep || view.step === "result" || view.step === "done" ? null : strip}
       </div>
     </AppShell>
   );
@@ -995,36 +987,20 @@ function WizardStepView({
   }
 
   if (view.step === "result") {
-    return <ResultStep origin={origin} view={view} busy={busy} message={message} onSend={onSend} />;
+    return (
+      <ResultStep
+        origin={origin}
+        view={view}
+        busy={busy}
+        message={message}
+        onSend={onSend}
+        stopped={<StoppedNote view={view} />}
+      />
+    );
   }
 
   if (view.step === "done") {
-    return (
-      <>
-        <h1>Done</h1>
-        <p className="lede">
-          Your enhanced file is in the job directory as <code>output.mp4</code>.
-        </p>
-        {view.output_ready ? (
-          <video
-            controls
-            src={outputSrc(origin, view.output_url) ?? undefined}
-            aria-label="Upscaled result"
-          />
-        ) : null}
-        <Versions origin={origin} view={view} />
-        <div className="actions">
-          <button
-            type="button"
-            className="secondary"
-            disabled={busy}
-            onClick={() => void onSend("new", {})}
-          >
-            Start a new video
-          </button>
-        </div>
-      </>
-    );
+    return <SavedStep origin={origin} view={view} busy={busy} message={message} onSend={onSend} />;
   }
 
   return (
@@ -1198,208 +1174,6 @@ function Alert({ text }: { text: string }) {
   return (
     <p className="error" role="alert">
       {text}
-    </p>
-  );
-}
-
-function ResultStep({
-  origin,
-  view,
-  busy,
-  message,
-  onSend,
-}: {
-  origin: string;
-  view: WizardView;
-  busy: boolean;
-  message: string | null;
-  onSend: SendAction;
-}) {
-  const [note, setNote] = useState("");
-  const src = outputSrc(origin, view.output_url);
-
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    void onSend("result", { note });
-  }
-
-  return (
-    <>
-      <h1>{resultTitle(view)}</h1>
-      <StoppedNote view={view} />
-      {view.scale !== null && view.strength !== null ? (
-        <p className="muted">
-          Scale {view.scale}× ·{" "}
-          {view.strength_summary ?? `strength ${view.strength.toFixed(2)}`}.
-          Lower strength means less invented texture.
-        </p>
-      ) : null}
-      {src ? (
-        <video controls src={src} aria-label="Upscaled result">
-          <p>
-            Your browser cannot play this video. The file is served at{" "}
-            <a href={src}>output.mp4</a>.
-          </p>
-        </video>
-      ) : (
-        <p>The result file is not ready yet.</p>
-      )}
-      <SeamNote seams={view.seams ?? []} error={view.seam_error ?? null} />
-      <Versions origin={origin} view={view} />
-      <p className="lede">Are you happy, or do you want to say something?</p>
-      {message ? <Alert text={message} /> : null}
-      <div className="actions">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void onSend("result", { mood: "happy" })}
-        >
-          I am happy
-        </button>
-      </div>
-      <form onSubmit={submit}>
-        <label htmlFor="revise-note">
-          Tell me what to change
-          <textarea
-            id="revise-note"
-            name="note"
-            rows={3}
-            value={note}
-            onChange={(event) => setNote(event.target.value)}
-            placeholder="e.g. reduce artificial detail from 00:30 to 00:40"
-          />
-        </label>
-        <div className="actions">
-          <button type="submit" disabled={busy}>
-            Revise this range
-          </button>
-          <button
-            type="button"
-            className="secondary"
-            disabled={busy}
-            onClick={() => void onSend("result", { note, restart: "1" })}
-          >
-            Start over from the scenes with this note
-          </button>
-        </div>
-      </form>
-      <div className="actions">
-        <button
-          type="button"
-          className="secondary"
-          disabled={busy}
-          onClick={() => void onSend("new", {})}
-        >
-          Start a new video
-        </button>
-      </div>
-    </>
-  );
-}
-
-/**
- * Every kept result of the job, newest first, each with a player that opens
- * in place and a download link. The one the job's output is now is marked.
- */
-function Versions({ origin, view }: { origin: string; view: WizardView }) {
-  const [open, setOpen] = useState<number | null>(null);
-  const list = versionsNewestFirst(view.versions);
-  if (!list.length) return null;
-  const now = Date.now();
-  return (
-    <section className="versions" aria-labelledby="versions-title">
-      <h2 id="versions-title">Versions</h2>
-      <p className="muted versions-summary">{versionsSummary(view.versions)}</p>
-      <ol className="versions-list">
-        {list.map((version) => (
-          <VersionRow
-            key={version.number}
-            origin={origin}
-            title={view.job?.title ?? null}
-            version={version}
-            now={now}
-            open={open === version.number}
-            onToggle={() => setOpen((shown) => (shown === version.number ? null : version.number))}
-          />
-        ))}
-      </ol>
-    </section>
-  );
-}
-
-function VersionRow({
-  origin,
-  title,
-  version,
-  now,
-  open,
-  onToggle,
-}: {
-  origin: string;
-  title: string | null;
-  version: OutputVersion;
-  now: number;
-  open: boolean;
-  onToggle: () => void;
-}) {
-  const src = outputSrc(origin, version.url) ?? undefined;
-  const label = versionLabel(version);
-  const note = versionNote(version);
-  const playerId = `version-player-${version.number}`;
-  return (
-    <li className={`version-row${version.current ? " current" : ""}`}>
-      <div className="version-text">
-        <p className="version-name">
-          <strong>{label}</strong>
-          {version.current ? <span className="badge ok">Current</span> : null}
-        </p>
-        <p className="version-meta">{versionMeta(version, now)}</p>
-        {note ? <p className="version-note">{note}</p> : null}
-      </div>
-      <div className="version-actions">
-        <button
-          type="button"
-          className="secondary small"
-          aria-expanded={open}
-          aria-controls={playerId}
-          aria-label={`${open ? "Hide" : "Play"} ${label.toLowerCase()}`}
-          onClick={onToggle}
-        >
-          {open ? "Hide" : "Play"}
-        </button>
-        <a
-          className="button secondary small"
-          href={src}
-          download={downloadName(title, version)}
-          aria-label={`Download ${label.toLowerCase()}`}
-        >
-          Download
-        </a>
-      </div>
-      <div id={playerId} className="version-player" hidden={!open}>
-        {open ? <video controls preload="metadata" src={src} aria-label={label} /> : null}
-      </div>
-    </li>
-  );
-}
-
-function SeamNote({
-  seams,
-  error,
-}: {
-  seams: { time_s: number; score: number }[];
-  error: string | null;
-}) {
-  if (error) return <p className="muted">{error}</p>;
-  if (!seams.length) return null;
-  const listed = seams.map((seam) => formatTime(seam.time_s)).join(", ");
-  const first = seams[0].time_s;
-  const example = `smooth ${formatTime(Math.max(0, first - 1))} to ${formatTime(first + 1)}`;
-  return (
-    <p className="muted">
-      Possible seam{seams.length > 1 ? "s" : ""} at {listed}: the picture jumps
-      there and the source does not. To re-render across one in a single pass,
-      write a note like “{example}”.
     </p>
   );
 }

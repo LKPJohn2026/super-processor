@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { outputSrc, type JobEntry, type WizardView } from "./api";
 import { busyHere, jobAction, jobMeta, jobStatus, newVideoRoute, type JobStatus } from "./jobsList";
-import { Badge, Banner, Button, Card, Icon, type BadgeTone } from "./ui";
+import { Badge, Banner, Button, Card, Icon, Menu, type BadgeTone } from "./ui";
 
 // The list's tones in the design's badge colours.
 const TONE: Record<JobStatus["tone"], BadgeTone> = {
@@ -83,9 +83,19 @@ export function JobsHome({
           </h1>
           <p className="muted">Pick up where you left off, or start a new one.</p>
         </div>
-        <Button icon="film" disabled={route === "blocked" || working} onClick={onNewVideo}>
-          Restore a new video
-        </Button>
+        <div className="row gap8 jobs-head-actions">
+          <Menu
+            srLabel="More: refresh the list, disconnect"
+            align="end"
+            items={[
+              { label: "Refresh the list", icon: "rotate", disabled: jobs === null && !loadError, onSelect: onRefresh },
+              { label: "Disconnect from the wizard", icon: "wifi", onSelect: onDisconnect },
+            ]}
+          />
+          <Button icon="film" disabled={route === "blocked" || working} onClick={onNewVideo}>
+            Restore a new video
+          </Button>
+        </div>
       </div>
       {route === "blocked" ? (
         <p className="muted jobs-hint">
@@ -145,15 +155,15 @@ export function JobsHome({
                       {entry.open ? <span className="job-here"> · open here</span> : null}
                     </h3>
                     {meta ? <span className="job-meta">{meta}</span> : null}
-                    <Badge tone={TONE[badge.tone]} srPrefix="Status: ">
-                      {badge.text}
-                    </Badge>
                     {result ? (
                       <a className="job-result" href={result} target="_blank" rel="noreferrer">
                         Watch the result<span className="sr-only"> of {entry.title} (opens a new tab)</span>
                       </a>
                     ) : null}
                   </div>
+                  <Badge tone={TONE[badge.tone]} srPrefix="Status: " className="job-badge">
+                    {badge.text}
+                  </Badge>
                   <div className="job-action">
                     <Button
                       kind="secondary"
@@ -177,19 +187,13 @@ export function JobsHome({
           </ul>
         </Card>
       ) : null}
-      <div className="row gap12 wrap">
-        {backLabel ? (
+      {backLabel ? (
+        <div className="row gap12 wrap">
           <Button kind="secondary" size="md" icon="chevron-left" onClick={onShowCurrent}>
             {backLabel}
           </Button>
-        ) : null}
-        <Button kind="ghost" size="md" icon="rotate" disabled={jobs === null && !loadError} onClick={onRefresh}>
-          Refresh the list
-        </Button>
-        <Button kind="ghost" size="md" icon="wifi" onClick={onDisconnect}>
-          Disconnect
-        </Button>
-      </div>
+        </div>
+      ) : null}
     </section>
   );
 }

@@ -7,6 +7,7 @@ export { Card } from "./Card";
 export { Chip, StaticChip } from "./Chip";
 export { Field, TextArea } from "./Field";
 export { Icon, type IconName } from "./Icon";
+export { Menu, type MenuItem } from "./Menu";
 export { Progress, StageRow, type StageState } from "./Progress";
 export { Segmented, type SegmentedOption } from "./Segmented";
 export { Toggle } from "./Toggle";
