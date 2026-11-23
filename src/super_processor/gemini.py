@@ -702,6 +702,11 @@ def _api_object(raw: bytes, what: str) -> dict[str, Any]:
     except ValueError:
         # Covers bad JSON and bytes that are not UTF-8.
         raise GeminiError(f"{what} could not be read: not JSON") from None
+    # Python 3.12+ bounds recursion by the real C stack, so a machine with a
+    # big stack parses very deep nesting without a RecursionError: check the
+    # depth itself.
+    if _too_deep(parsed, _MAX_REPLY_DEPTH):
+        raise GeminiError(f"{what} could not be read: nested too deep")
     if not isinstance(parsed, dict):
         raise GeminiError(f"{what} root must be an object")
     return parsed

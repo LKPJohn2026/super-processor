@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import short_id
 
 from super_processor import gemini
 from super_processor.gemini import (
@@ -320,7 +321,7 @@ def test_a_raw_reply_is_an_object_or_a_clean_error(
 
 
 @pytest.mark.parametrize("name", METHODS)
-@pytest.mark.parametrize("root", WRONG_ROOTS, ids=repr)
+@pytest.mark.parametrize("root", WRONG_ROOTS, ids=short_id)
 def test_a_reply_of_the_wrong_type_is_refused(
     name: str, root: Any, tmp_path: Path
 ) -> None:
@@ -472,7 +473,7 @@ LOOKS_BASE: dict[str, Any] = {
 }
 
 
-@pytest.mark.parametrize("path", _fields(LOOKS_BASE), ids=repr)
+@pytest.mark.parametrize("path", _fields(LOOKS_BASE), ids=short_id)
 def test_hostile_look_proposals_stay_in_bounds(
     path: tuple[Any, ...], tmp_path: Path
 ) -> None:
@@ -501,7 +502,7 @@ CHECK_BASE: dict[str, Any] = {
 }
 
 
-@pytest.mark.parametrize("path", _fields(CHECK_BASE), ids=repr)
+@pytest.mark.parametrize("path", _fields(CHECK_BASE), ids=short_id)
 def test_hostile_preview_checks_stay_in_bounds(
     path: tuple[Any, ...], tmp_path: Path
 ) -> None:
@@ -557,7 +558,7 @@ def _check_regions(shots: ShotList) -> None:
     _strict(shots.to_dict())
 
 
-@pytest.mark.parametrize("path", _fields(REGIONS_BASE), ids=repr)
+@pytest.mark.parametrize("path", _fields(REGIONS_BASE), ids=short_id)
 def test_hostile_regions_stay_in_the_frame(
     path: tuple[Any, ...], tmp_path: Path
 ) -> None:
@@ -576,7 +577,7 @@ LABELS_BASE: dict[str, Any] = {
 }
 
 
-@pytest.mark.parametrize("path", _fields(LABELS_BASE), ids=repr)
+@pytest.mark.parametrize("path", _fields(LABELS_BASE), ids=short_id)
 def test_hostile_labels_stay_known_and_short(
     path: tuple[Any, ...], tmp_path: Path
 ) -> None:
@@ -614,7 +615,7 @@ def _check_segments(segments: list[LoopSegment], duration_s: float) -> None:
     _strict(SegmentList(segments=segments).to_dict())
 
 
-@pytest.mark.parametrize("path", _fields(SEGMENTS_BASE), ids=repr)
+@pytest.mark.parametrize("path", _fields(SEGMENTS_BASE), ids=short_id)
 def test_hostile_segments_still_cover_the_video(
     path: tuple[Any, ...], tmp_path: Path
 ) -> None:
@@ -639,7 +640,7 @@ def _plan_five() -> UpscalePlan:
     return UpscalePlan(spans=(UpscaleSpan(0.0, 5.0, scale=2, strength=0.5),))
 
 
-@pytest.mark.parametrize("path", _fields(REVISE_BASE), ids=repr)
+@pytest.mark.parametrize("path", _fields(REVISE_BASE), ids=short_id)
 def test_hostile_revise_replies_make_a_sane_patch_or_none(
     path: tuple[Any, ...], tmp_path: Path
 ) -> None:
@@ -767,7 +768,7 @@ def test_non_finite_spans_are_dropped() -> None:
 # Small readers of reply values ----------------------------------------------------
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=short_id)
 def test_scale_readers_keep_an_allowed_scale(value: Any) -> None:
     assert reply_scale(value) in (None, 1, 2)
     assert _offered_scale(value, (1, 2)) in (None, 1, 2)
@@ -778,7 +779,7 @@ def test_scale_readers_keep_an_allowed_scale(value: Any) -> None:
         assert _offered_scale(value, (1, 2)) is None
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=short_id)
 def test_a_check_verdict_is_a_real_bool_or_none(value: Any) -> None:
     check = ShotCheck.from_dict({"ok": value, "note": value})
     if isinstance(value, bool):
@@ -789,7 +790,7 @@ def test_a_check_verdict_is_a_real_bool_or_none(value: Any) -> None:
     assert "\n" not in check.note and "\u2028" not in check.note
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=short_id)
 def test_look_readers_clamp_or_refuse(value: Any) -> None:
     for name in LOOK_BOUNDS:
         _check_look(look_from_model({name: value}))
@@ -824,7 +825,7 @@ def test_a_look_refuses_an_int_too_big_for_a_float() -> None:
     )
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=short_id)
 def test_region_reader_keeps_boxes_in_the_frame(value: Any) -> None:
     boxes: list[Any] = [
         value,
@@ -852,13 +853,13 @@ def test_region_reader_keeps_boxes_in_the_frame(value: Any) -> None:
         [0, 0, 500, math.inf],
         [math.nan, 0, 500, 500],
     ],
-    ids=repr,
+    ids=short_id,
 )
 def test_a_box_outside_the_frame_or_not_finite_is_dropped(box: list[Any]) -> None:
     assert region_from_model("faces", box) is None
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=short_id)
 def test_a_stored_span_refuses_or_stays_sane(value: Any) -> None:
     for field in ("start_s", "end_s", "scale", "strength", "look", "regions"):
         data = dict(REVISE_BASE, **{field: value})
@@ -875,7 +876,7 @@ def test_a_stored_span_refuses_or_stays_sane(value: Any) -> None:
             UpscaleSpan.from_dict(dict(REVISE_BASE, **{field: 10**400}))
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=short_id)
 def test_a_stored_recipe_stays_sane(value: Any) -> None:
     for field in ("strength", "look", "reason", "check", "rev", "shimmer"):
         recipe = ShotRecipe.from_dict({field: value})
@@ -926,7 +927,7 @@ def _check_models(client: GeminiClient) -> None:
     assert all(MODEL_NAME.fullmatch(name) for name in names)
 
 
-@pytest.mark.parametrize("path", _fields(MODEL_ROW), ids=repr)
+@pytest.mark.parametrize("path", _fields(MODEL_ROW), ids=short_id)
 def test_hostile_model_rows_are_skipped_or_read(path: tuple[Any, ...]) -> None:
     for row in _mutants(MODEL_ROW, [path]):
         _check_models(GeminiClient(api_key=KEY, transport=_Lister([row])))
@@ -957,7 +958,7 @@ def test_a_hostile_model_list_is_refused_or_read(rows: Any) -> None:
         "9" * 5000,
         {"used": 1e999},
     ],
-    ids=repr,
+    ids=short_id,
 )
 def test_rate_limits_that_are_not_counts_are_ignored(rpm: Any) -> None:
     for row in (
@@ -1218,7 +1219,7 @@ def _check_video(video: GeminiVideo) -> None:
     assert again == video
 
 
-@pytest.mark.parametrize("path", _fields(FILE_BASE), ids=repr)
+@pytest.mark.parametrize("path", _fields(FILE_BASE), ids=short_id)
 def test_hostile_upload_answers_give_a_clean_video_or_error(
     path: tuple[Any, ...], tmp_path: Path
 ) -> None:
@@ -1233,7 +1234,7 @@ def test_hostile_upload_answers_give_a_clean_video_or_error(
         assert client.delete_video(GeminiVideo(name="files/abc", uri="u")) is False
 
 
-@pytest.mark.parametrize("file", WRONG_ROOTS, ids=repr)
+@pytest.mark.parametrize("file", WRONG_ROOTS, ids=short_id)
 def test_an_upload_answer_that_is_not_an_object_is_refused(
     file: Any, tmp_path: Path
 ) -> None:
@@ -1259,7 +1260,7 @@ def test_an_expiry_time_is_finite_or_zero(stamp: str) -> None:
     assert math.isfinite(_parse_expiry(stamp))
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=short_id)
 def test_a_saved_video_record_is_finite_or_dropped(value: Any) -> None:
     base = {
         "name": "files/abc",
@@ -1280,7 +1281,7 @@ def test_a_saved_video_record_is_finite_or_dropped(value: Any) -> None:
 # Saved chat --------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=repr)
+@pytest.mark.parametrize("value", HOSTILE_VALUES, ids=short_id)
 def test_a_saved_chat_turn_is_read_or_refused(value: Any) -> None:
     base = {"role": "model", "text": "{}", "frame_refs": [], "structured": {}}
     for field in base:
@@ -1625,7 +1626,7 @@ def _check_pages(controller: WizardController, looks: dict[str, Any]) -> None:
         assert "&lt;script&gt;" in html
 
 
-@pytest.mark.parametrize("scale", [1, 4, 2**63, 1.0, -2, True], ids=repr)
+@pytest.mark.parametrize("scale", [1, 4, 2**63, 1.0, -2, True], ids=short_id)
 def test_the_reply_never_picks_the_size(
     scale: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1883,7 +1884,7 @@ ODD_SEGMENT_FILES: tuple[bytes, ...] = (
     ids=range(len(BROKEN_SEGMENT_FILES) + len(ODD_SEGMENT_FILES)),
 )
 @pytest.mark.parametrize(
-    "step", [WizardStep.SEGMENTS, WizardStep.READY_TO_RENDER], ids=str
+    "step", [WizardStep.SEGMENTS, WizardStep.READY_TO_RENDER], ids=short_id
 )
 def test_a_damaged_segment_list_is_refused_or_cut_down(
     raw: bytes, step: WizardStep, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

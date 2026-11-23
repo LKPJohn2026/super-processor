@@ -10,6 +10,37 @@ from pathlib import Path
 
 import pytest
 
+# Windows keeps the current test id in an environment variable capped at
+# 32,767 characters, so a parameter that is a huge string or a deep list
+# must not become the id itself.
+_MAX_ID_LEN = 60
+
+
+def short_id(value: object) -> str:
+    """A short, readable test id for any parameter value."""
+    try:
+        text = repr(value)
+    except RecursionError:
+        return f"{type(value).__name__}-deep"
+    if len(text) <= _MAX_ID_LEN:
+        return text
+    return f"{text[:40]}...len{len(text)}"
+
+
+def pytest_make_parametrize_id(
+    config: pytest.Config, val: object, argname: str
+) -> str | None:
+    """Shorten only long ids; short values keep pytest's own id."""
+    text = short_id(val)
+    return text if len(text) < len(_safe_repr(val)) else None
+
+
+def _safe_repr(value: object) -> str:
+    try:
+        return repr(value)
+    except RecursionError:
+        return "x" * (_MAX_ID_LEN + 1)
+
 
 @pytest.fixture(autouse=True)
 def _own_config_dir(
