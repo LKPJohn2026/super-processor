@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.2] - 2026-11-23
+
 ### Security
 
 - Replies from Gemini, and the Gemini API's own answers, are treated as
