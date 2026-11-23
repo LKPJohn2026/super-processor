@@ -70,10 +70,11 @@ class ShotLook:
             value = getattr(self, field.name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise LookError(f"{field.name} must be a number")
-            value = float(value)
+            # Compared before float(): an int too big for a float is refused,
+            # not an OverflowError.
             if not low <= value <= high:
                 raise LookError(f"{field.name} must be between {low:g} and {high:g}")
-            object.__setattr__(self, field.name, value)
+            object.__setattr__(self, field.name, float(value))
 
     def is_neutral(self) -> bool:
         return self == ShotLook()

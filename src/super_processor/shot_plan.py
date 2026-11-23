@@ -32,6 +32,7 @@ from .look import LOOK_BOUNDS, ShotLook
 from .regions import MAX_REGIONS, Region, region_from_model
 from .shots import STILLS_DIR, Shot, ShotError, ShotList, extract_still
 from .stability import SHIMMER_LIMIT, StabilityError, shimmer_index, video_size
+from .textline import one_line
 from .upscale import (
     UpscaleEngine,
     UpscalePlan,
@@ -105,10 +106,12 @@ class ShotCheck:
         if not isinstance(data, dict):
             return cls()
         ok = data.get("ok")
+        note = data.get("note")
         return cls(
             ok=ok if isinstance(ok, bool) else None,
             problems=_known(data.get("problems"), CHECK_PROBLEMS),
-            note=str(data.get("note", "")),
+            # Shown to the editor: one line, as short as a reason.
+            note=one_line(note, 240),
             adjusted=data.get("adjusted") is True,
         )
 
@@ -155,10 +158,11 @@ class ShotRecipe:
     def from_dict(cls, data: Any) -> ShotRecipe:
         if not isinstance(data, dict):
             raise ShotPlanError("a shot recipe must be an object")
+        reason = data.get("reason")
         return cls(
             strength=_clamp(data.get("strength"), 0.0, 1.0, DEFAULT_STRENGTH),
             look=look_from_model(data.get("look")),
-            reason=str(data.get("reason", "")),
+            reason=one_line(reason, 240),
             check=ShotCheck.from_dict(data.get("check")),
             rev=_count(data.get("rev")),
             stale=bool(data.get("stale", True)),
@@ -266,7 +270,11 @@ def _count(raw: Any) -> int:
 def _clamp(raw: Any, low: float, high: float, default: float) -> float:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return default
-    value = float(raw)
+    try:
+        value = float(raw)
+    except OverflowError:
+        # An int too big for a float is past either end.
+        return high if raw > 0 else low
     if value != value:  # NaN
         return default
     return min(high, max(low, value))
@@ -388,7 +396,8 @@ def apply_regions(
     by_index = {
         item.get("index"): item
         for item in found
-        if isinstance(item.get("index"), int)
+        if isinstance(item, dict)
+        and isinstance(item.get("index"), int)
         and not isinstance(item.get("index"), bool)
     }
     updated = list(shots.shots)
@@ -467,7 +476,7 @@ def apply_proposals(
             recipes[index],
             strength=cap_strength(strength, shot),
             look=look_from_model(item.get("look")),
-            reason=" ".join(str(item.get("reason", "")).split())[:240],
+            reason=one_line(item.get("reason"), 240),
         )
         # The editor's own upscale choice for the segment wins.
         recipes[index] = keep_editor_choices(
@@ -565,7 +574,10 @@ def load_plan(job_dir: Path) -> ShotPlan | None:
         return None
     try:
         data = json.loads(read_text_retrying(path))
-    except json.JSONDecodeError as exc:
+    except RecursionError as exc:
+        raise ShotPlanError("shot_plan.json is nested too deep") from exc
+    except ValueError as exc:
+        # Bad JSON, or bytes that are not UTF-8.
         raise ShotPlanError(f"shot_plan.json is not valid JSON: {exc}") from exc
     return ShotPlan.from_dict(data)
 

@@ -38,6 +38,7 @@ from typing import Any, Protocol
 
 from .atomic_io import write_text_atomic
 from .models import resolve_secret
+from .textline import one_line
 
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 CONFIG_DIR_ENV = "SUPER_PROCESSOR_CONFIG_DIR"
@@ -279,19 +280,50 @@ class GeminiVideo:
         if not isinstance(data, dict):
             return None
         name, uri = data.get("name"), data.get("uri")
-        if not isinstance(name, str) or not isinstance(uri, str):
+        if not isinstance(name, str) or not _FILE_NAME.fullmatch(name):
             return None
-        expires = data.get("expires_at")
+        if not isinstance(uri, str) or not _plain_uri(uri):
+            return None
         return cls(
             name=name,
             uri=uri,
-            mime_type=str(data.get("mime_type") or "video/mp4"),
-            expires_at=float(expires) if isinstance(expires, (int, float)) else 0.0,
+            mime_type=_video_mime(data.get("mime_type")),
+            expires_at=_finite_seconds(data.get("expires_at")),
         )
 
     def usable(self, now: float, *, margin_s: float = 3600.0) -> bool:
         """True while the upload has at least ``margin_s`` left to live."""
         return self.expires_at - margin_s > now
+
+
+# What Gemini is sent back about an upload: its address and type, bounded.
+_MAX_URI_LEN = 2048
+_VIDEO_MIME = re.compile(r"video/[a-z0-9.+-]{1,64}", re.ASCII)
+
+
+def _plain_uri(raw: Any) -> bool:
+    """True for a non-empty address of visible ASCII, no longer than a URL."""
+    return (
+        isinstance(raw, str)
+        and 0 < len(raw) <= _MAX_URI_LEN
+        and all("!" <= char <= "~" for char in raw)
+    )
+
+
+def _video_mime(raw: Any) -> str:
+    """A video type as the File API gives it; video/mp4 for anything else."""
+    return raw if isinstance(raw, str) and _VIDEO_MIME.fullmatch(raw) else "video/mp4"
+
+
+def _finite_seconds(raw: Any) -> float:
+    """A stored expiry as a finite float; 0 (expired) for anything else."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0.0
+    try:
+        value = float(raw)
+    except OverflowError:
+        return 0.0
+    return value if math.isfinite(value) else 0.0
 
 
 def video_part(
@@ -337,7 +369,9 @@ def _parse_expiry(raw: Any) -> float:
         text = f"{head}.{digits[:6].ljust(6, '0')}{zone}"
     try:
         return datetime.fromisoformat(text).timestamp()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
+        # A naive time far from now can fall outside the platform's range
+        # (OverflowError, or OSError on Windows).
         return 0.0
 
 
@@ -385,9 +419,19 @@ def _grouped(errors: list[str]) -> str:
     for line in errors:
         model, _, reason = line.partition(": ")
         by_reason.setdefault(reason, []).append(model)
-    return "; ".join(
-        f"{', '.join(models)}: {reason}" for reason, models in by_reason.items()
+    text = " ".join(
+        "; ".join(
+            f"{', '.join(models)}: {reason}" for reason, models in by_reason.items()
+        ).split()
     )
+    # Shown to the editor and saved with the job: one line, kept short.
+    return text[:_MAX_GROUPED_LEN] + ("…" if len(text) > _MAX_GROUPED_LEN else "")
+
+
+_MAX_GROUPED_LEN = 400
+# A model id as models.list names it (``gemini-2.5-flash``); anything else is
+# never tried, so a strange name cannot reach a URL or an error message.
+_MODEL_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,63}", re.ASCII)
 
 
 def _strip_models_prefix(name: str) -> str:
@@ -414,7 +458,7 @@ def _parse_rpm_fields(raw: dict[str, Any]) -> tuple[int | None, int | None]:
             continue
         try:
             value = int(raw[key])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if target == "limit":
             limit = value
@@ -437,7 +481,7 @@ def _parse_rpm_fields(raw: dict[str, Any]) -> tuple[int | None, int | None]:
                     used = int(rpm["used"])
                 if "limit" in rpm:
                     limit = int(rpm["limit"])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
     return used, limit
 
@@ -574,6 +618,10 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> tuple[int, str]:
     return status, detail
 
 
+# Longest retry delay worth telling the editor about: one week.
+_MAX_RETRY_DELAY_S = 7 * 24 * 3600.0
+
+
 def _retry_text(seconds: float) -> str:
     if seconds >= 3600:
         return f"about {round(seconds / 3600)} h"
@@ -592,20 +640,27 @@ def summarize_gemini_error(status: int, detail: str) -> str:
     """
     try:
         error = json.loads(detail).get("error") or {}
-    except (json.JSONDecodeError, AttributeError):
+    except (ValueError, AttributeError, RecursionError):
+        error = {}
+    if not isinstance(error, dict):
         error = {}
     message = " ".join(str(error.get("message") or detail).split())
     reason = str(error.get("status") or "")
     retry: str | None = None
     daily = False
-    for item in error.get("details") or []:
+    details = error.get("details")
+    for item in details if isinstance(details, list) else []:
         if not isinstance(item, dict):
             continue
         delay = str(item.get("retryDelay") or "")
         if delay.endswith("s"):
             with contextlib.suppress(ValueError):
-                retry = _retry_text(float(delay[:-1]))
-        for violation in item.get("violations") or []:
+                seconds = float(delay[:-1])
+                # Only a delay a person could wait for; not NaN or forever.
+                if 0 <= seconds <= _MAX_RETRY_DELAY_S:
+                    retry = _retry_text(seconds)
+        violations = item.get("violations")
+        for violation in violations if isinstance(violations, list) else []:
             if isinstance(violation, dict) and "PerDay" in str(
                 violation.get("quotaId", "")
             ):
@@ -620,6 +675,36 @@ def summarize_gemini_error(status: int, detail: str) -> str:
         return "this model is no longer available"
     first = message.split(". ")[0].rstrip(".")
     return first[:160] + ("…" if len(first) > 160 else "")
+
+
+# models.list is read a page at a time; this many pages, rows, and token
+# characters are more than the API has ever needed.
+_MAX_MODEL_PAGES = 20
+_MAX_MODEL_ROWS = 2000
+_MAX_PAGE_TOKEN_LEN = 1024
+
+
+def _refuse_constant(name: str) -> None:
+    """``parse_constant`` for API answers: NaN and Infinity are not JSON."""
+    raise ValueError(f"{name} is not JSON")
+
+
+def _api_object(raw: bytes, what: str) -> dict[str, Any]:
+    """The JSON object in an API answer; anything else is a GeminiError.
+
+    Bytes that are not UTF-8, text that is not JSON (NaN included), nesting
+    too deep to read, and a root that is not an object are all refused.
+    """
+    try:
+        parsed = json.loads(raw.decode("utf-8"), parse_constant=_refuse_constant)
+    except RecursionError:
+        raise GeminiError(f"{what} could not be read: nested too deep") from None
+    except ValueError:
+        # Covers bad JSON and bytes that are not UTF-8.
+        raise GeminiError(f"{what} could not be read: not JSON") from None
+    if not isinstance(parsed, dict):
+        raise GeminiError(f"{what} root must be an object")
+    return parsed
 
 
 class UrllibGeminiTransport:
@@ -646,28 +731,21 @@ class UrllibGeminiTransport:
         timeout = _VIDEO_REQUEST_TIMEOUT_S if _has_video(body) else _REQUEST_TIMEOUT_S
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
-                parsed: object = json.loads(response.read().decode("utf-8"))
+                raw = response.read()
         except urllib.error.HTTPError as exc:
             status, detail = _http_error_detail(exc)
             raise GeminiError(
                 f"Gemini HTTP {status}: {summarize_gemini_error(status, detail)}",
                 status=status,
             ) from None
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            OSError,
-            json.JSONDecodeError,
-        ) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise GeminiError(
                 f"Gemini request failed: {redact_secrets(str(exc))}"
             ) from None
         except (http.client.HTTPException, ValueError):
             # An InvalidURL or a bad header value quotes the request.
             raise GeminiError(f"Gemini request failed: {_INVALID_REQUEST}") from None
-        if not isinstance(parsed, dict):
-            raise GeminiError("Gemini response root must be an object")
-        return parsed
+        return _api_object(raw, "Gemini response")
 
     def upload_file(
         self,
@@ -701,7 +779,7 @@ class UrllibGeminiTransport:
             if not upload_url:
                 raise GeminiError("Gemini did not return an upload address")
             offset = 0
-            result: object = None
+            result = b""
             with path.open("rb") as handle:
                 while True:
                     piece = handle.read(_UPLOAD_CHUNK_BYTES)
@@ -726,7 +804,7 @@ class UrllibGeminiTransport:
                     if on_progress is not None:
                         on_progress(offset / size if size else 1.0)
                     if last:
-                        result = json.loads(body.decode("utf-8"))
+                        result = body
                         break
         except urllib.error.HTTPError as exc:
             status, detail = _http_error_detail(exc)
@@ -741,7 +819,7 @@ class UrllibGeminiTransport:
             ) from None
         except (http.client.HTTPException, ValueError):
             raise GeminiError(f"Gemini upload failed: {_INVALID_REQUEST}") from None
-        file = result.get("file") if isinstance(result, dict) else None
+        file = _api_object(result, "Gemini upload").get("file")
         if not isinstance(file, dict):
             raise GeminiError("Gemini upload returned no file")
         return file
@@ -756,7 +834,7 @@ class UrllibGeminiTransport:
         )
         try:
             with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as response:
-                parsed: object = json.loads(response.read().decode("utf-8"))
+                raw = response.read()
         except urllib.error.HTTPError as exc:
             status, detail = _http_error_detail(exc)
             raise GeminiError(
@@ -769,9 +847,7 @@ class UrllibGeminiTransport:
             ) from None
         except (http.client.HTTPException, ValueError):
             raise GeminiError(f"Gemini request failed: {_INVALID_REQUEST}") from None
-        if not isinstance(parsed, dict):
-            raise GeminiError("Gemini file response root must be an object")
-        return parsed
+        return _api_object(raw, "Gemini file response")
 
     def delete_file(
         self, *, api_key: str, name: str
@@ -805,7 +881,9 @@ class UrllibGeminiTransport:
     ) -> list[dict[str, Any]]:  # pragma: no cover - mocked in unit tests
         models: list[dict[str, Any]] = []
         page_token = ""
-        while True:
+        seen_tokens: set[str] = set()
+        # A server that always names a next page must not keep this looping.
+        for _page in range(_MAX_MODEL_PAGES):
             url = f"{_MODELS_URL}?pageSize=100"
             if page_token:
                 url += f"&pageToken={urllib.parse.quote(page_token)}"
@@ -814,19 +892,14 @@ class UrllibGeminiTransport:
             )
             try:
                 with urllib.request.urlopen(req, timeout=60) as response:
-                    parsed: object = json.loads(response.read().decode("utf-8"))
+                    raw = response.read()
             except urllib.error.HTTPError as exc:
                 status, detail = _http_error_detail(exc)
                 raise GeminiError(
                     f"Gemini HTTP {status}: {summarize_gemini_error(status, detail)}",
                     status=status,
                 ) from None
-            except (
-                urllib.error.URLError,
-                TimeoutError,
-                OSError,
-                json.JSONDecodeError,
-            ) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 raise GeminiError(
                     f"Gemini list models failed: {redact_secrets(str(exc))}"
                 ) from None
@@ -834,15 +907,21 @@ class UrllibGeminiTransport:
                 raise GeminiError(
                     f"Gemini list models failed: {_INVALID_REQUEST}"
                 ) from None
-            if not isinstance(parsed, dict):
-                raise GeminiError("Gemini models.list root must be an object")
+            parsed = _api_object(raw, "Gemini models.list")
             batch = parsed.get("models") or []
             if isinstance(batch, list):
                 models.extend(item for item in batch if isinstance(item, dict))
-            page_token = str(parsed.get("nextPageToken") or "")
-            if not page_token:
+            token = parsed.get("nextPageToken")
+            page_token = token if isinstance(token, str) else ""
+            if (
+                not page_token
+                or page_token in seen_tokens
+                or len(page_token) > _MAX_PAGE_TOKEN_LEN
+                or len(models) >= _MAX_MODEL_ROWS
+            ):
                 break
-        return models
+            seen_tokens.add(page_token)
+        return models[:_MAX_MODEL_ROWS]
 
 
 @dataclass(slots=True)
@@ -865,7 +944,9 @@ class ChatTurn:
         return payload
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> ChatTurn:
+    def from_dict(cls, data: Any) -> ChatTurn:
+        if not isinstance(data, dict):
+            raise GeminiError("chat turn must be an object")
         refs = data.get("frame_refs") or []
         if not isinstance(refs, list):
             raise GeminiError("frame_refs must be a list")
@@ -986,14 +1067,21 @@ def load_chat(job_dir: Path) -> list[ChatTurn]:
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except RecursionError as exc:
+        raise GeminiError(f"cannot read {CHAT_FILE_NAME}: nested too deep") from exc
+    except (OSError, ValueError) as exc:
+        # ValueError: bad JSON, or bytes that are not UTF-8.
         raise GeminiError(f"cannot read {CHAT_FILE_NAME}: {exc}") from exc
     if not isinstance(data, dict):
         raise GeminiError(f"{CHAT_FILE_NAME} root must be an object")
     turns = data.get("turns") or []
     if not isinstance(turns, list):
-        raise GeminiError("chat turns must be a list")
-    return [ChatTurn.from_dict(item) for item in turns if isinstance(item, dict)]
+        raise GeminiError(f"{CHAT_FILE_NAME}: chat turns must be a list")
+    try:
+        return [ChatTurn.from_dict(item) for item in turns if isinstance(item, dict)]
+    except GeminiError as exc:
+        # Name the file, so the editor knows what is damaged.
+        raise GeminiError(f"{CHAT_FILE_NAME}: {exc}") from exc
 
 
 def save_chat(job_dir: Path, turns: list[ChatTurn]) -> Path:
@@ -1059,16 +1147,46 @@ def _extract_text(response: dict[str, Any]) -> str:
     return "".join(texts)
 
 
+# No reply schema nests deeper than a handful of levels.
+_MAX_REPLY_DEPTH = 32
+
+
+def _too_deep(value: Any, limit: int) -> bool:
+    """True when ``value`` nests lists or objects more than ``limit`` deep."""
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        children = (
+            item.values()
+            if isinstance(item, dict)
+            else item
+            if isinstance(item, list)
+            else None
+        )
+        if children is None:
+            continue
+        if depth > limit:
+            return True
+        stack.extend(
+            (child, depth + 1) for child in children if isinstance(child, (dict, list))
+        )
+    return False
+
+
 def _parse_json_object(text: str) -> dict[str, Any]:
     """The object in a model reply. NaN, Infinity and numbers too big for a
     float are read as null here, once for every reply, so none reaches a
-    plan."""
+    plan. A reply nested deeper than any schema is refused."""
     try:
         data = loads_finite(text)
     except json.JSONDecodeError as exc:
         raise GeminiError(f"Gemini JSON parse failed: {exc}") from exc
+    except RecursionError as exc:
+        raise GeminiError("Gemini JSON parse failed: nested too deep") from exc
     if not isinstance(data, dict):
         raise GeminiError("Gemini structured output must be an object")
+    if _too_deep(data, _MAX_REPLY_DEPTH):
+        raise GeminiError("Gemini JSON parse failed: nested too deep")
     return data
 
 
@@ -1234,6 +1352,54 @@ _CHECK_SCHEMA: dict[str, Any] = {
 }
 
 
+# How much of a reply the chat keeps (see _chat_copy). Text fields the
+# editor reads keep their own caps; any other string is a short name.
+_CHAT_TEXT_CAPS = {"label": 80, "reason": 240, "note": 240, "scale_reason": 240}
+_CHAT_NAME_CAP = 32
+_CHAT_LIST_CAP = 40
+_CHAT_LIST_CAPS = {"regions": 8, "box_2d": 4}
+_CHAT_NAMES_CAP = 16
+
+
+def _chat_copy(value: Any, schema: dict[str, Any], key: str = "") -> Any:
+    """The part of a reply that ``schema`` asks for, cut to size.
+
+    Unknown keys go, a value of the wrong type becomes null, text is one
+    short line, and lists keep only their first items, so a hostile reply
+    cannot grow the chat that is sent again with every later call.
+    """
+    kind = str(schema.get("type", "")).lower()
+    if kind == "object":
+        if not isinstance(value, dict):
+            return None
+        properties: dict[str, Any] = schema.get("properties", {})
+        return {
+            name: _chat_copy(value[name], sub, name)
+            for name, sub in properties.items()
+            if name in value
+        }
+    if kind == "array":
+        if not isinstance(value, list):
+            return None
+        items: dict[str, Any] = schema.get("items", {})
+        cap = (
+            _CHAT_NAMES_CAP
+            if items.get("type") == "string"
+            else _CHAT_LIST_CAPS.get(key, _CHAT_LIST_CAP)
+        )
+        return [_chat_copy(item, items, key) for item in value[:cap]]
+    if kind == "string":
+        if not isinstance(value, str):
+            return None
+        return one_line(value, _CHAT_TEXT_CAPS.get(key, _CHAT_NAME_CAP))
+    if kind == "boolean":
+        return value if isinstance(value, bool) else None
+    if kind in ("number", "integer"):
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return value if number else None
+    return None
+
+
 class GeminiClient:
     """Call Gemini with a structured schema for upscale result notes.
 
@@ -1275,6 +1441,8 @@ class GeminiClient:
                 )
             ]
         raw_models = lister(api_key=self.api_key)
+        if not isinstance(raw_models, list):
+            raise GeminiError("Gemini models.list returned no list")
         return [parse_model_info(item) for item in raw_models if isinstance(item, dict)]
 
     def candidate_models(self, *, refresh: bool = False) -> list[str]:
@@ -1302,6 +1470,8 @@ class GeminiClient:
         for name in [self.model, *extras, *discovered]:
             clean = _strip_models_prefix(name)
             if not clean or clean in seen or clean in self._exhausted_models:
+                continue
+            if not _MODEL_NAME.fullmatch(clean):
                 continue
             # Skip image-generation / tool-specialist names even if env-listed.
             probe = ModelInfo(
@@ -1470,7 +1640,13 @@ class GeminiClient:
         labels = reply.get("shots")
         if not isinstance(labels, list):
             raise GeminiError("Gemini returned no shot labels")
-        self._log(job_dir, intro + f" ({len(shots)} shots)", reply, turns_out)
+        self._log(
+            job_dir,
+            intro + f" ({len(shots)} shots)",
+            reply,
+            turns_out,
+            schema=_SHOT_LABELS_SCHEMA,
+        )
         return [item for item in labels if isinstance(item, dict)]
 
     def upload_video(
@@ -1498,6 +1674,8 @@ class GeminiClient:
         )
         deadline = clock() + _FILE_ACTIVE_TIMEOUT_S
         while True:
+            if not isinstance(file, dict):
+                raise GeminiError("Gemini returned an upload that is not an object")
             state = str(file.get("state") or "")
             if state == "ACTIVE":
                 break
@@ -1505,16 +1683,26 @@ class GeminiClient:
                 raise GeminiError("Gemini could not process the uploaded video")
             if clock() > deadline:
                 raise GeminiError("Gemini took too long to process the uploaded video")
+            name = file.get("name")
+            if not isinstance(name, str) or not _FILE_NAME.fullmatch(name):
+                raise GeminiError("Gemini returned an upload with a bad name")
             sleep(_FILE_POLL_S)
-            file = getter(api_key=self.api_key, name=str(file.get("name") or ""))
+            file = getter(api_key=self.api_key, name=name)
+        uri = file.get("uri")
         video = GeminiVideo(
             name=str(file.get("name") or ""),
-            uri=str(file.get("uri") or ""),
-            mime_type=str(file.get("mimeType") or "video/mp4"),
+            # Sent back to Gemini with every request that watches the video.
+            uri=uri
+            if isinstance(uri, str) and _plain_uri(uri) and uri.startswith("https://")
+            else "",
+            mime_type=_video_mime(file.get("mimeType")),
             expires_at=_parse_expiry(file.get("expirationTime")),
         )
         if not video.name or not video.uri:
             raise GeminiError("Gemini returned an upload without a name or address")
+        if not _FILE_NAME.fullmatch(video.name):
+            # The name goes into File API URLs later; refuse anything else.
+            raise GeminiError("Gemini returned an upload with a bad name")
         return video
 
     def video_alive(self, video: GeminiVideo) -> bool:
@@ -1526,7 +1714,7 @@ class GeminiClient:
             file = getter(api_key=self.api_key, name=video.name)
         except GeminiError:
             return False
-        return str(file.get("state") or "") == "ACTIVE"
+        return isinstance(file, dict) and file.get("state") == "ACTIVE"
 
     def delete_video(self, video: GeminiVideo) -> bool:
         """Remove ``video`` from the File API, best effort.
@@ -1626,7 +1814,13 @@ class GeminiClient:
         )
         if not isinstance(reply.get("shots"), list):
             raise GeminiError("Gemini returned no shot recipes")
-        self._log(job_dir, intro + f" ({len(shots)} shots)", reply, turns_out)
+        self._log(
+            job_dir,
+            intro + f" ({len(shots)} shots)",
+            reply,
+            turns_out,
+            schema=_PROPOSE_SCHEMA,
+        )
         return reply
 
     def propose_segments(
@@ -1702,9 +1896,10 @@ class GeminiClient:
             for t_s, still in zip(times, stills, strict=True):
                 parts.append({"text": f"t={t_s:.3f}s"})
                 parts.append(_jpeg_part(still, under=job_dir))
+        schema = _segments_schema(scales)
         reply = self._generate(
             contents=[{"role": "user", "parts": parts}],
-            schema=_segments_schema(scales),
+            schema=schema,
             system=(
                 "You split videos into segments for a restoration tool and "
                 "choose its output size from the options given. You never "
@@ -1716,15 +1911,13 @@ class GeminiClient:
         if not isinstance(segments, list) or not segments:
             raise GeminiError("Gemini returned no segments")
         seen_as = "the video" if video is not None else f"{len(stills)} stills"
-        self._log(job_dir, intro + f" ({seen_as})", reply, turns_out)
+        self._log(job_dir, intro + f" ({seen_as})", reply, turns_out, schema=schema)
         scale = _offered_scale(reply.get("scale"), scales)
         reason = reply.get("scale_reason")
         return {
             "segments": [item for item in segments if isinstance(item, dict)],
             "scale": scale,
-            "scale_reason": " ".join(str(reason).split())[:240]
-            if scale is not None and isinstance(reason, str)
-            else "",
+            "scale_reason": one_line(reason, 240) if scale is not None else "",
         }
 
     def locate_regions(
@@ -1770,7 +1963,13 @@ class GeminiClient:
         found = reply.get("shots")
         if not isinstance(found, list):
             raise GeminiError("Gemini returned no regions")
-        self._log(job_dir, intro + f" ({len(shots)} shots)", reply, turns_out)
+        self._log(
+            job_dir,
+            intro + f" ({len(shots)} shots)",
+            reply,
+            turns_out,
+            schema=_REGIONS_SCHEMA,
+        )
         return [item for item in found if isinstance(item, dict)]
 
     def check_previews(
@@ -1821,7 +2020,13 @@ class GeminiClient:
         verdicts = reply.get("shots")
         if not isinstance(verdicts, list):
             raise GeminiError("Gemini returned no preview checks")
-        self._log(job_dir, intro + f" ({len(shots)} shots)", reply, turns_out)
+        self._log(
+            job_dir,
+            intro + f" ({len(shots)} shots)",
+            reply,
+            turns_out,
+            schema=_CHECK_SCHEMA,
+        )
         return [item for item in verdicts if isinstance(item, dict)]
 
     def _log(
@@ -1830,13 +2035,20 @@ class GeminiClient:
         prompt: str,
         reply: dict[str, Any],
         turns_out: list[ChatTurn] | None = None,
+        *,
+        schema: dict[str, Any] | None = None,
     ) -> None:
         """Keep the question and its answer as one user and model pair.
 
         With ``turns_out`` the pair is added to that list and the chat file
         is left alone, so the caller can append it later or drop it.
         Otherwise both turns are written to ``job_dir``'s chat in one go.
+        With ``schema`` only the fields it asks for are kept, cut to size
+        (see :func:`_chat_copy`), since the chat is replayed with every
+        later call for the job.
         """
+        if schema is not None:
+            reply = _chat_copy(reply, schema)
         turns = [
             ChatTurn(role="user", text=prompt),
             ChatTurn(role="model", text=json.dumps(reply), structured=reply),
@@ -1883,7 +2095,7 @@ class GeminiClient:
             ),
             prior=load_chat(job_dir) if job_dir is not None else None,
         )
-        self._log(job_dir, prompt, data, turns_out)
+        self._log(job_dir, prompt, data, turns_out, schema=_UPSCALE_SCHEMA)
         return data
 
 
@@ -1911,7 +2123,7 @@ def _offered_scale(raw: Any, scales: tuple[int, ...]) -> int | None:
         return None
     try:
         value = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return value if value in scales and float(raw) == value else None
 

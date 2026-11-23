@@ -33,6 +33,7 @@ from .shots import (
     measure_range,
     shot_still,
 )
+from .textline import one_line
 from .tools import FILE_INPUT, NO_METADATA, resolve_argv
 
 MAX_STILLS = 120
@@ -250,6 +251,14 @@ def make_gemini_copy(
     return out
 
 
+# Text kept from a saved list, the same caps a fresh proposal gets: a label
+# of a few words, Gemini's reason, the editor's note, and an error line.
+MAX_LABEL_LEN = 80
+MAX_REASON_LEN = 240
+MAX_NOTE_LEN = 500
+MAX_ERROR_LEN = 500
+
+
 @dataclass(frozen=True, slots=True)
 class LoopSegment:
     """One span of the video that is planned and previewed on its own."""
@@ -283,15 +292,19 @@ class LoopSegment:
     def from_dict(cls, data: Any) -> LoopSegment:
         if not isinstance(data, dict):
             raise SegmentLoopError("each segment must be an object")
+        start: Any = data.get("start_s")
+        end: Any = data.get("end_s")
+        if isinstance(start, bool) or isinstance(end, bool):
+            raise SegmentLoopError("a segment is missing start_s or end_s")
         try:
             return cls(
-                start_s=float(data["start_s"]),
-                end_s=float(data["end_s"]),
-                label=str(data.get("label", "")),
-                note=str(data.get("note", "")),
+                start_s=float(start),
+                end_s=float(end),
+                label=one_line(data.get("label"), MAX_LABEL_LEN),
+                note=one_line(data.get("note"), MAX_REASON_LEN),
                 contains=_contents(data.get("contains")),
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise SegmentLoopError("a segment is missing start_s or end_s") from exc
 
 
@@ -353,11 +366,13 @@ class SegmentList:
         )
         return cls(
             segments=[LoopSegment.from_dict(item) for item in raw],
-            approved=bool(data.get("approved", False)),
-            error=error if isinstance(error, str) else None,
-            note=str(data.get("note", "")),
+            approved=data.get("approved") is True,
+            error=one_line(error, MAX_ERROR_LEN) if isinstance(error, str) else None,
+            note=one_line(data.get("note"), MAX_NOTE_LEN),
             scale=scale if chosen else None,
-            scale_reason=str(data.get("scale_reason") or "") if chosen else "",
+            scale_reason=one_line(data.get("scale_reason"), MAX_REASON_LEN)
+            if chosen
+            else "",
             revision=revision,
         )
 
@@ -376,7 +391,12 @@ def load_segment_list(job_dir: Path) -> SegmentList | None:
         return None
     try:
         data = json.loads(read_text_retrying(path))
-    except (OSError, json.JSONDecodeError) as exc:
+    except RecursionError as exc:
+        raise SegmentLoopError(
+            f"cannot read {SEGMENTS_FILE_NAME}: nested too deep"
+        ) from exc
+    except (OSError, ValueError) as exc:
+        # ValueError: bad JSON, or bytes that are not UTF-8.
         raise SegmentLoopError(f"cannot read {SEGMENTS_FILE_NAME}: {exc}") from exc
     return SegmentList.from_dict(data)
 
@@ -399,18 +419,23 @@ def _contents(raw: Any) -> tuple[str, ...]:
 _Span = tuple[float, float, str, tuple[str, ...]]
 
 
+# Gemini is asked for at most MAX_LOOP_SEGMENTS; only this many of a longer
+# reply are read, so repair_coverage's merging stays quick.
+MAX_PROPOSED_SPANS = 100
+
+
 def _proposed_spans(raw: list[dict[str, Any]], duration_s: float) -> list[_Span]:
     """Gemini's spans clamped to the clip, in start order; broken ones dropped."""
     spans: list[_Span] = []
-    for item in raw:
+    for item in raw[:MAX_PROPOSED_SPANS]:
         try:
             start = min(max(float(item["start_s"]), 0.0), duration_s)
             end = min(max(float(item["end_s"]), 0.0), duration_s)
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
         if not (math.isfinite(start) and math.isfinite(end)) or end <= start:
             continue
-        label = " ".join(str(item.get("label", "")).split())[:80]
+        label = one_line(item.get("label"), MAX_LABEL_LEN)
         spans.append((start, end, label, _contents(item.get("contains"))))
     return sorted(spans)
 

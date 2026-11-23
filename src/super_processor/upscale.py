@@ -252,7 +252,7 @@ class UpscaleSpan:
                 regions=regions_from_dicts(data.get("regions")),
                 use_upscale=data.get("use_upscale") is not False,
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise UpscaleError(
                 "upscale span needs numbers for start_s, end_s and strength"
             ) from exc

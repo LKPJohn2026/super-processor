@@ -13,6 +13,7 @@ Inside a box, the SPAN share drops to the kind's ceiling in
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -99,7 +100,13 @@ def region_from_model(kind: Any, box: Any) -> Region | None:
         return None
     if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in box):
         return None
-    ymin, xmin, ymax, xmax = (min(1000.0, max(0.0, float(v))) / 1000 for v in box)
+    try:
+        values = [float(v) for v in box]
+    except OverflowError:
+        return None
+    if not all(math.isfinite(v) for v in values):
+        return None
+    ymin, xmin, ymax, xmax = (min(1000.0, max(0.0, v)) / 1000 for v in values)
     x0, x1 = sorted((xmin, xmax))
     y0, y1 = sorted((ymin, ymax))
     if x1 - x0 < 0.005 or y1 - y0 < 0.005:

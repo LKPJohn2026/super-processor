@@ -124,6 +124,7 @@ from .shots import (
     shots_path,
 )
 from .stability import StabilityError, find_seams, seam_candidates
+from .textline import one_line
 from .tools import resolve_argv, tool_path
 from .upscale import (
     UPSCALE_PLAN_FILE,
@@ -171,6 +172,20 @@ MAX_INPUT_LONG_EDGE = 1920
 MAX_INPUT_SHORT_EDGE = 1080
 # The upload Gemini watches, and its File API record (see _gemini_video).
 GEMINI_VIDEO_FILE = "gemini_video.json"
+# Longest saved error text shown again on a page.
+_MAX_SHOWN_ERROR = 500
+
+
+def _video_record(job_dir: Path) -> dict[str, Any]:
+    """The job's ``gemini_video.json``; empty when missing or damaged."""
+    try:
+        saved = json.loads((job_dir / GEMINI_VIDEO_FILE).read_text("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        # ValueError: bad JSON or bytes that are not UTF-8.
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
 # A render's time left is saved at least this often, so the page's estimate
 # stays fresh between whole-percent steps.
 _PROGRESS_SAVE_S = 5.0
@@ -1187,14 +1202,8 @@ class WizardController:
         is only logged (Google removes the file after about 48 hours).
         ``client`` is the one that uploaded it, when the key is changing.
         """
-        record = job_dir / GEMINI_VIDEO_FILE
-        try:
-            saved = json.loads(record.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        known = GeminiVideo.from_dict(
-            saved.get("video") if isinstance(saved, dict) else None
-        )
+        saved = _video_record(job_dir)
+        known = GeminiVideo.from_dict(saved.get("video"))
         if known is None:
             return
         with contextlib.suppress(OSError):
@@ -2935,14 +2944,8 @@ class WizardController:
         upload = getattr(client, "upload_video", None)
         if not callable(upload):
             return None
-        record = job_dir / GEMINI_VIDEO_FILE
-        try:
-            saved = json.loads(record.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            saved = {}
-        known = GeminiVideo.from_dict(
-            saved.get("video") if isinstance(saved, dict) else None
-        )
+        saved = _video_record(job_dir)
+        known = GeminiVideo.from_dict(saved.get("video"))
         alive = getattr(client, "video_alive", None)
         if (
             known is not None
@@ -2952,7 +2955,7 @@ class WizardController:
             return known
         if not allow_upload:
             return None
-        if isinstance(saved, dict) and saved.get("error") and known is None:
+        if saved.get("error") and known is None:
             # It failed for this job already; do not try on every call.
             return None
         middle = low + (high - low) * 0.4
@@ -3014,12 +3017,9 @@ class WizardController:
         self._save_video_record(job_dir, video, detail)
 
     def _video_problem(self, job_dir: Path) -> str:
-        try:
-            saved = json.loads((job_dir / GEMINI_VIDEO_FILE).read_text("utf-8"))
-        except (OSError, ValueError):
-            return ""
-        error = saved.get("error") if isinstance(saved, dict) else None
-        return error if isinstance(error, str) else ""
+        error = _video_record(job_dir).get("error")
+        # Shown on the Segments screen: one line, kept short.
+        return one_line(error, _MAX_SHOWN_ERROR)
 
     def _segmenting_failed(self, state: WizardState, detail: str) -> None:
         """Sampling or proposing failed; mark the job failed and go back to pick."""
@@ -4024,8 +4024,12 @@ class WizardController:
                 job_dir=job_dir,
             )
             ignored = reply_scale(raw.get("scale"))
-            raw["scale"] = scale
-            patch = UpscaleSpan.from_dict(raw)
+            # Only the fields the schema asks for: a stray "look", "source"
+            # or "use_upscale" in the reply must not reach the plan.
+            fields_asked = {
+                key: raw[key] for key in ("start_s", "end_s", "strength") if key in raw
+            }
+            patch = UpscaleSpan.from_dict({**fields_asked, "scale": scale})
             updated = replace_overlapping(
                 plan, patch, duration, preserve_shot_settings=True
             )

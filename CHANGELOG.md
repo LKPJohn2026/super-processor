@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Replies from Gemini, and the Gemini API's own answers, are treated as
+  untrusted throughout. Deeply nested, oversized, non-finite or
+  wrongly typed replies now end in a clean error or bounded values
+  instead of crashing the worker, looping without end (a model list that
+  never stops paging) or spending a minute of CPU on 50,000 segments.
+  Text from Gemini is kept to one capped line, keys outside the reply
+  schema are no longer applied or replayed, odd model names and file
+  addresses are refused, and damaged job files give a clear error. A new
+  test feeds hostile replies into every Gemini call.
+
 ## [4.3.1] - 2026-11-22
 
 ### Security

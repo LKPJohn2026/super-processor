@@ -28,6 +28,7 @@ from typing import Any
 
 from .atomic_io import write_text_atomic
 from .regions import Region, regions_from_dicts
+from .textline import one_line
 from .tools import FILE_INPUT, NO_METADATA, resolve_argv
 from .upscale import UpscalePlan, UpscaleSpan
 
@@ -181,7 +182,7 @@ class Shot:
         try:
             start = float(data["start_s"])
             end = float(data["end_s"])
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ShotError("a shot needs start_s and end_s") from exc
         return cls(
             start_s=start,
@@ -257,7 +258,10 @@ def load_shots(job_dir: Path) -> ShotList | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+    except RecursionError as exc:
+        raise ShotError("shots.json is nested too deep") from exc
+    except ValueError as exc:
+        # Bad JSON, or bytes that are not UTF-8.
         raise ShotError(f"shots.json is not valid JSON: {exc}") from exc
     return ShotList.from_dict(data)
 
@@ -574,7 +578,7 @@ def apply_labels(shots: ShotList, labels: list[dict[str, Any]]) -> ShotList:
         if not 0 <= index < len(updated):
             continue
         shot = updated[index]
-        label = " ".join(str(item.get("label", "")).split())[:80]
+        label = one_line(item.get("label"), 80)
         updated[index] = Shot(
             start_s=shot.start_s,
             end_s=shot.end_s,
