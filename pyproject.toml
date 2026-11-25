@@ -4,7 +4,7 @@
 # --no-isolation; tests/test_workflow_hardening.py checks the two match.
 # setuptools builds wheels itself, so "wheel" is not needed.
 requires = [
-  "Cython==3.3.0",
+  "Cython==3.3.1",
   "setuptools==84.2.1",
   "setuptools-scm[toml]==10.3.4",
 ]
