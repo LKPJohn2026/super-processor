@@ -142,6 +142,21 @@ jobs:
           npm test
           npm run build
 
+      # The app super-processor review serves, built into the package; the
+      # package job puts it in the sdist and the wheel.
+      - name: Build the web app for the package
+        working-directory: web
+        run: |
+          npm run build:package
+          npm run check:package
+
+      - name: Upload the web app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-dist
+          path: src/super_processor/web_dist
+          if-no-files-found: error
+
   gemini-live:
     name: Gemini live API
     runs-on: ubuntu-latest
@@ -234,6 +249,9 @@ jobs:
     name: Build distributions
     needs: [quality, test, frontend, gemini-live]
     runs-on: ubuntu-latest
+    env:
+      # setup.py stops the build if the web app is missing.
+      SUPER_PROCESSOR_REQUIRE_WEB_DIST: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -255,8 +273,17 @@ jobs:
           python -m pip install --require-hashes -r .github/requirements/build.txt
           python -m pip install --require-hashes -r .github/requirements/tools.txt
 
+      - name: Download the web app
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: src/super_processor/web_dist
+
       - name: Build source and wheel distributions
         run: python -m build --no-isolation
+
+      - name: Check the web app is in every distribution
+        run: python .github/scripts/check_web_dist.py dist
 
       - name: Check distribution metadata
         run: python -m twine check dist/*
@@ -265,6 +292,7 @@ jobs:
         run: |
           python -m pip install --no-deps --force-reinstall dist/*.whl
           super-processor self-test --sample-size 1000
+          python -c "import super_processor.review as r; assert (r.web_dist_dir() / 'index.html').is_file()"
 
       - name: Upload distributions
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -1,8 +1,10 @@
 # Localhost Wizard
 
 This document is the screen inventory and contract for the localhost website
-served by `super-processor review`. Implementation lives in `wizard.py`,
-`wizard_pages.py`, `gemini.py`, and the review HTTP server.
+served by `super-processor review`. The screens are the React app in `web/`;
+its build ships in the package as `super_processor/web_dist`. The steps and
+their JSON view live in `wizard.py` and `gemini.py`, and `review.py` serves
+the app, the `/api/*` routes and the job media.
 
 ## Entry
 
@@ -12,11 +14,19 @@ super-processor --jobs-dir .dogfood/jobs review
 super-processor review JOB_ID
 ```
 
-Without a job id the server starts at the introduction screen. With a job id it
-resumes that job’s wizard state when present, otherwise shows the legacy split
-review page when `segments.json` exists. An explicitly reopened wizard stays on
+Without a job id the server starts at the introduction screen. With a job id
+the printed address opens the app on that job, at the step its wizard state
+was saved at. Only jobs the wizard made have that state: for any other job
+`review JOB_ID` exits with status 2 and points to
+`super-processor segment JOB_ID --accept` or `--note TEXT`, which accept or
+redo a split made on the command line. An explicitly reopened wizard stays on
 that job even if another review window changes the last active job. Choosing
 “Start a new job” still leaves the reopened job intact and starts a fresh flow.
+
+If this copy of super-processor has no built app (a source checkout that never
+ran `npm run build:package` in `web/`), `/` answers with a short static page
+that says how to build it or how to use the Vite dev server instead; the API
+works either way.
 
 ## Live dogfood (real Gemini)
 
@@ -62,7 +72,7 @@ matrix. For an intentional local API check, configure a test key and run
 
 Each run makes a random token. `super-processor review` prints the address,
 `wizard token: …`, and `open in your browser: http://127.0.0.1:PORT/?token=…`.
-**Every** route needs the token: the pages, `/api/*`, `/output.mp4`, the stills,
+**Every** route needs the token: the app (`/` and `/assets/*`), `/api/*`, `/output.mp4`, the stills,
 the previews and `/jobs/<id>/…`, for GET, HEAD and POST alike. Without it the
 answer is 401 with a short note to open the printed address. Loopback has no
 per-user access control, so this is what keeps another local user or program
@@ -70,19 +80,42 @@ from reading your jobs, replacing your Gemini key or starting work. A request
 proves it holds the token in one of three ways:
 
 - the `X-Wizard-Token` header (scripts, and the React shell);
-- the cookie `sp_wizard_<port>`, which `GET <any page>?token=<token>` sets
+- the cookie `sp_wizard_<port>`, which `GET <any path>?token=<token>` sets
   (`HttpOnly; SameSite=Strict; Path=/`) before a 303 to the same address
   without the token. A wrong token sets nothing. The cookie counts only on a
   same-origin request (or one without `Sec-Fetch-Site`), because browsers send
-  cookies to every port of a host;
+  cookies to every port of a host. A launch link clicked on another website
+  arrives cross-site, so the Strict cookie is not sent and the answer is 401:
+  open the printed address in a new tab instead;
 - `?t=<token>` on a GET or HEAD of a video or still only, since `<video>` and
   `<img>` cannot send a header. The React shell adds it to the media URLs it
   builds.
 
-On top of the token, every POST and every `?run=1` request must also carry it
-as the header or a `token` field (the wizard puts it in its own forms and
-links), so the cookie a browser sends by itself never forges one. `/api/state`
-returns `token` only to a request that already proved it has it.
+On top of that, every POST and every `?run=1` request must carry the token as
+the `X-Wizard-Token` header. Nothing else counts there: not the cookie a
+browser sends by itself, and not a `token` form field or query value. A page
+on another site cannot add a custom header without a CORS preflight, which
+only the allowed origins below pass. `/api/state` returns `token` only to a
+request that already proved it has it.
+
+The app served at the wizard's own address gets its header this way: the
+launch sets the cookie and redirects to `/`; the page, its script, its
+stylesheet and its fonts load with the cookie (same origin); the app's first
+`GET /api/state` returns the token; the app keeps it in memory and in the
+tab's `sessionStorage` and sends it as the header from then on. This is safe
+because the token is only ever handed to a request that already holds it (the
+cookie, same-origin only), a page on another origin cannot read the answer
+(CORS goes only to the allowlist), the cookie is `HttpOnly`, and the CSP below
+lets only the app's own files run at that origin. After the launch request
+the token is in no address the app makes: media, new-tab links and downloads
+use bare paths that the cookie covers, so it stays out of `Referer`, copied
+links and a download's saved source address. One trace is left: the browser
+keeps the launch address `/?token=…` itself as a history entry (it is the
+start of a redirect) and may suggest it when you type the wizard's address.
+The token lasts until the wizard stops, so on a shared browser profile clear
+that entry or restart the wizard; each start makes a new token.
+Redirecting to `/#token=…` would put it back in the address bar, and writing
+it into `index.html` would need an inline script, which the CSP forbids.
 
 The browser checks stay as a second layer. The wizard answers only requests
 whose `Host` is `127.0.0.1`, `localhost`, or `[::1]`. A request carrying an
@@ -95,30 +128,62 @@ every project page of a GitHub account shares that one `https://<user>.github.io
 origin; prefer the Vite proxy. Add other origins the same way, comma
 separated; `*`, `null`, and anything that is not a plain `http(s)` origin are
 ignored. A cross-site GET that would start work (for example an image tag
-pointing at `/render?run=1`) is refused, and so is a cross-site load of a
+pointing at `/api/render?run=1`) is refused, and so is a cross-site load of a
 video or still that is not signed with `?t=`.
 
 Every response sends `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-`Content-Security-Policy: frame-ancestors 'none'`, `Referrer-Policy: same-origin`,
-`Cache-Control: no-store` and `Cross-Origin-Resource-Policy: same-site`
-(`cross-origin` for media signed with `?t=`). The split review page of
-`review JOB_ID` follows the same rules, with its own token. A connection that
+`Referrer-Policy: same-origin`, `Cache-Control: no-store`,
+`Cross-Origin-Resource-Policy: same-site` (`cross-origin` for media signed with
+`?t=`) and this Content-Security-Policy:
+
+```text
+default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self';
+img-src 'self' blob:; media-src 'self' blob:; connect-src 'self';
+manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self';
+frame-ancestors 'none'
+```
+
+The package build (`npm run build:package`) fits it: one module script and one
+stylesheet from `/assets/`, fonts as files rather than `data:` URLs
+(`assetsInlineLimit: 0`), no inline script or style; React's `style` props go
+through the DOM, which CSP allows. `blob:` is for the local preview of a file
+picked in the browser. `npm run check:package` checks the build for anything
+the CSP would block. Because of `connect-src 'self'`, the app served by a
+wizard talks only to that wizard: "Change address" to another port does not
+work there (use the Vite dev server for that). Asset types come from a fixed
+table, not the system's, so a `.js` file is never sent as `text/plain`. Only
+plain files directly in `web_dist/assets` are served; anything else is 404. A
+connection that
 sends or takes no byte for 60 seconds is closed (each read and write, not a
-whole download), and at most 64 connections are served at once, so idle
+whole download), and at most 512 connections are served at once, so idle
 connections cannot pin the server's threads. Bodies over 256 KiB get 413, and
 a bad `Content-Length` gets 400.
 
-Upscale runs on a single worker thread. `GET /render?run=1` and
-`GET /api/render?run=1` start a pass when none is running and return at once.
-The page refreshes, and the React shell polls `/api/state` (which reports
-`busy`) until the step changes. Posts are refused while a pass runs.
+Upscale runs on a single worker thread. `GET /api/render?run=1` (and
+`/api/segment`, `/api/analyze`, `/api/prefetch`) start a pass when none is
+running and return at once. The app polls `/api/state` (which reports `busy`)
+until the step changes. Posts are refused while a pass runs. Only `/api/*`
+takes a POST; any other POST path is 404.
 
 ## React shell connection and recovery
 
 `super-processor review` binds an **ephemeral backend port** and prints its URL,
-its token, and a ready-made `React shell` line. Keep that process running.
-`45143` is only the React shell's historical fallback, not a guaranteed
-backend port.
+its token, and the launch address, which opens the built app served by the
+wizard itself. The rest of this section is for working on the app with the
+Vite dev or preview server, or the GitHub Pages shell; in a checkout without
+a built app, `review` also prints a ready-made Vite line. Keep that process
+running. `45143` is only the React shell's historical fallback, not a
+guaranteed backend port.
+
+To try the served app from a checkout, build it into the package and restart
+`review`:
+
+```bash
+cd web
+npm ci
+npm run build:package   # writes ../src/super_processor/web_dist (not in git)
+npm run check:package   # fails on anything the wizard's CSP would block
+```
 
 The shell takes the token from the address it is opened with (`?token=` or
 `#token=`; the fragment never reaches a server), keeps it in memory and in
@@ -296,23 +361,28 @@ frame count is refused and the previous `output.mp4` is kept.
 
 ## Screen inventory
 
+Every screen is drawn by the web app at `GET /` from `GET /api/state`; the
+Route column names the JSON API call that moves the step on. Only `/api/*`
+takes a POST, and the old form paths (`/llm`, `/setup`, `/render` and the
+rest) return 404.
+
 | Step | Route | Purpose |
 |---|---|---|
-| Introduction | `GET /` (state `intro`) | Brand hero |
-| LLM type | `GET/POST /llm` (state `llm_choice`) | A: no local LLM → Gemini; B: have local LLM → stub |
-| Local LLM stub | `GET/POST /local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
-| Gemini setup | `GET/POST /setup` | Numbered Google AI Studio steps + paste key. The key is saved to `credentials.json` in the user's config folder (mode 0600) and used on every later run; the screen says where the key in use comes from (`GEMINI_API_KEY`, the file, or an older keyring entry) |
-| Pick file | `POST /browse` (`/api/browse`), `POST /upload` (`/api/upload`), `POST /pick` | "Choose a file…" opens the desktop's own file dialog on the wizard's machine (zenity through the XDG portal, then kdialog; `osascript` on macOS, PowerShell on Windows) and picks the real path. A file dropped on the page is uploaded: the body is the file, `X-File-Name` its name, `X-Wizard-Token` the token; it is streamed to `<jobs>/uploads/` (video extensions only, at most 32 GiB) and removed again if the pick refuses it. Uploads are saved readable by the user only (0600 in a 0700 `uploads/`). Typing a path is under "Type a path instead". Real video files only (a playlist or concat script, even one named `.mp4`, is refused with "… is a playlist or a list of other files, not a video file"). Verified CFR, up to 1080p and 30 minutes |
-| Go back | `POST /goto` (`/api/goto`) with `to=setup`, `file`, or `segments` | Setup, File, and Segments in the step rail are links when they can be reached, and each of those screens has a back link. Nothing is deleted: going back to the segments keeps the approved segments and previews, and approving them again carries on at the same segment. `/api/state` returns `navigation` |
-| Finding segments | `GET /segment?run=1` (`/api/segment?run=1`) | States `sampling` then `proposing`: FFmpeg saves the still grid and a silent copy, which is uploaded to Gemini; Gemini watches it and proposes segments and the output scale (from the stills if the video cannot be used) |
-| Segments | `POST /segments` (`/api/segments`) | `action=approve`, or `action=note` with `note` to propose again |
-| Analyzing | `GET /analyze?run=1` (`/api/analyze?run=1`) | The current segment only: Gemini proposes its settings, a short preview renders, Gemini checks it |
-| Segment preview | `POST /preview` (`/api/preview`) | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one; `action=upscale` with `on=0` or `on=1` overrides Gemini's upscale choice for this segment, which later proposals keep |
-| Ready to render | `POST /ready` (`/api/ready`) | Starts at Gemini's scale and shows its reason. Choose the upscale: `scale=2` ("Upscale 2× · SPAN on the GPU") or `scale=1` ("Don't upscale": same size, clean-up and finishing only, no upscaling); both are offered for every source. `action=render` starts the full render from every approved segment |
-| Upscaling | `GET /render` | SPAN 2x upscale and strength blend on the GPU; FFmpeg trims, splices, and encodes H.264 (`h264_nvenc`, or `libx264` without it) |
-| Result | `GET/POST /result` | Play output; happy, a note that retunes a time range, or a note with `restart=1` that starts over from the segments |
-| Done | `GET /` (state `done`) | Confirmation |
-| New video | `POST /new` (`/api/new`) | From Done or Result: back to pick (or setup without a key); the old job stays on disk |
+| Introduction | `POST /api/intro` (state `intro`) | Brand hero |
+| LLM type | `POST /api/llm` (state `llm_choice`) | A: no local LLM → Gemini; B: have local LLM → stub |
+| Local LLM stub | `POST /api/local-llm` (state `local_llm_stub`) | Deferred placeholder; route back to Gemini setup |
+| Gemini setup | `POST /api/setup` | Numbered Google AI Studio steps + paste key. The key is saved to `credentials.json` in the user's config folder (mode 0600) and used on every later run; the screen says where the key in use comes from (`GEMINI_API_KEY`, the file, or an older keyring entry) |
+| Pick file | `POST /api/browse`, `POST /api/upload`, `POST /api/pick` | "Choose a file…" opens the desktop's own file dialog on the wizard's machine (zenity through the XDG portal, then kdialog; `osascript` on macOS, PowerShell on Windows) and picks the real path. A file dropped on the page is uploaded: the body is the file, `X-File-Name` its name, `X-Wizard-Token` the token; it is streamed to `<jobs>/uploads/` (video extensions only, at most 32 GiB) and removed again if the pick refuses it. Uploads are saved readable by the user only (0600 in a 0700 `uploads/`). Typing a path is under "Type a path instead". Real video files only (a playlist or concat script, even one named `.mp4`, is refused with "… is a playlist or a list of other files, not a video file"). Verified CFR, up to 1080p and 30 minutes |
+| Go back | `POST /api/goto` with `to=setup`, `file`, or `segments` | Setup, File, and Segments in the step rail are links when they can be reached, and each of those screens has a back link. Nothing is deleted: going back to the segments keeps the approved segments and previews, and approving them again carries on at the same segment. `/api/state` returns `navigation` |
+| Finding segments | `GET /api/segment?run=1` | States `sampling` then `proposing`: FFmpeg saves the still grid and a silent copy, which is uploaded to Gemini; Gemini watches it and proposes segments and the output scale (from the stills if the video cannot be used) |
+| Segments | `POST /api/segments` | `action=approve`, or `action=note` with `note` to propose again |
+| Analyzing | `GET /api/analyze?run=1` | The current segment only: Gemini proposes its settings, a short preview renders, Gemini checks it |
+| Segment preview | `POST /api/preview` | `action=approve` moves to the next segment; `action=redo` with `note` (and `resample=1` for a new window) redoes this one; `action=upscale` with `on=0` or `on=1` overrides Gemini's upscale choice for this segment, which later proposals keep |
+| Ready to render | `POST /api/ready` | Starts at Gemini's scale and shows its reason. Choose the upscale: `scale=2` ("Upscale 2× · SPAN on the GPU") or `scale=1` ("Don't upscale": same size, clean-up and finishing only, no upscaling); both are offered for every source. `action=render` starts the full render from every approved segment |
+| Upscaling | `GET /api/render?run=1` | SPAN 2x upscale and strength blend on the GPU; FFmpeg trims, splices, and encodes H.264 (`h264_nvenc`, or `libx264` without it) |
+| Result | `POST /api/result` | Play output; happy, a note that retunes a time range, or a note with `restart=1` that starts over from the segments |
+| Done | `GET /api/state` (state `done`) | Confirmation |
+| New video | `POST /api/new` | From Done or Result: back to pick (or setup without a key); the old job stays on disk |
 
 ## State machine
 
@@ -627,23 +697,18 @@ name in the URL.
 
 ## UI presentation
 
-Server-rendered HTML in `wizard_pages.py` remains the live localhost wizard.
-Shared shell includes a step rail (Setup · File · Segments · Previews ·
-Result; upscaling is a choice on the ready screen, not a step),
-brand mark, and wait estimates. Intro is a single composition with Super
-Processor as the hero. The LLM choice screen uses lettered options matching the
-product sketch.
-
-`web/` is a separate React shell. GitHub Pages serves it as a static preview
-of the same steps. When a local wizard is reachable (`/api/state`, a Vite
-proxy, or `?api=http://127.0.0.1:<port>`), that shell drives every step,
+The React app in `web/` is the wizard's only interface; the server-rendered
+HTML pages it replaced are gone. `super-processor review` serves the build
+that ships in the package. GitHub Pages serves the same app as a static
+preview of the steps. When a local wizard is reachable (its own address, a
+Vite proxy, or `?api=http://127.0.0.1:<port>`), the app drives every step,
 from introduction through the segments and their previews to the result, and
 shows worker progress. Pages itself cannot run the GPU.
 
 ## CI coverage
 
 `tests/test_wizard_full_flow.py` drives the actual localhost `WizardServer`
-over HTTP: introduction → LLM choice → setup → pick → sampling/proposing →
+over its JSON API, as the app does: introduction → LLM choice → setup → pick → sampling/proposing →
 segments approval → analyzing → segment before/after preview and check →
 preview approval → ready to render → render → result note → range revise →
 done. It uses synthetic CFR video with audio and real local FFmpeg operations,

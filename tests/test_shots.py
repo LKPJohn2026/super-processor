@@ -46,7 +46,6 @@ from super_processor.wizard import (
     WizardStep,
     save_session_state,
 )
-from super_processor.wizard_pages import format_time
 
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg required"
@@ -283,12 +282,6 @@ def test_merge_labels_and_storage(tmp_path: Path) -> None:
         load_shots(tmp_path)
     with pytest.raises(ShotError):
         ShotList(shots=[]).to_plan()
-
-
-def test_times_print() -> None:
-    assert format_time(75) == "1:15"
-    assert format_time(5.5) == "0:05.5"
-    assert format_time(59.97) == "1:00"
 
 
 def _cuts_clip(path: Path) -> Path:

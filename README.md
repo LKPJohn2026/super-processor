@@ -40,14 +40,20 @@ still `super-processor`:
 
 ```bash
 python -m pip install ancient-processor        # add [gpu] for the upscale
+super-processor review
 ```
 
-From a checkout:
+The wheel and the sdist include the web app, so this needs no Node.js:
+`review` serves the app at its own address.
+
+From a checkout, build the web app into the package once (it is not in
+git), or `review` shows a page explaining how:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
+(cd web && npm ci && npm run build:package)
 
 export GEMINI_API_KEY=your_key   # or paste it in the wizard setup screen
 super-processor doctor
@@ -56,10 +62,14 @@ super-processor review
 
 `review` prints the wizard's address, its token, and an
 `open in your browser: http://127.0.0.1:PORT/?token=…` line. Open that last
-address: the wizard swaps the token for a browser cookie and drops it from
-the address bar. The plain address without the token answers 401, as does
-every other route, so other programs and users on the machine cannot read
-your jobs or drive the wizard.
+address (paste it into a new tab): the wizard swaps the token for a browser
+cookie, drops it from the address bar, and shows the web app. The plain
+address without the token answers 401, as does every other route, so other
+programs and users on the machine cannot read your jobs or drive the wizard.
+
+`super-processor review JOB_ID` opens the app on that job. It works for jobs
+the wizard made; a split made with the `segment` command is accepted or sent
+back with `super-processor segment JOB_ID --accept` or `--note TEXT`.
 
 The wizard walks through Gemini setup, file pick (up to 1080p and 30 minutes),
 segment review, a before/after preview of each segment in turn, a SPAN
@@ -248,18 +258,25 @@ See [docs/ui-wizard.md](docs/ui-wizard.md),
 [ordered release plan](docs/release-plan.md), and the
 [acceptance matrix and pending evidence](docs/acceptance.md).
 
-The `web/` app is a React shell for that wizard. GitHub Pages can host it as
-a static preview. The GPU upscale still runs only from `super-processor review`.
-Start `super-processor review` first and copy its printed backend URL: the
-server chooses an ephemeral port, not necessarily `45143`. In `web/`, install
-with `npm ci`, then run `VITE_PROXY_TARGET=http://127.0.0.1:PRINTED_PORT npm run dev`
-(replace `PRINTED_PORT` with the actual port). This proxies API, uploads, stills,
+### Working on the web app
+
+The app in `web/` (React) is what `super-processor review` serves; the
+package carries a build of it in `src/super_processor/web_dist`, made by
+`npm run build:package` (CI and the release do this for every wheel and the
+sdist). GitHub Pages can also host it as a static preview, but the GPU
+upscale runs only from `super-processor review`.
+
+To change the app with live reload, start `super-processor review` first
+and copy its printed backend URL: the server chooses an ephemeral port, not
+necessarily `45143`. In `web/`, install with `npm ci`, then run
+`VITE_PROXY_TARGET=http://127.0.0.1:PRINTED_PORT npm run dev` (replace
+`PRINTED_PORT` with the actual port). This proxies API, uploads, stills,
 previews, and output. Open `http://localhost:5173/#token=PRINTED_TOKEN`
-(`review` prints this line for you): the shell keeps the token for the tab,
-removes it from the address bar and sends it with every request. For a built
-app, use the same variable with `npm run preview` after `npm run build`. The
-fallback proxy target `http://127.0.0.1:45143` works only if that is the
-backend's actual address.
+(`review` prints this line when the checkout has no built app): the shell
+keeps the token for the tab, removes it from the address bar and sends it
+with every request. For a built app, use the same variable with
+`npm run preview` after `npm run build`. The fallback proxy target
+`http://127.0.0.1:45143` works only if that is the backend's actual address.
 
 Alternatively, paste the printed `open in your browser` address into the
 local shell's connection form, or open
@@ -270,7 +287,9 @@ address is refused, so a link cannot send your Gemini key or video elsewhere.
 See
 [frontend connection and recovery](docs/ui-wizard.md#react-shell-connection-and-recovery)
 for CORS, HTTPS restrictions, and retry behavior. Offline frontend regressions:
-`cd web && npm test && npm run build` (no API key, GPU, or browser required).
+`cd web && npm test && npm run build` (no API key, GPU, or browser required);
+`npm run build:package && npm run check:package` builds and checks the app
+the package serves.
 
 ## Development checks
 

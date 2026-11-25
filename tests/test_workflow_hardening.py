@@ -212,6 +212,59 @@ def test_ci_package_job_uses_the_release_toolchain() -> None:
     assert "python -m build --no-isolation" in runs
 
 
+def _runs(job: dict[str, Any]) -> str:
+    return "\n".join(str(s.get("run", "")) for s in _steps(job))
+
+
+def _downloads_web_dist(job: dict[str, Any]) -> bool:
+    return any(
+        "download-artifact" in str(s.get("uses", ""))
+        and (s.get("with") or {}).get("name") == "web-dist"
+        and (s.get("with") or {}).get("path") == "src/super_processor/web_dist"
+        for s in _steps(job)
+    )
+
+
+def test_release_builds_the_web_app_once_from_the_lockfile() -> None:
+    data = _load((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
+    web = data["jobs"]["web"]
+    assert _writes(web.get("permissions")) == []
+    node = [s for s in _steps(web) if "setup-node" in str(s.get("uses", ""))]
+    assert len(node) == 1
+    # A tag build must not restore a cache a branch run could have saved.
+    assert "cache" not in (node[0].get("with") or {})
+    build = [s for s in _steps(web) if "npm" in str(s.get("run", ""))]
+    assert [s.get("working-directory") for s in build] == ["web"]
+    lines = str(build[0]["run"]).split()
+    assert lines[:2] == ["npm", "ci"]
+    assert "install" not in lines
+    assert "npm run build:package" in _runs(web)
+    assert "npm run check:package" in _runs(web)
+    for name in ("sdist", "wheels"):
+        job = data["jobs"][name]
+        assert "web" in job["needs"], name
+        assert _downloads_web_dist(job), name
+    assert data["jobs"]["sdist"]["env"]["SUPER_PROCESSOR_REQUIRE_WEB_DIST"] == "1"
+    env = data["env"]["CIBW_ENVIRONMENT"]
+    assert "SUPER_PROCESSOR_REQUIRE_WEB_DIST=1" in env
+    assert "check_web_dist.py dist" in _runs(data["jobs"]["verify"])
+
+
+def test_ci_puts_the_web_app_in_the_distributions() -> None:
+    data = _load((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"))
+    frontend, package = data["jobs"]["frontend"], data["jobs"]["package"]
+    assert "npm ci" in _runs(frontend)
+    assert "npm run build:package" in _runs(frontend)
+    uploads = [s for s in _steps(frontend) if "upload-artifact" in str(s.get("uses"))]
+    assert [(s["with"]["name"], s["with"]["path"]) for s in uploads] == [
+        ("web-dist", "src/super_processor/web_dist")
+    ]
+    assert "frontend" in package["needs"]
+    assert _downloads_web_dist(package)
+    assert package["env"]["SUPER_PROCESSOR_REQUIRE_WEB_DIST"] == "1"
+    assert "check_web_dist.py dist" in _runs(package)
+
+
 def test_release_publishes_only_from_v_tags() -> None:
     data = _load((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
     assert data["on"] == {"push": {"tags": ["v*"]}}

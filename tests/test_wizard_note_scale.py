@@ -385,7 +385,7 @@ def test_output_url_changes_only_when_a_revise_replaces_the_file(
     )
     first = _output_url(controller)
     assert first.startswith(f"/jobs/{job_dir.name}/output.mp4?v=")
-    assert f'src="{first}"' in controller.render()
+    assert controller.api_view()["output_url"] == first
     assert _output_url(controller) == first
 
     # Refused: the file stays, and so does the URL.
@@ -397,7 +397,7 @@ def test_output_url_changes_only_when_a_revise_replaces_the_file(
     assert _size(job_dir / "output.mp4") == (320, 180)
     second = _output_url(controller)
     assert second != first
-    assert f'src="{second}"' in controller.render()
+    assert controller.api_view()["output_url"] == second
 
 
 @needs_ffmpeg
@@ -446,7 +446,6 @@ def test_note_on_a_4x_output_from_before_4x_was_retired_renders_it_again(
         span["scale"] = 4
     plan_file.write_text(json.dumps(saved))
     # The Result line reports the size on disk, not the plan's 2x.
-    assert "Scale 4×" in controller.render()
     assert controller.api_view()["scale"] == 4
 
     controller.handle_post("/result", {"note": ["less contrast from 1s to 3s"]})
@@ -454,4 +453,4 @@ def test_note_on_a_4x_output_from_before_4x_was_retired_renders_it_again(
     state = controller.current_state()
     assert state.step is WizardStep.RESULT and state.error is None, state.error
     assert _size(output) == (320, 180)
-    assert "Scale 2×" in controller.render()
+    assert controller.api_view()["scale"] == 2

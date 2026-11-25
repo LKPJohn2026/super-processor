@@ -115,12 +115,12 @@ def test_a_step_left_by_an_earlier_server_waits_for_the_editor(
     assert controller.start_segmenting() is False
     assert controller.start_analyze() is False
     assert calls == []
-    page = controller.render()
-    assert 'action="/resume"' in page and "Carry on where you left off?" in page
-    assert 'http-equiv="refresh"' not in page
+    # The app asks "Carry on where you left off?" and polls nothing.
+    assert view["step"] == step.value and view["running_elsewhere"] is False
     controller.handle_post("/resume", {"job_id": [job_id]})
-    assert controller.api_view()["interrupted"] is False
-    assert 'http-equiv="refresh"' in controller.render()
+    resumed = controller.api_view()
+    # Now the app starts the step's ?run=1 and polls.
+    assert resumed["interrupted"] is False and resumed["step"] == step.value
     starts = {
         WizardStep.SAMPLING: controller.start_segmenting,
         WizardStep.PROPOSING: controller.start_segmenting,
@@ -206,7 +206,6 @@ def test_an_interrupted_analysis_can_be_stopped_back_to_the_segments(
     )
     view = controller.api_view()
     assert view["interrupted"] is True and view["cancellable"] is True
-    assert 'action="/cancel"' in controller.render()
     controller.handle_post("/cancel", {"job_id": [job_id]})
     state = controller.current_state()
     assert state.step is WizardStep.SEGMENTS
@@ -493,8 +492,8 @@ def test_a_job_another_server_works_on_is_left_alone(
     assert by_id[other]["status"] == "paused"
     view = controller.api_view()
     assert view["running_elsewhere"] is True and view["cancellable"] is False
-    assert "Working in another window" in controller.render()
-    assert 'action="/resume"' not in controller.render()
+    # "Working in another window": nothing to resume or stop from here.
+    assert view["interrupted"] is True
     with pytest.raises(WizardError, match="another Super Processor window"):
         controller.resume()
     with pytest.raises(WizardError, match="another Super Processor window"):

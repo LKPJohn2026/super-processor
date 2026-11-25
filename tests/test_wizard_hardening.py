@@ -20,7 +20,6 @@ from super_processor.review import (
     MAX_BODY_BYTES,
     WizardServer,
     allowed_origins,
-    with_wizard_token,
 )
 from super_processor.segment_loop import (
     LoopSegment,
@@ -188,20 +187,23 @@ def test_bad_content_length_is_400(tmp_path: Path) -> None:
         server.stop()
 
 
-def test_state_changes_need_the_run_token(tmp_path: Path) -> None:
+def test_state_changes_need_the_run_token(tmp_path: Path, web_app: Path) -> None:
     controller = WizardController(tmp_path)
     server = WizardServer(tmp_path, controller=controller, token=TOKEN)
     base = server.start()
     port = urlparse(base).port
-    form = {"Content-Type": "application/x-www-form-urlencoded"}
+    as_json = {"Content-Type": "application/json"}
+    intro = b"{}"
     try:
         # No Origin and no Sec-Fetch-Site: only the token stops these.
-        assert _request(base, "POST", "/intro", headers=form, body=b"x=1")[0] == 401
-        wrong = {**form, "X-Wizard-Token": "guess"}
-        assert _request(base, "POST", "/intro", headers=wrong, body=b"x=1")[0] == 401
-        status, body = _request(base, "GET", "/render?run=1")
+        assert (
+            _request(base, "POST", "/api/intro", headers=as_json, body=intro)[0] == 401
+        )
+        wrong = {**as_json, "X-Wizard-Token": "guess"}
+        assert _request(base, "POST", "/api/intro", headers=wrong, body=intro)[0] == 401
+        status, body = _request(base, "GET", "/api/render?run=1")
         assert status == 403 and b"wizard token" in body
-        # The page itself (which embeds the token) needs it too.
+        # The app itself needs it too.
         assert _request(base, "GET", "/")[0] == 401
         assert controller.current_state().step is WizardStep.INTRO
 
@@ -211,32 +213,50 @@ def test_state_changes_need_the_run_token(tmp_path: Path) -> None:
         launched = connection.getresponse()
         launched.read()
         assert launched.status == 303
+        assert launched.getheader("Location") == "/"
         cookie = (launched.getheader("Set-Cookie") or "").split(";", 1)[0]
         assert cookie == f"sp_wizard_{port}={TOKEN}"
-        browser = {**form, "Cookie": cookie}
+        browser = {**as_json, "Cookie": cookie, "Sec-Fetch-Site": "same-origin"}
         status, page = _request(base, "GET", "/", headers=browser)
         assert status == 200
+        # The app's page is the built file: it holds no token.
+        assert TOKEN.encode() not in page
         connection = HTTPConnection("127.0.0.1", port)
         connection.request("GET", "/", headers=browser)
         framed = connection.getresponse()
         framed.read()
         assert framed.getheader("X-Frame-Options") == "DENY"
-        assert f'name="token" value="{TOKEN}"'.encode() in page
-        # The cookie comes along by itself, so a post also needs the
-        # page's own token field.
-        assert _request(base, "POST", "/intro", headers=browser, body=b"x=1")[0] == 403
-        field = f"token={TOKEN}".encode()
-        assert _request(base, "POST", "/intro", headers=browser, body=field)[0] == 303
-        assert controller.current_state().step is WizardStep.LLM_CHOICE
+        # The cookie comes along by itself, so it never starts anything.
+        status, _ = _request(base, "POST", "/api/intro", headers=browser, body=intro)
+        assert status == 403
+        status, _ = _request(base, "GET", "/api/render?run=1", headers=browser)
+        assert status == 403
+        # Nor does a token in the body or the query: only the header counts.
+        field = json.dumps({"token": TOKEN}).encode()
+        status, _ = _request(base, "POST", "/api/intro", headers=browser, body=field)
+        assert status == 403
+        form = {**browser, "Content-Type": "application/x-www-form-urlencoded"}
+        status, _ = _request(
+            base, "POST", "/api/intro", headers=form, body=f"token={TOKEN}".encode()
+        )
+        assert status == 403
+        status, _ = _request(base, "GET", f"/api/render?run=1&token={TOKEN}")
+        assert status == 403
+        assert controller.current_state().step is WizardStep.INTRO
 
-        # The API hands the token to the shell, which sends it as a header.
+        # The API hands the token to the app, which sends it as a header.
         status, body = _request(base, "GET", "/api/state", headers=browser)
         assert json.loads(body)["token"] == TOKEN
+        header = {**as_json, "X-Wizard-Token": TOKEN}
+        assert (
+            _request(base, "POST", "/api/intro", headers=header, body=intro)[0] == 200
+        )
+        assert controller.current_state().step is WizardStep.LLM_CHOICE
         status, _body = _request(
             base,
             "POST",
             "/api/llm",
-            headers={"Content-Type": "application/json", "X-Wizard-Token": TOKEN},
+            headers=header,
             body=json.dumps({"choice": "gemini"}).encode(),
         )
         assert status == 200
@@ -245,16 +265,22 @@ def test_state_changes_need_the_run_token(tmp_path: Path) -> None:
         server.stop()
 
 
-def test_pages_carry_the_token_into_run_links() -> None:
-    page = (
-        '<meta http-equiv="refresh" content="2;url=/render?run=1">'
-        '<form method="post" action="/preview"><button>Go</button></form>'
-        '<form method="get" action="/"></form>'
-    )
-    marked = with_wizard_token(page, "abc")
-    assert "url=/render?run=1&amp;token=abc" in marked
-    assert marked.count('name="token" value="abc"') == 1
-    assert '<form method="get" action="/"></form>' in marked
+def test_the_old_form_routes_are_gone(tmp_path: Path) -> None:
+    controller = WizardController(tmp_path)
+    server = WizardServer(tmp_path, controller=controller, token=TOKEN)
+    base = server.start()
+    header = {"X-Wizard-Token": TOKEN, "Content-Type": "application/json"}
+    try:
+        for path in ("/intro", "/setup", "/upload", "/segments", "/api/nope"):
+            status, body = _request(base, "POST", path, headers=header, body=b"{}")
+            assert status == 404, path
+            assert f"unknown endpoint {path}".encode() in body
+        for path in ("/render", "/segment", "/analyze"):
+            status, _ = _request(base, "GET", f"{path}?run=1", headers=header)
+            assert status == 404, path
+        assert controller.current_state().step is WizardStep.INTRO
+    finally:
+        server.stop()
 
 
 def test_each_server_makes_its_own_token(tmp_path: Path) -> None:
@@ -406,7 +432,8 @@ def test_starting_a_prefetch_needs_the_token_and_the_run_link(
     try:
         status, body = _request(base, "GET", "/api/prefetch?run=1")
         assert status == 403 and b"wizard token" in body
-        status, _body = _request(base, "GET", "/api/prefetch?run=1&token=guess")
+        status, _body = _request(base, "GET", f"/api/prefetch?run=1&token={TOKEN}")
+        # A token in the query does not count; only the header does.
         assert status == 403
         # Without the run link it is not an endpoint at all.
         status, _body = _request(
@@ -414,7 +441,9 @@ def test_starting_a_prefetch_needs_the_token_and_the_run_link(
         )
         assert status == 404
         assert started == []
-        status, body = _request(base, "GET", f"/api/prefetch?run=1&token={TOKEN}")
+        status, body = _request(
+            base, "GET", "/api/prefetch?run=1", headers={"X-Wizard-Token": TOKEN}
+        )
         assert status == 200 and json.loads(body)["step"] == "intro"
         assert started == ["prefetch"]
     finally:

@@ -182,7 +182,7 @@ def test_a_stop_while_gemini_proposes_goes_back_to_pick(tmp_path: Path) -> None:
     assert view["run"]["outcome"] == "stopped"
     assert view["stopped"] == state.stopped
     assert view["cancellable"] is False
-    assert "stopped finding the segments" in controller.render()
+    assert "stopped finding the segments" in view["stopped"]
 
     # The answer that comes in after the stop is dropped.
     gemini.release.set()
@@ -256,8 +256,7 @@ def test_a_stopped_re_propose_keeps_the_segments(tmp_path: Path) -> None:
     assert found is not None
     assert [s.label for s in found.segments] == ["old first", "old second"]
     assert found.note == "split at the door"
-    page = controller.render()
-    assert "segments from before" in page and 'class="notice"' in page
+    assert "segments from before" in controller.api_view()["stopped"]
     # The next action clears the message.
     controller.handle_post("/segments", {"action": ["bogus"]})
     assert controller.current_state().stopped is None
@@ -485,7 +484,6 @@ def test_resuming_drops_a_stop_asked_before_the_restart(
 def test_an_interrupted_run_can_be_stopped_without_a_worker(tmp_path: Path) -> None:
     controller, job_id, job_dir = _job(tmp_path, WizardStep.RENDERING)
     assert controller.api_view()["cancellable"] is True
-    assert 'action="/cancel"' in controller.render()
     controller.handle_post("/cancel", {"job_id": [job_id]})
     state = controller.current_state()
     assert state.step is WizardStep.READY_TO_RENDER and state.stopped is not None
@@ -512,7 +510,6 @@ def test_a_double_stop_is_one_stop(
         view = controller.api_view()
         assert view["cancel_requested"] is True and view["cancellable"] is False
         assert (job_dir / CANCEL_MARKER).exists()
-        assert "Stopping" in controller.render()
     assert controller.wait_idle(5)
     assert controller.current_state().step is WizardStep.READY_TO_RENDER
     assert controller.api_view()["cancel_requested"] is False

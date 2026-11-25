@@ -37,7 +37,6 @@ from .gemini import (
     GeminiVideo,
     append_chat_turn,
     append_chat_turns,
-    gemini_api_key_source,
     redact_payload,
     redact_secrets,
     resolve_gemini_api_key,
@@ -143,24 +142,6 @@ from .upscale import (
     require_supported_timing,
     save_upscale_plan,
     video_stream_facts,
-)
-from .wizard_pages import (
-    render_analyzing,
-    render_done,
-    render_interrupted,
-    render_intro,
-    render_llm_choice,
-    render_local_llm_stub,
-    render_pick,
-    render_preview_segment,
-    render_ready,
-    render_rendering,
-    render_result,
-    render_sampling,
-    render_segments,
-    render_setup,
-    with_navigation,
-    with_notice,
 )
 
 WIZARD_STATE_FILE = "wizard_state.json"
@@ -1939,10 +1920,6 @@ class WizardController:
         if self._session_state is not None:
             self._session_state = state
 
-    def render(self) -> str:
-        page = with_notice(self._render_page(), self._state().stopped)
-        return with_navigation(page, self.navigation())
-
     def navigation(self) -> dict[str, bool]:
         """Which of setup, file, and segments the editor can go to now."""
         state = self._state()
@@ -1963,83 +1940,6 @@ class WizardController:
             and resolve_gemini_api_key() is not None,
             "segments": segments and state.step is not WizardStep.SEGMENTS,
         }
-
-    def _render_page(self) -> str:
-        state = self._state()
-        busy = self.busy()
-        if self.interrupted(state, busy):
-            assert state.job_id
-            can_stop, _stopping = self._cancel_view(state, busy)
-            return render_interrupted(
-                state.step.value,
-                can_stop=can_stop,
-                elsewhere=running_elsewhere(self.store.job_dir(state.job_id)),
-            )
-        if state.step is WizardStep.INTRO:
-            return render_intro()
-        if state.step is WizardStep.LLM_CHOICE:
-            return render_llm_choice(error=state.error)
-        if state.step is WizardStep.LOCAL_LLM_STUB:
-            return render_local_llm_stub()
-        if state.step is WizardStep.SETUP:
-            return render_setup(
-                has_key=bool(resolve_gemini_api_key()),
-                error=state.error,
-                key_source=gemini_api_key_source(),
-            )
-        if state.step is WizardStep.PICK_FILE:
-            return render_pick(error=state.error)
-        if state.step in _SEGMENTING_STEPS:
-            can_stop, stopping = self._cancel_view(state, self.busy())
-            return render_sampling(state.progress, can_stop=can_stop, stopping=stopping)
-        if state.step is WizardStep.SEGMENTS:
-            assert state.job_id
-            return render_segments(
-                self._segments_view(self.store.job_dir(state.job_id)),
-                error=state.error,
-            )
-        if state.step is WizardStep.ANALYZING:
-            assert state.job_id
-            found = self._segments_view(self.store.job_dir(state.job_id))
-            count = len(found["segments"])
-            return render_analyzing(state.segment_index, count, state.progress)
-        if state.step is WizardStep.PREVIEW_SEGMENT:
-            assert state.job_id
-            return render_preview_segment(
-                self._segment_preview_view(
-                    self.store.job_dir(state.job_id), state.segment_index
-                ),
-                error=state.error,
-            )
-        if state.step is WizardStep.READY_TO_RENDER:
-            assert state.job_id
-            return render_ready(
-                self._ready_view(self.store.job_dir(state.job_id), state.job_id),
-                error=state.error,
-            )
-        if state.step is WizardStep.RENDERING:
-            can_stop, stopping = self._cancel_view(state, self.busy())
-            return render_rendering(
-                state.progress, can_stop=can_stop, stopping=stopping
-            )
-        if state.step is WizardStep.RESULT:
-            assert state.job_id
-            job_dir = self.store.job_dir(state.job_id)
-            scale, _strength, summary = _active_knobs(
-                job_dir, Path(self.store.load(state.job_id).source_path)
-            )
-            report = load_render_report(job_dir)
-            return render_result(
-                output_url=_output_url(job_dir) or "/output.mp4",
-                error=state.error,
-                scale=scale,
-                strength=summary,
-                seams=report["seams"],
-                seam_error=report["error"],
-            )
-        if state.step is WizardStep.DONE:
-            return render_done()
-        return render_intro()
 
     def api_view(self) -> dict[str, Any]:
         """JSON snapshot of the current step for a separate UI shell."""

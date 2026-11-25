@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
-from wizard_client import get
+from wizard_client import FAKE_INDEX, get
 
 from super_processor.gemini import credentials_path, resolve_gemini_api_key
 from super_processor.review import WizardServer
@@ -16,28 +17,22 @@ from super_processor.wizard import (
     load_session_state,
     save_session_state,
 )
-from super_processor.wizard_pages import render_intro
 
 
-def test_intro_page_describes_the_span_2x_enhancement() -> None:
-    html = render_intro()
-    assert "Super Processor" in html
-    # SPAN at 2x is the only upscaler; the page must not promise anything else.
-    assert "SPAN" in html and "2×" in html and "strength" in html
-    for gone in ("FlashVSR", "4×", "no invented frames"):
-        assert gone not in html
-
-
-def test_wizard_server_serves_intro(tmp_path: Path) -> None:
+def test_wizard_server_serves_the_app_on_the_intro_step(
+    tmp_path: Path, web_app: Path
+) -> None:
     server = WizardServer(tmp_path)
     base = server.start()
     try:
         with get(base + "/", server.token) as response:
             body = response.read().decode()
+        with get(base + "/api/state", server.token) as response:
+            view = json.loads(response.read())
     finally:
         server.stop()
-    assert "Super Processor" in body
-    assert 'action="/intro"' in body
+    assert body == FAKE_INDEX
+    assert view["step"] == "intro"
 
 
 def test_setup_saves_the_key_and_moves_on_to_the_pick(
@@ -52,7 +47,8 @@ def test_setup_saves_the_key_and_moves_on_to_the_pick(
     assert controller.current_state().step is WizardStep.LLM_CHOICE
     controller.handle_post("/llm", {"choice": ["local"]})
     assert controller.current_state().step is WizardStep.LOCAL_LLM_STUB
-    assert "Gemini" in controller.render()
+    view = controller.api_view()
+    assert view["step"] == "local_llm_stub" and view["error"] is None
     controller.handle_post("/local-llm", {})
     assert controller.current_state().step is WizardStep.SETUP
     # Without a key, "skip" cannot skip: it falls through to saving an empty

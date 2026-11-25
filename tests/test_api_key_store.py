@@ -167,7 +167,8 @@ def test_setup_screen_saves_the_key_for_later_runs(
     from super_processor.wizard import save_session_state
 
     save_session_state(controller.jobs_dir, WizardState(step=WizardStep.SETUP))
-    assert "Follow these steps" in controller.render()
+    view = controller.api_view()
+    assert view["step"] == "setup" and view["has_gemini_key"] is False
     controller.handle_post("/setup", {"api_key": ["AIza-pasted"]})
     assert controller.current_state().step is WizardStep.PICK_FILE
 
@@ -175,7 +176,8 @@ def test_setup_screen_saves_the_key_for_later_runs(
     monkeypatch.delenv("GEMINI_API_KEY")
     restarted = WizardController(tmp_path / "jobs")
     save_session_state(restarted.jobs_dir, WizardState(step=WizardStep.SETUP))
-    page = restarted.render()
-    assert "A Gemini API key is saved" in page
-    assert str(_own_config_dir / "credentials.json") in page
     assert restarted.api_view()["has_gemini_key"] is True
+    # Where the saved key comes from (the old setup page named it).
+    source = gemini_api_key_source()
+    assert source is not None
+    assert str(_own_config_dir / "credentials.json") in source

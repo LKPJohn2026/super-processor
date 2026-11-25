@@ -34,6 +34,8 @@ src/super_processor/_version.py
 # Static wizard shell
 web/node_modules/
 web/dist/
+# The web app built into the package (npm run build:package)
+src/super_processor/web_dist/
 
 # Editors and operating systems
 .DS_Store

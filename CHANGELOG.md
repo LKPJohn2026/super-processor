@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `super-processor review` now serves the web app itself. A normal
+  `pip install ancient-processor` includes the built app, so the printed
+  address opens the full UI with no Node or Vite needed. The Vite dev
+  server and the GitHub Pages shell still work for development.
+- `super-processor review JOB_ID` opens that job in the web app. A job made
+  with the command line (no wizard state) is pointed to
+  `segment --accept/--note` instead.
+
+### Removed
+
+- The built-in server-rendered wizard pages and the older per-job
+  split-review page. The JSON API and every wizard step are unchanged.
+
+### Security
+
+- The served app has a strict Content-Security-Policy (its own scripts,
+  styles, fonts and connections only, no framing). Actions take the token
+  only in the X-Wizard-Token header, never from a form field or the
+  address. Media from the served app no longer carries the token in its
+  address, the Host header is parsed strictly (one header, matching port),
+  and a decoy cookie set by another local port can no longer lock the app
+  out. Static files are served only from the built app, by name, with
+  fixed content types.
+
 ## [4.3.3] - 2026-11-24
 
 ### Changed

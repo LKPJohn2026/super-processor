@@ -55,7 +55,7 @@ from .recipe import (
 )
 from .reframe import ReframeError, plan_social_export, write_reframe_plan
 from .render import RenderError, ensure_encoder, render_chosen_plan
-from .review import ReviewError, ReviewServer, WizardServer, launch_url
+from .review import WizardServer, launch_url, web_dist_dir
 from .segments import (
     SegmentError,
     TimelineSegment,
@@ -85,6 +85,7 @@ from .treatments import (
     filter_treatments,
 )
 from .validator import validate_job_recipe
+from .wizard import load_job_wizard_state
 from .worker import FFmpegWorker, WorkerError, format_progress_status
 
 
@@ -249,13 +250,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_cmd = subparsers.add_parser(
         "review",
-        help="serve the localhost Gemini wizard (or a job review page)",
+        help="serve the wizard's web app on localhost; with a job id, open that job",
     )
     review_cmd.add_argument(
         "job_id",
         nargs="?",
         default=None,
-        help="optional job id; omit to start the wizard",
+        help="optional id of a job the wizard made, to open it in the app",
     )
     review_cmd.add_argument(
         "--prefetch",
@@ -542,35 +543,45 @@ def _plans_from_assignments(
 
 
 def run_review_command(arguments: argparse.Namespace) -> int:
-    """Serve the Gemini wizard or a job review page until interrupted."""
+    """Serve the wizard's web app until interrupted.
+
+    With a job id the app opens that job. Only jobs the wizard made can be
+    opened; a split made with ``segment`` is reviewed with ``segment``.
+    """
     store = _store_from_args(arguments)
     job_id = getattr(arguments, "job_id", None)
     # Off unless asked for: it spends GPU time and Gemini quota ahead.
     prefetch = bool(getattr(arguments, "prefetch", False))
     if job_id:
-        store.load(str(job_id))
-        server: ReviewServer | WizardServer = ReviewServer(
-            store.job_dir(str(job_id)),
-            jobs_dir=store.root,
-            job_id=str(job_id),
-            prefetch=prefetch,
-        )
+        job_id = str(job_id)
+        store.load(job_id)
+        if load_job_wizard_state(store.job_dir(job_id)) is None:
+            print(
+                f"error: job {job_id} was not made by the wizard; review its "
+                f"split with `super-processor segment {job_id} --accept` or "
+                "`--note TEXT`",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        server = WizardServer(store.root, job_id=job_id, prefetch=prefetch)
     else:
         store.ensure_root()
         server = WizardServer(store.root, prefetch=prefetch)
     base = server.start()
     print(base, flush=True)
-    if server.token:
-        # For scripts and the React shell: every request needs it, as the
-        # X-Wizard-Token header (or the cookie the open-in-browser URL sets).
-        print(f"wizard token: {server.token}", flush=True)
-        print(f"open in your browser: {launch_url(base, server.token)}", flush=True)
-        if not job_id:
-            print(
-                f"React shell (in web/): VITE_PROXY_TARGET={base} npm run dev, "
-                f"then open http://localhost:5173/#token={server.token}",
-                flush=True,
-            )
+    # For scripts and the Vite dev server: every request needs it, as the
+    # X-Wizard-Token header (or the cookie the open-in-browser URL sets).
+    print(f"wizard token: {server.token}", flush=True)
+    print(f"open in your browser: {launch_url(base, server.token)}", flush=True)
+    if not (web_dist_dir() / "index.html").is_file():
+        print(
+            "this checkout has no built web app: run `npm ci && npm run "
+            "build:package` in web/ and restart, or run the Vite dev server: "
+            f"VITE_PROXY_TARGET={base} npm run dev, then open "
+            f"http://localhost:5173/#token={server.token}",
+            flush=True,
+        )
     try:
         server.wait()
     except KeyboardInterrupt:
@@ -1170,7 +1181,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         SegmentError,
         TreatmentError,
         RenderError,
-        ReviewError,
     ) as exc:
         print(f"error: {exc}", flush=True)
         return 1

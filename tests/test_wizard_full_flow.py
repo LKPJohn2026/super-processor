@@ -1,4 +1,4 @@
-"""CI coverage: full localhost wizard website from intro through done."""
+"""CI coverage: the wizard's JSON API, as the app drives it, intro to done."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pytest
@@ -83,20 +82,26 @@ def _tiny_clip(path: Path, seconds: int = 12) -> Path:
     return path
 
 
-def _get(base: str, path: str = "/") -> str:
+def _get(base: str, path: str = "/api/state") -> dict[str, Any]:
+    """A GET of the API, as the app sends it."""
     with urlopen(Request(base + path, headers={"X-Wizard-Token": TOKEN})) as response:
-        return str(response.read().decode())
+        view = json.load(response)
+    assert isinstance(view, dict)
+    return view
 
 
-def _post(base: str, path: str, fields: dict[str, str]) -> str:
+def _post(base: str, action: str, fields: dict[str, str]) -> dict[str, Any]:
+    """A POST to /api/<action> with a JSON body; the answer is the new view."""
     req = Request(
-        base + path,
-        data=urlencode(fields).encode(),
-        headers={"X-Wizard-Token": TOKEN},
+        f"{base}/api/{action}",
+        data=json.dumps(fields).encode(),
+        headers={"X-Wizard-Token": TOKEN, "Content-Type": "application/json"},
         method="POST",
     )
     with urlopen(req) as response:
-        return str(response.read().decode())
+        view = json.load(response)
+    assert isinstance(view, dict)
+    return view
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
@@ -176,61 +181,63 @@ def test_wizard_website_full_flow_intro_to_done(
     server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
-        intro = _get(base)
-        assert "brand-hero" in intro
-        assert "Super Processor" in intro
-        assert "Continue" in intro
+        assert _get(base)["step"] == "intro"
 
-        llm = _post(base, "/intro", {})
-        assert "What type of LLM" in llm
-        assert "I don’t have a local LLM" in llm
+        llm = _post(base, "intro", {})
+        assert llm["step"] == "llm_choice"
 
-        setup = _post(base, "/llm", {"choice": "gemini"})
-        assert "Gemini API setup" in setup
+        setup = _post(base, "llm", {"choice": "gemini"})
+        assert setup["step"] == "setup" and setup["has_gemini_key"] is True
 
-        pick = _post(base, "/setup", {"skip": "1"})
-        assert "Pick a video file" in pick
+        pick = _post(base, "setup", {"skip": "1"})
+        assert pick["step"] == "pick_file"
 
-        sampling = _post(base, "/pick", {"path": str(clip)})
-        assert "Finding the segments" in sampling
+        sampling = _post(base, "pick", {"path": str(clip)})
+        assert sampling["step"] == "sampling"
         assert controller.current_state().step is WizardStep.SAMPLING
-        _get(base, "/segment?run=1")
+        _get(base, "/api/segment?run=1")
         assert controller.wait_idle(timeout=60)
         found = _get(base)
-        assert "<h1>Segments</h1>" in found
-        assert "1. flat gray card" in found and "0:00–0:12" in found
-        assert "Approve 1 segment<" in found
-        assert "made_up" not in found
+        assert found["step"] == "segments"
+        segments = found["segments"]["segments"]
+        assert [(s["label"], s["start_s"], s["end_s"]) for s in segments] == [
+            ("flat gray card", 0.0, 12.0)
+        ]
+        # A made-up kind of content is dropped, not shown.
+        assert "made_up" not in json.dumps(found)
 
-        analyzing = _post(base, "/segments", {"action": "approve"})
-        assert "<h1>Segment 1 of 1</h1>" in analyzing
-        _get(base, "/analyze?run=1")
+        analyzing = _post(base, "segments", {"action": "approve"})
+        assert analyzing["step"] == "analyzing" and analyzing["segment_index"] == 0
+        _get(base, "/api/analyze?run=1")
         assert controller.wait_idle(timeout=60)
         looks = _get(base)
-        assert "Approve and finish" in looks
-        assert "strength 0.40 · deblock 0.20 · contrast 1.05" in looks
-        assert "Flat card; light deblock" in looks
-        assert "Check passed. Cleaner, nothing invented." in looks
+        assert looks["step"] == "preview_segment"
+        preview = looks["segment_preview"]
+        assert (preview["index"], preview["count"]) == (0, 1)
+        shot = preview["shot"]
+        assert shot["strength"] == 0.4
+        assert (shot["look"]["deblock"], shot["look"]["contrast"]) == (0.2, 1.05)
+        assert shot["reason"].startswith("Flat card; light deblock")
+        assert shot["check"]["ok"] is True
+        assert shot["check"]["note"] == "Cleaner, nothing invented."
         # The plan's generation keeps a cached preview of an older plan away.
-        assert 'src="/previews/shot_000_r1_after.mp4?g=' in looks
-        assert 'poster="/previews/shot_000_r1_after.jpg?g=' in looks
+        assert shot["after_url"].startswith("/previews/shot_000_r1_after.mp4?g=")
         with get(base + "/previews/shot_000_r1_after.jpg", TOKEN) as response:
             assert response.headers.get_content_type() == "image/jpeg"
 
-        ready = _post(base, "/preview", {"action": "approve"})
-        assert "<h1>Ready to render</h1>" in ready
-        waiting = _post(base, "/ready", {"action": "render"})
-        assert "<h1>Upscaling</h1>" in waiting
+        ready = _post(base, "preview", {"action": "approve"})
+        assert ready["step"] == "ready_to_render"
+        waiting = _post(base, "ready", {"action": "render"})
+        assert waiting["step"] == "rendering"
         assert controller.current_state().step is WizardStep.RENDERING
 
-        started = _get(base, "/render?run=1")
-        assert "<h1>Upscaling</h1>" in started
+        started = _get(base, "/api/render?run=1")
+        assert started["step"] == "rendering"
         assert controller.wait_idle(timeout=60)
         result = _get(base)
-        assert "<h1>Result</h1>" in result
-        assert "A. I am happy" in result
-        assert "Scale 2" in result
-        assert "strength 0.40" in result
+        assert result["step"] == "result" and result["output_ready"] is True
+        assert result["scale"] == 2
+        assert result["strength_summary"] == "strength 0.40"
         assert controller.current_state().step is WizardStep.RESULT
         job_id = controller.current_state().job_id
         assert job_id
@@ -243,18 +250,18 @@ def test_wizard_website_full_flow_intro_to_done(
 
         revising = _post(
             base,
-            "/result",
+            "result",
             {"note": "reduce artificial detail from 2s to 5s"},
         )
-        assert "<h1>Upscaling</h1>" in revising
+        assert revising["step"] == "rendering"
         assert controller.current_state().step is WizardStep.RENDERING
 
-        _get(base, "/render?run=1")
+        _get(base, "/api/render?run=1")
         assert controller.wait_idle(timeout=60)
         revised = _get(base)
-        assert "<h1>Result</h1>" in revised
+        assert revised["step"] == "result"
         # Gemini's 0.20 covers 2-5 s only; the rest keeps the approved 0.40.
-        assert "strength 0.20–0.40" in revised
+        assert revised["strength_summary"] == "strength 0.20–0.40"
         plan = load_upscale_plan(controller.store.job_dir(job_id))
         assert plan is not None
         assert sorted((s.start_s, s.end_s, s.strength) for s in plan.spans) == [
@@ -273,8 +280,8 @@ def test_wizard_website_full_flow_intro_to_done(
             assert response.headers.get_content_type() == "video/mp4"
             assert len(response.read()) > 0
 
-        done = _post(base, "/result", {"mood": "happy"})
-        assert "<h1>Done</h1>" in done
+        done = _post(base, "result", {"mood": "happy"})
+        assert done["step"] == "done"
         assert controller.current_state().step is WizardStep.DONE
     finally:
         server.stop()
@@ -289,18 +296,16 @@ def test_wizard_website_local_llm_stub_then_gemini_path(
     server = WizardServer(tmp_path, token=TOKEN, controller=controller)
     base = server.start()
     try:
-        _post(base, "/intro", {})
-        unsure = _post(base, "/llm", {"choice": "both"})
-        assert "pick how you want to run the LLM" in unsure
+        _post(base, "intro", {})
+        unsure = _post(base, "llm", {"choice": "both"})
+        assert "pick how you want to run the LLM" in unsure["error"]
         assert controller.current_state().step is WizardStep.LLM_CHOICE
-        stub = _post(base, "/llm", {"choice": "local"})
-        assert "Local LLM setup" in stub
-        assert "not wired yet" in stub
-        assert "Use Gemini instead" in stub
+        stub = _post(base, "llm", {"choice": "local"})
+        assert stub["step"] == "local_llm_stub" and stub["error"] is None
         assert controller.current_state().step is WizardStep.LOCAL_LLM_STUB
 
-        setup = _post(base, "/local-llm", {"action": "gemini"})
-        assert "Gemini API setup" in setup
+        setup = _post(base, "local-llm", {"action": "gemini"})
+        assert setup["step"] == "setup" and setup["has_gemini_key"] is False
         assert controller.current_state().step is WizardStep.SETUP
     finally:
         server.stop()

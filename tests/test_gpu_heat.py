@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,7 @@ from super_processor.gpu_heat import (
     read_gpu_heat,
     slowing_from_heat,
 )
-from super_processor.wizard import WizardController
-from super_processor.wizard_pages import _progress_bar
+from super_processor.wizard import WizardController, _aged
 
 COOL = GpuHeat(temp_c=65.0, power_w=480.0, thermal_slowdown=False)
 HOT = GpuHeat(temp_c=HOT_C, power_w=500.0, thermal_slowdown=False)
@@ -212,9 +212,9 @@ def test_the_wizard_shows_the_note_under_the_render_progress(tmp_path: Path) -> 
     controller._progress(state, "rendering", 50, "Upscaling on the GPU: 50%")
     assert state.progress is not None
     assert state.progress["note"] == UNDERVOLT_NOTE
-    page = _progress_bar(state.progress)
-    assert "Undervolting the GPU" in page and 'class="notice"' in page
-    assert "Undervolting" in _progress_bar({**state.progress, "overall": None})
+    # What /api/state sends while the render runs.
+    sent = _aged(state.progress, time.time())
+    assert sent is not None and sent["note"] == UNDERVOLT_NOTE
     controller._heat_note = None
     controller._progress(state, "rendering", 60, "Upscaling on the GPU: 60%")
     assert "note" not in state.progress

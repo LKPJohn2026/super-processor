@@ -37,6 +37,7 @@ from super_processor.gemini import (
     contents_from_chat,
     load_chat,
     parse_model_info,
+    redact_payload,
     summarize_gemini_error,
 )
 from super_processor.look import LOOK_BOUNDS, LookError, ShotLook
@@ -101,7 +102,6 @@ from super_processor.wizard import (
     save_job_wizard_state,
     save_session_state,
 )
-from super_processor.wizard_pages import _look_card
 
 # Errors that mean our code tripped over a reply instead of refusing it.
 CRASHES = (
@@ -1427,16 +1427,39 @@ def _check_state(
     return view
 
 
-STYLE = re.compile(r'style="([^"]*)"')
-STYLE_VALUE = re.compile(r"(?:[a-z-]+:-?\d+(?:\.\d+)?%;?)+")
+# Fields the app turns into inline style (bar widths, scene and region
+# positions). They must be plain finite numbers, never a reply's string.
+LAYOUT_NUMBERS = frozenset(
+    {"start_s", "end_s", "duration_s", "pct", "overall", "x", "y", "w", "h"}
+)
 
 
-def _check_html(html: str) -> None:
-    """Reply text on a page is escaped, short, and never styles anything."""
-    assert "<script>alert" not in html
-    assert LONG[:1000] not in html
-    for value in STYLE.findall(html):
-        assert STYLE_VALUE.fullmatch(value), value
+def _check_layout_numbers(value: Any, where: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in LAYOUT_NUMBERS and item is not None:
+                assert isinstance(item, (int, float)), (where, key, item)
+                assert not isinstance(item, bool), (where, key, item)
+                assert math.isfinite(item), (where, key, item)
+            _check_layout_numbers(item, f"{where}.{key}")
+    elif isinstance(value, list):
+        for item in value:
+            _check_layout_numbers(item, where)
+
+
+def _check_view(view: dict[str, Any]) -> str:
+    """Reply text reaches the app as short plain strings in strict JSON.
+
+    The app shows them as React text, which escapes them; the web tests
+    check that no source writes server text as HTML.
+    """
+    text = json.dumps(view, allow_nan=False)
+    assert json.loads(text) == view
+    assert LONG[:1000] not in text
+    _check_layout_numbers(view, "api_view")
+    # Nothing in it is (or holds) a Gemini key.
+    assert redact_payload(view) == view
+    return text
 
 
 WIZARD_SEGMENT_REPLIES: tuple[str, ...] = (
@@ -1501,11 +1524,10 @@ def test_hostile_segments_reach_wizard_state_bounded(
     view = _check_state(controller, job_dir)
     assert view["segments"] is not None
     assert len(view["segments"]["segments"]) <= MAX_LOOP_SEGMENTS
-    html = controller.render()
-    _check_html(html)
+    text = _check_view(controller.api_view())
     if "<script>" in json.dumps(found.to_dict()):
-        # Shown, but as text.
-        assert "&lt;script&gt;" in html
+        # Sent as it is, for the app to show as text.
+        assert "<script>" in text
 
 
 WIZARD_REVISE_REPLIES: tuple[dict[str, Any] | str, ...] = (
@@ -1605,13 +1627,8 @@ def test_hostile_looks_reach_the_ready_view_bounded(
 
 
 def _check_pages(controller: WizardController, looks: dict[str, Any]) -> None:
-    """The ready page, and each shot's preview card, show reply text safely."""
-    pages = [controller.render()]
-    for item in looks["shots"]:
-        card = dict(item, before_url="/previews/b.mp4", after_url="/previews/a.mp4")
-        pages.append(_look_card(card, ""))
-    html = "".join(pages)
-    _check_html(html)
+    """The ready view, with each shot's card, carries reply text safely."""
+    text = _check_view(controller.api_view())
     shown = [
         text
         for item in looks["shots"]
@@ -1621,9 +1638,9 @@ def _check_pages(controller: WizardController, looks: dict[str, Any]) -> None:
             item["check"]["note"] if item["check"]["ok"] is not None else "",
         )
     ]
-    if any("<script>" in text for text in shown):
-        # Shown, but as text.
-        assert "&lt;script&gt;" in html
+    if any("<script>" in value for value in shown):
+        # Sent as it is, for the app to show as text.
+        assert "<script>" in text
 
 
 @pytest.mark.parametrize("scale", [1, 4, 2**63, 1.0, -2, True], ids=short_id)
@@ -1834,7 +1851,7 @@ def test_a_damaged_video_record_is_ignored(
         assert "no FFmpeg in this test" in problem
     save_segment_list(job_dir, SegmentList(segments=[whole_video(10.0)]))
     _check_state(controller, job_dir, skip=(GEMINI_VIDEO_FILE,))
-    _check_html(controller.render())
+    _check_view(controller.api_view())
 
 
 def _segment_file(**changes: Any) -> bytes:
@@ -1910,4 +1927,4 @@ def test_a_damaged_segment_list_is_refused_or_cut_down(
         _check_values(found.to_dict(), SEGMENTS_FILE_NAME)
     # The pages that read it on every poll still answer.
     _check_state(controller, job_dir, skip=(SEGMENTS_FILE_NAME,))
-    _check_html(controller.render())
+    _check_view(controller.api_view())

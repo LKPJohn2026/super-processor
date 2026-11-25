@@ -136,7 +136,7 @@ def test_server_refuses_other_sites(tmp_path: Path) -> None:
         status, _body, _allow = _request(
             base,
             "POST",
-            "/intro",
+            "/api/intro",
             headers={**evil, "Content-Type": "application/x-www-form-urlencoded"},
             body=b"x=1",
         )
@@ -148,7 +148,7 @@ def test_server_refuses_other_sites(tmp_path: Path) -> None:
         status, _body, _allow = _request(base, "OPTIONS", "/api/setup", headers=evil)
         assert status == 403
         status, _body, _allow = _request(
-            base, "GET", "/render?run=1", headers={"Sec-Fetch-Site": "cross-site"}
+            base, "GET", "/api/render?run=1", headers={"Sec-Fetch-Site": "cross-site"}
         )
         assert status == 403
         status, _body, _allow = _request(
@@ -172,11 +172,11 @@ def test_server_refuses_other_sites(tmp_path: Path) -> None:
         status, _body, _allow = _request(
             base,
             "POST",
-            "/intro",
+            "/api/intro",
             headers={"Origin": base, "X-Wizard-Token": server.token},
             body=b"x=1",
         )
-        assert status == 303
+        assert status == 200
         assert controller.current_state().step is WizardStep.LLM_CHOICE
     finally:
         server.stop()

@@ -105,10 +105,12 @@ reviewer, and outcome have not been recorded for final acceptance.
 
 ## Browser acceptance (both interfaces)
 
-Run the same core flow in the server-rendered wizard and the React shell. Record
-browser/OS/version rather than assuming one browser represents all platforms.
-For React, exercise local Vite dev and production preview proxies and an allowed
-direct backend connection using the actual printed ephemeral port.
+Run the same core flow in the app served by `super-processor review` (from an
+installed wheel) and in the React shell under Vite. Record browser/OS/version
+rather than assuming one browser represents all platforms; check the served
+app's console for Content-Security-Policy reports. For Vite, exercise local dev
+and production preview proxies and an allowed direct backend connection using
+the actual printed ephemeral port.
 
 - Upload and native file pick; refusal cleanup and readable errors.
 - Segment stills and before/after clips load; output playback and seeking work

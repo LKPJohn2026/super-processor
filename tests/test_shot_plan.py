@@ -56,7 +56,6 @@ from super_processor.wizard import (
     WizardController,
     WizardStep,
 )
-from super_processor.wizard_pages import check_summary, settings_summary
 
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg required"
@@ -182,22 +181,10 @@ def test_redo_marks_one_shot_and_storage_round_trips(tmp_path: Path) -> None:
     assert load_plan(tmp_path / "missing") is None
 
 
-def test_preview_window_and_summaries() -> None:
+def test_preview_window() -> None:
+    # The check's wording is the app's (web/tests/preview-view.test.mjs).
     assert preview_window(Shot(0, 2)) == (0, 2)
     assert preview_window(Shot(10, 20)) == (13.5, 16.5)
-    assert settings_summary(0.4, {"deblock": 0.2, "gamma": 1.0}) == (
-        "strength 0.40 · deblock 0.20"
-    )
-    assert check_summary({"ok": None}) == "Not checked."
-    assert check_summary({"ok": True, "note": "Clean."}) == "Check passed. Clean."
-    failed = check_summary({"ok": False, "problems": ["garbled_text"], "note": "Sign."})
-    assert failed == "Check found: garbled text. Sign."
-    adjusted = check_summary(
-        {"ok": False, "problems": [], "note": "soft", "adjusted": True}
-    )
-    assert adjusted == (
-        "Check found: a problem. soft. Settings were adjusted and the preview redone."
-    )
 
 
 def _clip(path: Path, seconds: int = 6) -> Path:
@@ -411,7 +398,7 @@ def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
     first = preview(controller)
     assert first["scale"] == 2 and first["error"] is None
     assert first["shot"]["strength"] == 0.7 and first["shot"]["check"]["ok"] is True
-    assert "upscaled 2×" in controller.render()
+    assert controller.api_view()["segment_preview"]["scale"] == 2
 
     approve_preview(controller)
     # The check failed segment 2: its settings changed and its preview was redone.
@@ -419,7 +406,9 @@ def test_wizard_plans_checks_and_redoes_one_segment(tmp_path: Path) -> None:
     assert second["strength"] == 0.4
     assert second["check"]["problems"] == ["fake_texture"]
     assert second["after_url"].partition("?")[0].endswith("shot_001_r2_after.mp4")
-    assert "Check found: fake texture. grain turned to worms." in controller.render()
+    check = controller.api_view()["segment_preview"]["shot"]["check"]
+    assert check["ok"] is False and check["problems"] == ["fake_texture"]
+    assert check["note"] == "grain turned to worms"
 
     approve_preview(controller)
     third = preview(controller)["shot"]

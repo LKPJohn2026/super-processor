@@ -38,36 +38,27 @@ def _seed_job(tmp_path: Path) -> tuple[WizardController, str, Path]:
     return controller, manifest.job_id, controller.store.job_dir(manifest.job_id)
 
 
-def test_render_each_wizard_step(tmp_path: Path) -> None:
+def test_the_view_of_each_wizard_step(tmp_path: Path) -> None:
     controller, job_id, job_dir = _seed_job(tmp_path)
-    # Each step's own heading, so a step that rendered another's page fails.
-    steps = [
-        (WizardStep.INTRO, '<p class="brand-hero">Super Processor</p>'),
-        (WizardStep.LLM_CHOICE, "<h1>What type of LLM do you have now?</h1>"),
-        (WizardStep.LOCAL_LLM_STUB, "<h1>Local LLM setup</h1>"),
-        (WizardStep.SETUP, "<h1>Gemini API setup</h1>"),
-        (WizardStep.PICK_FILE, "<h1>Pick a video file</h1>"),
-        (WizardStep.SAMPLING, "<h1>Finding the segments</h1>"),
-        (WizardStep.PROPOSING, "<h1>Finding the segments</h1>"),
-        (WizardStep.SEGMENTS, "<h1>Segments</h1>"),
-        (WizardStep.ANALYZING, "<title>Segment 1 of 0 · Super Processor</title>"),
-        (WizardStep.PREVIEW_SEGMENT, "<title>Segment preview · Super Processor"),
-        (WizardStep.READY_TO_RENDER, "<h1>Ready to render</h1>"),
-        (WizardStep.RENDERING, "<h1>Upscaling</h1>"),
-        (WizardStep.RESULT, "<h1>Result</h1>"),
-        (WizardStep.DONE, "<h1>Done</h1>"),
-    ]
-    assert {step for step, _needle in steps} == set(WizardStep)
-    for step, needle in steps:
+    # Every step has a view the app can draw, even with a bare job.
+    for step in WizardStep:
         state = WizardState(step=step, job_id=job_id)
         save_job_wizard_state(job_dir, state)
         save_session_state(tmp_path, state)
         if step in RUN_STEPS:
             # Reopened there, as by an earlier server: interrupted.
             controller.open_job(job_id)
-            assert "<h1>Carry on where you left off?</h1>" in controller.render()
+            view = controller.api_view()
+            assert view["interrupted"] is True and view["step"] == step.value
             controller.resume()
-        assert needle in controller.render()
+        view = controller.api_view()
+        assert view["step"] == step.value
+        assert view["interrupted"] is False and view["error"] is None
+        json.dumps(view)
+        assert (view["segments"] is not None) == (step is WizardStep.SEGMENTS)
+        assert (view["looks"] is not None) == (step is WizardStep.READY_TO_RENDER)
+        has_preview = view["segment_preview"] is not None
+        assert has_preview == (step is WizardStep.PREVIEW_SEGMENT)
 
 
 RUN_STEPS = {
@@ -97,7 +88,7 @@ def test_retired_steps_go_back_to_pick(tmp_path: Path) -> None:
         assert state.step is WizardStep.PICK_FILE
         assert state.job_id is None
         assert state.error is not None and "pick the file again" in state.error
-        assert "Pick" in controller.render()
+        assert controller.api_view()["step"] == "pick_file"
     loaded = load_job_wizard_state(job_dir)
     assert loaded is not None
     assert loaded.to_dict() == {
@@ -222,7 +213,8 @@ def test_failed_first_upscale_goes_back_to_ready_to_render(tmp_path: Path) -> No
     controller.run_segmenting()
     assert controller.current_state().step is WizardStep.SEGMENTS
     # Gemini is down, so the whole clip is one segment.
-    assert "could not propose segments" in controller.render()
+    found = controller.api_view()["segments"]
+    assert "could not propose segments" in found["error"]
     controller.handle_post("/segments", {"action": ["approve"]})
     assert controller.current_state().step is WizardStep.ANALYZING
     # Without a GPU the preview fails, and the editor is back on the segments.
@@ -230,13 +222,13 @@ def test_failed_first_upscale_goes_back_to_ready_to_render(tmp_path: Path) -> No
     state = controller.current_state()
     assert state.step is WizardStep.SEGMENTS
     assert state.error is not None and "preview failed" in state.error
-    assert "CUDA" in controller.render()
+    assert "CUDA" in controller.api_view()["error"]
     # With previews working, approve the segment; then the full render fails.
     controller._upscale = FakeUpscaleEngine()
     controller.handle_post("/segments", {"action": ["approve"]})
     controller.run_analyze()
     assert controller.current_state().step is WizardStep.PREVIEW_SEGMENT
-    assert "could not propose" in controller.render()
+    assert "could not propose" in controller.api_view()["segment_preview"]["error"]
     controller.handle_post("/preview", {"action": ["approve"]})
     controller.handle_post("/ready", {"action": ["render"]})
     assert controller.current_state().step is WizardStep.RENDERING
@@ -252,8 +244,8 @@ def test_failed_first_upscale_goes_back_to_ready_to_render(tmp_path: Path) -> No
     assert "no result yet" in state.error and "CUDA" in state.error
     assert controller.store.load(job_id).state is not JobState.FAILED
     assert controller.api_view()["run"]["outcome"] == "failed"
-    page = controller.render()
-    assert "Ready to render" in page and "CUDA" in page
+    view = controller.api_view()
+    assert view["step"] == "ready_to_render" and "CUDA" in view["error"]
     # With the GPU back, the same render goes through to the result.
     controller._upscale = FakeUpscaleEngine()
     controller.handle_post("/ready", {"action": ["render"]})
@@ -340,7 +332,8 @@ def test_start_new_job_from_done_and_result(
         state = WizardState(step=step, job_id=job_id)
         save_job_wizard_state(job_dir, state)
         save_session_state(tmp_path, state)
-        assert 'action="/new"' in controller.render()
+        # The app offers "New video" on both.
+        assert controller.api_view()["step"] in {"result", "done"}
         monkeypatch.setattr(
             "super_processor.wizard.resolve_gemini_api_key", lambda: "key"
         )

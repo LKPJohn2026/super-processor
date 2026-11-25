@@ -35,7 +35,6 @@ from super_processor.wizard import (
     save_job_wizard_state,
     save_session_state,
 )
-from super_processor.wizard_pages import with_navigation
 
 TOKEN = "test-token"
 needs_ffmpeg = pytest.mark.skipif(
@@ -187,20 +186,6 @@ def test_other_desktops_have_their_own_dialog(
 # Navigation ----------------------------------------------------------------
 
 
-def test_navigation_turns_rail_steps_into_links() -> None:
-    page = (
-        '<span class="step done" data-phase="setup">Setup</span>'
-        '<span class="step done" data-phase="file">File</span>'
-        '<span class="step active" data-phase="segments">Segments</span>'
-        "<!--back:file--><!--back:setup-->"
-    )
-    linked = with_navigation(page, {"setup": True, "file": False, "segments": False})
-    assert 'action="/goto"' in linked and 'value="setup"' in linked
-    assert '<span class="step done" data-phase="file">File</span>' in linked
-    assert "← Back to Gemini setup" in linked
-    assert "<!--back" not in linked and "Choose another file" not in linked
-
-
 @needs_ffmpeg
 def test_go_back_and_forward_between_setup_file_and_segments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -210,8 +195,8 @@ def test_go_back_and_forward_between_setup_file_and_segments(
     clip = _clip(tmp_path / "in.mp4")
     pick_and_segment(controller, clip)
     assert controller.navigation() == {"setup": True, "file": True, "segments": False}
-    page = controller.render()
-    assert 'name="to" value="file"' in page and "Choose another file" in page
+    # The app draws "Choose another file" and the setup link from this.
+    assert controller.api_view()["navigation"] == controller.navigation()
 
     controller.handle_post("/goto", {"to": ["file"]})
     assert controller.current_state().step is WizardStep.PICK_FILE
@@ -309,19 +294,9 @@ def test_dropped_file_is_uploaded_and_picked(tmp_path: Path) -> None:
         (kept,) = uploads.iterdir()
         assert kept.name.endswith("-My_Trailer__final_.mp4")
         assert kept.read_bytes() == clip.read_bytes()
-        page = controller.render()
-        assert "Finding the segments" in page
+        assert controller.api_view()["step"] == "sampling"
     finally:
         server.stop()
-
-
-def test_pick_page_offers_dialog_drop_and_path() -> None:
-    from super_processor.wizard_pages import render_pick
-
-    page = render_pick()
-    assert 'action="/browse"' in page and 'id="dropzone"' in page
-    assert 'xhr.open("POST", "/upload")' in page
-    assert "<summary>Type a path instead</summary>" in page
 
 
 # The upscale choice --------------------------------------------------------
@@ -353,16 +328,13 @@ def test_editor_can_turn_upscaling_off_for_a_segment(tmp_path: Path) -> None:
     analyze(controller)
     shot = preview(controller)["shot"]
     assert shot["use_upscale"] is True and shot["upscale_override"] is None
-    assert "Gemini chose: this segment is upscaled with SPAN" in controller.render()
     controller.handle_post("/preview", {"action": ["upscale"], "on": ["0"]})
     assert controller.current_state().step is WizardStep.ANALYZING
     analyze(controller)
     shot = preview(controller)["shot"]
     # Gemini proposed upscaling again; the editor's choice holds.
     assert shot["use_upscale"] is False and shot["upscale_override"] is False
-    page = controller.render()
-    assert "You chose: this segment skips upscaling" in page
-    assert "Use upscaling for this segment" in page
+    assert controller.api_view()["segment_preview"]["shot"]["use_upscale"] is False
 
 
 @needs_ffmpeg
@@ -414,10 +386,8 @@ def test_ready_screen_offers_the_upscale_choice(tmp_path: Path) -> None:
     job_dir = to_ready(controller, clip)
     view = controller.api_view()["looks"]
     assert view["scales"] == [1, 2] and view["source_size"] == [320, 180]
-    page = controller.render()
-    assert "Don't upscale" in page and "Upscale 2×" in page and "640×360" in page
-    assert "SPAN on the GPU" in page and "Upscale 4×" not in page
-    assert 'name="scale" value="2" checked' in page
+    # "Don't upscale" or "Upscale 2×" (640×360), with the plan's 2x chosen.
+    assert view["scale"] == 2
 
     controller.handle_post("/ready", {"action": ["render"], "scale": ["4"]})
     assert "pick one of the upscale options" in (controller.current_state().error or "")

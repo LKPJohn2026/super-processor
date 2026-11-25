@@ -318,12 +318,9 @@ def test_json_api_drives_upscale_flow(
         assert done["step"] == "done"
         assert done["output_ready"] is True
         assert controller.current_state().step is WizardStep.DONE
-        page = get(base + "/", TOKEN)
-        html = page.read().decode()
-        assert "<h1>Done</h1>" in html
         unknown, err, _origin = _json_request(base, "POST", "/api/nope", {})
-        assert unknown == 400
-        assert "unknown action" in err["error"]
+        assert unknown == 404
+        assert "unknown endpoint /api/nope" in err["error"]
     finally:
         server.stop()
 
@@ -338,20 +335,6 @@ class _RangeTransport:
     ) -> dict[str, Any]:
         payload = {"start_s": 1, "end_s": 3, "scale": 2, "strength": 0.2}
         return {"candidates": [{"content": {"parts": [{"text": json.dumps(payload)}]}}]}
-
-
-def test_html_post_still_redirects(tmp_path: Path) -> None:
-    server = WizardServer(tmp_path, token=TOKEN)
-    base = server.start()
-    try:
-        request = Request(
-            base + "/intro", data=b"", headers={"X-Wizard-Token": TOKEN}, method="POST"
-        )
-        with urlopen(request) as response:
-            html = response.read().decode()
-        assert "What type of LLM" in html
-    finally:
-        server.stop()
 
 
 def test_run_keeps_its_id_across_polls(tmp_path: Path) -> None:
@@ -415,8 +398,9 @@ def test_a_post_for_a_job_no_longer_open_is_409(tmp_path: Path) -> None:
             base, "POST", "/api/intro", {"job_id": "job00002"}
         )
         assert status == 200 and body["step"] == "llm_choice"
+        # A form-encoded body is read the same way.
         html = Request(
-            base + "/intro",
+            base + "/api/intro",
             data=b"job_id=job00001",
             headers={
                 "X-Wizard-Token": TOKEN,

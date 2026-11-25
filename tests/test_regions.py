@@ -503,11 +503,8 @@ def test_wizard_boxes_faces_before_planning(tmp_path: Path) -> None:
     # Boxed, so the shot keeps the strength Gemini asked for.
     assert view["strength"] == 0.9
     assert view["regions"][0]["kind"] == "faces"
-    # The faces are still protected in the render, but the preview page
-    # draws no boxes and does not mention them.
-    page = controller.render()
-    assert 'class="box' not in page
-    assert "Protected inside the boxes" not in page
+    # The faces are still protected in the render (the app draws no boxes
+    # over the previews).
     assert approve_preview(controller).step is WizardStep.READY_TO_RENDER
     controller.handle_post("/ready", {"action": ["render"]})
     plan = load_upscale_plan(job_dir)
@@ -520,7 +517,8 @@ def test_without_boxes_the_whole_shot_is_capped(tmp_path: Path) -> None:
     looks = preview(controller)
     assert looks["shot"]["strength"] == PROTECTED_STRENGTH
     assert "could not find where the faces" in looks["error"]
-    assert "no boxes were placed" not in controller.render()
+    # No boxes, so the app has none to mention.
+    assert looks["shot"]["regions"] == []
 
 
 @needs_ffmpeg

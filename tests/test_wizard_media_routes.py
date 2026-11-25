@@ -214,7 +214,7 @@ def test_setup_refuses_an_empty_key_and_saves_nothing(
     assert state.step is WizardStep.SETUP
     assert state.error == "API key is empty"
     assert not credentials_path().exists()
-    assert "API key is empty" in controller.render()
+    assert controller.api_view()["error"] == "API key is empty"
 
 
 def test_the_job_summary_stills_name_their_job_and_are_served(

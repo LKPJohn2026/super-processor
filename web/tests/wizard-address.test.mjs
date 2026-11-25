@@ -198,3 +198,25 @@ test("blocked storage leaves the token in memory only", async (t) => {
   api.adoptLaunchToken(api.configuredOrigin());
   assert.equal(api.outputSrc("", "/output.mp4"), "/output.mp4?t=mem");
 });
+
+test("the app the wizard serves keeps the token out of media URLs", async (t) => {
+  const { api } = await page(t, "http://127.0.0.1:41000/", { env: { MODE: "package" } });
+  api.setToken("", "served-T");
+  // Same origin: the HttpOnly cookie covers media, so no ?t= in any link.
+  assert.equal(api.outputSrc("", "/jobs/abc/output.mp4"), "/jobs/abc/output.mp4");
+  assert.equal(api.outputSrc("", "/output.mp4?v=2#t=1"), "/output.mp4?v=2#t=1");
+  assert.equal(
+    api.outputSrc("http://127.0.0.1:41000", "/output.mp4"),
+    "http://127.0.0.1:41000/output.mp4",
+  );
+  // Another wizard still needs the token in the URL (its cookie is not ours).
+  api.setToken("http://127.0.0.1:41001", "other-T");
+  assert.equal(
+    api.outputSrc("http://127.0.0.1:41001", "/output.mp4"),
+    "http://127.0.0.1:41001/output.mp4?t=other-T",
+  );
+  // The Vite and Pages shells (other modes) keep ?t=.
+  const shell = await page(t, "http://127.0.0.1:41000/", { env: { MODE: "development" } });
+  shell.api.setToken("", "served-T");
+  assert.equal(shell.api.outputSrc("", "/output.mp4"), "/output.mp4?t=served-T");
+});

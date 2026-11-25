@@ -17,6 +17,8 @@ description = "Local-first AI-assisted video processing"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+# The wheel ships the web app, which bundles React and three OFL fonts.
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
   { name = "Super Processor contributors" },
 ]
@@ -73,10 +75,18 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-super_processor = ["*.pyi", "py.typed"]
+# web_dist is the web app (`npm run build:package` in web/); it is not in
+# git, and CI and the release build it before making the sdist and wheels.
+super_processor = [
+  "*.pyi",
+  "py.typed",
+  "web_dist/*.html",
+  "web_dist/assets/*",
+]
 
 [tool.setuptools.exclude-package-data]
-super_processor = ["*.c", "*.html", "*.pyx"]
+# Only the Cython annotation: "*.html" would also drop web_dist/index.html.
+super_processor = ["*.c", "*.pyx", "_core.html"]
 
 [tool.setuptools_scm]
 fallback_version = "0.0.dev0"
@@ -104,10 +114,8 @@ source = ["super_processor"]
 omit = [
   "*/super_processor/__main__.py",
   "*/super_processor/_version.py",
-  "*/super_processor/wizard_pages.py",
   "src/super_processor/__main__.py",
   "src/super_processor/_version.py",
-  "src/super_processor/wizard_pages.py",
 ]
 
 [tool.coverage.report]

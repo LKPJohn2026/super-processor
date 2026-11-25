@@ -243,6 +243,28 @@ settings are proposed with what the editor disliked in view.
 The primary interface is a multi-step wizard served on localhost by the CLI
 (`super-processor review`). There is no Electron/Tauri shell in this train.
 
+The wizard's screens are the React app in `web/`. The server serves its
+build at its own address next to the JSON API (`/api/*`) and the job media;
+there are no server-rendered pages.
+
+### Web app packaging
+
+`npm run build:package` builds the app with base `/` and no inlined assets
+into `src/super_processor/web_dist`, which is not in git. The package data
+(`web_dist/*.html`, `web_dist/assets/*`) and `MANIFEST.in`
+(`graft src/super_processor/web_dist`) put it in the wheel and the sdist, so
+`pip install ancient-processor` needs no Node. CI's frontend job builds it
+and hands it to the package job as the `web-dist` artifact; the release's
+`web` job builds it once from `web/package-lock.json` and the sdist and all
+three cibuildwheel runs download that same artifact before building.
+`SUPER_PROCESSOR_REQUIRE_WEB_DIST=1` (set there, and passed into the Linux
+container with `CIBW_ENVIRONMENT`) makes `setup.py` refuse to build without
+it, and `.github/scripts/check_web_dist.py` checks that every distribution
+carries the same files. The server sends every response with a strict
+Content-Security-Policy (`script-src 'self'`, `connect-src 'self'`, no inline
+code, `frame-ancestors 'none'`); a checkout without the build shows a short
+page on how to make it.
+
 The CLI remains available for automation and legacy job commands. The wizard
 binds to the same on-disk job store, so every choice stays inspectable as JSON
 and stills.
@@ -465,8 +487,8 @@ output is written atomically.
 
 ```text
 super-processor doctor
-super-processor review              # localhost Gemini wizard
-super-processor review JOB          # open wizard / review for a job
+super-processor review              # localhost wizard: the web app and its API
+super-processor review JOB          # the same, opened on a job the wizard made
 super-processor models
 super-processor show JOB
 ```

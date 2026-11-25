@@ -699,16 +699,29 @@ export const runAnalyze: Runner = (origin, onProgress, signal) =>
   once(origin, "analyze", ["analyzing"], onProgress, signal);
 
 /**
+ * True when the wizard itself served this page (the package build) and
+ * `origin` is that same wizard. Its HttpOnly cookie then covers `<img>`,
+ * `<video>`, new-tab links and downloads, so media URLs need no token.
+ */
+function servedByWizard(origin: string): boolean {
+  // `?.`: the node tests load this file without an env.
+  return import.meta.env?.MODE === "package" && originKey(origin) === window.location.origin;
+}
+
+/**
  * A media URL the page can put in `<video>` or `<img>`. Those cannot send a
  * header, and a shell on another origin (or behind the Vite proxy) has no
- * wizard cookie, so the wizard's own paths carry the token as `?t=`, which
- * the wizard accepts for media only. Absolute URLs (another host) never get it.
+ * wizard cookie, so there the wizard's own paths carry the token as `?t=`,
+ * which the wizard accepts for media only. The app the wizard serves uses
+ * bare paths, so the token never lands in history, a download's saved
+ * source address or a copied link. Absolute URLs (another host) never get it.
  */
 export function outputSrc(origin: string, outputUrl: string | null): string | null {
   if (!outputUrl) return null;
   if (outputUrl.startsWith("http://") || outputUrl.startsWith("https://")) {
     return outputUrl;
   }
+  if (servedByWizard(origin)) return `${origin}${outputUrl}`;
   const token = tokenFor(origin);
   if (!token) return `${origin}${outputUrl}`;
   const cut = outputUrl.search(/#|$/);

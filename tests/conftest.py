@@ -84,3 +84,29 @@ def _fixed_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             upscale, "cuda_decode_works", lambda ffmpeg_bin="ffmpeg": False
         )
+
+
+@pytest.fixture
+def web_app(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Serve a small stand-in web app instead of the built one (if any)."""
+    from wizard_client import fake_web_app
+
+    from super_processor import review
+
+    root = fake_web_app(tmp_path_factory.mktemp("web_dist"))
+    monkeypatch.setattr(review, "WEB_DIST_DIR", root)
+    return root
+
+
+@pytest.fixture
+def no_web_app(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Act like a dev checkout that never ran ``npm run build:package``."""
+    from super_processor import review
+
+    root = tmp_path_factory.mktemp("no_web_dist") / "web_dist"
+    monkeypatch.setattr(review, "WEB_DIST_DIR", root)
+    return root

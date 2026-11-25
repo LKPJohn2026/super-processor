@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
@@ -14,11 +15,31 @@ export const frameGuard = {
   "Content-Security-Policy": "frame-ancestors 'none'",
 };
 
-export default defineConfig(({ command, isPreview }) => ({
-  // `vite preview` also reports command "serve", but it serves the production
-  // build, whose asset URLs carry the Pages base.
-  base: command === "serve" && !isPreview ? "/" : "/super-processor/",
-  plugins: [react()],
-  server: { proxy, headers: frameGuard },
-  preview: { proxy, headers: frameGuard },
-}));
+// `npm run build:package` writes the app that `super-processor review`
+// serves at its own address. That folder is not in git; CI and the release
+// build it and put it in every wheel and the sdist.
+export const PACKAGE_OUT_DIR = fileURLToPath(new URL("../src/super_processor/web_dist", import.meta.url));
+
+export default defineConfig(({ command, isPreview, mode }) =>
+  mode === "package"
+    ? {
+        base: "/",
+        plugins: [react()],
+        build: {
+          outDir: PACKAGE_OUT_DIR,
+          // The folder is outside web/, so Vite only clears it when asked.
+          emptyOutDir: true,
+          // Fonts as files, not data: URLs, so the wizard's CSP can stay
+          // font-src 'self'.
+          assetsInlineLimit: 0,
+        },
+      }
+    : {
+        // `vite preview` also reports command "serve", but it serves the
+        // production build, whose asset URLs carry the Pages base.
+        base: command === "serve" && !isPreview ? "/" : "/super-processor/",
+        plugins: [react()],
+        server: { proxy, headers: frameGuard },
+        preview: { proxy, headers: frameGuard },
+      },
+);

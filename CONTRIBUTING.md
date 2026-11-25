@@ -57,7 +57,17 @@ cd web
 npm ci
 npm test
 npm run build
+npm run build:package   # the app super-processor review serves
+npm run check:package
 ```
+
+`npm run build` makes the GitHub Pages build in `web/dist`.
+`npm run build:package` writes the app the wizard serves into
+`src/super_processor/web_dist`; restart `super-processor review` to use it.
+That folder is ignored by git: CI and the release build it and put it in the
+sdist and every wheel. Without it, `review` serves a short page saying how to
+build it or how to point the Vite dev server at the wizard
+(`VITE_PROXY_TARGET=<printed address> npm run dev`).
 
 The Node regressions simulate effect subscription lifecycles and failed/hung
 requests and exercise real dev/preview proxy forwarding. Browser end-to-end
@@ -81,10 +91,14 @@ reports, caches, or `*.egg-info` directories.
 exactly pinned build dependencies declared in `pyproject.toml` (CI and the
 release use the hash-checked copies instead; see [Supply chain](#supply-chain)); `twine check` validates their
 metadata without uploading anything. The sdist must also retain the tracked
-`web/` sources, especially `web/index.html`. Only generated Cython annotation
-HTML under `src/super_processor/` is excluded, not all HTML in the repository.
+`web/` sources, especially `web/index.html`, and the built app in
+`src/super_processor/web_dist` when it is there (run `npm run build:package`
+first, or the packages have no app). Only generated Cython annotation HTML
+under `src/super_processor/` is excluded, not all HTML in the repository.
 `tests/test_packaging.py` checks these manifest rules with setuptools, an
-existing development/build dependency.
+existing development/build dependency. Set
+`SUPER_PROCESSOR_REQUIRE_WEB_DIST=1` to make the build fail when the app is
+missing, as CI and the release do.
 
 For a clean-source frontend check, build into an ignored directory:
 

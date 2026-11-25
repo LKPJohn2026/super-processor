@@ -47,7 +47,6 @@ from super_processor.wizard import (
     save_session_state,
     strength_summary,
 )
-from super_processor.wizard_pages import render_result
 
 TOKEN = "test-token"
 
@@ -144,10 +143,9 @@ def test_segment_loop_end_to_end(
         (0.0, "first"),
         (3.5, "second"),
     ]
-    page = controller.render()
-    assert "1. first" in page and "0:00–0:03.5" in page
-    assert '<div class="timeline"' in page and "Approve 2 segments" in page
-    assert 'src="/segment_stills/t_' in page
+    assert view["segments"][0]["end_s"] == 3.5 and view["approved"] is False
+    for item in view["segments"]:
+        assert item["still_url"].startswith("/segment_stills/t_")
 
     controller.handle_post("/segments", {"action": ["note"], "note": [" "]})
     assert controller.current_state().error is not None
@@ -166,9 +164,6 @@ def test_segment_loop_end_to_end(
     assert gemini.looks_calls == [[0]]
     preview = controller.api_view()["segment_preview"]
     assert (preview["index"], preview["count"]) == (0, 2)
-    page = controller.render()
-    assert "Segment 1 of 2" in page and "Preview a different part" in page
-    assert preview["shot"]["after_url"] in page
     assert preview["shot"]["after_url"].partition("?")[0].endswith("_r1_after.mp4")
     assert state.job_id
     job_dir = controller.store.job_dir(state.job_id)
@@ -192,8 +187,10 @@ def test_segment_loop_end_to_end(
     controller.handle_post("/preview", {"action": ["approve"]})
     assert controller.current_state().step is WizardStep.READY_TO_RENDER
     assert len(controller.api_view()["looks"]["shots"]) == 2
-    page = controller.render()
-    assert "Render the whole video" in page and "· second:" in page
+    looks = controller.api_view()["looks"]
+    assert [shot["label"] for shot in looks["shots"]] == ["first", "second"]
+    # Both sizes are offered, with the plan's scale chosen.
+    assert looks["scales"] == [1, 2] and looks["scale"] in looks["scales"]
 
     controller.handle_post("/ready", {"action": ["wait"]})
     assert controller.current_state().step is WizardStep.READY_TO_RENDER
@@ -254,7 +251,9 @@ def test_a_crash_while_finding_segments_fails_the_job_and_goes_back_to_pick(
     assert state.error == "Finding the segments failed: 'segments'"
     assert state.progress is None
     assert controller.store.load(job_id).state is JobState.FAILED
-    assert "Finding the segments failed" in controller.render()
+    view = controller.api_view()
+    assert view["step"] == "pick_file"
+    assert view["error"] == "Finding the segments failed: 'segments'"
 
 
 def test_old_shot_flow_states_go_back_to_pick() -> None:
@@ -333,17 +332,6 @@ def test_segment_loop_over_the_json_api(
         server.stop()
 
 
-def test_busy_pages_show_progress() -> None:
-    from super_processor.wizard_pages import render_analyzing, render_sampling
-
-    page = render_analyzing(1, 3, {"pct": 140, "message": "Checking <it>"})
-    assert "Segment 2 of 3" in page
-    assert 'value="100"' in page and "Checking &lt;it&gt;" in page
-    assert "/analyze?run=1" in page
-    assert "<progress" not in render_sampling(None)
-    assert "<progress" not in render_sampling({"pct": "x"})
-
-
 class _Recording(_Gemini):
     """Records the chat each segment proposal sees, as the real client would."""
 
@@ -375,8 +363,8 @@ def test_result_note_can_restart_from_the_segments(tmp_path: Path) -> None:
     controller.handle_post("/ready", {"action": ["render"]})
     controller.run_render()
     assert controller.current_state().step is WizardStep.RESULT
-    page = controller.render()
-    assert 'name="restart" value="1"' in page
+    view = controller.api_view()
+    assert view["step"] == "result" and view["output_ready"] is True
     for name in ("segments.json", "shot_plan.json", "upscale_plan.json", "output.mp4"):
         assert (job_dir / name).is_file()
     chat_before = (job_dir / "gemini_chat.json").read_text(encoding="utf-8")
@@ -548,22 +536,6 @@ def test_task_progress_saves_again_after_a_while_within_one_percent(
     assert saves == ["0.500", "0.520", "0.800"]
 
 
-def test_segments_page_says_when_gemini_could_not_split() -> None:
-    from super_processor.wizard_pages import render_segments
-
-    page = render_segments(
-        {
-            "segments": [{"start_s": 0, "end_s": 52.2, "label": "whole video"}],
-            "error": "Gemini could not propose segments (daily quota used up)",
-        }
-    )
-    assert "could not split the video, so it is one segment" in page
-    assert '<p class="notice" role="status">Gemini could not propose' in page
-    assert "Approve 1 segment<" in page and "Nothing to protect" in page
-    empty = render_segments({"segments": [], "error": None})
-    assert '<div class="timeline"' not in empty
-
-
 class _Gemini4x(_Gemini):
     """Asks for 4x, as Gemini did for the trailer, and records what it was offered."""
 
@@ -623,8 +595,6 @@ def test_result_strength_describes_every_restored_span() -> None:
     )
     summary = strength_summary(spans)
     assert summary == "strength 0.30–0.45 · upscaling off for 9.9 s"
-    page = render_result(output_url="/output.mp4", scale=2, strength=summary)
-    assert "Scale 2× · strength 0.30–0.45 · upscaling off for 9.9 s." in page
 
 
 def test_result_strength_for_one_recipe_or_none() -> None:
@@ -749,10 +719,11 @@ def test_new_segments_from_a_note_get_new_preview_urls(tmp_path: Path) -> None:
     for side in ("before_url", "after_url"):
         assert again[side].partition("?")[0] == first[side].partition("?")[0]
         assert again[side] != first[side]
-    # The page's poster still is the one of the same plan.
-    assert again["after_url"].replace("_after.mp4?", "_after.jpg?") in (
-        controller.render()
-    )
+    # The poster still of the same plan is there to serve.
+    state = controller.current_state()
+    assert state.job_id
+    poster = again["after_url"].partition("?")[0].replace("_after.mp4", "_after.jpg")
+    assert (controller.store.job_dir(state.job_id) / poster.lstrip("/")).is_file()
 
 
 def _segments_job(

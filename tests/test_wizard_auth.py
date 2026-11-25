@@ -8,6 +8,7 @@ threads.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
 from http.client import HTTPConnection
@@ -16,18 +17,20 @@ from typing import Any
 from urllib.parse import urlparse
 
 import pytest
+from wizard_client import FAKE_ASSETS, FAKE_INDEX
 
 from super_processor import review
 from super_processor.review import (
-    ReviewServer,
+    CONTENT_SECURITY_POLICY,
     WizardServer,
     launch_url,
+    missing_app_page,
     request_authenticated,
     wizard_cookie_name,
 )
-from super_processor.segments import TimelineSegment, write_gray_still, write_segments
 from super_processor.wizard import (
     WizardController,
+    WizardError,
     WizardState,
     WizardStep,
     save_job_wizard_state,
@@ -82,6 +85,9 @@ def _wizard_with_output(tmp_path: Path) -> tuple[WizardController, str]:
 
 _GUARDED_GETS = (
     "/",
+    "/index.html",
+    "/assets/index-test.js",
+    "/assets/index-test.css",
     "/api/state",
     "/api/jobs",
     "/output.mp4",
@@ -90,7 +96,7 @@ _GUARDED_GETS = (
 
 
 def test_no_route_answers_without_the_token(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, web_app: Path
 ) -> None:
     controller, job_id = _wizard_with_output(tmp_path)
     stored: list[str] = []
@@ -200,7 +206,91 @@ def test_the_cookie_counts_only_on_a_same_origin_request() -> None:
     assert request_authenticated(headers(), **check, media_token="guess") is None
 
 
-def test_every_response_carries_the_safety_headers(tmp_path: Path) -> None:
+def test_a_decoy_cookie_from_another_port_does_not_lock_the_app_out() -> None:
+    from email.message import Message
+
+    name = wizard_cookie_name(9)
+    check: dict[str, Any] = {"token": TOKEN, "port": 9}
+    # Another local page set a same-named cookie with a longer path, so the
+    # browser sends it first; the real one still counts.
+    message = Message()
+    message["Cookie"] = f"{name}=junk; {name}={TOKEN}"
+    message["Sec-Fetch-Site"] = "same-origin"
+    assert request_authenticated(message, **check) == "cookie"
+    only_junk = Message()
+    only_junk["Cookie"] = f"{name}=junk; {name}=more-junk"
+    assert request_authenticated(only_junk, **check) is None
+
+
+def test_the_host_header_is_parsed_strictly(tmp_path: Path) -> None:
+    from email.message import Message
+
+    from super_processor.review import request_rejection
+
+    def host(*values: str) -> Message:
+        message = Message()
+        for value in values:
+            message["Host"] = value
+        return message
+
+    for good in (
+        "127.0.0.1:9000",
+        "localhost:9000",
+        "[::1]:9000",
+        "LOCALHOST:9000",
+        "127.0.0.1",
+    ):
+        assert request_rejection(host(good), port=9000, state_changing=True) is None, (
+            good
+        )
+    for bad in (
+        "127.0.0.1:9000, evil.test",
+        "127.0.0.1:9001",
+        "127.0.0.1:",
+        "127.0.0.1:9000:1",
+        "127.0.0.1:x",
+        "127.0.0.1:\u0669",
+        "[::1",
+        "[::1]9000",
+        "[::1]:9000x",
+        "::1",
+        "evil.test:9000",
+        ":9000",
+    ):
+        assert request_rejection(host(bad), port=9000, state_changing=False) == (
+            "unexpected Host header"
+        ), bad
+    # Two Host headers: refused, whichever comes first.
+    twice = host("127.0.0.1:9000", "evil.test")
+    assert request_rejection(twice, port=9000, state_changing=False) == (
+        "unexpected Host header"
+    )
+    # Over the wire too.
+    server = WizardServer(tmp_path / "jobs", token=TOKEN)
+    base = server.start()
+    port = _port(base)
+    try:
+        cookie = {"Cookie": f"{wizard_cookie_name(port)}={TOKEN}"}
+        raw = (
+            f"GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}, evil.test\r\n"
+            f"Cookie: {cookie['Cookie']}\r\nConnection: close\r\n\r\n"
+        ).encode()
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(raw)
+            reply = b""
+            while chunk := sock.recv(65536):
+                reply += chunk
+        assert reply.startswith(b"HTTP/1.0 403") or reply.startswith(b"HTTP/1.1 403"), (
+            reply[:40]
+        )
+        assert TOKEN.encode() not in reply
+    finally:
+        server.stop()
+
+
+def test_every_response_carries_the_safety_headers(
+    tmp_path: Path, web_app: Path
+) -> None:
     controller, _job_id = _wizard_with_output(tmp_path)
     server = WizardServer(controller.jobs_dir, controller=controller, token=TOKEN)
     base = server.start()
@@ -208,6 +298,8 @@ def test_every_response_carries_the_safety_headers(tmp_path: Path) -> None:
     try:
         for path, headers in (
             ("/", auth),
+            ("/assets/index-test.js", auth),
+            ("/assets/missing.js", auth),
             ("/api/state", auth),
             ("/output.mp4", auth),
             ("/api/state", {}),
@@ -216,7 +308,7 @@ def test_every_response_carries_the_safety_headers(tmp_path: Path) -> None:
             _status, sent, _body = _request(base, "GET", path, headers)
             assert sent["X-Content-Type-Options"] == "nosniff", path
             assert sent["X-Frame-Options"] == "DENY", path
-            assert "frame-ancestors 'none'" in sent["Content-Security-Policy"], path
+            assert sent["Content-Security-Policy"] == CONTENT_SECURITY_POLICY, path
             assert sent["Referrer-Policy"] == "same-origin", path
             assert sent["Cache-Control"] == "no-store", path
             assert sent["Cross-Origin-Resource-Policy"] == "same-site", path
@@ -267,63 +359,229 @@ def test_media_refuses_a_cross_site_embed_unless_signed(tmp_path: Path) -> None:
         server.stop()
 
 
-def _legacy_job(tmp_path: Path) -> Path:
-    job_dir = tmp_path / "job"
-    still = "segment_stills/seg_00.ppm"
-    write_gray_still(job_dir / still, bytes([40]) * (160 * 90))
-    write_segments(
-        job_dir,
-        [TimelineSegment(0, 0.0, 60.0, "indoor", "noisy", 10.0, 0, still)],
+def test_the_csp_lets_only_this_server_run_and_load() -> None:
+    rules = dict(
+        rule.strip().split(" ", 1) for rule in CONTENT_SECURITY_POLICY.split(";")
     )
-    return job_dir
+    assert rules == {
+        "default-src": "'none'",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "font-src": "'self'",
+        "img-src": "'self' blob:",
+        "media-src": "'self' blob:",
+        "connect-src": "'self'",
+        "manifest-src": "'self'",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'self'",
+        "frame-ancestors": "'none'",
+    }
+    assert "unsafe" not in CONTENT_SECURITY_POLICY
+    assert "data:" not in CONTENT_SECURITY_POLICY
 
 
-def test_the_split_review_page_needs_the_token_and_cannot_be_framed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _launched(base: str) -> dict[str, str]:
+    """The cookie a browser holds after opening the printed address."""
+    status, headers, _body = _request(base, "GET", f"/?token={TOKEN}")
+    assert status == 303 and headers["Location"] == "/"
+    cookie = headers["Set-Cookie"].split(";", 1)[0]
+    return {"Cookie": cookie, "Sec-Fetch-Site": "same-origin"}
+
+
+def test_the_launch_opens_the_app_which_gets_its_token_from_the_state(
+    tmp_path: Path, web_app: Path
 ) -> None:
-    applied: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        review,
-        "apply_review_action",
-        lambda jobs_dir, job_id, **kwargs: applied.append(kwargs),
-    )
-    server = ReviewServer(_legacy_job(tmp_path), jobs_dir=tmp_path, job_id="j")
-    assert server.controller is None and server.token
-    token = server.token
+    server = WizardServer(tmp_path, token=TOKEN)
     base = server.start()
     try:
-        for path in ("/", "/segments", "/segment_stills/seg_00.bmp"):
-            assert _request(base, "GET", path)[0] == 401, path
-        assert _request(base, "POST", "/accept", body=b"x=1")[0] == 401
-        status, headers, _body = _request(base, "GET", f"/?token={token}")
-        assert status == 303
-        cookie = {"Cookie": headers["Set-Cookie"].split(";", 1)[0]}
-        status, headers, page = _request(base, "GET", "/", cookie)
-        assert status == 200
-        assert headers["X-Frame-Options"] == "DENY"
-        assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
-        assert f'name="token" value="{token}"'.encode() in page
-        # The cookie comes with a framed click too: the form's token must as well.
-        origin = {**cookie, "Origin": base}
-        assert _request(base, "POST", "/accept", origin, b"x=1")[0] == 403
-        assert applied == []
-        body = f"token={token}".encode()
-        assert _request(base, "POST", "/accept", origin, body)[0] == 303
-        assert applied == [{"note": None, "accept": True}]
+        browser = _launched(base)
+        status, headers, page = _request(base, "GET", "/", browser)
+        assert status == 200 and page.decode() == FAKE_INDEX
+        assert headers["Content-Type"] == "text/html; charset=utf-8"
+        assert TOKEN.encode() not in page
+        types = {
+            "index-test.js": "text/javascript; charset=utf-8",
+            "index-test.css": "text/css; charset=utf-8",
+            "font-test.woff2": "font/woff2",
+        }
+        for name, kind in types.items():
+            # A crossorigin module script or stylesheet: same origin, cookie sent.
+            sent = {**browser, "Sec-Fetch-Mode": "cors", "Origin": base}
+            status, headers, body = _request(base, "GET", f"/assets/{name}", sent)
+            assert status == 200, name
+            assert headers["Content-Type"] == kind, name
+            assert body.decode() == FAKE_ASSETS[name], name
+            assert headers["Content-Security-Policy"] == CONTENT_SECURITY_POLICY
+        status, headers, body = _request(base, "HEAD", "/assets/index-test.js", browser)
+        assert status == 200 and body == b""
+        assert headers["Content-Length"] == str(len(FAKE_ASSETS["index-test.js"]))
+        status, _headers, body = _request(base, "HEAD", "/", browser)
+        assert status == 200 and body == b""
+        # The app's first call: the cookie gets it the token for its header.
+        status, _headers, body = _request(base, "GET", "/api/state", browser)
+        assert status == 200 and json.loads(body)["token"] == TOKEN
     finally:
         server.stop()
+
+
+def test_the_cookie_never_opens_the_app_from_another_site_or_port(
+    tmp_path: Path, web_app: Path
+) -> None:
+    server = WizardServer(tmp_path, token=TOKEN)
+    base = server.start()
+    try:
+        cookie = {"Cookie": _launched(base)["Cookie"]}
+        # Another localhost port is same-site; a page elsewhere is cross-site.
+        for site in ("same-site", "cross-site"):
+            sent = {**cookie, "Sec-Fetch-Site": site}
+            for path in ("/", "/assets/index-test.js", "/api/state"):
+                status, _headers, body = _request(base, "GET", path, sent)
+                assert status == 401, (site, path)
+                assert TOKEN.encode() not in body
+                assert b"in a new tab" in body
+    finally:
+        server.stop()
+
+
+def test_only_built_app_files_are_served(tmp_path: Path, web_app: Path) -> None:
+    (web_app / "secret.txt").write_text("SECRET", encoding="utf-8")
+    (web_app / "assets" / "notes.txt").write_text("SECRET", encoding="utf-8")
+    (web_app / "assets" / "sub").mkdir()
+    (web_app / "assets" / "sub" / "x.js").write_text("SECRET", encoding="utf-8")
+    outside = tmp_path / "outside.js"
+    outside.write_text("SECRET", encoding="utf-8")
+    linked = False
+    try:
+        os.symlink(outside, web_app / "assets" / "link.js")
+        linked = True
+    except (OSError, NotImplementedError):
+        pass  # Windows without the symlink privilege.
+    server = WizardServer(tmp_path / "jobs", token=TOKEN)
+    base = server.start()
+    auth = {"X-Wizard-Token": TOKEN}
+    try:
+        for path in (
+            "/secret.txt",
+            "/assets/notes.txt",
+            "/assets/sub/x.js",
+            "/assets/../secret.txt",
+            "/assets/%2e%2e/secret.txt",
+            "/assets/..%2fsecret.txt",
+            "/assets/.hidden.js",
+            "/assets/",
+            "/assets",
+            "/assets/missing.js",
+            "/assets/link.js",
+            "/index.htm",
+            # Windows path tricks: backslash, alternate stream, trailing dot.
+            "/assets/..\\secret.txt",
+            "/assets/index-test.js::$DATA",
+            "/assets/index-test.js.",
+            "/assets/index-test.js%00.png",
+        ):
+            for method in ("GET", "HEAD"):
+                status, _headers, body = _request(base, method, path, auth)
+                assert status == 404, (method, path)
+                assert b"SECRET" not in body, path
+        assert review.app_asset("/assets/link.js") is None
+        for trick in (
+            "/assets/..\\secret.txt",
+            "/assets/index-test.js::$DATA",
+            "/assets/index-test.js.",
+            "/assets/c:secret.js",
+        ):
+            assert review.app_asset(trick) is None, trick
+        # Served only on a case-blind file system, and then from assets/.
+        upper = review.app_asset("/assets/INDEX-TEST.JS")
+        if upper is not None:
+            assert upper[0].parent == web_app / "assets"
+            assert upper[1].startswith("text/javascript")
+        assert review.app_asset("/assets/index-test.js") is not None
+        if linked:
+            assert (web_app / "assets" / "link.js").is_symlink()
+    finally:
+        server.stop()
+
+
+def test_without_a_built_app_the_page_says_how_to_get_one(
+    tmp_path: Path, no_web_app: Path
+) -> None:
+    server = WizardServer(tmp_path, token=TOKEN)
+    base = server.start()
+    try:
+        assert _request(base, "GET", "/")[0] == 401
+        browser = _launched(base)
+        status, headers, page = _request(base, "GET", "/", browser)
+        assert status == 200
+        assert headers["Content-Type"] == "text/html; charset=utf-8"
+        assert headers["Content-Security-Policy"] == CONTENT_SECURITY_POLICY
+        text = page.decode()
+        assert "npm run build:package" in text
+        assert f"VITE_PROXY_TARGET=http://127.0.0.1:{_port(base)}" in text
+        assert "http://localhost:5173/#token=" in text
+        # Plain and static: no script or style, and no token.
+        assert "<script" not in text and "<style" not in text and "style=" not in text
+        assert TOKEN not in text
+        assert _request(base, "GET", "/assets/index-test.js", browser)[0] == 404
+        status, _headers, body = _request(base, "HEAD", "/", browser)
+        assert status == 200 and body == b""
+        # The API still works for the Vite dev server.
+        status, _headers, body = _request(base, "GET", "/api/state", browser)
+        assert status == 200 and json.loads(body)["step"] == "intro"
+    finally:
+        server.stop()
+    assert "&lt;x&gt;" in missing_app_page("<x>")
+
+
+def test_review_of_a_job_needs_the_token_and_cannot_be_framed(
+    tmp_path: Path, web_app: Path
+) -> None:
+    controller, job_id = _wizard_with_output(tmp_path)
+    job_dir = controller.store.job_dir(job_id)
+    save_job_wizard_state(job_dir, WizardState(step=WizardStep.RESULT, job_id=job_id))
+    server = WizardServer(controller.jobs_dir, job_id=job_id, token=TOKEN)
+    base = server.start()
+    try:
+        for path in ("/", "/assets/index-test.js", "/api/state", "/output.mp4"):
+            assert _request(base, "GET", path)[0] == 401, path
+        assert _request(base, "POST", "/api/intro", body=b"{}")[0] == 401
+        browser = _launched(base)
+        status, headers, page = _request(base, "GET", "/", browser)
+        assert status == 200 and page.decode() == FAKE_INDEX
+        assert headers["X-Frame-Options"] == "DENY"
+        assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+        # The app opens on that job.
+        status, _headers, body = _request(base, "GET", "/api/state", browser)
+        view = json.loads(body)
+        assert (view["job_id"], view["step"]) == (job_id, "result")
+        # The cookie comes with a framed click too: it never changes state.
+        origin = {**browser, "Origin": base, "Content-Type": "application/json"}
+        assert _request(base, "POST", "/api/new", origin, b"{}")[0] == 403
+        assert server.controller.current_state().step is WizardStep.RESULT
+    finally:
+        server.stop()
+
+
+def test_review_of_a_job_the_wizard_did_not_make_is_refused(tmp_path: Path) -> None:
+    controller = WizardController(tmp_path / "jobs")
+    source = tmp_path / "cli.mp4"
+    source.write_bytes(b"x")
+    job_id = controller.store.create(source).job_id
+    with pytest.raises(WizardError, match="no wizard state"):
+        WizardServer(controller.jobs_dir, job_id=job_id)
 
 
 def test_reopened_wizard_jobs_need_the_token(tmp_path: Path) -> None:
     controller, job_id = _wizard_with_output(tmp_path)
     job_dir = controller.store.job_dir(job_id)
     save_job_wizard_state(job_dir, WizardState(step=WizardStep.RESULT, job_id=job_id))
-    server = ReviewServer(job_dir, jobs_dir=controller.jobs_dir, job_id=job_id)
+    server = WizardServer(controller.jobs_dir, job_id=job_id)
     base = server.start()
     try:
         for path in ("/api/state", "/output.mp4"):
             assert _request(base, "GET", path)[0] == 401, path
-            status = _request(base, "GET", path, {"X-Wizard-Token": server.token or ""})
+            status = _request(base, "GET", path, {"X-Wizard-Token": server.token})
             assert status[0] == 200, path
     finally:
         server.stop()

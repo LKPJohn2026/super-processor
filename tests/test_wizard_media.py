@@ -130,6 +130,21 @@ def _facts(width: int, height: int, duration_s: float) -> MediaFacts:
     )
 
 
+WEB_CHOOSE_STEP = Path(__file__).resolve().parents[1] / "web" / "src" / "ChooseStep.tsx"
+
+
+def test_the_stated_input_limit_matches_the_wizard_check() -> None:
+    # The app's one stated limit must be the one the wizard enforces.
+    from super_processor.segments import MAX_DURATION_S
+    from super_processor.wizard import MAX_INPUT_LONG_EDGE, MAX_INPUT_SHORT_EDGE
+
+    assert (MAX_INPUT_LONG_EDGE, MAX_INPUT_SHORT_EDGE) == (1920, 1080)
+    assert MAX_DURATION_S == 30 * 60
+    if WEB_CHOOSE_STEP.is_file():  # Not in an installed wheel's test run.
+        text = WEB_CHOOSE_STEP.read_text(encoding="utf-8")
+        assert "up to 1080p and 30 minutes" in text
+
+
 def test_input_limit_error() -> None:
     assert input_limit_error(_facts(1920, 1080, 1800)) is None
     assert input_limit_error(_facts(1080, 1920, 600)) is None  # portrait

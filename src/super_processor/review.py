@@ -1,15 +1,19 @@
-"""Localhost review server: legacy split page and Gemini wizard."""
+"""Localhost wizard server: the React app, its JSON API, and job media.
+
+``super-processor review`` serves the web app built into the package
+(``web_dist``) at its own address, beside the ``/api/*`` routes the app
+calls and the videos and stills it shows.
+"""
 
 from __future__ import annotations
 
-import argparse
 import hmac
 import json
 import os
 import re
 import secrets
-import struct
 import threading
+from collections.abc import Callable
 from email.message import Message
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,25 +22,17 @@ from typing import ClassVar
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlparse
 
 from .atomic_io import open_private_new
-from .estimators import EstimatorError
 from .gemini import redact_payload, redact_secrets
 from .jobs import JobError
-from .segments import STILLS_DIR_NAME, SegmentError, load_segments
+from .segments import STILLS_DIR_NAME
 from .shot_plan import PREVIEW_NAME, PREVIEWS_DIR
 from .shots import STILLS_DIR
 from .wizard import (
     WizardConflict,
     WizardController,
     WizardError,
-    WizardStep,
     job_thumb,
-    load_job_wizard_state,
 )
-
-
-class ReviewError(RuntimeError):
-    """Raised when a review request cannot be served."""
-
 
 _STREAM_CHUNK = 1 << 20
 
@@ -86,12 +82,11 @@ MAX_BODY_BYTES = 256 * 1024
 # A dropped video is streamed to disk; 30 minutes of high-bitrate 1080p fits.
 MAX_UPLOAD_BYTES = 32 * 1024**3
 _UPLOAD_CHUNK = 1024 * 1024
-_UPLOAD_PATHS = frozenset({"/upload", "/api/upload"})
 # Every request to the wizard proves it holds this run's token: as this
 # header, as the per-port cookie the launch URL (``/?token=``) sets, or, for
-# a GET of a video or still only, as ``?t=``. State-changing requests also
-# carry it as this header or a ``token`` field, so the cookie alone (which a
-# browser sends by itself) cannot forge one.
+# a GET of a video or still only, as ``?t=``. State-changing requests (every
+# POST and every ``?run=1``) must carry it as this header, so the cookie
+# alone (which a browser sends by itself) cannot forge one.
 TOKEN_HEADER = "X-Wizard-Token"
 # The launch URL's query parameter; the wizard swaps it for the cookie.
 LAUNCH_TOKEN_PARAM = "token"
@@ -112,10 +107,38 @@ SOCKET_TIMEOUT_S = 60.0
 MAX_CONNECTIONS = 512
 UNAUTHENTICATED_MESSAGE = (
     "This wizard needs its token. Open the address that super-processor review "
-    "printed (it ends in ?token=...), or send the printed token as the "
-    "X-Wizard-Token header."
+    "printed (it ends in ?token=...) in a new tab, or send the printed token "
+    "as the X-Wizard-Token header."
 )
-_POST_FORM = re.compile(r'<form\b[^>]*\bmethod="post"[^>]*>', re.IGNORECASE)
+TOKEN_REFUSED_MESSAGE = (
+    "missing or wrong wizard token; send it as the X-Wizard-Token header "
+    "(reload the page)"
+)
+# Sent with every response. The app is plain files from this server: one
+# module script and one stylesheet, fonts as files, and React's inline styles
+# (set through the DOM, which CSP allows). blob: is for the local preview of a
+# file picked in the browser.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; "
+    "img-src 'self' blob:; media-src 'self' blob:; connect-src 'self'; "
+    "manifest-src 'self'; object-src 'none'; base-uri 'none'; "
+    "form-action 'self'; frame-ancestors 'none'"
+)
+# The built web app (``npm run build:package`` in web/). A dev checkout may
+# not have it; then ``/`` explains how to get it.
+WEB_DIST_DIR = Path(__file__).with_name("web_dist")
+_ASSET_URL = re.compile(r"/assets/([A-Za-z0-9][A-Za-z0-9._-]*)")
+# Fixed types: the OS table (the Windows registry) can map .js to text/plain,
+# which nosniff turns into a script that never runs.
+ASSET_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+}
 
 
 class BodyError(WizardError):
@@ -144,13 +167,6 @@ def new_wizard_token() -> str:
     return secrets.token_urlsafe(24)
 
 
-def with_wizard_token(page: str, token: str) -> str:
-    """Put ``token`` in every POST form and every ``?run=1`` link of a page."""
-    hidden = f'<input type="hidden" name="token" value="{token}">'
-    page = _POST_FORM.sub(lambda match: match.group(0) + hidden, page)
-    return page.replace("?run=1", f"?run=1&amp;token={token}")
-
-
 def token_matches(supplied: str | None, token: str) -> bool:
     return bool(supplied) and hmac.compare_digest(
         str(supplied).encode(), token.encode()
@@ -162,18 +178,29 @@ def wizard_cookie_name(port: int) -> str:
     return f"{WIZARD_COOKIE_PREFIX}{port}"
 
 
+# Enough for the real cookie plus a few decoys; caps the work per request.
+_MAX_COOKIE_VALUES = 8
+
+
 def launch_url(base: str, token: str) -> str:
     """The address to open: it logs the browser in, then drops the token."""
     return f"{base}/?{LAUNCH_TOKEN_PARAM}={quote(token, safe='')}"
 
 
-def _cookie(headers: Message, name: str) -> str | None:
+def _cookies(headers: Message, name: str) -> list[str]:
+    """Every value sent for cookie ``name``.
+
+    Cookies are not kept apart by port, so a page on another local port can
+    set a same-named cookie (say with ``Path=/api``) that the browser sends
+    first. Checking every value keeps such a decoy from locking the app out.
+    """
+    found: list[str] = []
     for raw in headers.get_all("Cookie") or []:
         for part in str(raw).split(";"):
             key, sep, value = part.strip().partition("=")
             if sep and key.strip() == name:
-                return value.strip().strip('"')
-    return None
+                found.append(value.strip().strip('"'))
+    return found
 
 
 def request_authenticated(
@@ -195,7 +222,10 @@ def request_authenticated(
         return "header"
     site = headers.get("Sec-Fetch-Site")
     same_origin = site is None or site in _TRUSTED_FETCH_SITES
-    if same_origin and token_matches(_cookie(headers, wizard_cookie_name(port)), token):
+    if same_origin and any(
+        token_matches(value, token)
+        for value in _cookies(headers, wizard_cookie_name(port))[:_MAX_COOKIE_VALUES]
+    ):
         return "cookie"
     if media_token is not None and token_matches(media_token, token):
         return "media"
@@ -209,11 +239,31 @@ def _same_path(path: str) -> str:
     return path
 
 
-def _hostname(host_header: str) -> str:
+def _host_parts(host_header: str) -> tuple[str, int | None] | None:
+    """``(name, port)`` from a Host value, or ``None`` when it is malformed.
+
+    Strict on purpose: ``name[:digits]`` or ``[v6][:digits]`` and nothing
+    else, so a value like ``127.0.0.1:1, evil.test`` is refused.
+    """
     value = host_header.strip().lower()
     if value.startswith("["):
-        return value[1 : value.find("]")] if "]" in value else value[1:]
-    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+        end = value.find("]")
+        if end < 0:
+            return None
+        name, rest = value[1:end], value[end + 1 :]
+    else:
+        name, sep, port = value.partition(":")
+        rest = sep + port
+    if not name or (not value.startswith("[") and ":" in rest[1:]):
+        return None
+    if not rest:
+        return name, None
+    digits = rest[1:]
+    if not rest.startswith(":") or not digits.isascii() or not digits.isdigit():
+        return None
+    if len(digits) > 5:
+        return None
+    return name, int(digits)
 
 
 def _server_port(server: object) -> int:
@@ -268,10 +318,15 @@ def request_rejection(
     :func:`request_authenticated`), since any local program can leave these
     headers out.
     """
-    host = headers.get("Host")
-    if host is None or not str(host).strip():
+    hosts = headers.get_all("Host") or []
+    if not hosts or not str(hosts[0]).strip():
         return "missing Host header"
-    if _hostname(host) not in _LOCAL_HOSTNAMES:
+    parts = _host_parts(str(hosts[0])) if len(hosts) == 1 else None
+    if parts is None or parts[0] not in _LOCAL_HOSTNAMES:
+        return "unexpected Host header"
+    # A browser names the port it connected to; another one means a
+    # rewritten or forged Host. ``port`` 0 means the port is not known.
+    if parts[1] is not None and port and parts[1] != port:
         return "unexpected Host header"
     origin = headers.get("Origin")
     if origin is not None and origin.rstrip("/") not in allowed_origins(port):
@@ -284,9 +339,10 @@ def request_rejection(
 
 
 class _GuardedHandler(BaseHTTPRequestHandler):
-    """What both servers share: the token gate and the safety headers.
+    """The token gate and the safety headers, kept apart from the wizard's
+    routes (``WizardServer`` builds its handler on this).
 
-    Subclasses set ``token``. ``timeout`` (``SOCKET_TIMEOUT_S`` when the
+    The handler class sets ``token``. ``timeout`` (``SOCKET_TIMEOUT_S`` when the
     server is made) makes an idle or trickling connection give its thread
     back instead of holding it forever.
     """
@@ -305,16 +361,15 @@ class _GuardedHandler(BaseHTTPRequestHandler):
     def end_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
-        # Not no-referrer: a browser then sends "Origin: null" on the pages'
-        # own form posts, which the origin check refuses. same-origin still
-        # sends no Referer to any other site.
+        self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+        # Not no-referrer: a browser may then send "Origin: null", which the
+        # origin check refuses. same-origin sends no Referer to other sites.
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header(
             "Cross-Origin-Resource-Policy",
             getattr(self, "resource_policy", "same-site"),
         )
-        # Pages and state hold the token; output.mp4 is rewritten in place.
+        # State holds the token; output.mp4 is rewritten in place.
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
@@ -327,14 +382,10 @@ class _GuardedHandler(BaseHTTPRequestHandler):
         )
 
     def _unauthorized(self, path: str) -> None:
-        if path.startswith("/api/") or path == "/segments":
-            body = json.dumps({"error": UNAUTHENTICATED_MESSAGE}).encode()
-            kind = "application/json"
-        else:
-            body = (UNAUTHENTICATED_MESSAGE + "\n").encode()
-            kind = "text/plain; charset=utf-8"
+        """401 as plain text (the wizard's handler overrides it for /api/*)."""
+        body = (UNAUTHENTICATED_MESSAGE + "\n").encode()
         self.send_response(401)
-        self.send_header("Content-Type", kind)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -390,265 +441,6 @@ class _LocalHTTPServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)  # type: ignore[arg-type]
         finally:
             self._slots.release()
-
-
-def segment_review_payload(job_dir: Path) -> dict[str, object]:
-    """Return the segment list, including a URL for each still."""
-    try:
-        segments = load_segments(job_dir)
-    except SegmentError as exc:
-        raise ReviewError(str(exc)) from exc
-    items: list[dict[str, object]] = []
-    for segment in segments:
-        data = segment.to_dict()
-        still = segment.still_path.replace("\\", "/")
-        data["still_url"] = f"/{still}" if still else ""
-        items.append(data)
-    return {"segments": items}
-
-
-def _still_file(job_dir: Path, url_path: str) -> Path | None:
-    """Resolve a still URL onto a file inside the job's still directory."""
-    relative = unquote(url_path).lstrip("/")
-    if not relative.startswith(f"{STILLS_DIR_NAME}/"):
-        return None
-    root = (job_dir / STILLS_DIR_NAME).resolve()
-    candidate = (job_dir / relative).resolve()
-    if candidate != root and root not in candidate.parents:
-        return None
-    if not candidate.is_file():
-        return None
-    return candidate
-
-
-def gray_ppm_to_bmp(ppm: bytes) -> bytes:
-    """Turn a binary gray PPM into a 24-bit BMP a browser can show."""
-    marker = b"\n255\n"
-    if not ppm.startswith(b"P5\n") or marker not in ppm:
-        raise ReviewError("still is not a gray PPM")
-    header, pixels = ppm[3:].split(marker, 1)
-    width_text, height_text = header.split()
-    width = int(width_text)
-    height = int(height_text)
-    if len(pixels) < width * height:
-        raise ReviewError("still is shorter than its header")
-    row_stride = (width * 3 + 3) & ~3
-    pixel_size = row_stride * height
-    header_size = 54
-    out = bytearray(b"BM")
-    out += struct.pack("<IHHI", header_size + pixel_size, 0, 0, header_size)
-    out += struct.pack(
-        "<IiiHHIIiiII", 40, width, height, 1, 24, 0, pixel_size, 0, 0, 0, 0
-    )
-    for y in range(height - 1, -1, -1):
-        start = y * width
-        row = bytearray()
-        for value in pixels[start : start + width]:
-            row += bytes((value, value, value))
-        row += b"\x00" * (row_stride - width * 3)
-        out += row
-    return bytes(out)
-
-
-def split_review_page(payload: dict[str, object]) -> str:
-    """Render the split review page from a segment payload."""
-    raw_segments = payload.get("segments")
-    segments = raw_segments if isinstance(raw_segments, list) else []
-    cards: list[str] = []
-    for item in segments:
-        if not isinstance(item, dict):
-            continue
-        start = item.get("start_s", "")
-        end = item.get("end_s", "")
-        context = escape(str(item.get("context", "")))
-        problem = escape(str(item.get("problem", "")))
-        still = str(item.get("still_url", ""))
-        image = ""
-        if still.endswith(".ppm"):
-            image = f'<img src="{escape(still[:-4] + ".bmp")}" alt="segment still">'
-        cards.append(
-            "<article>"
-            f"<p>{escape(str(start))}–{escape(str(end))}s {context} {problem}</p>"
-            f"{image}"
-            "</article>"
-        )
-    body = "\n".join(cards)
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Split review</title>
-<style>
-body {{ background: #fff; color: #111; font-family: sans-serif; }}
-img {{ display: block; margin: 0.4rem 0 1.2rem; background: #ddd; }}
-form {{ display: inline; margin-right: 0.6rem; }}
-</style>
-</head>
-<body>
-<h1>Split review</h1>
-<form method="post" action="/accept"><button type="submit">Accept</button></form>
-<form method="post" action="/note">
-<label>Note <input name="note" type="text"></label>
-<button type="submit">Send note</button>
-</form>
-{body}
-</body>
-</html>
-"""
-
-
-def apply_review_action(
-    jobs_dir: Path,
-    job_id: str,
-    *,
-    note: str | None,
-    accept: bool,
-) -> None:
-    """Run ``segment --accept`` or ``segment --note`` for this job."""
-    from .cli import run_segment_command
-
-    try:
-        code = run_segment_command(
-            argparse.Namespace(
-                jobs_dir=jobs_dir,
-                job_id=job_id,
-                note=note,
-                accept=accept,
-            )
-        )
-    except (JobError, SegmentError, EstimatorError) as exc:
-        raise ReviewError(str(exc)) from exc
-    if code != 0:
-        raise ReviewError("the split command failed")
-
-
-def _legacy_handler(
-    job_dir: Path,
-    *,
-    jobs_dir: Path | None,
-    job_id: str | None,
-    token: str,
-) -> type[BaseHTTPRequestHandler]:
-    run_token = token
-
-    class Handler(_GuardedHandler):
-        token = run_token
-        timeout = SOCKET_TIMEOUT_S
-
-        def _redirect(self) -> None:
-            self.send_response(303)
-            self.send_header("Location", "/")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-        def _send(self, kind: str, data: bytes, status: int = 200) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", kind)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def _reject(self, message: str, status: int = 400) -> None:
-            self._send("text/plain; charset=utf-8", message.encode(), status)
-
-        def _not_found(self) -> None:
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-        def _refused(self, *, state_changing: bool) -> bool:
-            reason = request_rejection(
-                self.headers,
-                port=self._port(),
-                state_changing=state_changing,
-            )
-            if reason is None:
-                return False
-            self._reject(reason, status=403)
-            return True
-
-        def do_POST(self) -> None:  # noqa: N802
-            if self._refused(state_changing=True):
-                return
-            path = urlparse(self.path).path
-            if self._authenticated() is None:
-                self._unauthorized(path)
-                return
-            if jobs_dir is None or job_id is None or path not in {"/accept", "/note"}:
-                self._not_found()
-                return
-            try:
-                length = content_length(self.headers)
-            except BodyError as exc:
-                self._reject(str(exc), status=exc.status)
-                return
-            fields = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
-            # The cookie comes along by itself; the page's own token must too.
-            supplied = fields.pop("token", [""])[0] or self.headers.get(TOKEN_HEADER)
-            if not token_matches(supplied, run_token):
-                self._reject("missing or wrong review token; reload the page", 403)
-                return
-            try:
-                if path == "/accept":
-                    apply_review_action(jobs_dir, job_id, note=None, accept=True)
-                else:
-                    note = fields.get("note", [""])[0].strip()
-                    if not note:
-                        raise ReviewError("a note is required")
-                    apply_review_action(jobs_dir, job_id, note=note, accept=False)
-            except (ReviewError, OSError) as exc:
-                self._reject(str(exc))
-                return
-            self._redirect()
-
-        def do_GET(self) -> None:  # noqa: N802
-            if self._refused(state_changing=False):
-                return
-            parsed = urlparse(self.path)
-            path = parsed.path
-            if LAUNCH_TOKEN_PARAM in parse_qs(parsed.query, keep_blank_values=True):
-                self._launch(path, parsed.query)
-                return
-            if self._authenticated() is None:
-                self._unauthorized(path)
-                return
-            if path == "/":
-                try:
-                    payload = segment_review_payload(job_dir)
-                except ReviewError as exc:
-                    self._reject(str(exc))
-                    return
-                page = with_wizard_token(split_review_page(payload), run_token)
-                self._send("text/html; charset=utf-8", page.encode())
-                return
-            if path.endswith(".bmp"):
-                still = _still_file(job_dir, path[:-4] + ".ppm")
-                if still is None:
-                    self._not_found()
-                    return
-                try:
-                    data = gray_ppm_to_bmp(still.read_bytes())
-                except ReviewError as exc:
-                    self._reject(str(exc))
-                    return
-                self._send("image/bmp", data)
-                return
-            if path == "/segments":
-                try:
-                    payload = segment_review_payload(job_dir)
-                except ReviewError as exc:
-                    error = json.dumps({"error": str(exc)}).encode()
-                    self._send("application/json", error, 404)
-                    return
-                self._send("application/json", json.dumps(payload).encode())
-                return
-            still = _still_file(job_dir, path)
-            if still is None:
-                self._not_found()
-                return
-            self._send("image/x-portable-pixmap", still.read_bytes())
-
-    return Handler
 
 
 # Shot stills are named by their start time in milliseconds.
@@ -723,7 +515,8 @@ def _job_media(
 
 
 def form_fields_from_body(raw: bytes, content_type: str) -> dict[str, list[str]]:
-    """Parse a wizard POST body from a form or a JSON object."""
+    """Parse a wizard POST body: a JSON object (what the app sends) or a
+    urlencoded form (handy from curl or a script; never a credential)."""
     if "application/json" in content_type:
         text = raw.decode("utf-8", errors="replace").strip()
         if not text:
@@ -757,31 +550,72 @@ def _is_media_path(path: str) -> bool:
     )
 
 
+def web_dist_dir() -> Path:
+    """Where the built web app lives (tests point it elsewhere)."""
+    return WEB_DIST_DIR
+
+
+def app_asset(path: str) -> tuple[Path, str] | None:
+    """Map ``/assets/<name>`` to a built file and its type, or ``None``.
+
+    Only a plain file directly in ``web_dist/assets`` with a known type is
+    served, never a symlink or anything outside that folder.
+    """
+    match = _ASSET_URL.fullmatch(path)
+    if match is None:
+        return None
+    name = match.group(1)
+    kind = ASSET_TYPES.get(Path(name).suffix.lower())
+    if kind is None:
+        return None
+    root = web_dist_dir() / "assets"
+    candidate = root / name
+    # The name has no slash, so only a symlink could lead out of the folder.
+    if candidate.is_symlink() or not candidate.is_file():
+        return None
+    return candidate, kind
+
+
+def missing_app_page(base: str) -> str:
+    """The short page ``/`` shows when this install has no built web app."""
+    target = escape(base)
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en"><head><meta charset="utf-8">'
+        "<title>Super Processor: web app not built</title></head><body>"
+        "<h1>The web app is not built in this checkout</h1>"
+        "<p>The wizard is running, but this copy of super-processor has no "
+        "built web app to show. Released packages include it. From a source "
+        "checkout, do one of these:</p>"
+        "<ol>"
+        "<li>Build it into the package, then restart "
+        "<code>super-processor review</code>:"
+        "<pre>cd web\nnpm ci\nnpm run build:package</pre></li>"
+        "<li>Or run the Vite dev server against this wizard:"
+        f"<pre>cd web\nVITE_PROXY_TARGET={target} npm run dev</pre>"
+        "then open <code>http://localhost:5173/#token=</code> followed by the "
+        "token super-processor review printed.</li>"
+        "</ol></body></html>\n"
+    )
+
+
 def _wizard_handler(
     controller: WizardController, token: str
 ) -> type[BaseHTTPRequestHandler]:
     run_token = token
+    # ?run=1 GETs that start a long pass on the worker thread. "prefetch"
+    # previews the next scene ahead (``--prefetch`` only); the view's
+    # segment_preview.next shows how it goes.
+    runners: dict[str, Callable[[], bool]] = {
+        "/api/render": controller.start_render,
+        "/api/segment": controller.start_segmenting,
+        "/api/analyze": controller.start_analyze,
+        "/api/prefetch": controller.start_prefetch,
+    }
 
     class Handler(_GuardedHandler):
         token = run_token
         timeout = SOCKET_TIMEOUT_S
-
-        def _redirect(self, location: str = "/") -> None:
-            self.send_response(303)
-            self.send_header("Location", location)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-        def _html(self, page: str, status: int = 200) -> None:
-            # Pages hold the token; the shared headers stop framing them. No
-            # page may show the Gemini key (it is taken out before the
-            # token goes in, so the token is never touched).
-            body = with_wizard_token(redact_secrets(page), token).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
 
         def _unauthorized(self, path: str) -> None:
             if path.startswith("/api/"):
@@ -805,16 +639,20 @@ def _wizard_handler(
                 return True
             cross_site = self.headers.get("Sec-Fetch-Site") == "cross-site"
             if media and how != "media" and cross_site:
-                self._reject("cross-site media request refused", status=403)
+                self._error(path, "cross-site media request refused", status=403)
                 return True
             if how == "media":
                 self.resource_policy = "cross-origin"
             return False
 
-        def _reject(self, message: str, status: int = 400) -> None:
-            self._html(
-                f"<!DOCTYPE html><html><body><p>{escape(message)}</p>"
-                f'<p><a href="/">Back</a></p></body></html>',
+        def _error(self, path: str, message: str, status: int = 400) -> None:
+            """An error as JSON for /api/*, else as plain text."""
+            if path.startswith("/api/"):
+                self._json({"error": message}, status=status)
+                return
+            self._send(
+                "text/plain; charset=utf-8",
+                (redact_secrets(message) + "\n").encode(),
                 status=status,
             )
 
@@ -824,10 +662,7 @@ def _wizard_handler(
             )
             if reason is None:
                 return False
-            if path.startswith("/api/"):
-                self._json({"error": reason}, status=403)
-            else:
-                self._reject(reason, status=403)
+            self._error(path, reason, status=403)
             return True
 
         def _json(self, payload: object, status: int = 200) -> None:
@@ -842,6 +677,16 @@ def _wizard_handler(
             self.send_header("Vary", "Origin")
             self.end_headers()
             self.wfile.write(body)
+
+        def _send(
+            self, kind: str, body: bytes, *, status: int = 200, head: bool = False
+        ) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
 
         def _not_found(self) -> None:
             self.send_response(404)
@@ -912,12 +757,37 @@ def _wizard_handler(
                 return None
             return _job_media(controller.store.job_dir(state.job_id), path)
 
+        def _app(self, path: str, *, head: bool) -> bool:
+            """Serve the web app's page or one of its files; False if not one."""
+            if path in {"/", "/index.html"}:
+                page = web_dist_dir() / "index.html"
+                if page.is_file() and not page.is_symlink():
+                    self._send_file(page, "text/html; charset=utf-8", head=head)
+                    return True
+                base = f"http://127.0.0.1:{self._port()}"
+                self._send(
+                    "text/html; charset=utf-8",
+                    missing_app_page(base).encode(),
+                    head=head,
+                )
+                return True
+            if path.startswith("/assets/"):
+                asset = app_asset(path)
+                if asset is None:
+                    self._not_found()
+                else:
+                    self._send_file(asset[0], asset[1], head=head)
+                return True
+            return False
+
         def do_HEAD(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             path = parsed.path
             if self._refused(path, state_changing=False):
                 return
             if self._gate(path, parse_qs(parsed.query)):
+                return
+            if self._app(path, head=True):
                 return
             try:
                 media = self._media_file(path)
@@ -930,16 +800,19 @@ def _wizard_handler(
 
         def _view(self) -> dict[str, object]:
             # Only sent to a request that already proved it holds the token.
+            # The app served here gets its X-Wizard-Token this way.
             return {**controller.api_view(), "token": token}
 
-        def _token_refused(self, path: str, supplied: str | None) -> bool:
-            if token_matches(self.headers.get(TOKEN_HEADER) or supplied, token):
+        def _token_refused(self, path: str) -> bool:
+            """True (and answered) unless the token came as the header.
+
+            The cookie never counts here, nor a form field or query value:
+            a custom header cannot be sent cross-site without a CORS
+            preflight, which only the allowed origins pass.
+            """
+            if token_matches(self.headers.get(TOKEN_HEADER), token):
                 return False
-            reason = "missing or wrong wizard token; reload the page"
-            if path.startswith("/api/"):
-                self._json({"error": reason}, status=403)
-            else:
-                self._reject(reason, status=403)
+            self._error(path, TOKEN_REFUSED_MESSAGE, status=403)
             return True
 
         def _read_fields(self) -> dict[str, list[str]]:
@@ -976,14 +849,8 @@ def _wizard_handler(
             """Stream a dropped video to disk, then pick it.
 
             The body is the file itself, so it skips the small-body limit
-            and gets its own cap; the token must come as a header.
+            and gets its own cap. do_POST has checked the token header.
             """
-            if not token_matches(self.headers.get(TOKEN_HEADER), token):
-                self._json(
-                    {"error": "missing or wrong wizard token; reload the page"},
-                    status=403,
-                )
-                return
             raw = (self.headers.get("Content-Length") or "").strip()
             if not raw.isdigit() or int(raw) <= 0:
                 self._json({"error": "the upload needs a Content-Length"}, status=411)
@@ -1029,35 +896,32 @@ def _wizard_handler(
             if self._authenticated() is None:
                 self._unauthorized(path)
                 return
-            if path in _UPLOAD_PATHS:
+            action = _API_POSTS.get(path)
+            if action is None and path != "/api/upload":
+                self._error(path, f"unknown endpoint {path}", status=404)
+                return
+            if self._token_refused(path):
+                return
+            if action is None:
                 self._upload()
                 return
             try:
                 fields = self._read_fields()
             except WizardError as exc:
                 status = exc.status if isinstance(exc, BodyError) else 400
-                if path.startswith("/api/"):
-                    self._json({"error": str(exc)}, status=status)
-                    return
-                self._reject(str(exc), status=status)
+                self._json({"error": str(exc)}, status=status)
                 return
-            if self._token_refused(path, fields.pop("token", [""])[0]):
-                return
-            action = _API_POSTS.get(path, path)
+            # A body field is never a credential (only the header is), so a
+            # stray "token" field must not reach the controller either.
+            fields.pop("token", None)
             try:
                 controller.handle_post(action, fields)
             except WizardError as exc:
                 # 409: the page shows a job the wizard has since left.
                 status = 409 if isinstance(exc, WizardConflict) else 400
-                if path.startswith("/api/"):
-                    self._json({"error": str(exc)}, status=status)
-                    return
-                self._reject(str(exc), status=status)
+                self._json({"error": str(exc)}, status=status)
                 return
-            if path.startswith("/api/"):
-                self._json(self._view())
-                return
-            self._redirect("/")
+            self._json(self._view())
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -1066,10 +930,9 @@ def _wizard_handler(
             runs = query.get("run", [""])[0] == "1"
             if self._refused(path, state_changing=runs):
                 return
-            supplied = query.get(LAUNCH_TOKEN_PARAM, [""])[0]
             if runs:
-                # A ?run=1 link carries the token itself, cookie or not.
-                if self._token_refused(path, supplied):
+                # Starts work: the header is the only credential that counts.
+                if self._token_refused(path):
                     return
             elif LAUNCH_TOKEN_PARAM in query:
                 self._launch(path, parsed.query)
@@ -1085,39 +948,12 @@ def _wizard_handler(
                     return
                 # Long passes run on the controller's worker thread. These
                 # GETs start one when none is running and return at once;
-                # callers poll /api/state (or the page refreshes).
-                if path == "/api/render" and runs:
-                    controller.start_render()
+                # callers poll /api/state.
+                if runs and path in runners:
+                    runners[path]()
                     self._json(self._view())
                     return
-                if path == "/render" and runs:
-                    controller.start_render()
-                    self._redirect("/")
-                    return
-                if path == "/api/segment" and runs:
-                    controller.start_segmenting()
-                    self._json(self._view())
-                    return
-                if path == "/segment" and runs:
-                    controller.start_segmenting()
-                    self._redirect("/")
-                    return
-                if path == "/api/analyze" and runs:
-                    controller.start_analyze()
-                    self._json(self._view())
-                    return
-                if path == "/analyze" and runs:
-                    controller.start_analyze()
-                    self._redirect("/")
-                    return
-                # Preview the next scene in the background (``--prefetch``
-                # only); the view's segment_preview.next shows how it goes.
-                if path == "/api/prefetch" and runs:
-                    controller.start_prefetch()
-                    self._json(self._view())
-                    return
-                if path == "/":
-                    self._html(controller.render())
+                if self._app(path, head=False):
                     return
                 media = self._media_file(path)
                 if media is not None:
@@ -1127,91 +963,34 @@ def _wizard_handler(
                     self._json({"error": f"unknown endpoint {path}"}, status=404)
                     return
                 self._not_found()
-            except (WizardError, ReviewError, OSError) as exc:
-                if path.startswith("/api/"):
-                    self._json({"error": str(exc)}, status=400)
-                    return
-                self._reject(str(exc))
+            except (WizardError, OSError) as exc:
+                self._error(path, str(exc))
 
     return Handler
 
 
-class ReviewServer:
-    """Serve one job directory on localhost until ``stop``."""
-
-    def __init__(
-        self,
-        job_dir: Path,
-        *,
-        jobs_dir: Path | None = None,
-        job_id: str | None = None,
-        host: str = "127.0.0.1",
-        port: int = 0,
-        prefetch: bool = False,
-    ) -> None:
-        self.job_dir = job_dir
-        # The wizard and the split page both need it on every request.
-        self.token: str | None = new_wizard_token()
-        self.controller: WizardController | None = None
-        wizard_state = load_job_wizard_state(job_dir)
-        if wizard_state is not None and wizard_state.step is not WizardStep.INTRO:
-            controller = WizardController(
-                jobs_dir or job_dir.parent, job_id=job_dir.name, prefetch=prefetch
-            )
-            self.controller = controller
-            handler: type[BaseHTTPRequestHandler] = _wizard_handler(
-                controller, self.token
-            )
-        else:
-            handler = _legacy_handler(
-                job_dir, jobs_dir=jobs_dir, job_id=job_id, token=self.token
-            )
-        self._httpd = _LocalHTTPServer((host, port), handler)
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-
-    @property
-    def url(self) -> str:
-        host, port = self._httpd.server_address[:2]
-        name = host.decode() if isinstance(host, bytes) else host
-        return f"http://{name}:{port}"
-
-    @property
-    def launch_url(self) -> str:
-        """The URL to open in a browser; it carries the token once."""
-        return launch_url(self.url, self.token or "")
-
-    def start(self) -> str:
-        """Start the server and return its base URL."""
-        self._thread.start()
-        return self.url
-
-    def wait(self) -> None:
-        """Block until ``stop`` is called."""
-        self._thread.join()
-
-    def stop(self) -> None:
-        """Stop the server."""
-        self._httpd.shutdown()
-        self._thread.join(timeout=5)
-        self._httpd.server_close()
-        if self.controller is not None:
-            self.controller.shutdown()
-
-
 class WizardServer:
-    """Serve the Gemini wizard for a jobs directory."""
+    """Serve the web app and the wizard for a jobs directory.
+
+    With ``job_id`` the wizard shows that job (it must have been made by the
+    wizard: :class:`.wizard.WizardError` otherwise), with its own session
+    state, so another window's session does not move it.
+    """
 
     def __init__(
         self,
         jobs_dir: Path,
         *,
+        job_id: str | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
         controller: WizardController | None = None,
         token: str | None = None,
         prefetch: bool = False,
     ) -> None:
-        self.controller = controller or WizardController(jobs_dir, prefetch=prefetch)
+        self.controller = controller or WizardController(
+            jobs_dir, job_id=job_id, prefetch=prefetch
+        )
         if prefetch:
             self.controller.prefetch = True
         self.token = token or new_wizard_token()

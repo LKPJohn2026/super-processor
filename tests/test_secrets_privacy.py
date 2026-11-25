@@ -49,6 +49,7 @@ from super_processor.upscale import UpscaleError, UpscaleSpan
 from super_processor.wizard import (
     GEMINI_VIDEO_FILE,
     WizardController,
+    WizardError,
     WizardState,
     WizardStep,
     job_state_path,
@@ -432,10 +433,18 @@ def test_a_failure_quoting_the_key_reaches_no_state_file_api_or_page(
         with get(f"{base}/api/state", server.token) as response:
             body = response.read().decode()
         assert KEY not in body and "***" in body
-        monkeypatch.setattr(controller, "render", lambda: f"<p>{KEY}</p>")
-        with get(f"{base}/", server.token) as response:
-            page = response.read().decode()
-        assert KEY not in page
+
+        # A plain-text error (here from a media route) is redacted too.
+        def broken() -> None:
+            raise WizardError(f"bad {KEY}")
+
+        monkeypatch.setattr(controller, "current_state", broken)
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            get(f"{base}/output.mp4", server.token)
+        page = refused.value.read().decode()
+        refused.value.close()
+        assert refused.value.code == 400
+        assert KEY not in page and "bad ***" in page
     finally:
         server.stop()
 
