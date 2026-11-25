@@ -109,7 +109,6 @@ export function ResultStep({ origin, view, busy, message, onSend, stopped }: Ste
           {src ? (
             <CompareViewer
               afterSrc={src}
-              regions={[]}
               afterLabel={resultTag(view.scale, version)}
               sceneName="The restored video"
               positionLabel="Position in the restored video"

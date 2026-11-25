@@ -166,7 +166,6 @@ export function PreviewStep({
               afterSrc={after}
               beforePoster={outputSrc(origin, poster(shot.before_url)) ?? undefined}
               afterPoster={outputSrc(origin, poster(shot.after_url)) ?? undefined}
-              regions={shot.regions ?? []}
               afterLabel={afterTag(preview.scale, shot.use_upscale)}
               sceneName={`scene ${preview.index + 1}, ${title}`}
               onDuration={setClipS}

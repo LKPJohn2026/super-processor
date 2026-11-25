@@ -19,7 +19,6 @@ const {
   previewOverline,
   previewRange,
   previewTitle,
-  regionLabel,
   sceneGets,
   stepTime,
   strengthWord,
@@ -59,7 +58,7 @@ test("strength reads as a word", () => {
   assert.equal(strengthWord(0.8), "Strong");
 });
 
-test("what the scene gets comes from its real look, in plain words", () => {
+test("what the scene gets comes from its real look, in plain words, with no protected-area lines", () => {
   const items = sceneGets(
     {
       strength: 0.3,
@@ -78,7 +77,6 @@ test("what the scene gets comes from its real look, in plain words", () => {
       ["AI detail", "gentle"],
       ["More contrast", "+5%"],
       ["Deepens the shadows", "-10%"],
-      ["Faces handled gently", ""],
     ],
   );
 });
@@ -87,8 +85,9 @@ test("a scene only resized says so, and a kept size has no AI detail line", () =
   const resized = sceneGets({ strength: 0.5, use_upscale: false, look: NEUTRAL, contains: [] }, 2);
   assert.deepEqual(resized.map((item) => item.text), ["Just resized, no AI detail"]);
   assert.deepEqual(sceneGets({ strength: 0.5, look: NEUTRAL, contains: [] }, 1), []);
+  // Protected content still changes the render, but the list no longer says so.
   const unboxed = sceneGets({ strength: 0.5, look: NEUTRAL, contains: ["text"], regions: [] }, 2);
-  assert.equal(unboxed.at(-1).text, "Held to a lower strength (no boxes placed)");
+  assert.deepEqual(unboxed.map((item) => item.text), ["AI detail"]);
 });
 
 test("the check box says passed, found, or not checked", () => {
@@ -110,8 +109,7 @@ test("the check box says passed, found, or not checked", () => {
   assert.equal(checkState(null).checked, false);
 });
 
-test("labels for boxes and the restored side", () => {
-  assert.equal(regionLabel({ kind: "text" }), "Text — handled gently");
+test("labels for the restored side", () => {
   assert.equal(afterTag(2, true), "Restored · 2×");
   assert.equal(afterTag(2, false), "Resized · 2×");
   assert.equal(afterTag(1, true), "Cleaned up");
@@ -142,4 +140,12 @@ test("the viewer's keys, wipe and clock", () => {
   assert.equal(stepTime(1, 3, 1, 0.04), 1.04);
   assert.equal(stepTime(0.01, 3, -1, 0.04), 0);
   assert.equal(stepTime(2.99, 3, 1, 0.04), 3);
+});
+
+test("the viewer draws no boxes over the preview", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../src/CompareViewer.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /protect|regions/);
+  const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.doesNotMatch(css, /\.protect\b/);
 });

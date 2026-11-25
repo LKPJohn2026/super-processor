@@ -3,7 +3,7 @@
 // "Something off?" chips and the note they build, and the comparison
 // viewer's arithmetic. Pure functions, so the node tests can check them;
 // types only from ./api.
-import type { LookShot, Region, ShotCheck, ShotLook } from "./api";
+import type { LookShot, ShotCheck, ShotLook } from "./api";
 
 /** `4:32` or `1:02:05` (the same as jobView's clockTime, kept here so this file stands alone). */
 function clock(seconds: number): string {
@@ -71,11 +71,11 @@ const EPS = 1e-6;
 
 /**
  * "What this scene gets", from the scene's real look settings: each
- * clean-up or finishing value away from neutral, the AI detail (or that
- * it is only resized), and what is handled gently inside the boxes.
+ * clean-up or finishing value away from neutral, and the AI detail (or
+ * that it is only resized).
  */
 export function sceneGets(
-  shot: Pick<LookShot, "strength" | "look" | "use_upscale" | "regions" | "contains">,
+  shot: Pick<LookShot, "strength" | "look" | "use_upscale">,
   scale: number | null,
 ): GetsItem[] {
   const look: Partial<ShotLook> = shot.look ?? {};
@@ -109,26 +109,7 @@ export function sceneGets(
   }
   const grain = look.grain ?? 0;
   if (grain > EPS) items.push({ icon: "film", text: "Adds film grain", amount: amount(grain) });
-  const kinds = [...new Set((shot.regions ?? []).map((region) => region.kind))].sort();
-  for (const kind of kinds) items.push({ icon: "shield", text: `${regionWord(kind)} handled gently`, amount: "" });
-  if (!kinds.length) {
-    const flagged = (shot.contains ?? []).filter((item) => ["faces", "hands", "text"].includes(item));
-    if (flagged.length && scale !== 1 && shot.use_upscale !== false) {
-      items.push({ icon: "shield", text: "Held to a lower strength (no boxes placed)", amount: "" });
-    }
-  }
   return items;
-}
-
-const REGION_WORDS: Record<string, string> = { faces: "Faces", hands: "Hands", text: "Text" };
-
-function regionWord(kind: string): string {
-  return REGION_WORDS[kind] ?? kind.replace(/_/g, " ").replace(/^./, (first) => first.toUpperCase());
-}
-
-/** A protect box's label on the picture: "Faces — handled gently". */
-export function regionLabel(region: Pick<Region, "kind">): string {
-  return `${regionWord(region.kind)} — handled gently`;
 }
 
 const PROBLEM_WORDS: Record<string, string> = {

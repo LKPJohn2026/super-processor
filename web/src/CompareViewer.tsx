@@ -7,11 +7,9 @@ import {
   type PointerEvent,
   type ReactNode,
 } from "react";
-import type { Region } from "./api";
 import {
   clampWipe,
   playerTime,
-  regionLabel,
   stepTime,
   viewerKey,
   wipeKey,
@@ -45,8 +43,8 @@ function keyOwner(target: EventTarget | null): "field" | "control" | null {
 /**
  * The comparison viewer (mockup 05, gen.py `viewer()`): the real before and
  * after previews kept in step, with one play/pause, one scrubber and frame
- * steps; Wipe (a draggable, keyboard handle), Side by side or A/B; a 100%
- * view; the protect boxes with their labels. Keys (s9): Space plays, ←/→
+ * steps; Wipe (a draggable, keyboard handle), Side by side or A/B; and a 100%
+ * view. Keys (s9): Space plays, ←/→
  * step a frame, B flips before/after, Z zooms to 100%; with `onMark`, I
  * and O mark the start and end of a part at the player's time.
  *
@@ -59,7 +57,6 @@ export function CompareViewer({
   afterSrc,
   beforePoster,
   afterPoster,
-  regions,
   afterLabel,
   sceneName,
   onDuration,
@@ -72,7 +69,6 @@ export function CompareViewer({
   afterSrc: string;
   beforePoster?: string;
   afterPoster?: string;
-  regions: Region[];
   afterLabel: string;
   sceneName: string;
   onDuration?: (seconds: number) => void;
@@ -259,20 +255,6 @@ export function CompareViewer({
   } as CSSProperties;
   const stacked = single || mode !== "side";
   const tag = (text: string, side: "left" | "right") => <span className={`vtag ${side}`}>{text}</span>;
-  const boxes = regions.map((region, index) => (
-    <span
-      key={`${region.kind}-${index}`}
-      className={`protect ${region.kind}${region.y0 < 0.1 ? " inside" : ""}`}
-      style={{
-        left: `${region.x0 * 100}%`,
-        top: `${region.y0 * 100}%`,
-        width: `${(region.x1 - region.x0) * 100}%`,
-        height: `${(region.y1 - region.y0) * 100}%`,
-      }}
-    >
-      <span>{regionLabel(region)}</span>
-    </span>
-  ));
   // The two videos keep their place in the tree in every mode, so changing
   // mode never reloads them or loses the time.
   const beforeFrameStyle: CSSProperties = { ...frameStyle };
@@ -304,7 +286,6 @@ export function CompareViewer({
           onPause={() => setPlaying(false)}
         />
         {stacked ? null : tag(afterLabel, "left")}
-        {stacked ? null : boxes}
       </div>
       {single ? null : (
       <div className="vframe v-before" style={beforeFrameStyle}>
@@ -320,12 +301,10 @@ export function CompareViewer({
           tabIndex={-1}
         />
         {stacked ? null : tag("Original", "left")}
-        {stacked ? null : boxes}
       </div>
       )}
       {single ? (
         <div className="vframe v-overlay" style={frameStyle}>
-          {boxes}
           {tag(afterLabel, "left")}
         </div>
       ) : stacked ? (
@@ -348,7 +327,6 @@ export function CompareViewer({
             dragging.current = false;
           }}
         >
-          {boxes}
           {mode === "wipe" ? (
             <>
               <span className="wipe-line" style={{ left: `${wipe}%` }} aria-hidden="true" />

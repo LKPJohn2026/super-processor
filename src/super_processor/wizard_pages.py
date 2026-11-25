@@ -385,13 +385,6 @@ img, video {{
 .pair figure {{ margin: 0; }}
 .pair video {{ margin: 0; width: 100%; }}
 .frame {{ position: relative; margin-top: 0.2rem; line-height: 0; }}
-.box {{
-  position: absolute;
-  border: 2px solid #e8b44a;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
-  pointer-events: none;
-}}
-.box.text {{ border-color: #6fc3df; }}
 .pair figcaption {{ font-size: 0.8rem; color: var(--muted); }}
 .check-ok {{ color: var(--leaf); }}
 .seg-progress {{
@@ -688,20 +681,18 @@ def _look_card(shot: dict[str, object], redo: str) -> str:
     if shot.get("after_url"):
         before = str(shot.get("before_url"))
         after = str(shot.get("after_url"))
-        boxes = _boxes(_items(shot, "regions"))
         videos = f"""<div class="pair">
 <figure><figcaption>Before</figcaption><div class="frame">
 <video controls muted loop preload="metadata" src="{escape(before)}"
-poster="{escape(_poster(before))}"></video>{boxes}</div></figure>
+poster="{escape(_poster(before))}"></video></div></figure>
 <figure><figcaption>After</figcaption><div class="frame">
 <video controls muted loop preload="metadata" src="{escape(after)}"
-poster="{escape(_poster(after))}"></video>{boxes}</div></figure>
+poster="{escape(_poster(after))}"></video></div></figure>
 </div>"""
     return f"""<div class="card">
 <h2>{index + 1}. {format_time(start)}–{format_time(end)} · {label}</h2>
 {videos}
 <p class="tags"><strong>{escape(summary)}</strong></p>
-{_protected_line(_items(shot, "regions"), _items(shot, "contains"))}
 <p class="tags">{escape(str(shot.get("reason") or ""))}</p>
 <p class="tags muted">{escape(check_summary(check))}{shimmer}</p>
 {redo}
@@ -1134,45 +1125,6 @@ def _shimmer_text(value: object) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return ""
     return f" Texture stability: {float(value):.1f}× as jumpy as the source."
-
-
-def _boxes(regions: list[object]) -> str:
-    """Outlines over a preview for each protected region."""
-    spans: list[str] = []
-    for region in regions:
-        if not isinstance(region, dict):
-            continue
-        try:
-            x0, y0 = float(region["x0"]), float(region["y0"])
-            x1, y1 = float(region["x1"]), float(region["y1"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        kind = escape(str(region.get("kind", "")))
-        spans.append(
-            f'<span class="box {kind}" title="{kind}" style="left:{x0 * 100:.1f}%;'
-            f"top:{y0 * 100:.1f}%;width:{(x1 - x0) * 100:.1f}%;"
-            f'height:{(y1 - y0) * 100:.1f}%"></span>'
-        )
-    return "".join(spans)
-
-
-def _protected_line(regions: list[object], contains: list[object]) -> str:
-    kinds = sorted(
-        {str(r.get("kind")) for r in regions if isinstance(r, dict) and r.get("kind")}
-    )
-    if kinds:
-        return (
-            '<p class="tags muted">Protected inside the boxes: '
-            f"{escape(', '.join(kinds))}.</p>"
-        )
-    flagged = [str(item) for item in contains if item in ("faces", "hands", "text")]
-    if flagged:
-        return (
-            '<p class="tags muted">Contains '
-            f"{escape(', '.join(flagged))} but no boxes were placed, so the "
-            "whole shot is held to a lower strength.</p>"
-        )
-    return ""
 
 
 def _poster(video_url: str) -> str:

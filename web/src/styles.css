@@ -2833,33 +2833,6 @@ button.text-link:disabled {
   right: 16px;
 }
 
-.protect {
-  position: absolute;
-  border: 2px dashed #e9c46a;
-  border-radius: 4px;
-  pointer-events: none;
-}
-
-.protect > span {
-  position: absolute;
-  left: -2px;
-  top: -26px;
-  padding: 3px 8px;
-  border-radius: 4px 4px 4px 0;
-  background: #e9c46a;
-  color: #2a220a;
-  font-size: 12px;
-  line-height: 16px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.protect.inside > span {
-  top: 0;
-  left: 0;
-  border-radius: 0 0 4px 0;
-}
-
 .vcontrols {
   display: flex;
   flex-wrap: wrap;

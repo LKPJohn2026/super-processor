@@ -2637,8 +2637,9 @@ class WizardController:
             )
         except (GeminiError, ShotError) as exc:
             warnings.append(
-                f"Gemini could not box faces, hands, and text ({exc}); those "
-                f"shots are capped at strength {PROTECTED_STRENGTH:g} overall"
+                "Gemini could not find where the faces, hands, and text are "
+                f"({exc}); those shots are capped at strength "
+                f"{PROTECTED_STRENGTH:g} overall"
             )
             return shots
         shots = apply_regions(shots, found, targets)

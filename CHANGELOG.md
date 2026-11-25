@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Previews no longer draw boxes over faces, hands and text, and the list of
+  what a scene gets no longer says what is handled gently. Those areas are
+  still found and still restored more gently, so renders are unchanged.
+  This applies to the web app and the built-in page.
+
 ## [4.3.2] - 2026-11-23
 
 ### Security
