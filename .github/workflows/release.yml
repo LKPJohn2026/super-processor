@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # A dry run from main: builds and verifies the web app, the sdist and every
+  # wheel on all three systems, but publishes nothing (both publish jobs
+  # need a v* tag).
+  workflow_dispatch:
 
 # Read-only by default. Only github-release (contents: write) and pypi
 # (id-token: write, in the pypi environment) get more, and only for themselves.
@@ -177,6 +181,7 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [verify]
     runs-on: ubuntu-latest
     # The only job with contents: write. It runs nothing but GitHub's own

@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `super-processor review JOB_ID` opens that job in the web app. A job made
   with the command line (no wizard state) is pointed to
   `segment --accept/--note` instead.
+- The release workflow can be started by hand as a dry run: it builds and
+  checks the web app, the sdist and every wheel, and publishes nothing.
 
 ### Removed
 

@@ -267,12 +267,14 @@ def test_ci_puts_the_web_app_in_the_distributions() -> None:
 
 def test_release_publishes_only_from_v_tags() -> None:
     data = _load((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))
-    assert data["on"] == {"push": {"tags": ["v*"]}}
+    # A manual run is a dry run: it may build, but only a v* tag publishes.
+    assert data["on"] == {"push": {"tags": ["v*"]}, "workflow_dispatch": None}
     pypi = data["jobs"]["pypi"]
     assert pypi["environment"]["name"] == "pypi"
     assert "startsWith(github.ref, 'refs/tags/v')" in pypi["if"]
     assert _writes(pypi["permissions"]) == ["id-token"]
     release = data["jobs"]["github-release"]
+    assert release["if"] == "startsWith(github.ref, 'refs/tags/v')"
     assert _writes(release["permissions"]) == ["contents"]
     assert all(
         "uses" not in s or s["uses"].startswith("actions/") for s in _steps(release)
