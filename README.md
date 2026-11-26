@@ -145,8 +145,19 @@ file is then expected in its `SPAN/` folder). The wizard checks the file's
 sha256 before it loads it and names the expected one if it differs; it reads
 the file once and loads those same checked bytes, so a file replaced after
 the check is never used. Keep the models folder private to you (`700`, as
-above) and do not run from a folder other users can write to. Then
-check each piece:
+above) and do not run from a folder other users can write to.
+
+DPIR, the stronger GPU denoiser, needs no setup. A scene gets it only when
+your note on its preview asks for it ("more denoise", "still noisy", "too
+grainy"); each such note raises it one level (of 3), "less denoise" lowers
+it, and "no DPIR" turns it off. Gemini cannot turn it on. The first time a
+scene needs it, its weights, `drunet_color.pth` (about 130 MB, MIT), are
+fetched into `.dogfood/models/DPIR/` from the pinned KAIR release on GitHub
+and kept only if their size and sha256 match (see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+`SUPER_PROCESSOR_DPIR_WEIGHTS=/path/to/drunet_color.pth` uses a copy you
+downloaded yourself, and `SUPER_PROCESSOR_DPIR_DOWNLOAD=0` turns the
+download off. Then check each piece:
 
 ```bash
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"

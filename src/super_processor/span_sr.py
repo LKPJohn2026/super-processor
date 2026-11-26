@@ -223,21 +223,37 @@ def prepare_blend(
 
 
 def restore_block(
-    model: Any, blend: Blend, frames: bytearray, *, batch: int
+    model: Any,
+    blend: Blend,
+    frames: bytearray,
+    *,
+    batch: int,
+    dpir: Any = None,
+    dpir_level: int = 0,
+    scale: int = SPAN_SCALE,
 ) -> bytearray:  # pragma: no cover - needs torch
     """Upscale packed yuv420p source frames by 2, blended, as packed yuv420p.
 
     All of it runs on ``blend.device``, ``batch`` frames at a time (GPU
-    memory follows the batch): yuv420p to RGB, SPAN, a lanczos 2x base, the
-    detail swap and strength mix (see :func:`blend_detail`), and back to
-    yuv420p. Only the 8-bit planes cross to the host, straight into the
-    returned buffer, so nothing is copied again before the encoder's pipe.
-    Bytes past the last whole frame are ignored.
+    memory follows the batch): yuv420p to RGB, DPIR when ``dpir`` is given
+    (see :mod:`super_processor.dpir`), SPAN, a lanczos 2x base, the detail
+    swap and strength mix (see :func:`blend_detail`), and back to yuv420p.
+    Only the 8-bit planes cross to the host, straight into the returned
+    buffer, so nothing is copied again before the encoder's pipe. Bytes past
+    the last whole frame are ignored.
+
+    Without SPAN (``model`` is ``None``, a pass-through scene that DPIR
+    cleans) the picture is the lanczos base at ``scale`` 2, or the denoised
+    frame itself at ``scale`` 1.
     """
     torch = importlib.import_module("torch")
     width, height = blend.width, blend.height
     frame_in = yuv420_frame_bytes(width, height)
-    out_w, out_h = width * SPAN_SCALE, height * SPAN_SCALE
+    if model is None and scale not in (1, SPAN_SCALE):
+        raise SpanError(f"a pass-through scene is 1x or {SPAN_SCALE}x, not {scale}x")
+    if model is not None:
+        scale = SPAN_SCALE
+    out_w, out_h = width * scale, height * scale
     frame_out = yuv420_frame_bytes(out_w, out_h)
     count = len(frames) // frame_in
     out = bytearray(count * frame_out)
@@ -250,6 +266,16 @@ def restore_block(
         for first in range(0, count, max(1, batch)):
             part = source[first : first + max(1, batch)].to(blend.device)
             rgb = yuv420_to_rgb(*split_yuv420(part, width, height))
+            if dpir is not None:
+                from .dpir import denoise
+
+                rgb = denoise(dpir, rgb, dpir_level)
+            if model is None:
+                mixed = rgb if scale == 1 else lanczos2x(rgb, blend.taps)
+                del rgb
+                target[first : first + len(part)].copy_(pack_yuv420(mixed.clamp_(0, 1)))
+                del mixed
+                continue
             x = rgb.to(blend.dtype).contiguous(memory_format=torch.channels_last)
             up = model(x).float().clamp_(0.0, 1.0)
             del x

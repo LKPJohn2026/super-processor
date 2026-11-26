@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- DPIR, a stronger GPU denoiser (DRUNet), for the scenes you ask it for. A
+  note on a scene's preview such as "more denoise", "still noisy", or "too
+  grainy" turns it on for that scene, one level of 3 per note; "less
+  denoise" lowers it and "no DPIR" turns it off. A result note does the
+  same for the scenes in its time range. Gemini cannot turn it on or off.
+  It runs before SPAN, in place of the look's FFmpeg denoise, and the
+  preview's "What this scene gets" says when a scene has it.
+- `doctor` says where the DPIR weights are, or that they are fetched on
+  first use.
+
+### Security
+
+- The DPIR weights (`drunet_color.pth`, about 130 MB, MIT) are fetched only
+  from one pinned KAIR release URL, over HTTPS, from GitHub's hosts (each
+  redirect is checked too). The download goes to a private temp file and
+  is kept only if its size and sha256 match; it stops at the expected size.
+  Loading checks the hash again on the bytes it loads, with
+  `weights_only=True`. `SUPER_PROCESSOR_DPIR_WEIGHTS` uses your own copy and
+  is never downloaded over; `SUPER_PROCESSOR_DPIR_DOWNLOAD=0` turns the
+  download off.
+
 ## [4.4.0] - 2026-11-25
 
 ### Changed

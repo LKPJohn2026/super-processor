@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import re
@@ -134,6 +135,7 @@ from .upscale import (
     UpscaleSpan,
     _ffprobe_for,
     default_span,
+    dpir_runs_here,
     load_upscale_plan,
     render_control,
     render_plan,
@@ -681,6 +683,12 @@ _STALE_SEGMENTS = (
     "the scenes changed since this page showed them; look at them again "
     "before changing them"
 )
+
+
+@functools.cache
+def _dpir_on_gpu() -> bool:
+    """Whether DPIR runs here; asked once, as it imports PyTorch."""
+    return dpir_runs_here()
 
 
 def _check_revision(
@@ -2665,6 +2673,8 @@ class WizardController:
                     "shimmer": recipe.shimmer,
                     "use_upscale": recipe.use_upscale,
                     "upscale_override": recipe.upscale_override,
+                    "dpir": recipe.dpir,
+                    "dpir_on_gpu": _dpir_on_gpu() if recipe.dpir else None,
                     "before_url": before if recipe.rev else None,
                     "after_url": after if recipe.rev else None,
                 }
@@ -3932,7 +3942,7 @@ class WizardController:
             }
             patch = UpscaleSpan.from_dict({**fields_asked, "scale": scale})
             updated = replace_overlapping(
-                plan, patch, duration, preserve_shot_settings=True
+                plan, patch, duration, preserve_shot_settings=True, note=note
             )
             write_text_atomic(
                 job_dir / _PLAN_BEFORE_NOTE, json.dumps(plan.to_dict(), indent=2) + "\n"

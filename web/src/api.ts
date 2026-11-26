@@ -126,6 +126,10 @@ export type LookShot = {
   strength: number;
   use_upscale?: boolean;
   upscale_override?: boolean | null;
+  // DPIR level the editor's notes set (0 off); see dpir.py.
+  dpir?: number;
+  // False when this machine cannot run DPIR, so the strongest FFmpeg denoise stands in.
+  dpir_on_gpu?: boolean;
   look: ShotLook;
   reason: string;
   check: ShotCheck;

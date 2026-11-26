@@ -79,6 +79,18 @@ copyright notice and licence must go with it.
 - Loaded through [spandrel](https://github.com/chaiNNer-org/spandrel) (MIT),
   whose SPAN implementation keeps the Apache-2.0 terms.
 
+## DPIR (DRUNet) weights
+
+- File: `drunet_color.pth` (130,579,305 bytes), sha256
+  `479abe3c5327dfd10ff54a80ec7d4098ca80752a5c9492cdff31cee430bec4b4`, from
+  the KAIR v1.0 release, <https://github.com/cszn/KAIR/releases/tag/v1.0>.
+- Author: Kai Zhang, "Plug-and-Play Image Restoration with Deep Denoiser
+  Prior" (Zhang, Li, Zuo, Zhang, Van Gool, Timofte; IEEE TPAMI 2021),
+  <https://github.com/cszn/DPIR>.
+- Licence: MIT (Copyright (c) 2019 Kai Zhang), as KAIR's LICENSE file.
+- Not bundled: fetched the first time an editor's note asks for DPIR.
+- Loaded through spandrel (MIT), whose DRUNet implementation is KAIR's.
+
 ## Apache-2.0 attribution
 
 Apache-2.0 lets you use, change, and redistribute these works if you keep

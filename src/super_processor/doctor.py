@@ -283,6 +283,34 @@ def check_gpu_video() -> list[CheckResult]:
     ]
 
 
+def check_dpir_weights() -> CheckResult:
+    """Where DPIR's weights are, or that they are fetched on first use.
+
+    Optional: only a scene whose note asks for more denoise uses DPIR. Only
+    the size is checked here; the hash is checked before every load.
+    """
+    from . import dpir
+    from .upscale import models_dir
+
+    path = dpir.weights_path(models_dir())
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = -1
+    if size == dpir.DPIR_SIZE:
+        detail = f"DPIR weights are at {path}"
+    elif size >= 0:
+        detail = f"{path} is not the DPIR weights ({size} bytes); it is fetched again"
+    elif dpir.download_allowed():
+        detail = f"fetched from {dpir.DPIR_URL} the first time a note asks for DPIR"
+    else:
+        detail = (
+            f"not at {path}, and {dpir.DPIR_DOWNLOAD_ENV} turns the download "
+            f"off; download {dpir.DPIR_URL} there"
+        )
+    return CheckResult(name="model:dpir", ok=True, detail=detail, path=str(path))
+
+
 def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
     """Run all doctor checks and return structured results."""
     return [
@@ -296,6 +324,7 @@ def collect_doctor_report(jobs_dir: Path | None = None) -> list[CheckResult]:
             hint="required for previews, delivery, and export",
         ),
         *check_gpu_video(),
+        check_dpir_weights(),
         *[
             check_ffmpeg_capability(
                 f"encoder:{name}",

@@ -277,3 +277,25 @@ def test_doctor_says_whether_nvenc_and_nvdec_run(
     else:
         assert "libx264 (CPU)" in results["gpu:h264_nvenc"].detail
         assert "on the CPU" in results["gpu:cuda_decode"].detail
+
+
+def test_doctor_says_where_dpir_weights_come_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from super_processor import dpir
+
+    monkeypatch.setenv("SUPER_PROCESSOR_MODELS", str(tmp_path))
+    monkeypatch.delenv(dpir.DPIR_WEIGHTS_ENV, raising=False)
+    monkeypatch.delenv(dpir.DPIR_DOWNLOAD_ENV, raising=False)
+    result = doctor.check_dpir_weights()
+    assert result.ok and dpir.DPIR_URL in result.detail
+    monkeypatch.setenv(dpir.DPIR_DOWNLOAD_ENV, "0")
+    assert "turns the download off" in doctor.check_dpir_weights().detail
+    path = tmp_path / "DPIR" / "drunet_color.pth"
+    path.parent.mkdir()
+    path.write_bytes(b"x")
+    assert "is not the DPIR weights" in doctor.check_dpir_weights().detail
+    monkeypatch.setattr(dpir, "DPIR_SIZE", 1)
+    assert doctor.check_dpir_weights().detail == f"DPIR weights are at {path}"
+    names = {item.name for item in doctor.collect_doctor_report(tmp_path / "jobs")}
+    assert "model:dpir" in names

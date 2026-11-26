@@ -90,6 +90,22 @@ test("a scene only resized says so, and a kept size has no AI detail line", () =
   assert.deepEqual(unboxed.map((item) => item.text), ["AI detail"]);
 });
 
+test("a scene with DPIR shows it in place of the look's denoise", () => {
+  const look = { ...NEUTRAL, denoise: 0.4 };
+  const on = sceneGets({ strength: 0.5, look, dpir: 2, dpir_on_gpu: true }, 2);
+  assert.deepEqual(
+    on.map((item) => [item.text, item.amount]),
+    [
+      ["Strong denoise (DPIR)", "level 2 of 3"],
+      ["AI detail", "medium"],
+    ],
+  );
+  const cpu = sceneGets({ strength: 0.5, look, dpir: 1, dpir_on_gpu: false }, 1);
+  assert.deepEqual(cpu.map((item) => item.text), ["Strongest denoise (no GPU for DPIR)"]);
+  const off = sceneGets({ strength: 0.5, look, dpir: 0 }, 1);
+  assert.deepEqual(off.map((item) => item.text), ["Reduces noise"]);
+});
+
 test("the check box says passed, found, or not checked", () => {
   assert.deepEqual(checkState({ ok: true, problems: [], note: "Fur stays natural" }), {
     tone: "success",

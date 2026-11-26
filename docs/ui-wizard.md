@@ -604,7 +604,12 @@ The check never fails a render; if it cannot run, the Result screen says so.
 
 A note on a segment ("skin looks waxy") sends that segment back: Gemini
 re-plans it with the note and its current settings, and it gets a new preview
-and check. Preview files carry a revision number (`shot_002_r3_after.mp4`), so
+and check. The note's own words also set the segment's DPIR level, which
+Gemini cannot change: "more denoise", "still noisy", or "too grainy" raise
+it by one (up to 3), "less denoise" lowers it, and "no DPIR" turns it off
+(see `dpir.note_level`). The preview's "What this scene gets" then shows
+"Strong denoise (DPIR)" in place of the look's denoise. A result note does
+the same for the segments in its range. Preview files carry a revision number (`shot_002_r3_after.mp4`), so
 a browser never shows an older one. When the last segment is approved, the
 ready screen lists every segment's settings; rendering writes one upscale span
 per segment with its scale, strength, look, and `use_upscale`.

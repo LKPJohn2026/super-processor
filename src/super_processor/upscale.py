@@ -42,6 +42,7 @@ from typing import IO, Any, Protocol
 
 from .atomic_io import unlink_quietly
 from .cancel import Cancelled, stop_process
+from .dpir import DpirError, ffmpeg_look, gpu_look, level_of, note_level
 from .look import LookError, ShotLook
 from .regions import Region, regions_from_dicts, strength_expr
 from .tools import FILE_INPUT, resolve_argv, tool_path
@@ -203,8 +204,11 @@ class UpscaleSpan:
     regions: tuple[Region, ...] = ()
     # False: skip SPAN and only resize this span (see :func:`restore_to_delivery`).
     use_upscale: bool = True
+    # The editor's DPIR level for this span (0 off); see :mod:`.dpir`.
+    dpir: int = 0
 
     def __post_init__(self) -> None:
+        _require_dpir(self.dpir)
         scale = _require_scale(self.scale)
         strength = _require_strength(self.strength)
         start = float(self.start_s)
@@ -230,6 +234,7 @@ class UpscaleSpan:
             "look": self.look.to_dict(),
             "regions": [region.to_dict() for region in self.regions],
             "use_upscale": self.use_upscale,
+            "dpir": self.dpir,
         }
 
     @classmethod
@@ -251,6 +256,7 @@ class UpscaleSpan:
                 look=look,
                 regions=regions_from_dicts(data.get("regions")),
                 use_upscale=data.get("use_upscale") is not False,
+                dpir=level_of(data.get("dpir")),
             )
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise UpscaleError(
@@ -310,17 +316,31 @@ class UpscaleRequest:
     # Called with the share of this clip done (0 to 1) as an engine works
     # through it; SPAN reports once per block of frames.
     on_progress: ProgressFn | None = field(default=None, compare=False, repr=False)
+    # DPIR level (0 off): on the GPU it replaces the look's hqdn3d.
+    dpir: int = 0
 
     def __post_init__(self) -> None:
+        _require_dpir(self.dpir)
         object.__setattr__(self, "scale", _require_scale(self.scale))
         object.__setattr__(self, "strength", _require_strength(self.strength))
+
+    @property
+    def ffmpeg_look(self) -> ShotLook:
+        """The look for FFmpeg-only work: with DPIR asked for, its stand-in."""
+        return ffmpeg_look(self.look, self.dpir)
+
+
+def _require_dpir(level: Any) -> None:
+    if level_of(level) != level or isinstance(level, bool):
+        raise UpscaleError("dpir must be a whole number from 0 to 3")
 
 
 class UpscaleEngine(Protocol):
     """Restore and upscale a clip.
 
-    Implementations apply ``request.look.clean_filter()`` to the frames they
-    read and nothing else; finishing happens in the delivery encode.
+    Implementations apply ``request.ffmpeg_look.clean_filter()`` to the
+    frames they read (or, running DPIR, the look without its hqdn3d) and
+    nothing else; finishing happens in the delivery encode.
     """
 
     def upscale(self, request: UpscaleRequest) -> Path:
@@ -418,6 +438,7 @@ def replace_overlapping(
     duration_s: float,
     *,
     preserve_shot_settings: bool = False,
+    note: str = "",
 ) -> UpscalePlan:
     """Store a range revise. A scale change re-renders the whole timeline.
 
@@ -428,8 +449,10 @@ def replace_overlapping(
     :func:`render_plan` reads as "render every shot again".
 
     Result notes set ``preserve_shot_settings`` to retune only scale and
-    strength. Split those patches at shot boundaries; a multi-shot revision
-    uses the full-render path because a range splice accepts only one recipe.
+    strength, and the DPIR level of each shot in the range by the words of
+    their ``note`` (see :func:`.dpir.note_level`). Split those patches at
+    shot boundaries; a multi-shot revision uses the full-render path because
+    a range splice accepts only one recipe.
     """
     patch = clamp_span(patch, duration_s)
     if _covers_all(patch, duration_s) and not preserve_shot_settings:
@@ -453,6 +476,7 @@ def replace_overlapping(
                     end_s=min(span.end_s, patch.end_s),
                     scale=patch.scale,
                     strength=patch.strength,
+                    dpir=note_level(note, span.dpir),
                 )
             )
         if patch.start_s - span.start_s > 0.05:
@@ -490,7 +514,7 @@ class FakeUpscaleEngine:
                 str(request.source),
                 "-vf",
                 _join_filters(
-                    request.look.clean_filter(),
+                    request.ffmpeg_look.clean_filter(),
                     f"scale=iw*{request.scale}:ih*{request.scale}",
                 ),
                 "-c:v",
@@ -508,18 +532,30 @@ class FakeUpscaleEngine:
 
 @dataclass(frozen=True)
 class _Span:
-    """The SPAN weights to load, already checked."""
+    """The weights to load, already checked: SPAN's, DPIR's, or both."""
 
-    weights: Path
+    weights: Path | None
+    dpir_weights: Path | None = None
 
     def load(self) -> _Loaded:
+        from .dpir import load_dpir
         from .span_sr import load_span
 
-        return _Loaded(load_span(self.weights))
+        loaded = _Loaded(None)
+        try:
+            if self.weights is not None:
+                loaded.model = load_span(self.weights)
+            if self.dpir_weights is not None:
+                loaded.dpir = load_dpir(self.dpir_weights)
+        except BaseException:
+            _unload(loaded)
+            raise
+        return loaded
 
 
 class _Loaded:
-    """The SPAN network on the GPU, and the batch it runs at.
+    """The networks on the GPU (SPAN, DPIR, either may be ``None``), and the
+    batch they run at.
 
     ``batch`` is 0 (by frame size, see
     :func:`super_processor.span_sr.batch_size`) until a batch runs out of
@@ -528,6 +564,7 @@ class _Loaded:
 
     def __init__(self, model: Any) -> None:
         self.model = model
+        self.dpir: Any = None
         self.batch = 0
 
 
@@ -548,6 +585,32 @@ def _span_ready(scale: int) -> _Span:
     return _Span(resolve_span_weights(models_dir()))
 
 
+def _dpir_weights() -> Path:
+    """The DPIR weights, fetched if needed, or a wizard-facing error. A
+    Stop during the download ends it (see :func:`.dpir.resolve_weights`)."""
+    from .dpir import resolve_weights
+
+    try:
+        return resolve_weights(models_dir(), should_stop=_check)
+    except DpirError as exc:
+        raise UpscaleError(str(exc)) from exc
+
+
+def dpir_runs_here() -> bool:
+    """True when DPIR can run on this machine: PyTorch, spandrel, and CUDA.
+
+    A broken install (any error while importing) counts as "no", so the
+    scene falls back to hqdn3d instead of failing the screen that asks.
+    """
+    try:
+        if not cuda_available():
+            return False
+        importlib.import_module("spandrel")
+    except Exception:  # noqa: BLE001 - any import failure means no DPIR
+        return False
+    return True
+
+
 def plain_delivery(
     request: UpscaleRequest, dest: Path, *, ffmpeg_bin: str = "ffmpeg"
 ) -> Path:
@@ -561,8 +624,13 @@ def plain_delivery(
     two blurs and three lookup tables a strength of 0 threw away: on 200
     frames of 1440x1080 that took 0.29 CPU-seconds a frame against 0.10 now
     (with NVENC; the lanczos resize is most of what is left).
+
+    A span with DPIR goes through the GPU instead where DPIR can run (see
+    :func:`dpir_delivery`), and gets the strongest hqdn3d where it cannot.
     """
     require_supported_timing(request.source, ffmpeg_bin=ffmpeg_bin)
+    if request.dpir and dpir_runs_here():
+        return dpir_delivery(request, dest)
     size = _frame_size(request.source)
     if size is None:
         raise UpscaleError(f"could not read the frame size of {request.source}")
@@ -572,7 +640,8 @@ def plain_delivery(
     dest.parent.mkdir(parents=True, exist_ok=True)
     delivery_marker_path(dest).unlink(missing_ok=True)
     picture = _join_filters(
-        _base_chain(out[0], out[1], request.look), request.look.finish_filter()
+        _base_chain(out[0], out[1], request.ffmpeg_look),
+        request.ffmpeg_look.finish_filter(),
     )
     tmp = dest.with_name(dest.stem + ".encoding" + dest.suffix)
     try:
@@ -602,7 +671,7 @@ def plain_delivery(
         # A failed or stopped encode leaves no half-written file behind.
         unlink_quietly(tmp)
         raise
-    look = request.look
+    look = request.ffmpeg_look
     _write_marker(
         dest,
         encoder,
@@ -610,6 +679,14 @@ def plain_delivery(
         look=None if look.is_neutral() else look,
     )
     return dest
+
+
+def dpir_delivery(request: UpscaleRequest, dest: Path) -> Path:
+    """A pass-through span (no SPAN) cleaned by DPIR on the GPU, resized by
+    its scale with lanczos, and encoded into the delivery settings at
+    ``dest`` in one stream (see :func:`_stream_span`)."""
+    streamed = replace(request, output=dest, strength=0.0)
+    return SpanEngine()._run(_Span(None, _dpir_weights()), [streamed])[0]
 
 
 def restore_to_delivery(
@@ -639,8 +716,9 @@ def restore_to_delivery(
         ffmpeg_bin=ffmpeg_bin,
         blend_with=request.source,
         strength=request.strength,
-        look=request.look,
+        look=request.ffmpeg_look,
         regions=request.regions,
+        dpir=request.dpir,
     )
 
 
@@ -685,11 +763,12 @@ class SpanEngine:
         backend = _span_ready(requests[0].scale)
         for request in requests[1:]:
             _span_ready(request.scale)
+        if any(request.dpir for request in requests):
+            backend = replace(backend, dpir_weights=_dpir_weights())
         return self._run(backend, requests)
 
     def upscale(self, request: UpscaleRequest) -> Path:
-        require_supported_timing(request.source)
-        return self._run(_span_ready(request.scale), [request])[0]
+        return self.upscale_many([request])[0]
 
     def _run(self, backend: _Span, requests: list[UpscaleRequest]) -> list[Path]:
         failed: UpscaleError | None = None
@@ -735,6 +814,9 @@ def _load(backend: _Span) -> _Loaded:
 def _unload(loaded: _Loaded) -> None:
     _release_gpu(loaded.model)
     loaded.model = None
+    if loaded.dpir is not None:
+        _release_gpu(loaded.dpir)
+        loaded.dpir = None
     _release_gpu()
 
 
@@ -834,6 +916,12 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
     from . import span_sr
     from .span_sr import SPAN_SCALE
 
+    if loaded.model is None and request.scale not in (1, SPAN_SCALE):
+        raise UpscaleError(f"a DPIR pass-through is 1x or {SPAN_SCALE}x")
+    if request.dpir and loaded.dpir is None:
+        raise UpscaleError("DPIR was asked for but is not loaded")
+    scale = SPAN_SCALE if loaded.model is not None else request.scale
+    dpir = request.dpir if loaded.dpir is not None else 0
     source = request.source
     size = _frame_size(source)
     if size is None:
@@ -843,7 +931,8 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
     frame_in = yuv420_frame_bytes(width, height)
     per_block = block_frames(width, height)
     slack = max(FRAME_SLACK, int(want * 0.02))
-    clean = request.look.clean_filter()
+    # With DPIR on the GPU the decoder only deblocks; DPIR replaces hqdn3d.
+    clean = gpu_look(request.look, dpir).clean_filter()
     decode = [
         tool_path("ffmpeg"),
         *_QUIET,
@@ -955,7 +1044,16 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
                     count = len(block) // frame_in
                     restored = _restore_span(
                         loaded,
-                        _Prepared(source, size, count, rate, blend, payload=block),
+                        _Prepared(
+                            source,
+                            size,
+                            count,
+                            rate,
+                            blend,
+                            payload=block,
+                            scale=scale,
+                            dpir=dpir,
+                        ),
                     )
                     del block
                     if stop.is_set():
@@ -992,9 +1090,10 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
                 request.output,
                 blend_with=source,
                 strength=request.strength,
-                look=request.look,
+                look=request.ffmpeg_look,
                 regions=request.regions,
-                frames_in=(width * SPAN_SCALE, height * SPAN_SCALE, rate, feed),
+                frames_in=(width * scale, height * scale, rate, feed),
+                dpir=dpir,
             )
         finally:
             _stop_ffmpeg(decoder, decoder.stdout)
@@ -1045,15 +1144,26 @@ def _restore_span(loaded: _Loaded, prepared: _Prepared) -> _Restored:
     that does not fit (another program holds GPU memory) is halved until one
     does, down to a single frame; only then is it an error.
     """
-    from .span_sr import SPAN_SCALE, batch_size, restore_block
+    from . import dpir
+    from .span_sr import batch_size, restore_block
 
     width, height = prepared.size
     raw: bytearray = prepared.payload
     prepared.payload = None
     batch = loaded.batch or batch_size(width, height)
+    if prepared.dpir:
+        batch = min(batch, dpir.batch_size(width, height))
     while True:
         try:
-            pictures = restore_block(loaded.model, prepared.blend, raw, batch=batch)
+            pictures = restore_block(
+                loaded.model,
+                prepared.blend,
+                raw,
+                batch=batch,
+                dpir=loaded.dpir if prepared.dpir else None,
+                dpir_level=prepared.dpir,
+                scale=prepared.scale,
+            )
             break
         except Exception as exc:
             if not _gpu_out_of_memory(exc):
@@ -1062,13 +1172,14 @@ def _restore_span(loaded: _Loaded, prepared: _Prepared) -> _Restored:
             _forget_frames(exc)
         if batch <= 1:
             raise GpuOutOfMemory(
-                "SPAN ran out of GPU memory even one frame at a time. "
+                f"{'SPAN' if loaded.model is not None else 'DPIR'} ran out of "
+                "GPU memory even one frame at a time. "
                 f"{_GPU_ADVICE} ({reason})"
             )
         batch = loaded.batch = batch // 2
         _empty_cuda_cache()
     del raw
-    size = (width * SPAN_SCALE, height * SPAN_SCALE)
+    size = (width * prepared.scale, height * prepared.scale)
     frame_out = yuv420_frame_bytes(*size)
     view = memoryview(pictures)
     return _Restored(
@@ -1140,6 +1251,8 @@ class _Prepared:
     rate: str
     blend: Any = None
     payload: Any = None
+    scale: int = 2
+    dpir: int = 0
 
 
 @dataclass(frozen=True)
@@ -1293,13 +1406,18 @@ def _write_marker(
     delivery_marker_path(video).write_text(json.dumps(data) + "\n", encoding="utf-8")
 
 
-def _blend_record(strength: float, regions: tuple[Region, ...]) -> dict[str, Any]:
+def _blend_record(
+    strength: float, regions: tuple[Region, ...], dpir: int = 0
+) -> dict[str, Any]:
     """What a blended encode was made with, so an identical one can be skipped."""
-    return {
+    record: dict[str, Any] = {
         "strength": strength,
         "structure_sigma": STRUCTURE_SIGMA,
         "regions": [region.to_dict() for region in regions],
     }
+    if dpir:
+        record["dpir"] = dpir
+    return record
 
 
 def blend_filter(
@@ -1452,6 +1570,7 @@ def encode_delivery(
     regions: tuple[Region, ...] = (),
     on_progress: ProgressFn | None = None,
     frames_in: FramesIn | None = None,
+    dpir: int = 0,
 ) -> Path:
     """Encode a picture once into the settings every splice part shares.
 
@@ -1465,9 +1584,11 @@ def encode_delivery(
     With ``frames_in`` the picture comes from a pipe instead of ``source``
     (see :func:`_stream_span`), already blended on the GPU: ``blend_with``
     and the strength are only recorded. Its feeder reports its own progress.
+    ``dpir`` is recorded with the blend: the level DPIR cleaned the picture
+    at, so a file made without it is never reused for a span that asks.
     """
     look = look or ShotLook()
-    record = _blend_record(strength, regions) if blend_with is not None else None
+    record = _blend_record(strength, regions, dpir) if blend_with is not None else None
     finish = look.finish_filter()
     if frames_in is not None:
         if record is None:
@@ -1971,6 +2092,7 @@ def _upscale_full(
             look=span.look,
             regions=span.regions,
             on_progress=on_progress,
+            dpir=span.dpir,
         ),
         work / "full_delivery.mp4",
         use_upscale=span.use_upscale,
@@ -2047,6 +2169,7 @@ def apply_range_revise(
             look=span.look,
             regions=span.regions,
             on_progress=on_progress,
+            dpir=span.dpir,
         ),
         work / "range_delivery.mp4",
         use_upscale=span.use_upscale,
@@ -2174,21 +2297,24 @@ def shot_timeline(
 
 
 def _coalesce(ordered: list[UpscaleSpan]) -> list[UpscaleSpan]:
-    """Join neighbouring spans whose complete restoration settings match."""
+    """Join neighbouring spans whose complete restoration settings match.
+
+    Every field but the times is compared (the DPIR level too), so a field
+    added to :class:`UpscaleSpan` later cannot be merged away unnoticed.
+    """
     out: list[UpscaleSpan] = []
     for span in ordered:
         last = out[-1] if out else None
-        if last is not None and (
-            last.scale,
-            last.strength,
-            last.look,
-            last.regions,
-            last.use_upscale,
-        ) == (span.scale, span.strength, span.look, span.regions, span.use_upscale):
+        if last is not None and _settings(last) == _settings(span):
             out[-1] = replace(last, end_s=span.end_s)
         else:
             out.append(span)
     return out
+
+
+def _settings(span: UpscaleSpan) -> UpscaleSpan:
+    """``span`` without its times, to compare restoration settings."""
+    return replace(span, start_s=0.0, end_s=1.0)
 
 
 # Where a part is cut, in frames before the frame it starts on. FFmpeg rounds
@@ -2298,6 +2424,7 @@ def render_shots(
                     look=span.look,
                     regions=span.regions,
                     on_progress=whole,
+                    dpir=span.dpir,
                 ),
                 work / f"shot_{index}_delivery.mp4",
                 use_upscale=span.use_upscale,

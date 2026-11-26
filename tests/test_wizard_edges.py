@@ -581,3 +581,31 @@ def test_a_failed_pick_shows_no_scene_strip(tmp_path: Path) -> None:
     job = view["job"]
     assert job["stage"] == "file" and job["scenes"] == []
     assert job["current_index"] is None
+
+
+def test_a_more_denoise_note_turns_dpir_on_for_that_scene_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from super_processor import wizard
+
+    wizard._dpir_on_gpu.cache_clear()
+    monkeypatch.setattr(wizard, "dpir_runs_here", lambda: True)
+    controller = _job(tmp_path, WizardStep.PREVIEW_SEGMENT, segment_index=1)
+    job_dir = _job_dir(controller)
+    _planned(job_dir)
+    controller.handle_post(
+        "/preview", {"action": ["redo"], "note": ["still noisy, more denoise"]}
+    )
+    plan = load_plan(job_dir)
+    assert plan is not None
+    assert [r.dpir for r in plan.recipes] == [0, 2]
+    view = controller._segment_preview_view(job_dir, 1)
+    assert (view["shot"]["dpir"], view["shot"]["dpir_on_gpu"]) == (2, True)
+    other = controller._segment_preview_view(job_dir, 0)
+    assert (other["shot"]["dpir"], other["shot"]["dpir_on_gpu"]) == (0, None)
+    _back_on_preview(controller)
+    controller.handle_post("/preview", {"action": ["redo"], "note": ["no dpir"]})
+    plan = load_plan(job_dir)
+    assert plan is not None
+    assert [r.dpir for r in plan.recipes] == [0, 0]
+    wizard._dpir_on_gpu.cache_clear()

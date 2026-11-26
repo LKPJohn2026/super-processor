@@ -98,6 +98,26 @@ newer, the first release where `weights_only=True` cannot be bypassed to run
 code (CVE-2025-32434). One lock keeps two wizard threads from loading it at once, and
 a batch of preview clips shares one load.
 
+A scene can also get DPIR (`dpir.py`): DRUNet, a denoiser told how much
+noise to remove, run in half precision on the GPU right after the frames are
+decoded, before SPAN and before the lanczos base of the blend, in place of
+the look's `hqdn3d` (the decoder then only deblocks). It is the editor's
+choice alone: `dpir.note_level` reads the words of a scene's note ("more
+denoise", "still noisy" raise its level by one, up to 3; "less denoise"
+lowers it; "no DPIR" turns it off), and the level is stored beside the
+recipe's other editor choices, so Gemini's proposals neither set nor clear
+it. Levels 1-3 give DRUNet a noise level of 10, 15, and 25 (of 255). A
+pass-through scene with DPIR streams through the GPU without SPAN; on a
+machine that cannot run it, it gets `hqdn3d` at its strongest instead. On an
+RTX 5090 DRUNet runs about 22 frames a second at 1440x1080, two frames a
+batch in 2.5 GB; half and full precision agree to 78 dB. Its weights are
+fetched once from a pinned KAIR release URL (HTTPS, GitHub's hosts only,
+redirects included), written to a private temp file, and kept only if the
+size and sha256 match; loading hashes the bytes again and hands those same
+bytes to `torch.load(..., weights_only=True)`. The level is recorded in the
+delivery marker's blend, so a part made without DPIR is never reused for
+one with it.
+
 It replaced FlashVSR v1.1 and FlashVSR+ outright. In a bake-off on an RTX
 5090, FlashVSR blended at strength 0.5 was almost the same as plain SPAN 2x
 on SD (consistency 41.9 against 41.5 dB, detail 32.1 against 32.6, added

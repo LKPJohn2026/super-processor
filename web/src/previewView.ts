@@ -75,15 +75,25 @@ const EPS = 1e-6;
  * that it is only resized).
  */
 export function sceneGets(
-  shot: Pick<LookShot, "strength" | "look" | "use_upscale">,
+  shot: Pick<LookShot, "strength" | "look" | "use_upscale" | "dpir" | "dpir_on_gpu">,
   scale: number | null,
 ): GetsItem[] {
   const look: Partial<ShotLook> = shot.look ?? {};
   const items: GetsItem[] = [];
   const deblock = look.deblock ?? 0;
   if (deblock > EPS) items.push({ icon: "layers", text: "Removes blockiness", amount: amount(deblock) });
+  const dpir = shot.dpir ?? 0;
   const denoise = look.denoise ?? 0;
-  if (denoise > EPS) items.push({ icon: "sparkles", text: "Reduces noise", amount: amount(denoise) });
+  if (dpir > 0) {
+    // DPIR replaces the look's denoise; without a GPU the strongest FFmpeg one stands in.
+    items.push(
+      shot.dpir_on_gpu === false
+        ? { icon: "sparkles", text: "Strongest denoise (no GPU for DPIR)", amount: "" }
+        : { icon: "sparkles", text: "Strong denoise (DPIR)", amount: `level ${dpir} of 3` },
+    );
+  } else if (denoise > EPS) {
+    items.push({ icon: "sparkles", text: "Reduces noise", amount: amount(denoise) });
+  }
   if (scale !== 1) {
     if (shot.use_upscale === false) {
       items.push({ icon: "film", text: "Just resized, no AI detail", amount: scale ? `${scale}×` : "" });

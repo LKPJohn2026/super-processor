@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .atomic_io import read_text_retrying, write_text_atomic
+from .dpir import level_of, note_level
 from .look import LOOK_BOUNDS, ShotLook
 from .regions import MAX_REGIONS, Region, region_from_model
 from .shots import STILLS_DIR, Shot, ShotError, ShotList, extract_still
@@ -138,6 +139,8 @@ class ShotRecipe:
     # The editor's own upscale choice for this segment; when set it wins
     # over what Gemini proposes.
     upscale_override: bool | None = None
+    # DPIR level, set only by the editor's notes (see :func:`.dpir.note_level`).
+    dpir: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +148,7 @@ class ShotRecipe:
             "use_upscale": self.use_upscale,
             "preview_start": self.preview_start,
             "upscale_override": self.upscale_override,
+            "dpir": self.dpir,
             "look": self.look.to_dict(),
             "reason": self.reason,
             "check": self.check.to_dict(),
@@ -175,6 +179,7 @@ class ShotRecipe:
                 if isinstance(data.get("upscale_override"), bool)
                 else None
             ),
+            dpir=level_of(data.get("dpir")),
         )
 
 
@@ -237,6 +242,7 @@ class ShotPlan:
                     look=recipe.look,
                     regions=shot.regions,
                     use_upscale=recipe.use_upscale,
+                    dpir=recipe.dpir,
                 )
                 for shot, recipe in zip(shots.shots, self.recipes, strict=True)
             )
@@ -551,6 +557,8 @@ def shots_payload(
                     "strength": recipe.strength,
                     "look": recipe.look.to_dict(),
                 }
+            if recipe.dpir:
+                item["dpir"] = recipe.dpir
             if recipe.note:
                 item["editor_note"] = recipe.note
         items.append(item)
@@ -642,6 +650,7 @@ def render_previews(
     requests: list[UpscaleRequest] = []
     # Shots that skip SPAN are only resized; see :func:`plain_delivery`.
     plain: dict[int, UpscaleRequest] = {}
+    requests_by_index: dict[int, UpscaleRequest] = {}
     for index in indexes:
         recipe = replace(recipes[index], rev=recipes[index].rev + 1)
         recipes[index] = recipe
@@ -662,7 +671,9 @@ def render_previews(
             strength=recipe.strength,
             look=recipe.look,
             regions=shots.shots[index].regions,
+            dpir=recipe.dpir,
         )
+        requests_by_index[index] = request
         if recipe.use_upscale and request.scale > 1:
             requests.append(request)
         else:
@@ -685,8 +696,9 @@ def render_previews(
                 ffmpeg_bin=ffmpeg_bin,
                 blend_with=clips[index],
                 strength=recipe.strength,
-                look=recipe.look,
+                look=requests_by_index[index].ffmpeg_look,
                 regions=shots.shots[index].regions,
+                dpir=recipe.dpir,
             )
         encode_delivery(clips[index], before, ffmpeg_bin=ffmpeg_bin)
         for side, video in (("before", before), ("after", after)):
@@ -849,7 +861,9 @@ def request_redo(
     if not text:
         raise ShotPlanError("say what to change about this shot")
     recipes = list(plan.recipes)
-    recipes[index] = replace(recipes[index], stale=True, note=text[:500])
+    # Only the editor's words move DPIR (see :func:`.dpir.note_level`).
+    level = note_level(text[:500], recipes[index].dpir)
+    recipes[index] = replace(recipes[index], stale=True, note=text[:500], dpir=level)
     if resample:
         recipes[index] = replace(recipes[index], preview_start=None)
     return replace(plan, recipes=recipes, error=None)
@@ -858,8 +872,8 @@ def request_redo(
 def keep_editor_choices(fresh: ShotRecipe, old: ShotRecipe) -> ShotRecipe:
     """``fresh`` with what the editor set on ``old`` kept.
 
-    That is the preview count and window, a pending note, and their own
-    upscale choice.
+    That is the preview count and window, a pending note, their own
+    upscale choice, and the DPIR level their notes set.
     """
     use = (
         old.upscale_override if old.upscale_override is not None else fresh.use_upscale
@@ -871,6 +885,7 @@ def keep_editor_choices(fresh: ShotRecipe, old: ShotRecipe) -> ShotRecipe:
         preview_start=old.preview_start,
         upscale_override=old.upscale_override,
         use_upscale=use,
+        dpir=old.dpir,
     )
 
 

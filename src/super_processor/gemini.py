@@ -1789,7 +1789,9 @@ class GeminiClient:
             "look. "
             f"Pick one scale for the whole video from {list(scales)}. If a "
             "shot has an editor_note, follow it; current shows its settings "
-            "now. Return a short reason per shot in plain words."
+            "now. A shot with dpir is already denoised more strongly by the "
+            "editor's choice, which replaces the look's denoise; leave its "
+            "denoise as it is. Return a short reason per shot in plain words."
         )
         if video is not None:
             intro += (

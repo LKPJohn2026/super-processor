@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 
+from super_processor import dpir as dpir_module
 from super_processor import span_sr, upscale
 from super_processor.cancel import Cancelled
 from super_processor.look import ShotLook
@@ -845,6 +846,9 @@ class FakeSpan:
         self.firsts: list[bytes] = []
         # What each clip's blend was prepared with.
         self.blends: list[dict[str, Any]] = []
+        # DPIR: weights loaded, and (level, scale, SPAN model) per GPU call.
+        self.dpir_loads = 0
+        self.calls: list[tuple[int, int, str | None]] = []
 
 
 def _yuv420(width: int, height: int) -> int:
@@ -885,12 +889,26 @@ def fake_span(
         fake.blends.append({"size": (width, height), **kwargs})
         return types.SimpleNamespace(width=width, height=height)
 
+    def load_dpir(path: Path) -> str:
+        fake.dpir_loads += 1
+        return "dpir"
+
     def restore_block(
-        model: str, blend: Any, frames: bytearray, *, batch: int
+        model: str | None,
+        blend: Any,
+        frames: bytearray,
+        *,
+        batch: int,
+        dpir: Any = None,
+        dpir_level: int = 0,
+        scale: int = 2,
     ) -> bytearray:
-        assert model == "model"
+        assert model in ("model", None)
+        assert (dpir == "dpir") == (dpir_level > 0)
         assert isinstance(frames, bytearray)
+        scale = 2 if model is not None else scale
         fake.batches.append(batch)
+        fake.calls.append((dpir_level, scale, model))
         if fail:
             raise RuntimeError(fail)
         if max_batch is not None and batch > max_batch:
@@ -913,7 +931,7 @@ def fake_span(
                 "-i",
                 "-",
                 "-vf",
-                "scale=iw*2:ih*2:flags=neighbor",
+                f"scale=iw*{scale}:ih*{scale}:flags=neighbor",
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -924,9 +942,10 @@ def fake_span(
             check=True,
             capture_output=True,
         ).stdout
-        keep = max(1, count - drop) * _yuv420(2 * width, 2 * height)
+        keep = max(1, count - drop) * _yuv420(scale * width, scale * height)
         return bytearray(doubled[:keep])
 
+    monkeypatch.setattr(dpir_module, "load_dpir", load_dpir)
     monkeypatch.setattr(span_sr, "load_span", load_span)
     monkeypatch.setattr(span_sr, "prepare_blend", prepare_blend)
     monkeypatch.setattr(span_sr, "restore_block", restore_block)
@@ -1432,11 +1451,13 @@ def test_a_gpu_error_partway_stops_the_stream(
     real = span_sr.restore_block
     calls: list[int] = []
 
-    def third_fails(model: str, blend: Any, frames: Any, *, batch: int) -> Any:
+    def third_fails(
+        model: str, blend: Any, frames: Any, *, batch: int, **kwargs: Any
+    ) -> Any:
         calls.append(batch)
         if len(calls) == 3:
             raise RuntimeError("illegal memory access")
-        return real(model, blend, frames, batch=batch)
+        return real(model, blend, frames, batch=batch, **kwargs)
 
     monkeypatch.setattr(span_sr, "restore_block", third_fails)
     source = tmp_path / "numbered.mp4"
@@ -1480,11 +1501,13 @@ def test_a_failed_stream_ends_ffmpeg_behind_a_launcher(
     restore = span_sr.restore_block
     calls: list[int] = []
 
-    def third_fails(model: str, blend: Any, frames: Any, *, batch: int) -> Any:
+    def third_fails(
+        model: str, blend: Any, frames: Any, *, batch: int, **kwargs: Any
+    ) -> Any:
         calls.append(batch)
         if len(calls) == 3:
             raise RuntimeError("illegal memory access")
-        return restore(model, blend, frames, batch=batch)
+        return restore(model, blend, frames, batch=batch, **kwargs)
 
     monkeypatch.setattr(span_sr, "restore_block", third_fails)
     # Windows refuses to delete a file a live process has open: note any
