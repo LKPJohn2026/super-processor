@@ -103,7 +103,7 @@ def sigma(level: int) -> float:
 
 # A note is read clause by clause, as the size in a note is (see
 # :func:`super_processor.shot_plan.note_scale`); the last clause that names
-# DPIR or the amount of denoising decides.
+# DPIR or the amount of denoising decides, so a note moves one step at most.
 _CLAUSE = re.compile(r"[,;!?\n]|[.:](?!\d)|\b(?:and|but)\b")
 _NEGATION = re.compile(r"\b(?:not|never|without|don't|dont|doesn't|isn't)\b")
 _NOISE = r"(?:noise|noisy|grain|grainy|speckles?)"
@@ -133,21 +133,25 @@ def note_level(note: str, current: int) -> int:
     Only the note's words decide. Asking for more denoise raises the level by
     one (up to :data:`MAX_LEVEL`), less lowers it by one, and "no DPIR" or
     "no denoise" turns it off; a note that says none of these keeps it.
+    One note moves the level one step at most, however many ways it asks:
+    "still noisy, more denoise" is one request. After an "off", the last
+    clause that asks for more, less or no more decides the step.
     "Less grain" is not a request for DPIR: grain is also the look's own
     finishing grain, which Gemini sets.
     """
     level = level_of(current)
+    step = 0
     text = note.lower().replace("’", "'")
     for clause in _CLAUSE.split(text):
         if _OFF.search(clause):
-            level = 0
+            level, step = 0, 0
         elif _HOLD.search(clause):
-            continue
+            step = 0
         elif _LESS.search(clause):
-            level = max(0, level - 1)
+            step = -1
         elif _MORE.search(clause) and not _NEGATION.search(clause):
-            level = min(MAX_LEVEL, level + 1)
-    return level
+            step = 1
+    return max(0, min(MAX_LEVEL, level + step))
 
 
 def ffmpeg_look(look: ShotLook, level: int) -> ShotLook:

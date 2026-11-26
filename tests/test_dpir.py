@@ -108,8 +108,15 @@ needs_ffmpeg = pytest.mark.skipif(
         ("make it brighter", 2, 2),
         ("warmer skin and 2x", 0, 0),
         ("", 1, 1),
-        # Each clause counts; the last one wins for on/off.
-        ("still noisy, and more denoise", 0, 2),
+        # One note is one request: asking twice still moves one step.
+        ("still noisy, more denoise", 0, 1),
+        ("still noisy, and more denoise", 0, 1),
+        ("more denoise. more denoise", 1, 2),
+        ("more denoise please, it is still noisy", 2, 3),
+        # The last clause decides the step; "off" resets before it.
+        ("more denoise, actually less denoise", 2, 1),
+        ("less denoise, no, more denoise", 1, 2),
+        ("more denoise, no more denoise", 1, 1),
         ("more denoise. actually no dpir", 1, 0),
         ("no dpir; still noisy", 2, 1),
         # A curly apostrophe reads as a straight one.

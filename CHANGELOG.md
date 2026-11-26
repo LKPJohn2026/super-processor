@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A note that asks for more denoise in two ways, such as "still noisy, more
+  denoise", now raises the scene's DPIR level by one step, not two. One note
+  moves the level one step at most; its last request decides the direction.
+
 ## [4.5.0] - 2026-11-26
 
 ### Added

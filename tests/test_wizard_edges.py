@@ -598,9 +598,9 @@ def test_a_more_denoise_note_turns_dpir_on_for_that_scene_only(
     )
     plan = load_plan(job_dir)
     assert plan is not None
-    assert [r.dpir for r in plan.recipes] == [0, 2]
+    assert [r.dpir for r in plan.recipes] == [0, 1]
     view = controller._segment_preview_view(job_dir, 1)
-    assert (view["shot"]["dpir"], view["shot"]["dpir_on_gpu"]) == (2, True)
+    assert (view["shot"]["dpir"], view["shot"]["dpir_on_gpu"]) == (1, True)
     other = controller._segment_preview_view(job_dir, 0)
     assert (other["shot"]["dpir"], other["shot"]["dpir_on_gpu"]) == (0, None)
     _back_on_preview(controller)
