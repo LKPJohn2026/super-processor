@@ -16,6 +16,7 @@ import os
 import shutil
 import stat
 import subprocess
+import types
 import urllib.error
 from pathlib import Path
 from typing import Any
@@ -378,7 +379,9 @@ def test_missing_gpu_modules_name_the_extra(monkeypatch: pytest.MonkeyPatch) -> 
     def no_torch(name: str) -> Any:
         raise ImportError(name)
 
-    monkeypatch.setattr(dpir.importlib, "import_module", no_torch)
+    monkeypatch.setattr(
+        dpir, "importlib", types.SimpleNamespace(import_module=no_torch)
+    )
     with pytest.raises(DpirError, match=r"ancient-processor\[gpu\]"):
         dpir.import_gpu_modules()
 
@@ -738,5 +741,7 @@ def test_a_broken_gpu_install_means_no_dpir(monkeypatch: pytest.MonkeyPatch) -> 
     def no_spandrel(name: str) -> Any:
         raise ImportError(name)
 
-    monkeypatch.setattr(upscale.importlib, "import_module", no_spandrel)
+    monkeypatch.setattr(
+        upscale, "importlib", types.SimpleNamespace(import_module=no_spandrel)
+    )
     assert upscale.dpir_runs_here() is False
