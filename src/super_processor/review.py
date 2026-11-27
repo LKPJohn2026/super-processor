@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from collections.abc import Callable
 from email.message import Message
 from html import escape
@@ -82,6 +83,12 @@ MAX_BODY_BYTES = 256 * 1024
 # A dropped video is streamed to disk; 30 minutes of high-bitrate 1080p fits.
 MAX_UPLOAD_BYTES = 32 * 1024**3
 _UPLOAD_CHUNK = 1024 * 1024
+# A POST refused before its body is read still has that body unread. Closing
+# a socket with unread bytes makes Windows send a reset, which can wipe the
+# refusal out before the client reads it. Up to this much is read and thrown
+# away first, for this long; a larger body is left and the reset risked.
+_DISCARD_BYTES = 1024 * 1024
+_DISCARD_TIMEOUT_S = 2.0
 # Every request to the wizard proves it holds this run's token: as this
 # header, as the per-port cookie the launch URL (``/?token=``) sets, or, for
 # a GET of a video or still only, as ``?t=``. State-changing requests (every
@@ -815,8 +822,33 @@ def _wizard_handler(
             self._error(path, TOKEN_REFUSED_MESSAGE, status=403)
             return True
 
+        def _discard_unread_body(self) -> None:
+            """Read and drop a refused POST's body, so the close is clean."""
+            if getattr(self, "_body_taken", False):
+                return
+            raw = (self.headers.get("Content-Length") or "").strip()
+            left = int(raw) if raw.isdigit() else 0
+            if not 0 < left <= _DISCARD_BYTES:
+                return
+            # A total deadline, so a client sending a byte at a time cannot
+            # hold the thread past it.
+            deadline = time.monotonic() + _DISCARD_TIMEOUT_S
+            try:
+                while left:
+                    wait = deadline - time.monotonic()
+                    if wait <= 0:
+                        return
+                    self.connection.settimeout(wait)
+                    chunk = self.rfile.read1(min(_UPLOAD_CHUNK, left))
+                    if not chunk:
+                        return
+                    left -= len(chunk)
+            except OSError:
+                return
+
         def _read_fields(self) -> dict[str, list[str]]:
             length = content_length(self.headers)
+            self._body_taken = True
             raw = self.rfile.read(length)
             return form_fields_from_body(raw, self.headers.get("Content-Type", ""))
 
@@ -869,6 +901,7 @@ def _wizard_handler(
                 self._json({"error": str(exc)}, status=415)
                 return
             left = length
+            self._body_taken = True
             try:
                 with open_private_new(dest) as out:
                     while left:
@@ -889,6 +922,13 @@ def _wizard_handler(
             self._json(self._view())
 
         def do_POST(self) -> None:  # noqa: N802
+            self._body_taken = False
+            try:
+                self._post()
+            finally:
+                self._discard_unread_body()
+
+        def _post(self) -> None:
             path = urlparse(self.path).path
             if self._refused(path, state_changing=True):
                 return

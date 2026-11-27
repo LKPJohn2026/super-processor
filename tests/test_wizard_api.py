@@ -469,6 +469,68 @@ def test_upload_refusals_save_nothing(tmp_path: Path) -> None:
         server.stop()
 
 
+def test_a_refused_post_reads_its_body_before_closing(tmp_path: Path) -> None:
+    # Closing with the body unread would reset the connection on Windows,
+    # and the reset can wipe the refusal out before the client reads it.
+    server = WizardServer(tmp_path, token=TOKEN, controller=WizardController(tmp_path))
+    base = server.start()
+    try:
+        address = _connection(base)
+        with socket.create_connection((address.host, address.port)) as raw:
+            raw.settimeout(5)
+            raw.sendall(
+                b"POST /api/upload HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"X-Wizard-Token: wrong\r\n"
+                b"X-File-Name: clip.mp4\r\n"
+                b"Content-Length: 20\r\n\r\n"
+                b"first half"
+            )
+            reply = b""
+            while not reply.endswith(b"}"):
+                chunk = raw.recv(65536)
+                assert chunk, f"closed before the reply ended: {reply!r}"
+                reply += chunk
+            assert reply.split(b"\r\n", 1)[0].endswith(b" 401 Unauthorized")
+            # The server is still reading the body, so the connection stays.
+            raw.settimeout(0.3)
+            with pytest.raises(TimeoutError):
+                raw.recv(1)
+            raw.settimeout(5)
+            raw.sendall(b"other half")
+            assert raw.recv(1) == b""  # then a clean close, not a reset
+    finally:
+        server.stop()
+
+
+def test_a_stalled_refused_body_is_dropped_at_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from super_processor import review
+
+    monkeypatch.setattr(review, "_DISCARD_TIMEOUT_S", 0.2)
+    server = WizardServer(tmp_path, token=TOKEN, controller=WizardController(tmp_path))
+    base = server.start()
+    try:
+        address = _connection(base)
+        with socket.create_connection((address.host, address.port)) as raw:
+            raw.settimeout(5)
+            raw.sendall(
+                b"POST /api/upload HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"X-Wizard-Token: wrong\r\n"
+                b"Content-Length: 1000\r\n\r\n"
+                b"a trickle"
+            )
+            reply = b""
+            # The rest never comes: the server gives up and closes anyway.
+            while chunk := raw.recv(65536):
+                reply += chunk
+            assert reply.split(b"\r\n", 1)[0].endswith(b" 401 Unauthorized")
+    finally:
+        server.stop()
+
+
 def _job_on(tmp_path: Path, step: WizardStep, **state: Any) -> tuple[str, Path]:
     """A job with two approved, previewed scenes and the wizard on ``step``.
 

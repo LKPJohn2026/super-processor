@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A refused upload or wizard request that carries a small body now gets its
+  refusal (401, 409 and the like) on Windows too. The wizard reads and drops
+  up to 1 MiB of a refused body, for at most 2 seconds, before closing.
+  Before, Windows could reset the connection and the browser saw a network
+  error instead of the reason.
+
 ## [4.5.3] - 2026-11-27
 
 ### Fixed
