@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.2] - 2026-11-26
+
 ### Changed
 
 - A scene with DPIR keeps the temporal half of its look's `hqdn3d`. DPIR
