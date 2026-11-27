@@ -1790,7 +1790,7 @@ class GeminiClient:
             f"Pick one scale for the whole video from {list(scales)}. If a "
             "shot has an editor_note, follow it; current shows its settings "
             "now. A shot with dpir is already denoised more strongly by the "
-            "editor's choice, which replaces the look's denoise; leave its "
+            "editor's choice, on top of the look's denoise; leave its "
             "denoise as it is. Return a short reason per shot in plain words."
         )
         if video is not None:

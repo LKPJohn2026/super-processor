@@ -93,8 +93,13 @@ class ShotLook:
             raise LookError(f"unknown look settings: {', '.join(sorted(unknown))}")
         return cls(**data)
 
-    def clean_filter(self) -> str:
-        """FFmpeg filters for step 1, or ``""`` when there is nothing to clean."""
+    def clean_filter(self, *, spatial: bool = True) -> str:
+        """FFmpeg filters for step 1, or ``""`` when there is nothing to clean.
+
+        ``spatial=False`` keeps only the temporal half of ``hqdn3d``: the
+        smoothing between frames that a one-frame denoiser such as DPIR,
+        running next, does not do.
+        """
         parts: list[str] = []
         if self.deblock > 0:
             d = self.deblock
@@ -105,6 +110,8 @@ class ShotLook:
             )
         if self.denoise > 0:
             ls, cs, lt, ct = (limit * self.denoise for limit in _DENOISE_MAX)
+            if not spatial:
+                ls = cs = 0.0
             parts.append(f"hqdn3d={ls:.3f}:{cs:.3f}:{lt:.3f}:{ct:.3f}")
         return ",".join(parts)
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A scene with DPIR keeps the temporal half of its look's `hqdn3d`. DPIR
+  cleans each frame on its own and replaces only the spatial half, so asking
+  for more denoise no longer makes the scene flicker a little more between
+  frames.
+
 ## [4.5.1] - 2026-11-26
 
 ### Fixed

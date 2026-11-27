@@ -101,7 +101,9 @@ a batch of preview clips shares one load.
 A scene can also get DPIR (`dpir.py`): DRUNet, a denoiser told how much
 noise to remove, run in half precision on the GPU right after the frames are
 decoded, before SPAN and before the lanczos base of the blend, in place of
-the look's `hqdn3d` (the decoder then only deblocks). It is the editor's
+the spatial half of the look's `hqdn3d` (the decoder still deblocks and
+keeps `hqdn3d`'s temporal half, since DRUNet cleans each frame on its own and
+does not smooth flicker between frames). It is the editor's
 choice alone: `dpir.note_level` reads the words of a scene's note ("more
 denoise", "still noisy" raise its level by one, up to 3; "less denoise"
 lowers it; "no DPIR" turns it off), and the level is stored beside the

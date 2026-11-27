@@ -42,7 +42,7 @@ from typing import IO, Any, Protocol
 
 from .atomic_io import unlink_quietly
 from .cancel import Cancelled, stop_process
-from .dpir import DpirError, ffmpeg_look, gpu_look, level_of, note_level
+from .dpir import DpirError, ffmpeg_look, gpu_clean_filter, level_of, note_level
 from .look import LookError, ShotLook
 from .regions import Region, regions_from_dicts, strength_expr
 from .tools import FILE_INPUT, resolve_argv, tool_path
@@ -55,6 +55,8 @@ CHUNK_OVERLAP_S = 0.5
 # encodes them again first (see apply_range_revise), so one file never mixes
 # encoders.
 DELIVERY_VERSION = 3
+# What the decoder does before DPIR, in a DPIR scene's blend record.
+DPIR_CLEAN = "deblock+temporal-hqdn3d"
 NVENC = "h264_nvenc"
 X264 = "libx264"
 # Against a lossless 2880x2160 upscale (200 frames, these keyframe flags):
@@ -316,7 +318,7 @@ class UpscaleRequest:
     # Called with the share of this clip done (0 to 1) as an engine works
     # through it; SPAN reports once per block of frames.
     on_progress: ProgressFn | None = field(default=None, compare=False, repr=False)
-    # DPIR level (0 off): on the GPU it replaces the look's hqdn3d.
+    # DPIR level (0 off): on the GPU it replaces the spatial half of hqdn3d.
     dpir: int = 0
 
     def __post_init__(self) -> None:
@@ -339,7 +341,7 @@ class UpscaleEngine(Protocol):
     """Restore and upscale a clip.
 
     Implementations apply ``request.ffmpeg_look.clean_filter()`` to the
-    frames they read (or, running DPIR, the look without its hqdn3d) and
+    frames they read (or, running DPIR, :func:`gpu_clean_filter`) and
     nothing else; finishing happens in the delivery encode.
     """
 
@@ -931,8 +933,8 @@ def _stream_span(loaded: _Loaded, request: UpscaleRequest) -> Path:
     frame_in = yuv420_frame_bytes(width, height)
     per_block = block_frames(width, height)
     slack = max(FRAME_SLACK, int(want * 0.02))
-    # With DPIR on the GPU the decoder only deblocks; DPIR replaces hqdn3d.
-    clean = gpu_look(request.look, dpir).clean_filter()
+    # With DPIR on the GPU the decoder keeps deblock and hqdn3d's temporal half.
+    clean = gpu_clean_filter(request.look, dpir)
     decode = [
         tool_path("ffmpeg"),
         *_QUIET,
@@ -1417,6 +1419,9 @@ def _blend_record(
     }
     if dpir:
         record["dpir"] = dpir
+        # The decoder keeps hqdn3d's temporal half under DPIR; a part from an
+        # older release, made without it and so without this key, is not reused.
+        record["dpir_clean"] = DPIR_CLEAN
     return record
 
 

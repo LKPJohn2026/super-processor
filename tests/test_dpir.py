@@ -30,7 +30,7 @@ from super_processor.dpir import (
     MAX_LEVEL,
     DpirError,
     ffmpeg_look,
-    gpu_look,
+    gpu_clean_filter,
     level_of,
     note_level,
 )
@@ -148,14 +148,30 @@ def test_levels_map_to_drunet_noise_levels() -> None:
 def test_the_look_stand_ins() -> None:
     look = ShotLook(deblock=0.4, denoise=0.3, contrast=1.1)
     assert ffmpeg_look(look, 0) == look
-    assert gpu_look(look, 0) == look
+    assert gpu_clean_filter(look, 0) == look.clean_filter()
     assert ffmpeg_look(look, 2).denoise == dpir.FALLBACK_DENOISE
     assert "hqdn3d=6.000" in ffmpeg_look(look, 2).clean_filter()
-    on_gpu = gpu_look(look, 1)
-    assert on_gpu.denoise == 0.0
-    assert on_gpu.clean_filter().startswith("deblock=")
-    assert "hqdn3d" not in on_gpu.clean_filter()
-    assert (on_gpu.deblock, on_gpu.contrast) == (look.deblock, look.contrast)
+    # On the GPU, DRUNet replaces hqdn3d's spatial half only: the decoder
+    # still deblocks and keeps the temporal half, which smooths flicker.
+    on_gpu = gpu_clean_filter(look, 1)
+    assert on_gpu.startswith("deblock=")
+    assert on_gpu.endswith(",hqdn3d=0.000:0.000:1.800:1.350")
+    assert look.clean_filter().endswith(",hqdn3d=1.800:1.350:1.800:1.350")
+
+
+def test_a_dpir_part_from_before_the_temporal_hqdn3d_is_not_reused() -> None:
+    record = upscale._blend_record(0.3, (), dpir=1)
+    assert record["dpir_clean"] == upscale.DPIR_CLEAN
+    before = {key: value for key, value in record.items() if key != "dpir_clean"}
+    assert before != record
+    assert "dpir_clean" not in upscale._blend_record(0.3, ())
+
+
+def test_a_look_without_denoise_keeps_no_hqdn3d_under_dpir() -> None:
+    look = ShotLook(deblock=0.4)
+    assert gpu_clean_filter(look, 3) == look.clean_filter()
+    assert "hqdn3d" not in gpu_clean_filter(look, 3)
+    assert gpu_clean_filter(ShotLook(), 1) == ""
 
 
 def test_batches_follow_the_frame_size() -> None:
@@ -513,7 +529,7 @@ def weights_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[int]:
 
 
 @needs_ffmpeg
-def test_dpir_replaces_hqdn3d_before_span(
+def test_dpir_replaces_spatial_hqdn3d_before_span(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, weights_ok: list[int]
 ) -> None:
     fake = fake_span(tmp_path, monkeypatch)
@@ -525,13 +541,13 @@ def test_dpir_replaces_hqdn3d_before_span(
     assert video_stream_facts(output)[0] == 24
     assert fake.dpir_loads == 1 and weights_ok == [1]
     assert {call[:2] for call in fake.calls} == {(2, 2)}
-    # The decoder only deblocked: DRUNet, not hqdn3d, does the denoising.
-    assert fake.firsts[0] == _first_frame(
-        source, "-vf", gpu_look(look, 2).clean_filter()
-    )
+    # The decoder deblocked and smoothed between frames; DRUNet, not
+    # hqdn3d's spatial half, cleaned each frame.
+    assert fake.firsts[0] == _first_frame(source, "-vf", gpu_clean_filter(look, 2))
     assert fake.firsts[0] != _first_frame(source, "-vf", look.clean_filter())
     marker = json.loads(upscale.delivery_marker_path(output).read_text("utf-8"))
     assert marker["blend"]["dpir"] == 2
+    assert marker["blend"]["dpir_clean"] == upscale.DPIR_CLEAN
 
 
 @needs_ffmpeg

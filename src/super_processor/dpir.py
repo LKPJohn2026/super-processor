@@ -12,10 +12,12 @@ denoise" or "still noisy" raises it by one, "less denoise" lowers it, and
 "no DPIR" turns it off. The level lives on the scene's recipe beside the
 editor's other choices, so a new Gemini proposal keeps it.
 
-Where it runs, it replaces the FFmpeg ``hqdn3d`` of the look's clean step:
-the decoded frames go through DRUNet on the GPU before SPAN and before the
-lanczos base of the strength blend, so both halves of the blend are cleaned
-the same way. Without an NVIDIA GPU (a pass-through scene on a machine with
+Where it runs, it replaces the spatial half of the look's FFmpeg
+``hqdn3d``: the decoded frames go through DRUNet on the GPU before SPAN and
+before the lanczos base of the strength blend, so both halves of the blend
+are cleaned the same way. The temporal half of ``hqdn3d`` stays, because
+DRUNet cleans each frame on its own and does not smooth flicker between
+frames. Without an NVIDIA GPU (a pass-through scene on a machine with
 none), the scene gets the strongest ``hqdn3d`` instead, and the wizard says
 so.
 
@@ -159,9 +161,15 @@ def ffmpeg_look(look: ShotLook, level: int) -> ShotLook:
     return replace(look, denoise=FALLBACK_DENOISE) if level else look
 
 
-def gpu_look(look: ShotLook, level: int) -> ShotLook:
-    """The look the decoder applies when DPIR runs on the GPU: no hqdn3d."""
-    return replace(look, denoise=0.0) if level else look
+def gpu_clean_filter(look: ShotLook, level: int) -> str:
+    """The decoder's clean step when DPIR runs next on the GPU.
+
+    DRUNet cleans each frame on its own, which hqdn3d's spatial half barely
+    does, but it does not smooth flicker between frames. So the decoder keeps
+    the look's deblock and hqdn3d's temporal half, and drops only its spatial
+    half, which DPIR replaces.
+    """
+    return look.clean_filter(spatial=not level)
 
 
 def weights_path(models_dir: Path) -> Path:
