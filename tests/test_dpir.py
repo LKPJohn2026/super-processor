@@ -16,6 +16,7 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 import types
 import urllib.error
 from pathlib import Path
@@ -727,6 +728,50 @@ def test_a_stop_ends_the_download_and_keeps_nothing(
     with pytest.raises(Stopped):
         dpir.resolve_weights(pinned, opener=_opener(big, []), should_stop=stop_on_third)
     assert _leftovers(pinned / "DPIR") == []
+
+
+def test_a_stop_ends_the_wait_for_another_download(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Stopped(Exception):
+        pass
+
+    monkeypatch.setattr(dpir, "_LOCK_POLL_S", 0.01)
+    waits: list[int] = []
+
+    def stop_on_second_wait() -> None:
+        waits.append(1)
+        if len(waits) == 2:
+            raise Stopped
+
+    def no_download(url: str) -> Any:
+        raise AssertionError("a stopped render must not download")
+
+    # Another render is mid-download and holds the lock.
+    assert dpir._DOWNLOAD_LOCK.acquire(timeout=1)
+    try:
+        with pytest.raises(Stopped):
+            dpir.resolve_weights(
+                pinned, opener=no_download, should_stop=stop_on_second_wait
+            )
+    finally:
+        dpir._DOWNLOAD_LOCK.release()
+    assert len(waits) == 2
+    # The lock was not taken by the stopped render, so it is free again.
+    assert dpir._DOWNLOAD_LOCK.acquire(blocking=False)
+    dpir._DOWNLOAD_LOCK.release()
+
+
+def test_a_render_without_stop_waits_for_the_other_download(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dpir, "_LOCK_POLL_S", 0.01)
+    assert dpir._DOWNLOAD_LOCK.acquire(timeout=1)
+    threading.Timer(0.05, dpir._DOWNLOAD_LOCK.release).start()
+    path = dpir.resolve_weights(pinned, opener=_opener(_FAKE, []))
+    assert path.read_bytes() == _FAKE
+    assert dpir._DOWNLOAD_LOCK.acquire(blocking=False)
+    dpir._DOWNLOAD_LOCK.release()
 
 
 def test_a_download_past_its_deadline_keeps_nothing(

@@ -205,6 +205,24 @@ def _matches(path: Path) -> bool:
 
 
 _DOWNLOAD_LOCK = threading.Lock()
+# How often a render waiting for another render's download checks its Stop.
+_LOCK_POLL_S = 0.5
+
+
+@contextlib.contextmanager
+def _download_lock(should_stop: Callable[[], None] | None) -> Any:
+    """Hold :data:`_DOWNLOAD_LOCK`, calling ``should_stop`` while waiting.
+
+    Another render may be downloading for up to :data:`_DOWNLOAD_DEADLINE_S`;
+    a Stop on this one must not wait for that to end.
+    """
+    while not _DOWNLOAD_LOCK.acquire(timeout=_LOCK_POLL_S):
+        if should_stop is not None:
+            should_stop()
+    try:
+        yield
+    finally:
+        _DOWNLOAD_LOCK.release()
 
 
 def resolve_weights(
@@ -218,14 +236,15 @@ def resolve_weights(
     A file from ``SUPER_PROCESSOR_DPIR_WEIGHTS`` is never replaced or
     downloaded over: if it is wrong, that is an error. Raises
     :class:`DpirError` with what to do when the file cannot be had.
-    ``should_stop`` is called between downloaded chunks; whatever it raises
+    ``should_stop`` is called between downloaded chunks, and while waiting
+    for another render's download; whatever it raises
     (the render's :class:`~super_processor.cancel.Cancelled`) ends the
     download, keeping nothing. The whole download has
     :data:`_DOWNLOAD_DEADLINE_S` to finish.
     """
     path = weights_path(models_dir)
     pinned = bool(os.environ.get(DPIR_WEIGHTS_ENV, "").strip())
-    with _DOWNLOAD_LOCK:
+    with _download_lock(should_stop):
         if path.is_file():
             if _matches(path):
                 return path

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop now works on a render that is waiting for another render to finish
+  downloading the DPIR weights. Before, it waited until that download ended,
+  which could take up to 30 minutes on a slow link.
+
 ## [4.5.2] - 2026-11-26
 
 ### Changed
